@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+## [0.0.6] - 2026-03-24
+
+### Fixed
+
+- Fixed Zig 0.15.2 dependency integration compatibility by accepting both `-Doptimize` and `-Doptimization` build options in `build.zig`.
+  - This resolves [Issue #11](https://github.com/muhammad-fiaz/httpx.zig/issues/11).
+
+### Changed
+
+- Bumped project version to `0.0.6`.
+- Updated default User-Agent version to `httpx.zig/0.0.6`.
+- Updated README, docs, and installation references to `0.0.6`.
+- Updated docs metadata (`package.json`, `package-lock.json`, and VitePress schema `softwareVersion`) to `0.0.6`.
+- Updated `SECURITY.md` supported-version checklist for `0.0.6` and below.
+
 ## [0.0.5] - 2026-03-21
 
 ### Fixed

@@ -14,7 +14,10 @@ fn linkPlatformLibs(compile: *std.Build.Step.Compile, target: std.Build.Resolved
 /// Supports HTTP/1.1, HTTP/2, HTTP/3 with TLS, connection pooling, and more.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Zig ecosystem templates are split between .optimize and .optimization
+    // for dependency arguments. Support both so dependent projects build cleanly.
+    const optimize_alias = b.option(std.builtin.OptimizeMode, "optimization", "Compatibility alias for -Doptimize");
+    const optimize = optimize_alias orelse b.standardOptimizeOption(.{});
 
     const httpx_module = b.createModule(.{
         .root_source_file = b.path("src/httpx.zig"),

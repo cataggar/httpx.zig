@@ -48,7 +48,7 @@ zig build -Dtarget=aarch64-macos
 Use the latest tagged release for reproducible builds:
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz
 ```
 
 ## Method 2: Zig Fetch (Nightly/Main)
@@ -69,7 +69,7 @@ You can also add the dependency manually:
     .version = "0.1.0",
     .dependencies = .{
         .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz",
+            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz",
             .hash = "...", // Run zig fetch --save <url> to auto-fill this.
         },
     },
@@ -124,6 +124,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 }
 ```
+
+If your Zig template generated `.optimization = optimize` for dependency args, that also works.
+`httpx.zig` accepts both `.optimize` and `.optimization` for Zig 0.15.x compatibility.
 
 ## Import in your code
 
