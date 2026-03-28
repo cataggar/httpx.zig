@@ -7,8 +7,11 @@
 //!
 //! - This is a thin wrapper around the stdlib TLS implementation.
 //! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client` in a
-//!   way this library uses for HTTP/2/HTTP/3 protocol selection.
-//! - The higher-level HTTP client currently speaks HTTP/1.1 over TLS.
+//!   way this library uses for strict HTTP/2 protocol selection.
+//! - The higher-level HTTP client supports HTTP/1.1 and an HTTP/2 runtime path
+//!   over TLS, but strict ALPN-dependent server negotiation is not yet exposed.
+//! - The high-level HTTP/3 runtime path uses UDP + QUIC framing primitives and
+//!   does not go through this TLS wrapper.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -281,11 +284,11 @@ pub fn parsePemCertificate(allocator: Allocator, pem_data: []const u8) ![]const 
     base64_block = std.mem.trim(u8, base64_block, " \t\r\n");
 
     // Remove all whitespace/newlines from the base64 body.
-    var compact = std.ArrayList(u8).init(allocator);
-    defer compact.deinit();
+    var compact = std.ArrayList(u8).empty;
+    defer compact.deinit(allocator);
     for (base64_block) |ch| {
         if (ch == '\r' or ch == '\n' or ch == '\t' or ch == ' ') continue;
-        try compact.append(ch);
+        try compact.append(allocator, ch);
     }
 
     const decoder = std.base64.standard.Decoder;

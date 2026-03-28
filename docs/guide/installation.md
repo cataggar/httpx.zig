@@ -5,11 +5,11 @@ This guide covers all supported installation methods for `httpx.zig`.
 ## Requirements
 
 - **Zig Version**: 0.15.0 or later (tested on 0.15.2)
-- **Operating System**: Windows, Linux, macOS, or FreeBSD
+- **Operating System**: Windows, Linux, or macOS
 
 ## Platform Support
 
-httpx.zig supports all major platforms and architectures:
+httpx.zig supports Linux, Windows, and macOS across 32-bit and 64-bit builds:
 
 ### Operating Systems
 
@@ -18,7 +18,6 @@ httpx.zig supports all major platforms and architectures:
 | Linux | Full support | All major distributions |
 | Windows | Full support | Windows 10/11, Server 2019+ |
 | macOS | Full support | macOS 11+ (Big Sur and later) |
-| FreeBSD | Full support | FreeBSD 13+ |
 
 ### Architectures
 
@@ -26,8 +25,7 @@ httpx.zig supports all major platforms and architectures:
 |--------------|-------|---------|-------|
 | x86_64 (64-bit) | Yes | Yes | Yes |
 | aarch64 (ARM64) | Yes | Yes | Yes |
-| i386 (32-bit) | Yes | Yes | Yes |
-| arm (32-bit) | Yes | Yes | Yes |
+| x86 (32-bit) | Yes | Yes | Yes |
 
 ::: tip Cross-Compilation
 Zig makes cross-compilation easy. You can build for any supported target from any host:
@@ -48,7 +46,7 @@ zig build -Dtarget=aarch64-macos
 Use the latest tagged release for reproducible builds:
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.7.tar.gz
 ```
 
 ## Method 2: Zig Fetch (Nightly/Main)
@@ -69,7 +67,7 @@ You can also add the dependency manually:
     .version = "0.1.0",
     .dependencies = .{
         .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz",
+            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.7.tar.gz",
             .hash = "...", // Run zig fetch --save <url> to auto-fill this.
         },
     },
@@ -125,9 +123,6 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-If your Zig template generated `.optimization = optimize` for dependency args, that also works.
-`httpx.zig` accepts both `.optimize` and `.optimization` for Zig 0.15.x compatibility.
-
 ## Import in your code
 
 ```zig
@@ -145,3 +140,50 @@ pub fn main() !void {
     _ = try client.get("https://httpbin.org/get", .{});
 }
 ```
+
+## Validation and Target Matrix
+
+Run these commands from the repository root to verify functionality:
+
+```bash
+# Host tests and runnable examples
+zig build test
+zig build run-all-examples
+
+# Cross-target library compile matrix
+zig build build-all-targets
+```
+
+To validate Linux runtime behavior (not only cross-compilation), build Linux-target artifacts and execute them on Linux/WSL:
+
+```bash
+# Build Linux artifacts
+zig build test -Dtarget=x86_64-linux
+zig build example-udp_local -Dtarget=x86_64-linux
+
+# Run on Linux/WSL
+./zig-out/bin/test
+./zig-out/bin/udp_local
+```
+
+To compile tests or examples for a specific target:
+
+```bash
+# Cross-target test artifact build
+zig build test -Dtarget=x86-windows
+
+# Cross-target example build
+zig build example-udp_local -Dtarget=aarch64-macos
+```
+
+For client requests against external endpoints, prefer explicit timeout and error handling:
+
+```zig
+var res = client.get("https://example.com", .{ .timeout_ms = 10_000 }) catch |err| {
+    std.debug.print("request failed: {s}\n", .{@errorName(err)});
+    return;
+};
+defer res.deinit();
+```
+
+`httpx.zig` uses `build-all-targets` as the all-targets validation step.

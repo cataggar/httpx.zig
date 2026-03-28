@@ -4,7 +4,7 @@ import llmstxt from "vitepress-plugin-llms";
 // Site configuration
 export const SITE_URL = "https://muhammad-fiaz.github.io/httpx.zig";
 export const SITE_NAME = "httpx.zig";
-export const SITE_DESCRIPTION = "Production-ready HTTP/1.1 client & server library for Zig with TLS (HTTPS), plus HTTP/2 and HTTP/3 framing utilities.";
+export const SITE_DESCRIPTION = "Production-ready HTTP client and server library for Zig with HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 runtime support plus protocol primitives.";
 
 // Google Analytics and Google Tag Manager IDs
 export const GA_ID = "G-6BVYCRK57P";
@@ -207,7 +207,7 @@ gtag('config', '${GA_ID}');`,
           "priceCurrency": "USD"
         },
         "downloadUrl": "https://github.com/muhammad-fiaz/httpx.zig",
-        "softwareVersion": "0.0.6",
+        "softwareVersion": "0.0.7",
         "license": "https://opensource.org/licenses/MIT"
       });
     } else {
@@ -280,8 +280,9 @@ gtag('config', '${GA_ID}');`,
     nav: [
       { text: "Home", link: "/" },
       { text: "Guide", link: "/guide/getting-started" },
-      { text: "API", link: "/api/client" },
+      { text: "API", link: "/api/" },
       { text: "Examples", link: "/examples/" },
+      { text: "Changelog", link: "https://github.com/muhammad-fiaz/httpx.zig/blob/main/CHANGELOG.md" },
       {
         text: "Support",
         items: [
@@ -298,6 +299,7 @@ gtag('config', '${GA_ID}');`,
         items: [
           { text: "Getting Started", link: "/guide/getting-started" },
           { text: "Installation", link: "/guide/installation" },
+          { text: "Validation Matrix", link: "/guide/installation" },
         ],
       },
       {
@@ -343,13 +345,19 @@ gtag('config', '${GA_ID}');`,
           { text: "Static Files", link: "/examples/static-files" },
           { text: "Multi Page Website", link: "/examples/multi-page-website" },
           { text: "HTTP/2 Example", link: "/examples/http2-example" },
+          { text: "HTTP/2 Client Runtime", link: "/examples/http2-client-runtime" },
+          { text: "HTTP/2 Server Runtime", link: "/examples/http2-server-runtime" },
           { text: "HTTP/3 Example", link: "/examples/http3-example" },
+          { text: "HTTP/3 Client Runtime", link: "/examples/http3-client-runtime" },
+          { text: "HTTP/3 Server Runtime", link: "/examples/http3-server-runtime" },
+          { text: "TCP Local", link: "/examples/tcp-local" },
           { text: "UDP Local", link: "/examples/udp-local" },
         ],
       },
       {
         text: "API Reference",
         items: [
+          { text: "API Overview", link: "/api/" },
           { text: "Client API", link: "/api/client" },
           { text: "Server API", link: "/api/server" },
           { text: "Middleware API", link: "/api/middleware" },

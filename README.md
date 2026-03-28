@@ -45,9 +45,12 @@
 > **Custom HTTP/2 & HTTP/3 implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
 > - **HPACK** header compression (RFC 7541) for HTTP/2
+> - **HTTP/2 high-level client and server runtime paths** (preface/settings/headers/data flow)
 > - **HTTP/2** stream multiplexing and flow control (RFC 7540)
 > - **QPACK** header compression (RFC 9204) for HTTP/3
 > - **QUIC** transport framing (RFC 9000) for HTTP/3
+> - **HTTP/3 high-level client and server runtime paths** over UDP + QUIC/HTTP3/QPACK primitives
+> - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 
 ---
 
@@ -56,7 +59,7 @@
 
 | Feature | Description | Documentation |
 |---------|-------------|---------------|
-| **Protocol Support** | Full runtime support for **HTTP/1.0** and **HTTP/1.1**; **HTTP/2** and **HTTP/3** protocol primitives are available for advanced integrations. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
+| **Protocol Support** | Full runtime support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2**, and **HTTP/3** in high-level client/server APIs, plus low-level protocol primitives. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Header Compression** | HPACK (RFC 7541) for HTTP/2 and QPACK (RFC 9204) for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
 | **Stream Multiplexing** | HTTP/2 stream state machine with flow control and priority handling. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Connection Pooling** | Automatic reuse of TCP connections with keep-alive and health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
@@ -94,20 +97,19 @@ Before using `httpx.zig`, ensure you have the following:
 | Requirement | Version | Notes |
 |-------------|---------|-------|
 | **Zig** | 0.15.0+ | Download from [ziglang.org](https://ziglang.org/download/) |
-| **Operating System** | Windows 10+, Linux, macOS, FreeBSD | Cross-platform networking support |
+| **Operating System** | Windows 10+, Linux, macOS | Cross-platform networking support |
 
 ---
 
 ## Supported Platforms
 
-`httpx.zig` compiles and runs on a wide range of architectures:
+`httpx.zig` is validated on these architectures:
 
-| Platform | x86_64 (64-bit) | aarch64 (ARM64) | i386 (32-bit) | arm (32-bit) |
-|----------|-----------------|-----------------|---------------|--------------|
-| **Linux** | Yes | Yes | Yes | Yes |
-| **Windows** | Yes | Yes | Yes | Yes |
-| **macOS** | Yes | Yes (Apple Silicon) | Yes | Yes |
-| **FreeBSD** | Yes | Yes | Yes | Yes |
+| Platform | x86_64 (64-bit) | aarch64 (ARM64) | x86 (32-bit) |
+|----------|-----------------|-----------------|--------------|
+| **Linux** | Yes | Yes | Yes |
+| **Windows** | Yes | Yes | Yes |
+| **macOS** | Yes | Yes (Apple Silicon) | No |
 
 ### Cross-Compilation
 
@@ -124,7 +126,7 @@ zig build -Dtarget=x86_64-windows
 zig build -Dtarget=aarch64-macos
 
 # Build for 32-bit Windows
-zig build -Dtarget=i386-windows
+zig build -Dtarget=x86-windows
 ```
 
 </details>
@@ -136,7 +138,7 @@ zig build -Dtarget=i386-windows
 ### Method 1: Zig Fetch (Recommended Stable Release)
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.7.tar.gz
 ```
 
 ### Method 2: Zig Fetch (Nightly/Main)
@@ -152,7 +154,7 @@ Add this dependency entry to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.6.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.7.tar.gz",
         .hash = "...", // Run zig fetch --save <url> to auto-fill this.
     },
 },
@@ -187,9 +189,6 @@ const httpx_dep = b.dependency("httpx", .{
 });
 exe.root_module.addImport("httpx", httpx_dep.module("httpx"));
 ```
-
-If your Zig template generated `.optimization = optimize` instead, that now works too.
-`httpx.zig` accepts both names for compatibility across Zig 0.15.x project templates.
 
 ## Quick Start
 
@@ -238,6 +237,55 @@ defer response.deinit();
 
 var by_method = try httpx.send(allocator, .GET, "https://httpbin.org/headers", .{});
 defer by_method.deinit();
+
+// Additional aliases
+var del_res = try httpx.delete(allocator, "https://httpbin.org/delete", .{});
+defer del_res.deinit();
+
+var opts_res = try httpx.opts(allocator, "https://httpbin.org/get", .{});
+defer opts_res.deinit();
+```
+
+### Explicit Network Helpers
+
+```zig
+// Network lifecycle (optional explicit init/deinit)
+try httpx.netInit();
+defer httpx.netDeinit();
+
+// Address helpers
+const one = try httpx.resolveAddress("example.com", 443);
+_ = one;
+
+const parsed = try httpx.parseHostAndPort("localhost:8080", 80);
+_ = parsed;
+
+const final_addr = try httpx.parseAndResolveAddress("127.0.0.1:9000", 80);
+_ = final_addr;
+
+const is_ip = httpx.isIpAddress("::1");
+_ = is_ip;
+```
+
+### Explicit Concurrency Helpers
+
+```zig
+const specs = [_]httpx.RequestSpec{
+    .{ .method = .GET, .url = "https://httpbin.org/get" },
+    .{ .method = .GET, .url = "https://httpbin.org/headers" },
+};
+
+var client_for_concurrency = httpx.Client.init(allocator);
+defer client_for_concurrency.deinit();
+
+var all_results = try httpx.all(allocator, &client_for_concurrency, &specs);
+defer {
+    for (all_results) |*r| r.deinit();
+    allocator.free(all_results);
+}
+
+var first_ok = try httpx.first(allocator, &client_for_concurrency, &specs);
+if (first_ok) |*resp| resp.deinit();
 ```
  
 ### Server Usage
@@ -289,13 +337,60 @@ The `examples/` directory contains comprehensive examples for all major features
 - **Server Core**: `simple_server.zig`, `router_example.zig`, `middleware_example.zig`
 - **Static Assets Demo**: `static_files.zig` (file-based static routes + directory-based wildcard mounts for CSS/JS/images)
 - **Website Demo**: `multi_page_website.zig` (full multi-page website serving `index/about/contact` with static assets)
-- **Protocol Demos**: `http2_example.zig`, `http3_example.zig`
-- **Networking Utility**: `udp_local.zig`
+- **Protocol Demos**: `http2_example.zig`, `http2_client_runtime.zig`, `http2_server_runtime.zig`, `http3_example.zig`, `http3_client_runtime.zig`, `http3_server_runtime.zig`
+- **Networking Utility**: `tcp_local.zig`, `udp_local.zig`
  
 To run an example:
 ```bash
 zig build run-simple_get
 ```
+
+## Validation Matrix
+
+Validate host functionality and cross-target compatibility with these commands:
+
+```bash
+# Host runtime validation
+zig build test
+zig build run-all-examples
+
+# Cross-target library compile validation
+zig build build-all-targets
+```
+
+To validate Linux runtime behavior (not just compilation), run Linux-target artifacts from a Linux shell (or WSL):
+
+```bash
+# Build Linux test/example artifacts
+zig build test -Dtarget=x86_64-linux
+zig build example-tcp_local -Dtarget=x86_64-linux
+
+# Run on Linux/WSL
+./zig-out/bin/test
+./zig-out/bin/tcp_local
+```
+
+If a remote endpoint appears to stall, set a per-request timeout and print errors explicitly:
+
+```zig
+var response = client.get(url, .{ .timeout_ms = 10_000 }) catch |err| {
+    std.debug.print("request failed: {s}\n", .{@errorName(err)});
+    return;
+};
+defer response.deinit();
+```
+
+For explicit cross-target test and example compilation, pass `-Dtarget=...`:
+
+```bash
+# Example: compile tests for 32-bit Windows
+zig build test -Dtarget=x86-windows
+
+# Example: compile an example for macOS ARM64
+zig build example-tcp_local -Dtarget=aarch64-macos
+```
+
+> Note: this project exposes `build-all-targets` as a build step. Use `zig build build-all-targets`.
  
 ## Performance
  

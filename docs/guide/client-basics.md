@@ -21,11 +21,19 @@ const config = httpx.ClientConfig{
         .connect_ms = 5000,
         .read_ms = 10000,
     },
-    .http2_enabled = false,
+    .http2_enabled = true,
+    .http2_settings = .{
+        .max_frame_size = 16 * 1024,
+    },
 };
 var client = httpx.Client.initWithConfig(allocator, config);
 defer client.deinit();
 ```
+
+## Protocol Selection
+
+- Set `.http2_enabled = true` to use the high-level HTTP/2 request path.
+- Set `.http3_enabled = true` to use the high-level HTTP/3 request path over UDP + QUIC/HTTP3/QPACK primitives.
 
 ## Making Requests
 
@@ -40,6 +48,20 @@ defer response.deinit();
 if (response.status.isSuccess()) {
     std.debug.print("Body: {s}\n", .{response.body.?});
 }
+```
+
+### GET with explicit timeout and error handling
+
+For external endpoints, prefer an explicit per-request timeout and `catch` handler so errors are visible immediately:
+
+```zig
+var response = client.get("https://httpbin.org/get", .{
+    .timeout_ms = 10_000,
+}) catch |err| {
+    std.debug.print("request failed: {s}\n", .{@errorName(err)});
+    return;
+};
+defer response.deinit();
 ```
 
 ### POST JSON
@@ -63,12 +85,20 @@ _ = try client.put("/users/1", .{ .json = updated_json });
 // DELETE
 _ = try client.delete("/users/1", .{});
 
+// Short alias for DELETE
+_ = try client.del("/users/1", .{});
+
 // HEAD
 const head_res = try client.head("/large-file", .{});
 
 // Alias helpers
 const fetch_res = try client.fetch("/users", .{});
 const opt_res = try client.options("/users", .{});
+const opt_short = try client.opts("/users", .{});
+
+_ = fetch_res;
+_ = opt_res;
+_ = opt_short;
 ```
 
 ## Cookie Jar

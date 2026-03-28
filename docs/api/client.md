@@ -1,6 +1,6 @@
 # Client API
 
-The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0 and HTTP/1.1. HTTPS is supported via Zig's standard library TLS (`std.crypto.tls`). HTTP/2 and HTTP/3 primitives are available in the protocol module.
+The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3. HTTPS is supported via Zig's standard library TLS (`std.crypto.tls`) for HTTP/1.x and HTTP/2.
 
 ## Protocol Support
 
@@ -8,8 +8,10 @@ The `httpx.zig` client provides a high-level HTTP client for making requests ove
 |----------|--------|-----------|-------|
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
-| HTTP/2 | ✅ Full | TCP/TLS | Full protocol-module support (framing/HPACK/streams) with advanced integration paths |
-| HTTP/3 | ✅ Full | QUIC/UDP | Full protocol-module support (framing/QPACK/QUIC) with advanced integration paths |
+| HTTP/2 | ✅ Client Runtime + Primitives | TCP/TLS | High-level client request execution path plus full framing/HPACK/stream primitives |
+| HTTP/3 | ✅ Client Runtime + Primitives | QUIC/UDP | High-level client runtime over UDP + QUIC/HTTP3/QPACK primitives (suitable for local/integration endpoints) |
+
+HTTP/3 runtime mode is available in the high-level client and uses QUIC packet/stream framing primitives directly. Interoperability with endpoints that require full TLS-in-QUIC handshake negotiation may vary depending on deployment expectations.
 
 The protocol module provides HTTP/2 and HTTP/3 building blocks (HPACK/QPACK, framing, and transport primitives). See [Protocol API](protocol.md) for details.
 
@@ -43,12 +45,14 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.0.6"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.0.7"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
-| `http2_enabled` | `bool` | `false` | Enable HTTP/2 protocol (requires ALPN negotiation). See [HPACK](protocol.md#hpack-header-compression) for header compression. |
-| `http3_enabled` | `bool` | `false` | Enable HTTP/3 protocol (requires QUIC transport). See [QPACK](protocol.md#qpack-header-compression) and [QUIC](protocol.md#quic-transport). |
+| `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
+| `http3_enabled` | `bool` | `false` | Enable high-level HTTP/3 execution path over UDP/QUIC stream framing. |
+| `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS values sent during connection setup (`header_table_size`, `max_frame_size`, etc.). |
+| `http3_settings` | `Http3Settings` | `{}` | HTTP/3/QPACK settings sent on the control stream (`max_field_section_size`, `qpack_max_table_capacity`, `qpack_blocked_streams`, etc.). |
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
 
@@ -70,6 +74,13 @@ Alias for `request` with shorter naming.
 pub fn send(self: *Self, method: Method, url: []const u8, options: RequestOptions) !Response
 ```
 
+#### Short aliases
+
+```zig
+pub fn del(self: *Self, url: []const u8, options: RequestOptions) !Response
+pub fn opts(self: *Self, url: []const u8, options: RequestOptions) !Response
+```
+
 #### Convenience Methods
 
 | Method | Description |
@@ -79,10 +90,12 @@ pub fn send(self: *Self, method: Method, url: []const u8, options: RequestOption
 | `post(url, options)` | HTTP POST request |
 | `put(url, options)` | HTTP PUT request |
 | `delete(url, options)` | HTTP DELETE request |
+| `del(url, options)` | Alias for HTTP DELETE request |
 | `patch(url, options)` | HTTP PATCH request |
 | `head(url, options)` | HTTP HEAD request |
 | `httpOptions(url, options)` | HTTP OPTIONS request |
 | `options(url, options)` | Alias for HTTP OPTIONS request |
+| `opts(url, options)` | Alias for HTTP OPTIONS request |
 | `send(method, url, options)` | Alias for generic request |
 | `addInterceptor(interceptor)` | Add request/response interceptor |
 
@@ -290,6 +303,12 @@ defer b.deinit();
 
 var c = try httpx.post(allocator, "https://example.com/items", .{ .json = "{\"name\":\"demo\"}" });
 defer c.deinit();
+
+var d = try httpx.delete(allocator, "https://example.com/items/42", .{});
+defer d.deinit();
+
+var e = try httpx.opts(allocator, "https://example.com/items", .{});
+defer e.deinit();
 ```
 
 ## See Also
