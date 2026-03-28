@@ -15,6 +15,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ZIG_LOCAL_CACHE_DIR: .zig-cache
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
     steps:
       - name: Checkout
@@ -46,6 +49,9 @@ jobs:
     name: Run Examples Matrix (hostable targets)
     needs: build
     runs-on: ${{ matrix.os }}
+    env:
+      ZIG_LOCAL_CACHE_DIR: .zig-cache
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
     strategy:
       matrix:
         include:
@@ -95,6 +101,9 @@ jobs:
     name: Build Examples / Library Matrix (build-only for many targets)
     needs: build
     runs-on: ubuntu-latest
+    env:
+      ZIG_LOCAL_CACHE_DIR: .zig-cache
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
     strategy:
       matrix:
         target:
