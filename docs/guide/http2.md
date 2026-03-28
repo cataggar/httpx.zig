@@ -14,7 +14,7 @@ HTTP/2 support is validated across Linux, Windows, and macOS targets:
 |----------|--------------|--------|
 | Linux    | x86_64, aarch64, x86 | ✅ |
 | Windows  | x86_64, aarch64, x86 | ✅ |
-| macOS    | x86_64, aarch64, x86 | ✅ |
+| macOS    | x86_64, aarch64 | ✅ |
 
 ## Features
 

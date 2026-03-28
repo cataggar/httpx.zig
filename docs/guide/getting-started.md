@@ -45,7 +45,7 @@ Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx
 |--------------|-------|---------|-------|-------|
 | x86_64 (64-bit) | ✅ | ✅ | ✅ | Primary development target |
 | aarch64 (ARM64) | ✅ | ✅ | ✅ | Apple Silicon, AWS Graviton, Raspberry Pi 4+ |
-| x86 (32-bit) | ✅ | ✅ | ✅ | Legacy x86 support |
+| x86 (32-bit) | ✅ | ✅ | ❌ | Legacy x86 support on Linux/Windows |
 
 ### Cross-Compilation
 

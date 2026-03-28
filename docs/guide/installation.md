@@ -25,7 +25,7 @@ httpx.zig supports Linux, Windows, and macOS across 32-bit and 64-bit builds:
 |--------------|-------|---------|-------|
 | x86_64 (64-bit) | Yes | Yes | Yes |
 | aarch64 (ARM64) | Yes | Yes | Yes |
-| x86 (32-bit) | Yes | Yes | Yes |
+| x86 (32-bit) | Yes | Yes | No |
 
 ::: tip Cross-Compilation
 Zig makes cross-compilation easy. You can build for any supported target from any host:
