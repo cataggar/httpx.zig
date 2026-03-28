@@ -15,9 +15,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
 
     steps:
       - name: Checkout
@@ -31,13 +28,13 @@ jobs:
           version: 0.15.2
 
       - name: Run Zig tests
-        run: zig build test --summary all
+        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache test --summary all
 
       - name: Build library (Debug)
-        run: zig build -Doptimize=Debug
+        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Doptimize=Debug
 
       - name: Build library (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Doptimize=ReleaseFast
 
       - name: Run all examples (skipped here - run in matrix job)
         run: echo "Examples are tested in a dedicated matrix job on Linux, macOS, and Windows runners"
@@ -49,9 +46,6 @@ jobs:
     name: Run Examples Matrix (hostable targets)
     needs: build
     runs-on: ${{ matrix.os }}
-    env:
-      ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
     strategy:
       fail-fast: false
       matrix:
@@ -65,10 +59,12 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-linux
             linux_setup: aarch64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-macos
+            macos_rosetta: true
           - os: macos-latest
             target: aarch64-macos
+            macos_rosetta: false
           - os: windows-latest
             target: x86_64-windows
           - os: windows-latest
@@ -96,21 +92,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
 
+      - name: Install Rosetta (macOS x86_64 runtime lane)
+        if: runner.os == 'macOS' && matrix.macos_rosetta == true
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+
       - name: Run Zig tests on ${{ matrix.target }}
-        run: zig build test -Dtarget=${{ matrix.target }} --summary all
+        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache test -Dtarget=${{ matrix.target }} --summary all
 
       - name: Run all examples on ${{ matrix.target }}
         run: |
           echo "Running examples for ${{ matrix.target }}"
-          zig build run-all-examples -Dtarget=${{ matrix.target }}
+          zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache run-all-examples -Dtarget=${{ matrix.target }}
 
   examples-build-only:
     name: Build Examples / Library Matrix (build-only for many targets)
     needs: build
     runs-on: ubuntu-latest
-    env:
-      ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
     strategy:
       fail-fast: false
       matrix:
@@ -144,4 +142,4 @@ jobs:
           version: 0.15.2
 
       - name: Build for ${{ matrix.target }} (build-only)
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
+        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Dtarget=${{ matrix.target }} -Doptimize=Debug
