@@ -53,15 +53,19 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: .zig-cache
       ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-linux
+            linux_setup: none
           - os: ubuntu-latest
             target: x86-linux
+            linux_setup: x86
           - os: ubuntu-latest
             target: aarch64-linux
-          - os: macos-latest
+            linux_setup: aarch64
+          - os: macos-13
             target: x86_64-macos
           - os: macos-latest
             target: aarch64-macos
@@ -80,14 +84,17 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install QEMU and Multilib (Linux)
-        if: runner.os == 'Linux' && (matrix.target == 'aarch64-linux' || matrix.target == 'x86-linux')
+      - name: Install Multilib (Linux x86 runtime)
+        if: runner.os == 'Linux' && matrix.linux_setup == 'x86'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static gcc-multilib
-          if [ "${{ matrix.target }}" = "aarch64-linux" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+          sudo apt-get install -y gcc-multilib
+
+      - name: Install QEMU + AArch64 Toolchain (Linux aarch64 runtime)
+        if: runner.os == 'Linux' && matrix.linux_setup == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
 
       - name: Run Zig tests on ${{ matrix.target }}
         run: zig build test -Dtarget=${{ matrix.target }} --summary all
@@ -105,6 +112,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: .zig-cache
       ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-linux
