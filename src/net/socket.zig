@@ -739,9 +739,25 @@ pub const UdpSocket = struct {
             if (rc == ws2_32.SOCKET_ERROR) return UdpError.RecvFailed;
             return .{ .n = @intCast(rc), .addr = net.Address{ .any = addr } };
         } else {
-            var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-            const n = try posix.recvfrom(self.handle, buffer, 0, &addr, &addr_len);
-            return .{ .n = n, .addr = net.Address{ .any = addr } };
+            while (true) {
+                var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                const rc = posix.system.recvfrom(self.handle, buffer.ptr, buffer.len, 0, &addr, &addr_len);
+
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return .{ .n = @intCast(rc), .addr = net.Address{ .any = addr } },
+                    .INTR => continue,
+                    .AGAIN => return error.WouldBlock,
+                    .CONNREFUSED => return error.ConnectionRefused,
+                    .CONNRESET => return error.ConnectionResetByPeer,
+                    .TIMEDOUT => return error.ConnectionTimedOut,
+                    .NOMEM => return error.SystemResources,
+                    .NOTCONN => return error.SocketNotConnected,
+                    // Closing the socket from another thread while blocked in recvfrom
+                    // is a valid shutdown path for the HTTP/3 server loop.
+                    .BADF, .NOTSOCK, .FAULT, .INVAL => return UdpError.RecvFailed,
+                    else => return UdpError.RecvFailed,
+                }
+            }
         }
     }
 
