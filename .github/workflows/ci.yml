@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
 
     steps:
       - name: Checkout
@@ -51,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
     strategy:
       fail-fast: false
       matrix:
@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIG_LOCAL_CACHE_DIR: .zig-cache
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
     strategy:
       fail-fast: false
       matrix:
