@@ -147,7 +147,13 @@ zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.
 zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
 ```
 
-### Method 3: Manual `build.zig.zon` Configuration
+### Method 3: Project Starter Template (Quick Start)
+
+Get started quickly with a pre-configured project template:
+
+**[Download Project Starter Example](https://download-directory.github.io/?url=https://github.com/muhammad-fiaz/httpx.zig/tree/main/httpx-project-starter)**
+
+### Method 4: Manual `build.zig.zon` Configuration
 
 Add this dependency entry to your `build.zig.zon`:
 
@@ -160,7 +166,7 @@ Add this dependency entry to your `build.zig.zon`:
 },
 ```
 
-### Method 4: Local Source Checkout
+### Method 5: Local Source Checkout
 
 ```bash
 git clone https://github.com/muhammad-fiaz/httpx.zig.git
