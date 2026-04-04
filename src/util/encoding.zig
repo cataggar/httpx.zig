@@ -133,23 +133,23 @@ pub const PercentEncoding = struct {
 
     /// Encodes a string for use in URLs.
     pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
-        const writer = result.writer(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
 
         for (input) |c| {
             if (std.mem.indexOfScalar(u8, unreserved, c) != null) {
-                try writer.writeByte(c);
+                try aw.writer.writeByte(c);
             } else {
-                try writer.print("%{X:0>2}", .{c});
+                try aw.writer.print("%{X:0>2}", .{c});
             }
         }
 
-        return result.toOwnedSlice(allocator);
+        return aw.toOwnedSlice();
     }
 
     /// Decodes a percent-encoded string.
     pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result = std.ArrayListUnmanaged(u8).empty;
 
         var i: usize = 0;
         while (i < input.len) {
@@ -175,19 +175,19 @@ pub const PercentEncoding = struct {
 
 /// Encodes key-value pairs as application/x-www-form-urlencoded.
 pub fn encodeFormData(allocator: Allocator, params: []const struct { []const u8, []const u8 }) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    const writer = result.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
     for (params, 0..) |param, idx| {
-        if (idx > 0) try writer.writeByte('&');
+        if (idx > 0) try aw.writer.writeByte('&');
         const key = try PercentEncoding.encode(allocator, param[0]);
         defer allocator.free(key);
         const value = try PercentEncoding.encode(allocator, param[1]);
         defer allocator.free(value);
-        try writer.print("{s}={s}", .{ key, value });
+        try aw.writer.print("{s}={s}", .{ key, value });
     }
 
-    return result.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 test "Base64 encode" {

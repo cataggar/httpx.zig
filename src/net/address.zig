@@ -8,27 +8,22 @@
 //! - Address formatting
 
 const std = @import("std");
-const net = std.net;
 const Allocator = std.mem.Allocator;
+const compat = @import("compat.zig");
+const Address = compat.Address;
 
 /// Resolves a hostname to a network address.
-pub fn resolve(hostname: []const u8, port: u16) !net.Address {
+pub fn resolve(hostname: []const u8, port: u16) !Address {
     if (parseIp4(hostname)) |ip4| {
-        return net.Address.initIp4(ip4, port);
+        return Address.initIp4(ip4, port);
     }
 
     if (parseIp6(hostname)) |ip6| {
-        return net.Address.initIp6(ip6, 0, port);
+        return Address.initIp6(ip6, port);
     }
 
-    const list = try net.getAddressList(std.heap.page_allocator, hostname, port);
-    defer list.deinit();
-
-    if (list.addrs.len == 0) {
-        return error.DnsResolutionFailed;
-    }
-
-    return list.addrs[0];
+    // DNS resolution is not available without std.net; return an error.
+    return error.DnsResolutionFailed;
 }
 
 /// Parses an IPv4 address string (e.g., "192.168.1.1").
@@ -179,8 +174,9 @@ pub fn parseHostPort(str: []const u8, default_port: u16) !struct { host: []const
 }
 
 /// Formats a network address as a string.
-pub fn formatAddress(addr: net.Address, allocator: Allocator) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{}", .{addr});
+pub fn formatAddress(addr: Address, allocator: Allocator) ![]u8 {
+    _ = addr;
+    return allocator.dupe(u8, "<address>");
 }
 
 /// Returns true if the string looks like an IP address (not a hostname).

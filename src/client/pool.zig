@@ -9,7 +9,16 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const net = std.net;
+
+fn milliTimestamp() i64 {
+    if (@hasDecl(std.time, "milliTimestamp")) {
+        return std.time.milliTimestamp();
+    } else if (@hasDecl(std.time, "nanoTimestamp")) {
+        return @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    } else {
+        return 0;
+    }
+}
 
 const Socket = @import("../net/socket.zig").Socket;
 const address_mod = @import("../net/address.zig");
@@ -34,13 +43,13 @@ pub const Connection = struct {
     /// Marks the connection as in use.
     pub fn acquire(self: *Self) void {
         self.in_use = true;
-        self.last_used = std.time.milliTimestamp();
+        self.last_used = milliTimestamp();
     }
 
     /// Releases the connection back to the pool.
     pub fn release(self: *Self) void {
         self.in_use = false;
-        self.last_used = std.time.milliTimestamp();
+        self.last_used = milliTimestamp();
         self.requests_made += 1;
     }
 
@@ -48,7 +57,7 @@ pub const Connection = struct {
     pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
         if (self.in_use) return false;
         if (!self.socket.isValid()) return false;
-        const idle_time = std.time.milliTimestamp() - self.last_used;
+        const idle_time = milliTimestamp() - self.last_used;
         return idle_time < max_idle_ms;
     }
 
@@ -57,7 +66,7 @@ pub const Connection = struct {
         if (self.in_use) return false;
         if (!self.socket.isValid()) return true;
         if (self.requests_made >= max_requests_per_connection) return true;
-        const idle_time = std.time.milliTimestamp() - self.last_used;
+        const idle_time = milliTimestamp() - self.last_used;
         return idle_time >= idle_timeout_ms;
     }
 
@@ -144,7 +153,7 @@ pub const ConnectionPool = struct {
         errdefer socket.close();
         try socket.connect(addr);
 
-        const now = std.time.milliTimestamp();
+        const now = milliTimestamp();
 
         try self.connections.append(self.allocator, .{
             .socket = socket,
@@ -223,8 +232,8 @@ test "Connection health check" {
         .socket = try Socket.create(),
         .host = "localhost",
         .port = 8080,
-        .created_at = std.time.milliTimestamp(),
-        .last_used = std.time.milliTimestamp(),
+        .created_at = milliTimestamp(),
+        .last_used = milliTimestamp(),
     };
     defer conn.socket.close();
 

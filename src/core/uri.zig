@@ -117,30 +117,30 @@ pub const Uri = struct {
 
     /// Reconstructs the full URI string.
     pub fn format(self: Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8){};
-        const writer = buffer.writer(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
 
-        if (self.scheme) |s| try writer.print("{s}://", .{s});
-        if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
-        try writer.print("{s}", .{self.path});
-        if (self.query) |q| try writer.print("?{s}", .{q});
-        if (self.fragment) |f| try writer.print("#{s}", .{f});
+        if (self.scheme) |s| try aw.writer.print("{s}://", .{s});
+        if (self.userinfo) |u| try aw.writer.print("{s}@", .{u});
+        if (self.host) |h| try aw.writer.print("{s}", .{h});
+        if (self.port) |p| try aw.writer.print(":{d}", .{p});
+        try aw.writer.print("{s}", .{self.path});
+        if (self.query) |q| try aw.writer.print("?{s}", .{q});
+        if (self.fragment) |f| try aw.writer.print("#{s}", .{f});
 
-        return buffer.toOwnedSlice(allocator);
+        return aw.toOwnedSlice();
     }
 
     /// Returns the authority component (userinfo@host:port).
     pub fn authority(self: Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8){};
-        const writer = buffer.writer(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
 
-        if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
+        if (self.userinfo) |u| try aw.writer.print("{s}@", .{u});
+        if (self.host) |h| try aw.writer.print("{s}", .{h});
+        if (self.port) |p| try aw.writer.print(":{d}", .{p});
 
-        return buffer.toOwnedSlice(allocator);
+        return aw.toOwnedSlice();
     }
 };
 
@@ -149,23 +149,23 @@ const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234567
 
 /// Percent-encodes a string for URI inclusion.
 pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    const writer = result.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
     for (input) |c| {
         if (mem.indexOfScalar(u8, unreserved, c) != null) {
-            try writer.writeByte(c);
+            try aw.writer.writeByte(c);
         } else {
-            try writer.print("%{X:0>2}", .{c});
+            try aw.writer.print("%{X:0>2}", .{c});
         }
     }
 
-    return result.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Decodes a percent-encoded string.
 pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
+    var result = std.ArrayListUnmanaged(u8).empty;
 
     var i: usize = 0;
     while (i < input.len) {
@@ -190,19 +190,19 @@ pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
 
 /// Encodes query parameters as a query string.
 pub fn encodeQueryParams(allocator: Allocator, params: []const struct { []const u8, []const u8 }) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    const writer = result.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
     for (params, 0..) |param, idx| {
-        if (idx > 0) try writer.writeByte('&');
+        if (idx > 0) try aw.writer.writeByte('&');
         const key = try encode(allocator, param[0]);
         defer allocator.free(key);
         const value = try encode(allocator, param[1]);
         defer allocator.free(value);
-        try writer.print("{s}={s}", .{ key, value });
+        try aw.writer.print("{s}={s}", .{ key, value });
     }
 
-    return result.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 test "URI parsing basic" {

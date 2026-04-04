@@ -13,6 +13,16 @@
 const std = @import("std");
 const Context = @import("server.zig").Context;
 const Response = @import("../core/response.zig").Response;
+
+fn milliTimestamp() i64 {
+    if (@hasDecl(std.time, "milliTimestamp")) {
+        return std.time.milliTimestamp();
+    } else if (@hasDecl(std.time, "nanoTimestamp")) {
+        return @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    } else {
+        return 0;
+    }
+}
 const types = @import("../core/types.zig");
 
 /// Middleware function type.
@@ -85,9 +95,9 @@ pub fn logger() Middleware {
         .name = "logger",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                const start = std.time.milliTimestamp();
+                const start = milliTimestamp();
                 const response = try next(ctx);
-                const duration = std.time.milliTimestamp() - start;
+                const duration = milliTimestamp() - start;
 
                 std.debug.print("{s} {s} - {d}ms\n", .{
                     ctx.request.method.toString(),

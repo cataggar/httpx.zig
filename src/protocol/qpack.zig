@@ -168,7 +168,7 @@ pub const DynamicEntry = struct {
 /// QPACK dynamic table with Required Insert Count tracking
 pub const DynamicTable = struct {
     allocator: Allocator,
-    entries: std.ArrayListUnmanaged(DynamicEntry) = .{},
+    entries: std.ArrayListUnmanaged(DynamicEntry) = .empty,
     current_size: usize = 0,
     max_size: usize = 0, // Default 0, set via SETTINGS
     /// Number of entries ever inserted (used for absolute indexing)
@@ -406,7 +406,7 @@ pub fn encodeHeaders(
     headers: []const HeaderEntry,
     allocator: Allocator,
 ) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
 
     // Required Insert Count = 0 (we don't use dynamic table references)
@@ -453,7 +453,7 @@ pub fn decodeHeaders(
     data: []const u8,
     allocator: Allocator,
 ) ![]DecodedHeader {
-    var headers = std.ArrayListUnmanaged(DecodedHeader){};
+    var headers = std.ArrayListUnmanaged(DecodedHeader).empty;
     errdefer {
         for (headers.items) |h| {
             allocator.free(h.name);

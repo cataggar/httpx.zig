@@ -158,7 +158,7 @@ pub const Http1Connection = struct {
 
     /// Decodes a chunked transfer encoded body.
     fn readChunkedBody(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result = std.ArrayListUnmanaged(u8).empty;
         var line_buf: [256]u8 = undefined;
 
         while (true) {
@@ -187,7 +187,7 @@ pub const Http1Connection = struct {
 
     /// Reads all remaining data until the connection is closed by the peer.
     fn readUntilClose(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result = std.ArrayListUnmanaged(u8).empty;
         var buf: [4096]u8 = undefined;
 
         while (true) {
@@ -365,7 +365,7 @@ pub const Http2Connection = struct {
 
     /// Transmits the local settings to the peer.
     fn sendSettings(self: *Self) !void {
-        var payload = std.ArrayListUnmanaged(u8){};
+        var payload = std.ArrayListUnmanaged(u8).empty;
         defer payload.deinit(self.allocator);
 
         try encodeSettingsPayload(self.settings, self.allocator, &payload);
@@ -593,49 +593,49 @@ pub const Http3FrameHeader = struct {
 
 /// Formats a request object into HTTP/1.x wire format.
 pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
-    const writer = buffer.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
     const method_str = req.method.toString();
-    try writer.print("{s} {s}", .{ method_str, req.uri.path });
+    try aw.writer.print("{s} {s}", .{ method_str, req.uri.path });
     if (req.uri.query) |q| {
-        try writer.print("?{s}", .{q});
+        try aw.writer.print("?{s}", .{q});
     }
-    try writer.print(" {s}\r\n", .{req.version.toString()});
+    try aw.writer.print(" {s}\r\n", .{req.version.toString()});
 
     for (req.headers.entries.items) |h| {
-        try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
+        try aw.writer.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
-    try writer.writeAll("\r\n");
+    try aw.writer.writeAll("\r\n");
 
     if (req.body) |body| {
-        try writer.writeAll(body);
+        try aw.writer.writeAll(body);
     }
 
-    return buffer.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Formats a response object into HTTP/1.x wire format.
 pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
-    const writer = buffer.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
-    try writer.print("{s} {d} {s}\r\n", .{
+    try aw.writer.print("{s} {d} {s}\r\n", .{
         resp.version.toString(),
         resp.status.code,
         resp.status.phrase,
     });
 
     for (resp.headers.entries.items) |h| {
-        try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
+        try aw.writer.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
-    try writer.writeAll("\r\n");
+    try aw.writer.writeAll("\r\n");
 
     if (resp.body) |body| {
-        try writer.writeAll(body);
+        try aw.writer.writeAll(body);
     }
 
-    return buffer.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Determines the highest supported HTTP version based on ALPN negotiation string.
@@ -735,7 +735,7 @@ test "HTTP/2 SETTINGS payload encode/decode" {
         .max_header_list_size = 9000,
     };
 
-    var payload = std.ArrayListUnmanaged(u8){};
+    var payload = std.ArrayListUnmanaged(u8).empty;
     defer payload.deinit(allocator);
     try encodeSettingsPayload(settings_in, allocator, &payload);
 

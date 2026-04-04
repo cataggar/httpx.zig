@@ -12,7 +12,8 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const net = std.net;
+const compat = @import("../net/compat.zig");
+const Address = compat.Address;
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -210,7 +211,7 @@ pub const Server = struct {
 
     /// Starts the server and begins accepting connections.
     pub fn listen(self: *Self) !void {
-        const addr = try net.Address.parseIp(self.config.host, self.config.port);
+        const addr = try Address.parseIp(self.config.host, self.config.port);
         self.listener = try TcpListener.init(addr);
         self.running = true;
 
