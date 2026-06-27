@@ -5,7 +5,7 @@ description: A production-ready, high-performance HTTP client and server library
 
 hero:
   name: httpx.zig
-  text: A production-ready, high-performance HTTP client and server library for Zig
+  text: HTTP client and server library for Zig
   tagline: Production-ready HTTP/1.x/2/3 client and server runtime with proxy support, concurrency, and protocol primitives
   image:
     src: /logo.png
