@@ -420,11 +420,19 @@ pub const SocketIoReader = struct {
     }
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        var iovecs_buffer: [4][]u8 = undefined;
+        const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
+        const dest = iovecs_buffer[0..dest_n];
+        if (dest.len == 0 or dest[0].len == 0) return 0;
+
         const p = parent(r);
-        if (bufs.len == 0) return 0;
-        const buf = bufs[0];
-        const n = p.socket.recv(buf) catch return error.ReadFailed;
+        const n = p.socket.recv(dest[0]) catch return error.ReadFailed;
         if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            @branchHint(.likely);
+            r.end += n - data_size;
+            return data_size;
+        }
         return n;
     }
 
