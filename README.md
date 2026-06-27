@@ -26,8 +26,7 @@
 
 </div>
 
-
-`httpx.zig` is a comprehensive, high-performance HTTP library for building robust networked applications in Zig, with modern client and server primitives, support for major HTTP versions, connection pooling, and pattern-based routing. You can build your own APIs and website servers directly on top of these components; see the runnable examples in the repository: [examples/](https://github.com/muhammad-fiaz/httpx.zig/tree/main/examples), [examples/static_files.zig](https://github.com/muhammad-fiaz/httpx.zig/blob/main/examples/static_files.zig), and [examples/multi_page_website.zig](https://github.com/muhammad-fiaz/httpx.zig/blob/main/examples/multi_page_website.zig).
+`httpx.zig` is a modern, high-performance HTTP library for Zig, providing everything needed to build fast and reliable networked applications, including HTTP clients, servers, APIs, web services, reverse proxies, and full-featured websites.
 
 **Related Zig projects:**
 
@@ -79,7 +78,7 @@
 | **Unified Any-Method Routing** | `any(path, handler)` to register all standard HTTP methods on one endpoint. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Concurrency** | Parallel request patterns (`race`, `all`, `any`) and async task execution. | https://muhammad-fiaz.github.io/httpx.zig/guide/concurrency |
 | **Socket APIs** | Cross-platform TCP/UDP socket helpers, listener wrappers, and TLS stream adapters. | https://muhammad-fiaz.github.io/httpx.zig/api/net |
-| **Proxy Support** | Client-side forward proxy routing and server-side reverse proxy middleware. | https://muhammad-fiaz.github.io/httpx.zig/examples/proxy-example |
+| **Proxy Support** | Client-side HTTP forward proxy routing, SOCKS5h tunneling, and server-side reverse proxy middleware. | https://muhammad-fiaz.github.io/httpx.zig/examples/proxy-example |
 | **Interceptors** | Global hooks to modify requests and responses (e.g., Auth injection). | https://muhammad-fiaz.github.io/httpx.zig/guide/interceptors |
 | **Logging Hooks** | Server log callbacks plus logger middleware customization for structured output. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **Smart Retries** | Configurable retry policies with exponential backoff. | https://muhammad-fiaz.github.io/httpx.zig/api/client |
@@ -470,21 +469,23 @@ zig build bench
 > Benchmark results will vary based on hardware and network conditions.
 > The benchmark suite reports multiple rounds with min/avg/max and throughput to improve result quality.
 
-Latest benchmark snapshot (`x86_64-windows`, `ReleaseFast`):
+Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 | Benchmark | Avg (ns/op) | Throughput (ops/sec) |
 |-----------|-------------|----------------------|
-| headers_parse | 34228.26 | 29215 |
-| uri_parse | 53.14 | 18818251 |
-| status_lookup | 2.28 | 439313265 |
-| method_lookup | 9.27 | 107889064 |
-| base64_encode | 4569.04 | 218864 |
-| base64_decode | 4859.87 | 205766 |
-| json_builder | 4687.50 | 213333 |
-| request_build | 26806.72 | 37304 |
-| response_builders | 35379.08 | 28265 |
-| h2_frame_header | 1.82 | 550533466 |
-| h3_varint_encode | 1.22 | 816790601 |
+| headers_parse | 17143.40 | 58331 |
+| uri_parse | 30.54 | 32742548 |
+| status_lookup | 0.87 | 1153375931 |
+| method_lookup | 14.33 | 69779969 |
+| base64_encode | 5740.49 | 174201 |
+| base64_decode | 5647.98 | 177054 |
+| json_builder | 5886.02 | 169894 |
+| request_build | 28003.02 | 35710 |
+| response_builders | 27856.15 | 35898 |
+| executor_run_all | 178.57 | 5599956 |
+| proxy_request_build | 46943.72 | 21302 |
+| h2_frame_header | 0.96 | 1041362935 |
+| h3_varint_encode | 0.97 | 1025960914 |
  
 ## Contributing
  

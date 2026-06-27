@@ -15,6 +15,17 @@ HTTP/3 runtime mode is available in the high-level client and uses QUIC packet/s
 
 The protocol module provides HTTP/2 and HTTP/3 building blocks (HPACK/QPACK, framing, and transport primitives). See [Protocol API](protocol.md) for details.
 
+## Proxy Modes
+
+`httpx.zig` supports two client proxy modes:
+
+| Kind | Behavior | DNS resolution |
+|------|----------|----------------|
+| `http` | Standard forward proxy or HTTPS CONNECT tunnel | Client resolves the target host unless the proxy protocol performs the tunnel itself |
+| `socks5h` | SOCKS5 proxy with remote host resolution | Proxy resolves the hostname and connects on behalf of the client |
+
+Use `socks5h` when you want to avoid local DNS lookups or when the proxy has access to names that are not visible on the client network.
+
 ## Client
 
 The `Client` struct is the main entry point for making requests. It manages connection pooling, cookies, and interceptors.
@@ -77,7 +88,7 @@ defer client.deinit();
 | `keep_alive` | `bool` | `true` | Reuse TCP connections when possible. |
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
-| `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. |
+| `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. Use `.kind = .socks5h` for SOCKS5h tunneling; the default kind is HTTP. |
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
 
@@ -101,7 +112,7 @@ If you do not set a field, the implicit default value is used. Builder helpers o
 | `withKeepAlive(enabled)` | Toggle keep-alive connection reuse. |
 | `withMaxResponseSize(bytes)` | Override maximum response body size. |
 | `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
-| `withProxy(proxy_or_null)` | Configure or clear a forward proxy. |
+| `withProxy(proxy_or_null)` | Configure or clear a forward proxy. Set `.kind = .socks5h` for SOCKS5h tunneling. |
 
 ### Client Initialization Helpers
 

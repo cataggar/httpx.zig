@@ -33,6 +33,7 @@ const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const ConnectionPool = @import("pool.zig").ConnectionPool;
+const proxy_mod = @import("proxy.zig");
 const PoolStats = @import("pool.zig").PoolStats;
 const common = @import("../util/common.zig");
 const list_writer = @import("../util/list_writer.zig");
@@ -606,7 +607,7 @@ pub const Client = struct {
 
         var request_data: []u8 = undefined;
         if (self.config.proxy) |proxy| {
-            if (!req.uri.isTls()) {
+            if (proxy.kind == .http and !req.uri.isTls()) {
                 request_data = try self.formatProxyRequest(req, proxy);
             } else {
                 request_data = try http.formatRequest(req, self.allocator);
@@ -634,7 +635,11 @@ pub const Client = struct {
             try socket.connect(addr);
 
             if (self.config.proxy) |proxy| {
-                try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+                if (proxy.kind == .socks5h) {
+                    try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+                } else {
+                    try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+                }
             }
 
             return self.executeTlsHttp(&socket, host, request_data);
@@ -677,6 +682,12 @@ pub const Client = struct {
 
         try socket.connect(addr);
 
+        if (self.config.proxy) |proxy| {
+            if (proxy.kind == .socks5h) {
+                try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+            }
+        }
+
         try socket.sendAll(request_data);
         return self.readResponseFromTcp(&socket);
     }
@@ -706,7 +717,11 @@ pub const Client = struct {
         try socket.connect(addr);
 
         if (self.config.proxy) |proxy| {
-            try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+            if (proxy.kind == .socks5h) {
+                try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+            } else {
+                try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+            }
         }
 
         if (req.uri.isTls()) {

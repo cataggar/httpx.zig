@@ -127,6 +127,7 @@ pub const RetryPolicy = types.RetryPolicy;
 pub const RedirectPolicy = types.RedirectPolicy;
 pub const Http2Settings = types.Http2Settings;
 pub const Http3Settings = types.Http3Settings;
+pub const ProxyKind = types.ProxyKind;
 pub const Proxy = types.Proxy;
 
 pub const Headers = headers.Headers;

@@ -30,6 +30,8 @@ The root module re-exports core types and convenience helpers so most apps can i
 - `httpx.RequestOptions.defaults().withHttp2()`
 - `httpx.RequestOptions.defaults().withHttp3()`
 - `httpx.BasicAuth`
+- `httpx.Proxy`
+- `httpx.ProxyKind`
 
 ### Server Types
 

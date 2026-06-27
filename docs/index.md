@@ -1,10 +1,12 @@
 ---
 layout: home
+title: httpx.zig
+description: A production-ready, high-performance HTTP client and server library for Zig with HTTP/1.x, HTTP/2, HTTP/3, proxy support, concurrency, and protocol primitives.
 
 hero:
   name: httpx.zig
-  text: Production-Ready HTTP Library for Zig
-  tagline: Production-ready HTTP/1.x/2/3 client and server runtime, plus protocol primitives
+  text: A production-ready, high-performance HTTP client and server library for Zig
+  tagline: Production-ready HTTP/1.x/2/3 client and server runtime with proxy support, concurrency, and protocol primitives
   image:
     src: /logo.png
     alt: httpx.zig
@@ -35,6 +37,26 @@ features:
   - title: MIME Ready
     details: Case-insensitive MIME detection for common web/document/media/font/archive formats with explicit fallback override.
 ---
+
+## Latest Benchmark Snapshot
+
+Benchmark target: `x86_64-windows`, `ReleaseFast`.
+
+| Benchmark | Avg (ns/op) | Throughput (ops/sec) |
+|-----------|-------------|----------------------|
+| headers_parse | 17143.40 | 58331 |
+| uri_parse | 30.54 | 32742548 |
+| status_lookup | 0.87 | 1153375931 |
+| method_lookup | 14.33 | 69779969 |
+| base64_encode | 5740.49 | 174201 |
+| base64_decode | 5647.98 | 177054 |
+| json_builder | 5886.02 | 169894 |
+| request_build | 28003.02 | 35710 |
+| response_builders | 27856.15 | 35898 |
+| executor_run_all | 178.57 | 5599956 |
+| proxy_request_build | 46943.72 | 21302 |
+| h2_frame_header | 0.96 | 1041362935 |
+| h3_varint_encode | 0.97 | 1025960914 |
 
 ## Install
 

@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const Socket = @import("../net/socket.zig").Socket;
 const address_mod = @import("../net/address.zig");
 const types = @import("../core/types.zig");
+const proxy_mod = @import("proxy.zig");
 const Proxy = types.Proxy;
 
 fn nowMillis() i64 {
@@ -98,7 +99,6 @@ pub const ConnectionPool = struct {
     allocator: Allocator,
     config: PoolConfig,
     connections: std.ArrayList(Connection) = .empty,
-    hosts_owned: std.ArrayList([]u8) = .empty,
 
     const Self = @This();
 
@@ -119,13 +119,9 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *Self) void {
         for (self.connections.items) |*conn| {
             conn.close();
+            self.allocator.free(conn.host);
         }
         self.connections.deinit(self.allocator);
-
-        for (self.hosts_owned.items) |host| {
-            self.allocator.free(host);
-        }
-        self.hosts_owned.deinit(self.allocator);
     }
 
     /// Gets or creates a connection to the specified host.
@@ -153,7 +149,7 @@ pub const ConnectionPool = struct {
     /// Creates a new connection.
     fn createConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy) !*Connection {
         const host_owned = try self.allocator.dupe(u8, host);
-        try self.hosts_owned.append(self.allocator, host_owned);
+        errdefer self.allocator.free(host_owned);
 
         const connect_host = if (proxy) |p| p.host else host;
         const connect_port = if (proxy) |p| p.port else port;
@@ -162,6 +158,12 @@ pub const ConnectionPool = struct {
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
         try socket.connect(addr);
+
+        if (proxy) |p| {
+            if (p.kind == .socks5h) {
+                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
+            }
+        }
 
         const now = nowMillis();
 
@@ -190,6 +192,7 @@ pub const ConnectionPool = struct {
             const conn = &self.connections.items[i];
             if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
                 conn.close();
+                self.allocator.free(conn.host);
                 _ = self.connections.orderedRemove(i);
             } else {
                 i += 1;

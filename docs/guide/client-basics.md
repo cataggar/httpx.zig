@@ -207,6 +207,17 @@ var client = httpx.Client.initWithConfig(allocator, config);
 defer client.deinit();
 ```
 
+For SOCKS5h, set the proxy kind explicitly:
+
+```zig
+const socks_config = httpx.ClientConfig.defaults()
+    .withProxy(.{
+        .kind = .socks5h,
+        .host = "127.0.0.1",
+        .port = 1080,
+    });
+```
+
 ## Response Handling
 
 The `Response` object provides helpers to access data:

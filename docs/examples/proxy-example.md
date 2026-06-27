@@ -1,6 +1,21 @@
 # Proxy and Reverse Proxy
 
-Demonstrates how to use client-side forward proxying and server-side reverse proxying.
+Demonstrates how to use client-side forward proxying and server-side reverse proxying. The client-side config also accepts `.kind = .socks5h` when you want the proxy to resolve the target host remotely.
+
+## SOCKS5h Notes
+
+SOCKS5h is useful when you want remote hostname resolution instead of local DNS lookup. In `httpx.zig`, set the proxy kind explicitly:
+
+```zig
+const socks_proxy = httpx.ClientConfig.defaults()
+    .withProxy(.{
+        .kind = .socks5h,
+        .host = "127.0.0.1",
+        .port = 1080,
+    });
+```
+
+With `http`, the client keeps the current forward-proxy behavior and still supports CONNECT tunnels for TLS endpoints.
 
 ## Demo Program
 

@@ -4,7 +4,7 @@ import llmstxt from "vitepress-plugin-llms";
 // Site configuration
 export const SITE_URL = "https://muhammad-fiaz.github.io/httpx.zig";
 export const SITE_NAME = "httpx.zig";
-export const SITE_DESCRIPTION = "Production-ready HTTP client and server library for Zig with HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 runtime support plus protocol primitives.";
+export const SITE_DESCRIPTION = "A production-ready, high-performance HTTP client and server library for Zig with HTTP/1.x, HTTP/2, HTTP/3, concurrency, proxy support, and protocol primitives.";
 
 // Google Analytics and Google Tag Manager IDs
 export const GA_ID = "G-6BVYCRK57P";
@@ -14,7 +14,7 @@ export const GTM_ID = "GTM-P4M9T8ZR";
 export const ADSENSE_CLIENT_ID = "ca-pub-2040560600290490";
 
 // SEO Keywords
-export const KEYWORDS = "zig, http, https, http3, quic, server, client, networking, library, async, production, connection pooling, middleware, routing, tls, ssl, performance";
+export const KEYWORDS = "zig, http, https, http3, quic, server, client, networking, library, async, production, connection pooling, middleware, routing, tls, ssl, performance, socks5h, proxy";
 
 export default defineConfig({
   lang: "en-US",
@@ -125,11 +125,15 @@ gtag('config', '${GA_ID}');`,
 
   ignoreDeadLinks: [/.*\.zig$/],
 
-  transformPageData(pageData) {
+  transformPageData(pageData: any) {
     // Dynamic OG image generation based on page title
     const pageTitle = pageData.title || SITE_NAME;
     const pageDescription = pageData.description || SITE_DESCRIPTION;
-    const canonicalUrl = `${SITE_URL}/${pageData.relativePath.replace(/((^|\/)index)?\.md$/, '$2').replace(/\.md$/, '')}`;
+    const normalizedPath = pageData.relativePath
+      .replace(/\.md$/, "")
+      .replace(/(^|\/)index$/, "$1")
+      .replace(/\/$/, "");
+    const canonicalUrl = normalizedPath.length > 0 ? `${SITE_URL}/${normalizedPath}` : SITE_URL;
 
     pageData.frontmatter.head ??= [];
     pageData.frontmatter.head.push(
@@ -247,7 +251,7 @@ gtag('config', '${GA_ID}');`,
       const pathParts = pageData.relativePath.replace(/\.md$/, '').split('/');
       let currentPath = SITE_URL;
       
-      pathParts.forEach((part, index) => {
+      pathParts.forEach((part: string, index: number) => {
         currentPath += `/${part}`;
         // Best effort capitalization
         const name = part.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ');
@@ -342,6 +346,7 @@ gtag('config', '${GA_ID}');`,
           { text: "Interceptors", link: "/examples/interceptors" },
           { text: "Cookies Demo", link: "/examples/cookies-demo" },
           { text: "Proxy Example", link: "/examples/proxy-example" },
+          { text: "SOCKS5h Proxy", link: "/examples/socks5h-proxy" },
           { text: "Simplified API Aliases", link: "/examples/simplified-api-aliases" },
           { text: "Simple Server", link: "/examples/simple-server" },
           { text: "Router Example", link: "/examples/router-example" },

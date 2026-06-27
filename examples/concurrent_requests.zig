@@ -48,7 +48,7 @@ pub fn main() !void {
     _ = try builder.get("http://127.0.0.1:45235/data");
     _ = try builder.get("http://127.0.0.1:45235/data");
 
-    var client = httpx.Client.initWithConfig(allocator, .{});
+    var client = httpx.Client.initWithConfig(allocator, .{ .keep_alive = false });
     defer client.deinit();
 
     // 3. Mode: multi_thread (implicit background workers)

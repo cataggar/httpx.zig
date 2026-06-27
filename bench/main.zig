@@ -60,6 +60,7 @@ fn runBenchmark(name: []const u8, cfg: BenchConfig, func: *const fn () void) voi
 }
 
 var bench_allocator: std.mem.Allocator = undefined;
+var bench_executor: *httpx.Executor = undefined;
 
 fn benchHeadersParse() void {
     var headers = httpx.Headers.init(bench_allocator);
@@ -124,6 +125,61 @@ fn benchRequestBuild() void {
     request.addQueryParam("page", "1") catch {};
 }
 
+fn benchProxyRequestBuild() void {
+    var request = httpx.Request.init(bench_allocator, .GET, "https://api.example.com/users") catch return;
+    defer request.deinit();
+
+    const proxy = httpx.Proxy{
+        .kind = .http,
+        .host = "127.0.0.1",
+        .port = 8080,
+        .username = "user",
+        .password = "pass",
+    };
+
+    const auth_val = httpx.Base64.formatBasicAuth(bench_allocator, proxy.username.?, proxy.password orelse "") catch return;
+    defer bench_allocator.free(auth_val);
+
+    const query_prefix = if (request.uri.query != null) "?" else "";
+    const query_value = if (request.uri.query) |q| q else "";
+
+    const proxy_request = std.fmt.allocPrint(
+        bench_allocator,
+        "{s} http://{s}:{d}{s}{s}{s} {s}\r\nProxy-Authorization: {s}\r\n\r\n",
+        .{
+            request.method.toString(),
+            request.uri.host orelse "",
+            request.uri.effectivePort(),
+            request.uri.path,
+            query_prefix,
+            query_value,
+            request.version.toString(),
+            auth_val,
+        },
+    ) catch return;
+    bench_allocator.free(proxy_request);
+}
+
+fn benchExecutorRunAll() void {
+    const Noop = struct {
+        fn run(_: ?*anyopaque) void {}
+    };
+
+    const tasks = [_]httpx.Task{
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+        .{ .func = Noop.run },
+    };
+
+    bench_executor.executeAll(&tasks) catch return;
+    bench_executor.runAll();
+}
+
 fn benchResponseBuilders() void {
     var text_resp = httpx.Response.fromText(bench_allocator, 200, "ok") catch return;
     defer text_resp.deinit();
@@ -153,6 +209,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     bench_allocator = gpa.allocator();
 
+    var executor = httpx.Executor.initWithConfig(bench_allocator, .{ .num_threads = 1, .task_queue_size = 64 });
+    defer executor.deinit();
+    bench_executor = &executor;
+
     std.debug.print("=== httpx.zig Benchmarks ===\n\n", .{});
     std.debug.print("Host: {s}-{s} ({s})\n\n", .{
         @tagName(@import("builtin").cpu.arch),
@@ -178,6 +238,10 @@ pub fn main() !void {
     std.debug.print("\nRequest Building:\n", .{});
     runBenchmark("request_build", heavy_cfg, benchRequestBuild);
     runBenchmark("response_builders", heavy_cfg, benchResponseBuilders);
+
+    std.debug.print("\nConcurrency & Proxy:\n", .{});
+    runBenchmark("executor_run_all", heavy_cfg, benchExecutorRunAll);
+    runBenchmark("proxy_request_build", heavy_cfg, benchProxyRequestBuild);
 
     std.debug.print("\nHTTP/2 & HTTP/3:\n", .{});
     runBenchmark("h2_frame_header", parser_cfg, benchHttp2FrameHeader);

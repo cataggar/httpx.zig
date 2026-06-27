@@ -383,8 +383,15 @@ pub const Http3Settings = struct {
     enable_datagrams: bool = false,
 };
 
+/// Supported proxy transport types.
+pub const ProxyKind = enum {
+    http,
+    socks5h,
+};
+
 /// Proxy configuration settings.
 pub const Proxy = struct {
+    kind: ProxyKind = .http,
     host: []const u8,
     port: u16,
     username: ?[]const u8 = null,

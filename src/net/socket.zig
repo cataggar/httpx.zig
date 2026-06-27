@@ -1184,7 +1184,7 @@ test "SocketIoReader readVec fills internal buffer for empty input" {
 
     var scratch: [32]u8 = undefined;
     var io_reader = SocketIoReader.init(&client, scratch[0..]);
-    var empty_iov = [_][]u8{.{}};
+    var empty_iov = [_][]u8{};
 
     const n = try SocketIoReader.readVec(&io_reader.reader, &empty_iov);
     try std.testing.expectEqual(@as(usize, 0), n);
