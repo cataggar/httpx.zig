@@ -1,8 +1,8 @@
 //! httpx.zig - Production-Ready HTTP Library for Zig
 //!
 //! A comprehensive HTTP client and server library with production-ready HTTP/1.x
-//! runtime support, high-level HTTP/2 client runtime support, and HTTP/2/HTTP/3
-//! protocol primitives.
+//! runtime support, high-level HTTP/2 and HTTP/3 client/server runtime support,
+//! and HTTP/2/HTTP/3 protocol primitives.
 //!
 //! ## Important Note
 //!
@@ -18,8 +18,8 @@
 //!
 //! - **HTTP/1.0**: Basic request-response semantics
 //! - **HTTP/1.1**: Persistent connections, chunked transfer, pipelining
-//! - **HTTP/2**: High-level client runtime path plus HPACK/framing primitives
-//! - **HTTP/3**: High-level client runtime path plus QPACK/QUIC framing primitives
+//! - **HTTP/2**: High-level client/server runtime paths plus HPACK/framing primitives
+//! - **HTTP/3**: High-level client/server runtime paths plus QPACK/QUIC framing primitives
 //!
 //! ## Platform Support
 //!
@@ -101,6 +101,7 @@ pub const middleware = @import("server/middleware.zig");
 pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
+pub const mime = @import("util/mime.zig");
 pub const common = @import("util/common.zig");
 pub const utils = common;
 
@@ -113,6 +114,8 @@ pub const BatchBuilder = concurrency.BatchBuilder;
 
 pub const Executor = executor.Executor;
 pub const Task = executor.Task;
+pub const TaskFn = executor.TaskFn;
+pub const ExecutorConfig = executor.ExecutorConfig;
 
 pub const Method = types.Method;
 pub const Version = types.Version;
@@ -142,6 +145,8 @@ pub const ResponseBuilder = response.ResponseBuilder;
 pub const Socket = socket.Socket;
 pub const TcpListener = socket.TcpListener;
 pub const UdpSocket = socket.UdpSocket;
+pub const Address = address.Address;
+pub const AddressList = address.AddressList;
 pub const ShutdownMode = socket.ShutdownMode;
 pub const TcpSocket = Socket;
 pub const DatagramSocket = UdpSocket;
@@ -200,6 +205,7 @@ pub const negotiateVersion = http.negotiateVersion;
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const BasicAuth = client_mod.BasicAuth;
 pub const Interceptor = client_mod.Interceptor;
 pub const RequestInterceptor = client_mod.RequestInterceptor;
 pub const ResponseInterceptor = client_mod.ResponseInterceptor;
@@ -213,12 +219,14 @@ pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
+pub const PortConflictStrategy = server_mod.PortConflictStrategy;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
 pub const CookieOptions = server_mod.CookieOptions;
 pub const SameSite = server_mod.SameSite;
 pub const SseEvent = server_mod.SseEvent;
 pub const PreRouteHook = server_mod.PreRouteHook;
+pub const FileResponseOptions = server_mod.FileResponseOptions;
 pub const HttpServer = Server;
 pub const Ctx = Context;
 
@@ -243,12 +251,16 @@ pub const Base64 = encoding.Base64;
 pub const Hex = encoding.Hex;
 pub const PercentEncoding = encoding.PercentEncoding;
 pub const CookiePair = common.CookiePair;
+pub const MimeMapping = mime.MimeMapping;
+pub const MimeRegistry = mime.MimeRegistry;
+pub const defaultMimeMappings = mime.default_mappings;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
 
 pub const VERSION = meta.version;
 pub const DEFAULT_USER_AGENT = meta.default_user_agent;
+const default_alias_allocator = std.heap.page_allocator;
 
 /// Resolves a hostname to a network address.
 pub const resolveAddress = address.resolve;
@@ -283,6 +295,15 @@ pub const parseSetCookiePair = common.parseSetCookiePair;
 /// Alias for parseSetCookiePair().
 pub const parseCookiePair = common.parseSetCookiePair;
 
+/// Returns a best-effort MIME type from file extension.
+pub const mimeTypeFromPath = common.mimeTypeFromPath;
+
+/// Returns a MIME type from file extension with a custom fallback.
+pub const mimeTypeFromPathOr = common.mimeTypeFromPathOr;
+
+/// Returns a MIME type using caller-provided mappings and fallback.
+pub const mimeTypeFromPathWith = common.mimeTypeFromPathWith;
+
 /// HTTP/3 varint encode alias.
 pub const encodeVarInt = http.encodeVarInt;
 
@@ -309,6 +330,16 @@ pub fn allSettled(allocator: std.mem.Allocator, client: *Client, specs: []const 
     return concurrency.allSettled(allocator, client, specs);
 }
 
+/// Counts successful results returned by all/allSettled.
+pub fn successfulCount(results: []const RequestResult) usize {
+    return concurrency.successfulCount(results);
+}
+
+/// Counts failed results returned by all/allSettled.
+pub fn errorCount(results: []const RequestResult) usize {
+    return concurrency.errorCount(results);
+}
+
 /// Alias for any() for first-success semantics.
 pub fn first(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !?Response {
     return any(allocator, client, specs);
@@ -325,19 +356,34 @@ pub fn settled(allocator: std.mem.Allocator, client: *Client, specs: []const Req
 }
 
 /// Convenience function to create a GET request.
-pub fn get(allocator: std.mem.Allocator, url: []const u8) !Response {
+pub fn get(url: []const u8) !Response {
+    return getWithAllocator(default_alias_allocator, url);
+}
+
+/// Convenience function to create a GET request with an explicit allocator.
+pub fn getWithAllocator(allocator: std.mem.Allocator, url: []const u8) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.get(url, .{});
 }
 
 /// Convenience alias for GET requests.
-pub fn fetch(allocator: std.mem.Allocator, url: []const u8) !Response {
-    return get(allocator, url);
+pub fn fetch(url: []const u8) !Response {
+    return get(url);
+}
+
+/// Convenience alias for GET requests with an explicit allocator.
+pub fn fetchWithAllocator(allocator: std.mem.Allocator, url: []const u8) !Response {
+    return getWithAllocator(allocator, url);
 }
 
 /// Convenience function to create a request with an explicit method.
-pub fn send(
+pub fn send(method: Method, url: []const u8, req_options: RequestOptions) !Response {
+    return sendWithAllocator(default_alias_allocator, method, url, req_options);
+}
+
+/// Convenience function to create a request with an explicit method and allocator.
+pub fn sendWithAllocator(
     allocator: std.mem.Allocator,
     method: Method,
     url: []const u8,
@@ -349,81 +395,205 @@ pub fn send(
 }
 
 /// Convenience function to create a POST request with JSON body.
-pub fn postJson(allocator: std.mem.Allocator, url: []const u8, body: []const u8) !Response {
+pub fn postJson(url: []const u8, body: []const u8) !Response {
+    return postJsonWithAllocator(default_alias_allocator, url, body);
+}
+
+/// Convenience function to create a POST request with JSON body and allocator.
+pub fn postJsonWithAllocator(allocator: std.mem.Allocator, url: []const u8, body: []const u8) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.post(url, .{ .json = body });
 }
 
 /// Convenience function to create a POST request.
-pub fn post(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+pub fn post(url: []const u8, req_options: RequestOptions) !Response {
+    return postWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a POST request with an explicit allocator.
+pub fn postWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.post(url, req_options);
 }
 
 /// Convenience function to create a PUT request.
-pub fn put(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+pub fn put(url: []const u8, req_options: RequestOptions) !Response {
+    return putWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a PUT request with an explicit allocator.
+pub fn putWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.put(url, req_options);
 }
 
 /// Convenience function to create a DELETE request.
-pub fn del(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+pub fn del(url: []const u8, req_options: RequestOptions) !Response {
+    return delWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a DELETE request with an explicit allocator.
+pub fn delWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.delete(url, req_options);
 }
 
 /// Convenience alias for DELETE requests.
-pub fn delete(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    return del(allocator, url, req_options);
+pub fn delete(url: []const u8, req_options: RequestOptions) !Response {
+    return del(url, req_options);
+}
+
+/// Convenience alias for DELETE requests with an explicit allocator.
+pub fn deleteWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+    return delWithAllocator(allocator, url, req_options);
 }
 
 /// Convenience function to create a PATCH request.
-pub fn patch(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+pub fn patch(url: []const u8, req_options: RequestOptions) !Response {
+    return patchWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a PATCH request with an explicit allocator.
+pub fn patchWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.patch(url, req_options);
 }
 
 /// Convenience function to create a HEAD request.
-pub fn head(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+pub fn head(url: []const u8, req_options: RequestOptions) !Response {
+    return headWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a HEAD request with an explicit allocator.
+pub fn headWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.head(url, req_options);
 }
 
+/// Convenience function to create a TRACE request.
+pub fn trace(url: []const u8, req_options: RequestOptions) !Response {
+    return traceWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a TRACE request with an explicit allocator.
+pub fn traceWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator);
+    defer c.deinit();
+    return c.trace(url, req_options);
+}
+
+/// Convenience function to create a CONNECT request.
+pub fn connect(url: []const u8, req_options: RequestOptions) !Response {
+    return connectWithAllocator(default_alias_allocator, url, req_options);
+}
+
+/// Convenience function to create a CONNECT request with an explicit allocator.
+pub fn connectWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator);
+    defer c.deinit();
+    return c.connect(url, req_options);
+}
+
 /// Convenience function to create an OPTIONS request.
-pub fn options(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
+pub fn options(url: []const u8, options_in: RequestOptions) !Response {
+    return optionsWithAllocator(default_alias_allocator, url, options_in);
+}
+
+/// Convenience function to create an OPTIONS request with an explicit allocator.
+pub fn optionsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
     var c = Client.init(allocator);
     defer c.deinit();
     return c.options(url, options_in);
 }
 
 /// Convenience alias for OPTIONS requests.
-pub fn opts(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
-    return options(allocator, url, options_in);
+pub fn opts(url: []const u8, options_in: RequestOptions) !Response {
+    return options(url, options_in);
+}
+
+/// Convenience alias for OPTIONS requests with an explicit allocator.
+pub fn optsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
+    return optionsWithAllocator(allocator, url, options_in);
 }
 
 test "top-level alias compile checks" {
-    const delete_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = delete;
-    const opts_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = opts;
+    const get_ptr: *const fn ([]const u8) anyerror!Response = get;
+    const get_alloc_ptr: *const fn (std.mem.Allocator, []const u8) anyerror!Response = getWithAllocator;
+    const fetch_ptr: *const fn ([]const u8) anyerror!Response = fetch;
+    const fetch_alloc_ptr: *const fn (std.mem.Allocator, []const u8) anyerror!Response = fetchWithAllocator;
+    const post_json_ptr: *const fn ([]const u8, []const u8) anyerror!Response = postJson;
+    const post_json_alloc_ptr: *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!Response = postJsonWithAllocator;
+    const send_ptr: *const fn (Method, []const u8, RequestOptions) anyerror!Response = send;
+    const send_alloc_ptr: *const fn (std.mem.Allocator, Method, []const u8, RequestOptions) anyerror!Response = sendWithAllocator;
+    const post_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = post;
+    const post_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = postWithAllocator;
+    const put_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = put;
+    const put_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = putWithAllocator;
+    const del_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = del;
+    const del_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = delWithAllocator;
+    const delete_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = delete;
+    const delete_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = deleteWithAllocator;
+    const patch_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = patch;
+    const patch_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = patchWithAllocator;
+    const head_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = head;
+    const head_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = headWithAllocator;
+    const trace_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = trace;
+    const trace_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = traceWithAllocator;
+    const connect_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = connect;
+    const connect_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = connectWithAllocator;
+    const options_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = options;
+    const options_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = optionsWithAllocator;
+    const opts_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = opts;
+    const opts_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = optsWithAllocator;
     const first_ptr: *const fn (std.mem.Allocator, *Client, []const RequestSpec) anyerror!?Response = first;
     const fastest_ptr: *const fn (std.mem.Allocator, *Client, []const RequestSpec) anyerror!RequestResult = fastest;
     const settled_ptr: *const fn (std.mem.Allocator, *Client, []const RequestSpec) anyerror![]RequestResult = settled;
-    const resolve_addr_ptr: *const fn ([]const u8, u16) anyerror!std.net.Address = resolveAddress;
-    const resolve_all_addr_ptr: *const fn (std.mem.Allocator, []const u8, u16) anyerror![]std.net.Address = resolveAllAddresses;
+    const resolve_addr_ptr: *const fn ([]const u8, u16) anyerror!address.Address = resolveAddress;
+    const resolve_all_addr_ptr: *const fn (std.mem.Allocator, []const u8, u16) anyerror![]address.Address = resolveAllAddresses;
     const parse_host_port_ptr = parseHostAndPort;
-    const parse_and_resolve_ptr: *const fn ([]const u8, u16) anyerror!std.net.Address = parseAndResolveAddress;
+    const parse_and_resolve_ptr: *const fn ([]const u8, u16) anyerror!address.Address = parseAndResolveAddress;
     const is_ip_ptr: *const fn ([]const u8) bool = isIpAddress;
     const is_ip4_ptr: *const fn ([]const u8) bool = isIp4Address;
     const is_ip6_ptr: *const fn ([]const u8) bool = isIp6Address;
+    const mime_ptr: *const fn ([]const u8) []const u8 = mimeTypeFromPath;
+    const mime_or_ptr: *const fn ([]const u8, []const u8) []const u8 = mimeTypeFromPathOr;
+    const mime_with_ptr: *const fn ([]const u8, []const common.MimeMapping, []const u8) []const u8 = mimeTypeFromPathWith;
     const net_init_ptr: *const fn () anyerror!void = netInit;
     const net_deinit_ptr: *const fn () void = netDeinit;
+    _ = get_ptr;
+    _ = get_alloc_ptr;
+    _ = fetch_ptr;
+    _ = fetch_alloc_ptr;
+    _ = post_json_ptr;
+    _ = post_json_alloc_ptr;
+    _ = send_ptr;
+    _ = send_alloc_ptr;
+    _ = post_ptr;
+    _ = post_alloc_ptr;
+    _ = put_ptr;
+    _ = put_alloc_ptr;
+    _ = del_ptr;
+    _ = del_alloc_ptr;
     _ = delete_ptr;
+    _ = delete_alloc_ptr;
+    _ = patch_ptr;
+    _ = patch_alloc_ptr;
+    _ = head_ptr;
+    _ = head_alloc_ptr;
+    _ = trace_ptr;
+    _ = trace_alloc_ptr;
+    _ = connect_ptr;
+    _ = connect_alloc_ptr;
+    _ = options_ptr;
+    _ = options_alloc_ptr;
     _ = opts_ptr;
+    _ = opts_alloc_ptr;
     _ = first_ptr;
     _ = fastest_ptr;
     _ = settled_ptr;
@@ -434,6 +604,9 @@ test "top-level alias compile checks" {
     _ = is_ip_ptr;
     _ = is_ip4_ptr;
     _ = is_ip6_ptr;
+    _ = mime_ptr;
+    _ = mime_or_ptr;
+    _ = mime_with_ptr;
     _ = net_init_ptr;
     _ = net_deinit_ptr;
 }

@@ -13,7 +13,9 @@ pub fn main() !void {
     defer recv_sock.close();
 
     try recv_sock.setReuseAddr(true);
-    try recv_sock.bind(try std.net.Address.parseIp("127.0.0.1", 0));
+
+    const listen_addr = try httpx.Address.parseIp("127.0.0.1", 0);
+    try recv_sock.bind(listen_addr);
 
     const recv_addr = try recv_sock.getLocalAddress();
 

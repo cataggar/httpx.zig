@@ -34,6 +34,27 @@ var client = httpx.Client.initWithConfig(allocator, .{
     .user_agent = "my-app/1.0",
 });
 defer client.deinit();
+
+// Initialize with default config + base URL helper
+var api = httpx.Client.initForBaseUrl(allocator, "https://api.example.com");
+defer api.deinit();
+```
+
+For optional explicit customization, `ClientConfig` supports chainable helpers:
+
+```zig
+const cfg = httpx.ClientConfig.defaults()
+    .withBaseUrl("https://api.example.com")
+    .withTimeouts(httpx.Timeouts.fast())
+    .withRetryPolicy(httpx.RetryPolicy.noRetry())
+    .withFollowRedirects(false)
+    .withHttp2Settings(.{ .max_concurrent_streams = 100 })
+    .withHttp3Settings(.{ .enable_datagrams = true })
+    .withPoolLimits(64, 16)
+    .withUserAgent("my-app/2.0");
+
+var client = httpx.Client.initWithConfig(allocator, cfg);
+defer client.deinit();
 ```
 
 ### Configuration (`ClientConfig`)
@@ -45,7 +66,7 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.0.7"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.1.0"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
@@ -53,8 +74,40 @@ defer client.deinit();
 | `http3_enabled` | `bool` | `false` | Enable high-level HTTP/3 execution path over UDP/QUIC stream framing. |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS values sent during connection setup (`header_table_size`, `max_frame_size`, etc.). |
 | `http3_settings` | `Http3Settings` | `{}` | HTTP/3/QPACK settings sent on the control stream (`max_field_section_size`, `qpack_max_table_capacity`, `qpack_blocked_streams`, etc.). |
+| `keep_alive` | `bool` | `true` | Reuse TCP connections when possible. |
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
+
+If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
+
+### Config Helper Methods
+
+| Helper | Description |
+|--------|-------------|
+| `ClientConfig.defaults()` | Returns default config (`.{}`). |
+| `ClientConfig.forBaseUrl(url)` | Returns defaults with `base_url` set. |
+| `withBaseUrl(url_or_null)` | Override base URL on a copy. |
+| `withTimeouts(timeouts)` | Override timeout bundle (`Timeouts`). |
+| `withRetryPolicy(policy)` | Override retry behavior (`RetryPolicy`). |
+| `withRedirectPolicy(policy)` | Override redirect behavior (`RedirectPolicy`). |
+| `withDefaultHeaders(headers_or_null)` | Override default client headers. |
+| `withUserAgent(ua)` | Override `User-Agent` string. |
+| `withFollowRedirects(enabled)` | Override client-level redirect following. |
+| `withProtocols(http2, http3)` | Override protocol runtime toggles. |
+| `withHttp2Settings(settings)` | Override HTTP/2 SETTINGS values. |
+| `withHttp3Settings(settings)` | Override HTTP/3 SETTINGS values. |
+| `withSslVerification(enabled)` | Toggle TLS certificate verification. |
+| `withKeepAlive(enabled)` | Toggle keep-alive connection reuse. |
+| `withMaxResponseSize(bytes)` | Override maximum response body size. |
+| `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
+
+### Client Initialization Helpers
+
+| Helper | Description |
+|--------|-------------|
+| `Client.init(allocator)` | Default client config. |
+| `Client.initWithConfig(allocator, cfg)` | Explicit config. |
+| `Client.initForBaseUrl(allocator, url)` | Default config with base URL set. |
 
 ### Methods
 
@@ -93,11 +146,16 @@ pub fn opts(self: *Self, url: []const u8, options: RequestOptions) !Response
 | `del(url, options)` | Alias for HTTP DELETE request |
 | `patch(url, options)` | HTTP PATCH request |
 | `head(url, options)` | HTTP HEAD request |
+| `trace(url, options)` | HTTP TRACE request |
+| `connect(url, options)` | HTTP CONNECT request |
 | `httpOptions(url, options)` | HTTP OPTIONS request |
 | `options(url, options)` | Alias for HTTP OPTIONS request |
 | `opts(url, options)` | Alias for HTTP OPTIONS request |
 | `send(method, url, options)` | Alias for generic request |
 | `addInterceptor(interceptor)` | Add request/response interceptor |
+| `cleanupIdleConnections()` | Evict idle/exhausted pooled connections |
+| `poolStats()` | Snapshot total/active/idle pool counts |
+| `hostPoolConnectionCount(host, port)` | Count pooled connections for one host:port |
 
 ### Cookie Jar API
 
@@ -144,6 +202,14 @@ const auth_response = try client.get("https://api.example.com/protected", .{
 });
 defer auth_response.deinit();
 
+// Built-in auth helpers
+const bearer_opts = httpx.RequestOptions.defaults()
+    .withBearerToken("token123")
+    .withHeaders(&.{.{ "Accept", "application/json" }});
+
+const bearer_response = try client.get("https://api.example.com/protected", bearer_opts);
+defer bearer_response.deinit();
+
 // With timeout
 const timeout_response = try client.get("https://slow-api.com/data", .{
     .timeout_ms = 30000, // 30 seconds
@@ -163,6 +229,7 @@ For complete copy/paste demos, see these example pages:
 - [Connection Pool](/examples/connection-pool)
 - [Interceptors](/examples/interceptors)
 - [Cookies Demo](/examples/cookies-demo)
+- [HTTP Auth Helpers](/examples/http-auth-helpers)
 - [Simplified API Aliases](/examples/simplified-api-aliases)
 
 ### Request Options (`RequestOptions`)
@@ -172,10 +239,59 @@ Per-request overrides for configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `headers` | `?[]const [2][]const u8` | `null` | Additional headers for this request. |
+| `query_params` | `?[]const [2][]const u8` | `null` | Percent-encoded query params appended to the request URL. |
 | `body` | `?[]const u8` | `null` | Raw request body. |
 | `json` | `?[]const u8` | `null` | JSON string body (sets Content-Type). |
+| `form_fields` | `?[]const [2][]const u8` | `null` | Form fields encoded as `application/x-www-form-urlencoded`. |
+| `bearer_token` | `?[]const u8` | `null` | Sets `Authorization: Bearer <token>`. |
+| `basic_auth` | `?BasicAuth` | `null` | Sets `Authorization: Basic ...` using username/password credentials. |
 | `timeout_ms` | `?u64` | `null` | Request-specific timeout. |
 | `follow_redirects` | `?bool` | `null` | Override client redirect setting. |
+| `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
+
+Unset request-option fields stay `null`, meaning client-level defaults are used implicitly.
+
+When multiple body-style fields are provided, precedence is:
+
+1. `body`
+2. `json`
+3. `form_fields`
+
+Authentication helper precedence when both are set directly in a literal:
+
+1. `basic_auth`
+2. `bearer_token` (applied last)
+
+Optional builder helpers are available for concise per-request setup when you want explicit overrides:
+
+```zig
+const opts = httpx.RequestOptions.defaults()
+    .withHeaders(&.{ .{ "Accept", "application/json" } })
+    .withBearerToken("demo-token")
+    .withQueryParams(&.{ .{ "page", "1" } })
+    .withTimeoutMs(10_000)
+    .withHttp2()
+    .withFollowRedirects(true);
+
+var res = try client.get("/users", opts);
+defer res.deinit();
+```
+
+Available helpers:
+
+- `RequestOptions.defaults()`
+- `withHeaders(headers)`
+- `withQueryParams(params)`
+- `withBody(body)`
+- `withJson(json)`
+- `withFormUrlEncoded(fields)`
+- `withBearerToken(token)`
+- `withBasicAuth(username, password)`
+- `withTimeoutMs(ms)`
+- `withFollowRedirects(bool)`
+- `withVersion(version)`
+- `withHttp2()`
+- `withHttp3()`
 
 ## Response
 
@@ -295,20 +411,30 @@ const response = client.get("https://example.com", .{}) catch |err| switch (err)
 The root module also exposes simple aliases for common client usage:
 
 ```zig
-var a = try httpx.fetch(allocator, "https://example.com");
+var a = try httpx.fetch("https://example.com");
 defer a.deinit();
 
-var b = try httpx.send(allocator, .GET, "https://example.com/health", .{});
+var b = try httpx.send(.GET, "https://example.com/health", .{});
 defer b.deinit();
 
-var c = try httpx.post(allocator, "https://example.com/items", .{ .json = "{\"name\":\"demo\"}" });
+var c = try httpx.post("https://example.com/items", .{ .json = "{\"name\":\"demo\"}" });
 defer c.deinit();
 
-var d = try httpx.delete(allocator, "https://example.com/items/42", .{});
+var d = try httpx.delete("https://example.com/items/42", .{});
 defer d.deinit();
 
-var e = try httpx.opts(allocator, "https://example.com/items", .{});
+var e = try httpx.opts("https://example.com/items", .{});
 defer e.deinit();
+
+var f = try httpx.trace("https://example.com/trace", .{});
+defer f.deinit();
+
+var g = try httpx.connect("https://example.com/tunnel", .{});
+defer g.deinit();
+
+// Optional explicit allocator override
+var h = try httpx.sendWithAllocator(allocator, .GET, "https://example.com/health", .{ .timeout_ms = 10_000 });
+defer h.deinit();
 ```
 
 ## See Also

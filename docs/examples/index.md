@@ -20,18 +20,19 @@ zig build example-http3_example -Dtarget=aarch64-macos
 
 - [Simple Get](/examples/simple-get): Basic GET request and response handling.
 - [Simple Get Deserialize](/examples/simple-get-deserialize): Parse JSON into typed structs.
+- [HTTP Auth Helpers](/examples/http-auth-helpers): Use built-in Bearer and Basic auth request helpers against a local loopback server.
 - [Post JSON](/examples/post-json): Send JSON payloads with POST.
 - [Custom Headers](/examples/custom-headers): Attach auth and custom metadata headers.
 - [Concurrent Requests](/examples/concurrent-requests): Execute multiple requests in parallel.
 - [Connection Pool](/examples/connection-pool): Reuse pooled connections efficiently.
 - [Interceptors](/examples/interceptors): Apply request and response interceptors.
 - [Cookies Demo](/examples/cookies-demo): Manage cookie jar values in client flows.
-- [Simplified API Aliases](/examples/simplified-api-aliases): Use short top-level helper APIs.
+- [Simplified API Aliases](/examples/simplified-api-aliases): Use short top-level helper APIs with local loopback success mode by default.
 - [Simple Server](/examples/simple-server): Start a minimal HTTP server.
 - [Router Example](/examples/router-example): Route params and grouped endpoints.
 - [Middleware Example](/examples/middleware-example): Chain middleware with shared behavior.
 - [Streaming](/examples/streaming): Stream data responses.
-- [Static Files](/examples/static-files): Serve assets with content types.
+- [Static Files](/examples/static-files): Serve assets with content types, ETag headers, and conditional GET (`If-None-Match`) support.
 - [Multi Page Website](/examples/multi-page-website): Serve multiple HTML pages.
 - [HTTP/2 Example](/examples/http2-example): HTTP/2 framing and stream primitives.
 - [HTTP/2 Client Runtime](/examples/http2-client-runtime): End-to-end high-level HTTP/2 client request against a local loopback server.

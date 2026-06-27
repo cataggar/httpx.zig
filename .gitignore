@@ -10,7 +10,6 @@ build
 *.lib
 *.exe
 httpx.lib
-
 # IDEs
 .vscode/
 .idea/

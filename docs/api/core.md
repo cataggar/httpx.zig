@@ -19,7 +19,16 @@ Usually constructed via `RequestBuilder` or internally by the server.
 - **Selected methods**:
   - `setBody(body)`: Set request body and Content-Length.
   - `setJson(body)`: Set JSON body and Content-Type.
+  - `setFormUrlEncoded(fields)`: Set form body and Content-Type.
+  - `setBearerAuth(token)`: Set `Authorization: Bearer <token>`.
+  - `setBasicAuth(username, password)`: Set `Authorization: Basic ...`.
   - `addQueryParam(key, value)`: Append a percent-encoded query parameter.
+  - `addQueryParams(fields)`: Append multiple query parameters.
+  - `hasContentType(media_type)`: Match request Content-Type ignoring parameters.
+  - `isJsonContent()`: True when Content-Type is `application/json`.
+  - `isFormContent()`: True when Content-Type is `application/x-www-form-urlencoded`.
+  - `accepts(media_type)`: True when Accept header allows a media type.
+  - `acceptsJson()`: True when Accept allows `application/json`.
 
 ### `httpx.RequestBuilder`
 
@@ -80,8 +89,11 @@ A wrapper around an insertion-ordered String HashMap (or list) for HTTP headers.
 
 - **Methods**:
   - `get(name)`: Get first value.
+  - `getOr(name, fallback)`: Get first value or fallback.
   - `set(name, value)`: Set/Overwrite value.
   - `append(name, value)`: Append value (for multi-value headers).
+  - `appendIfMissing(name, value)`: Append only when missing.
+  - `mergeFrom(other, overwrite)`: Merge another header collection.
   - `remove(name)`: Remove header.
 
 ## URI

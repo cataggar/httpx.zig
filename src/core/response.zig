@@ -11,6 +11,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const list_writer = @import("../util/list_writer.zig");
 
 const types = @import("types.zig");
 const Headers = @import("headers.zig").Headers;
@@ -154,8 +155,8 @@ pub const Response = struct {
 
     /// Serializes to an allocated buffer.
     pub fn toSlice(self: *const Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8){};
-        const writer = buffer.writer(allocator);
+        var buffer = std.ArrayList(u8).empty;
+        const writer = list_writer.init(allocator, &buffer);
         try self.serialize(writer);
         return buffer.toOwnedSlice(allocator);
     }
@@ -167,6 +168,7 @@ pub const ResponseBuilder = struct {
     status_code: u16 = 200,
     headers: Headers,
     body_data: ?[]const u8 = null,
+    body_owned: bool = false,
 
     const Self = @This();
 
@@ -180,7 +182,18 @@ pub const ResponseBuilder = struct {
 
     /// Releases builder resources.
     pub fn deinit(self: *Self) void {
+        self.clearOwnedBody();
         self.headers.deinit();
+    }
+
+    fn clearOwnedBody(self: *Self) void {
+        if (self.body_owned) {
+            if (self.body_data) |b| {
+                self.allocator.free(b);
+            }
+        }
+        self.body_data = null;
+        self.body_owned = false;
     }
 
     /// Sets the status code.
@@ -197,6 +210,7 @@ pub const ResponseBuilder = struct {
 
     /// Sets the response body.
     pub fn body(self: *Self, data: []const u8) *Self {
+        self.clearOwnedBody();
         self.body_data = data;
         return self;
     }
@@ -204,14 +218,17 @@ pub const ResponseBuilder = struct {
     /// Sets a JSON body with appropriate Content-Type.
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
+        self.clearOwnedBody();
         const serialized = try stringifyJsonAlloc(self.allocator, value, .{});
         self.body_data = serialized;
+        self.body_owned = true;
         return self;
     }
 
     /// Sets an HTML body with appropriate Content-Type.
     pub fn html(self: *Self, content: []const u8) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "text/html; charset=utf-8");
+        self.clearOwnedBody();
         self.body_data = content;
         return self;
     }
@@ -219,6 +236,7 @@ pub const ResponseBuilder = struct {
     /// Sets a plain text body with appropriate Content-Type.
     pub fn text(self: *Self, content: []const u8) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "text/plain; charset=utf-8");
+        self.clearOwnedBody();
         self.body_data = content;
         return self;
     }
@@ -232,8 +250,16 @@ pub const ResponseBuilder = struct {
         }
 
         if (self.body_data) |b| {
-            response.body = try self.allocator.dupe(u8, b);
-            response.body_owned = true;
+            if (self.body_owned) {
+                // Transfer ownership for allocated JSON payloads.
+                response.body = b;
+                response.body_owned = true;
+                self.body_data = null;
+                self.body_owned = false;
+            } else {
+                response.body = try self.allocator.dupe(u8, b);
+                response.body_owned = true;
+            }
 
             if (!response.headers.isChunked()) {
                 var len_buf: [32]u8 = undefined;
@@ -286,6 +312,19 @@ test "ResponseBuilder" {
 
     try std.testing.expectEqual(@as(u16, 201), response.status.code);
     try std.testing.expect(response.body != null);
+}
+
+test "ResponseBuilder json ownership transfer" {
+    const allocator = std.testing.allocator;
+    var builder = ResponseBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.json(.{ .ok = true });
+    var response = try builder.build();
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("application/json", response.contentType().?);
+    try std.testing.expect(response.text() != null);
 }
 
 test "Response serialization" {

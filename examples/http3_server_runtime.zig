@@ -6,8 +6,13 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
+fn sleepMs(ms: i64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
+}
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -26,8 +31,9 @@ pub fn main() !void {
 
     const server_thread = try std.Thread.spawn(.{}, serverThreadMain, .{&server});
     defer server_thread.join();
+    defer server.stop();
 
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    sleepMs(50);
 
     var client = httpx.Client.initWithConfig(allocator, .{
         .http3_enabled = true,
@@ -46,8 +52,6 @@ pub fn main() !void {
     std.debug.print("Response version: {s}\n", .{response.version.toString()});
     std.debug.print("Status: {d}\n", .{response.status.code});
     std.debug.print("Body: {s}\n", .{response.text() orelse ""});
-
-    server.stop();
 }
 
 fn handleH3(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -66,7 +70,7 @@ fn pickFreeUdpPort() !u16 {
     var socket = try httpx.UdpSocket.create();
     defer socket.close();
 
-    try socket.bind(try std.net.Address.parseIp("127.0.0.1", 0));
+    try socket.bind(try httpx.Address.parseIp("127.0.0.1", 0));
     const addr = try socket.getLocalAddress();
     return addr.getPort();
 }
