@@ -758,4 +758,3 @@ test "ConcurrencyConfig modes execution" {
         try std.testing.expect(!r.isSuccess());
     }
 }
-

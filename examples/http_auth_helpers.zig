@@ -55,7 +55,6 @@ fn basicHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.json(.{ .kind = "basic", .ok = true });
 }
 
-
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

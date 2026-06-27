@@ -58,7 +58,6 @@ fn handleH3(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("hello from http3 server runtime");
 }
 
-
 fn pickFreeUdpPort() !u16 {
     var socket = try httpx.UdpSocket.create();
     defer socket.close();

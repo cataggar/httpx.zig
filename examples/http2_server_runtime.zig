@@ -56,7 +56,6 @@ fn handleH2(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("hello from http2 server runtime");
 }
 
-
 fn pickFreeTcpPort() !u16 {
     var listener = try httpx.TcpListener.init(try httpx.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();

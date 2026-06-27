@@ -44,7 +44,6 @@ fn okHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("ok");
 }
 
-
 fn buildLocalUrls(allocator: std.mem.Allocator, port: u16) !DemoUrls {
     return .{
         .fetch = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/anything", .{port}),

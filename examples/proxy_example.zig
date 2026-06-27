@@ -64,9 +64,9 @@ pub fn main() !void {
         .withTimeouts(httpx.Timeouts.fast())
         .withRetryPolicy(httpx.RetryPolicy.noRetry())
         .withProxy(.{
-            .host = "127.0.0.1",
-            .port = proxy_port,
-        });
+        .host = "127.0.0.1",
+        .port = proxy_port,
+    });
 
     var client = httpx.Client.initWithConfig(allocator, client_config);
     defer client.deinit();
