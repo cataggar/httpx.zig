@@ -147,9 +147,9 @@ zig build -Dtarget=x86-windows
 
 ## Installation
 
-### Method 1: Zig Fetch
+### Method 1: Zig Fetch (Recommended)
 
-**Recommended (Latest Release - v0.1.1)**
+**Latest Release (v0.1.1)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
@@ -162,28 +162,32 @@ zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.
 ```
 
 > [!WARNING]
-> Zig `0.15` is deprecated. It uses an older API surface and is only retained in `0.0.7`.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.1**.
 
-### Method 2: Zig Fetch (Nightly/Main)
+### Method 2: Zig Fetch (Main Branch)
+
+Use the latest development version from the `main` branch.
 
 ```bash
 zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
 ```
 
-### Method 5: Manual `build.zig.zon` Configuration
+### Method 3: Manual `build.zig.zon` Configuration
 
-Add this dependency entry to your `build.zig.zon`:
+Add the dependency to your `build.zig.zon` file.
 
 ```zig
 .dependencies = .{
     .httpx = .{
         .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz",
-        .hash = "...", // Run zig fetch --save <url> to auto-fill this.
+        .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
     },
 },
 ```
 
-### Method 6: Local Source Checkout
+### Method 4: Local Source Checkout
+
+Clone the repository locally.
 
 ```bash
 git clone https://github.com/muhammad-fiaz/httpx.zig.git
@@ -191,7 +195,7 @@ cd httpx.zig
 zig build
 ```
 
-If you want to consume a local checkout from another project, use a local path dependency:
+To use a local checkout from another project, add a path dependency to your `build.zig.zon`:
 
 ```zig
 .dependencies = .{
