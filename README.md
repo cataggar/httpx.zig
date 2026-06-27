@@ -148,30 +148,24 @@ zig build -Dtarget=x86-windows
 
 ## Installation
 
-### Method 1: Zig Fetch (Latest Release 0.1.1)
+### Method 1: Zig Fetch
+
+**Recommended (Latest Release - v0.1.1)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
 ```
 
-### Method 2: Zig Fetch (Previous Stable 0.1.0)
+**Previous Stable Release (v0.1.0)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.0.tar.gz
 ```
 
-### Method 3: Zig Fetch (Legacy Zig 0.15 Support - 0.0.7)
-
-For Zig version 0.15 support, use this version:
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.7.tar.gz
-```
-
 > [!WARNING]
 > Zig `0.15` is deprecated. It uses an older API surface and is only retained in `0.0.7`.
 
-### Method 4: Zig Fetch (Nightly/Main)
+### Method 2: Zig Fetch (Nightly/Main)
 
 ```bash
 zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
