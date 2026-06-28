@@ -43,8 +43,8 @@ var server = httpx.Server.initWithConfig(allocator, .{
 | `port_conflict` | `PortConflictStrategy` | `.fail` | Startup behavior when the preferred port is occupied (`.fail` or `.increment`). |
 | `max_port_tries` | `u16` | `32` | Number of port candidates to try (including the initial port) when `port_conflict = .increment`. |
 | `max_body_size` | `usize` | `10MB` | Max request body size. |
-| `request_timeout_ms` | `u64` | `30000` | Timeout for request processing. |
-| `keep_alive_timeout_ms` | `u64` | `60000` | Timeout for keep-alive requests. |
+| `request_timeout_ms` | `u64` | `30000` | Timeout for request processing (enforced via socket receive timeout on each connection). |
+| `keep_alive_timeout_ms` | `u64` | `60000` | Timeout for subsequent requests on a keep-alive connection. |
 | `keep_alive` | `bool` | `true` | Enable HTTP Keep-Alive. |
 | `max_connections` | `u32` | `1000` | Max concurrent connections. |
 | `threads` | `u32` | `0` | Reserved for future thread configuration. |

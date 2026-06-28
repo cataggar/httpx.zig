@@ -1,16 +1,152 @@
-# Observability & Metrics Guide
+# Metrics and Observability Guide
 
-`httpx.zig` includes a built-in observability tracker (`Metrics`), providing real-time request counts, status-code classifications, latency analysis, and success rate monitoring.
+`httpx.zig` includes a lightweight, allocation-free metrics module for tracking requests, responses, latency, and connection counts using atomic operations.
 
 ## Overview
 
-Observability is crucial for health monitoring and debugging production servers. The metrics module automatically records statistics during route execution, letting you expose real-time metrics endpoints for dashboard collectors (like Prometheus).
+`Metrics` uses `std.atomic.Value` for all counters, making it safe to call from multiple threads without locks. `MetricsSnapshot` is a plain struct copy taken at a point in time, safe to read without synchronization.
 
-## Using Metrics
+## Initializing Metrics
 
-### 1. Collect Metrics
+```zig
+const httpx = @import("httpx");
 
-Initialize the metrics registry and update metrics inside your handlers or custom middleware:
+// Basic metrics instance
+var metrics = httpx.Metrics.init();
+
+// With a custom callback for external integrations
+var metrics = httpx.Metrics.initWithCallback(myCallbackFn);
+```
+
+## Recording Events
+
+### Requests and responses
+
+```zig
+metrics.recordRequest();                         // increment request counter
+metrics.recordResponse(200, 1024, 1_500_000);   // status, bytes, latency_ns
+metrics.recordResponse(500, 0, 800_000);
+metrics.recordError();                           // increment error counter
+```
+
+`recordResponse` automatically buckets the status code into `responses_2xx`, `responses_3xx`, `responses_4xx`, or `responses_5xx` and updates latency min/max/total.
+
+### Connections
+
+```zig
+metrics.connectionOpened();   // +1 to active_connections
+metrics.connectionClosed();   // -1 to active_connections
+```
+
+### Bytes sent
+
+```zig
+metrics.recordBytesSent(4096);
+```
+
+## Taking a Snapshot
+
+`snapshot()` reads all atomic values and returns a `MetricsSnapshot`:
+
+```zig
+const snap = metrics.snapshot();
+
+std.debug.print("requests={d} responses={d}\n", .{
+    snap.total_requests, snap.total_responses,
+});
+std.debug.print("2xx={d} 4xx={d} 5xx={d}\n", .{
+    snap.responses_2xx, snap.responses_4xx, snap.responses_5xx,
+});
+std.debug.print("avg_latency={d}ns\n", .{snap.avg_latency_ns});
+std.debug.print("error_rate={d:.2}\n", .{snap.errorRate()});
+std.debug.print("success_rate={d:.2}\n", .{snap.successRate()});
+```
+
+### `MetricsSnapshot` fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_requests` | `u64` | Total recorded requests |
+| `total_responses` | `u64` | Total recorded responses |
+| `active_connections` | `i64` | Current open connections |
+| `errors` | `u64` | Total errors |
+| `bytes_sent` | `u64` | Total bytes sent |
+| `bytes_received` | `u64` | Total bytes received |
+| `responses_2xx` | `u64` | 2xx response count |
+| `responses_3xx` | `u64` | 3xx response count |
+| `responses_4xx` | `u64` | 4xx response count |
+| `responses_5xx` | `u64` | 5xx response count |
+| `avg_latency_ns` | `u64` | Average response latency (nanoseconds) |
+| `min_latency_ns` | `u64` | Minimum observed latency |
+| `max_latency_ns` | `u64` | Maximum observed latency |
+
+### `MetricsSnapshot` methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `errorRate()` | `f64` | `errors / total_requests`, 0.0 if no requests |
+| `successRate()` | `f64` | `responses_2xx / total_responses`, 0.0 if no responses |
+| `print()` | `void` | Print a human-readable summary to stderr |
+
+## Custom Callbacks
+
+Register a callback to forward events to external monitoring systems:
+
+```zig
+fn myCallback(event: httpx.MetricsEvent) void {
+    switch (event) {
+        .request => { /* increment external counter */ },
+        .response => |r| {
+            std.debug.print("status={d} latency={d}ns\n", .{
+                r.status, r.latency_ns,
+            });
+        },
+        .err => { /* alert on errors */ },
+        .connection_open, .connection_close => {},
+        .bytes_sent => |n| _ = n,
+    }
+}
+
+var metrics = httpx.Metrics.initWithCallback(myCallback);
+```
+
+`MetricsEvent` is a tagged union with variants: `request`, `response` (with `status`, `bytes`, `latency_ns`), `bytes_sent`, `err`, `connection_open`, `connection_close`.
+
+## Thread Safety
+
+All `Metrics` methods use `.monotonic` atomic operations. This means:
+- Individual counter updates are atomic and safe from any thread.
+- `snapshot()` reads each counter independently; there is no global snapshot lock, so values from different fields may come from slightly different instants. For most observability use cases this is fine.
+- If you need a strictly consistent snapshot, take it from a single thread or add your own mutex.
+
+## Resetting Counters
+
+```zig
+metrics.reset(); // sets all counters back to zero
+```
+
+## Exposing a Metrics Endpoint
+
+```zig
+const httpx = @import("httpx");
+
+var global_metrics = httpx.Metrics.init();
+
+fn metricsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const snap = global_metrics.snapshot();
+    return ctx.json(.{
+        .requests = snap.total_requests,
+        .responses = snap.total_responses,
+        .errors = snap.errors,
+        .success_rate = snap.successRate(),
+        .error_rate = snap.errorRate(),
+        .avg_latency_ms = snap.avg_latency_ns / 1_000_000,
+        .active_connections = snap.active_connections,
+    });
+}
+```
+
+## Full Working Example
 
 ```zig
 const std = @import("std");
@@ -18,58 +154,36 @@ const httpx = @import("httpx");
 
 var metrics = httpx.Metrics.init();
 
-fn myRouteHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+fn apiHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     metrics.recordRequest();
-    const start_time = std.time.nanoTimestamp();
-    
-    // Execute logic...
-    const response = ctx.text("Hello!");
+    const t0 = std.time.nanoTimestamp();
 
-    const duration = std.time.nanoTimestamp() - start_time;
-    
-    // Record response details
-    metrics.recordResponse(response.status.code, response.body.len, @intCast(duration));
-    
-    return response;
+    const resp = try ctx.json(.{ .hello = "world" });
+
+    const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+    metrics.recordResponse(200, resp.body.len, elapsed);
+    return resp;
 }
-```
 
-### 2. Expose Metrics Endpoint
-
-Expose a `/metrics` endpoint on the server returning a metrics snapshot:
-
-```zig
 fn metricsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    const snapshot = metrics.snapshot();
-    
+    const snap = metrics.snapshot();
+    snap.print();
     return ctx.json(.{
-        .total_requests = snapshot.total_requests,
-        .success_rate = snapshot.successRate(),
-        .avg_latency_ms = snapshot.avg_latency_ns / 1_000_000,
-        .status_2xx = snapshot.responses_2xx,
-        .status_4xx = snapshot.responses_4xx,
-        .status_5xx = snapshot.responses_5xx,
+        .requests = snap.total_requests,
+        .success_rate = snap.successRate(),
     });
 }
-```
 
-### 3. Custom/External Service Callbacks
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-To forward metrics events directly to external monitoring platforms (like Datadog, Prometheus pushgateway, or internal logging aggregators), register a custom callback:
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
 
-```zig
-const std = @import("std");
-const httpx = @import("httpx");
-
-fn customMetricsCallback(event: httpx.MetricsEvent) void {
-    switch (event) {
-        .request => std.debug.print("[Metrics] Outgoing request started\n", .{}),
-        .response => |resp| std.debug.print("[Metrics] Received status {d} (latency: {d} ns)\n", .{ resp.status, resp.latency_ns }),
-        .err => std.debug.print("[Metrics] Error encountered\n", .{}),
-        else => {},
-    }
+    try server.get("/api", apiHandler);
+    try server.get("/metrics", metricsHandler);
+    try server.listen();
 }
-
-// Initialize registry with callback integration
-var metrics = httpx.Metrics.initWithCallback(customMetricsCallback);
 ```

@@ -42,6 +42,12 @@ const io_util = @import("../util/any_io.zig");
 const defaultIo = io_util.defaultIo;
 const sleepMs = io_util.sleepMs;
 
+const RequestTimeouts = struct {
+    connect_ms: u64,
+    read_ms: u64,
+    write_ms: u64,
+};
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
     base_url: ?[]const u8 = null,
@@ -333,6 +339,7 @@ pub const Client = struct {
             .pool = ConnectionPool.initWithConfig(allocator, .{
                 .max_connections = config.pool_max_connections,
                 .max_per_host = config.pool_max_per_host,
+                .connect_timeout_ms = config.timeouts.connect_ms,
             }),
         };
     }
@@ -585,9 +592,19 @@ pub const Client = struct {
         }
     }
 
+    fn resolveRequestTimeouts(self: *const Self, timeout_override_ms: ?u64) RequestTimeouts {
+        if (timeout_override_ms) |ms| {
+            return .{ .connect_ms = ms, .read_ms = ms, .write_ms = ms };
+        }
+        return .{
+            .connect_ms = self.config.timeouts.connect_ms,
+            .read_ms = self.config.timeouts.read_ms,
+            .write_ms = self.config.timeouts.write_ms,
+        };
+    }
+
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.read_ms;
-        const write_timeout_ms = timeout_override_ms orelse self.config.timeouts.write_ms;
+        const timeouts = self.resolveRequestTimeouts(timeout_override_ms);
 
         if (self.config.unix_socket_path) |path| {
             const unix_mod = @import("../net/unix.zig");
@@ -595,11 +612,11 @@ pub const Client = struct {
             var socket = Socket.fromHandle(unix_sock.fd);
             defer socket.close();
 
-            if (timeout_ms > 0) {
-                try socket.setRecvTimeout(timeout_ms);
+            if (timeouts.read_ms > 0) {
+                try socket.setRecvTimeout(timeouts.read_ms);
             }
-            if (write_timeout_ms > 0) {
-                try socket.setSendTimeout(write_timeout_ms);
+            if (timeouts.write_ms > 0) {
+                try socket.setSendTimeout(timeouts.write_ms);
             }
 
             const request_data = try http.formatRequest(req, self.allocator);
@@ -617,11 +634,11 @@ pub const Client = struct {
 
         if (wants_http3) {
             if (self.config.proxy != null) return error.ProxyNotSupported;
-            return self.executeRequestHttp3(req, host, port, timeout_ms, write_timeout_ms);
+            return self.executeRequestHttp3(req, host, port, timeouts);
         }
 
         if (wants_http2) {
-            return self.executeRequestHttp2(req, host, port, timeout_ms, write_timeout_ms);
+            return self.executeRequestHttp2(req, host, port, timeouts);
         }
 
         var request_data: []u8 = undefined;
@@ -644,14 +661,14 @@ pub const Client = struct {
             var socket = try Socket.createForAddress(addr);
             defer socket.close();
 
-            if (timeout_ms > 0) {
-                try socket.setRecvTimeout(timeout_ms);
+            if (timeouts.read_ms > 0) {
+                try socket.setRecvTimeout(timeouts.read_ms);
             }
-            if (write_timeout_ms > 0) {
-                try socket.setSendTimeout(write_timeout_ms);
+            if (timeouts.write_ms > 0) {
+                try socket.setSendTimeout(timeouts.write_ms);
             }
 
-            try socket.connect(addr);
+            try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
             if (self.config.proxy) |proxy| {
                 if (proxy.kind == .socks5h) {
@@ -665,15 +682,15 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive) {
-            var conn = try self.pool.getConnection(host, port, self.config.proxy);
+            var conn = try self.pool.getConnection(host, port, self.config.proxy, timeouts.connect_ms);
             errdefer conn.close();
             defer self.pool.releaseConnection(conn);
 
-            if (timeout_ms > 0) {
-                try conn.socket.setRecvTimeout(timeout_ms);
+            if (timeouts.read_ms > 0) {
+                try conn.socket.setRecvTimeout(timeouts.read_ms);
             }
-            if (write_timeout_ms > 0) {
-                try conn.socket.setSendTimeout(write_timeout_ms);
+            if (timeouts.write_ms > 0) {
+                try conn.socket.setSendTimeout(timeouts.write_ms);
             }
             try conn.socket.setKeepAlive(true);
 
@@ -692,14 +709,14 @@ pub const Client = struct {
         var socket = try Socket.createForAddress(addr);
         defer socket.close();
 
-        if (timeout_ms > 0) {
-            try socket.setRecvTimeout(timeout_ms);
+        if (timeouts.read_ms > 0) {
+            try socket.setRecvTimeout(timeouts.read_ms);
         }
-        if (write_timeout_ms > 0) {
-            try socket.setSendTimeout(write_timeout_ms);
+        if (timeouts.write_ms > 0) {
+            try socket.setSendTimeout(timeouts.write_ms);
         }
 
-        try socket.connect(addr);
+        try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
         if (self.config.proxy) |proxy| {
             if (proxy.kind == .socks5h) {
@@ -716,8 +733,7 @@ pub const Client = struct {
         req: *Request,
         host: []const u8,
         port: u16,
-        timeout_ms: u64,
-        write_timeout_ms: u64,
+        timeouts: RequestTimeouts,
     ) !Response {
         const connect_host = if (self.config.proxy) |p| p.host else host;
         const connect_port = if (self.config.proxy) |p| p.port else port;
@@ -726,14 +742,14 @@ pub const Client = struct {
         var socket = try Socket.createForAddress(addr);
         defer socket.close();
 
-        if (timeout_ms > 0) {
-            try socket.setRecvTimeout(timeout_ms);
+        if (timeouts.read_ms > 0) {
+            try socket.setRecvTimeout(timeouts.read_ms);
         }
-        if (write_timeout_ms > 0) {
-            try socket.setSendTimeout(write_timeout_ms);
+        if (timeouts.write_ms > 0) {
+            try socket.setSendTimeout(timeouts.write_ms);
         }
 
-        try socket.connect(addr);
+        try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
         if (self.config.proxy) |proxy| {
             if (proxy.kind == .socks5h) {
@@ -763,19 +779,18 @@ pub const Client = struct {
         req: *Request,
         host: []const u8,
         port: u16,
-        timeout_ms: u64,
-        write_timeout_ms: u64,
+        timeouts: RequestTimeouts,
     ) !Response {
         const addr = try address_mod.resolve(host, port);
 
         var socket = try UdpSocket.createForAddress(addr);
         defer socket.close();
 
-        if (timeout_ms > 0) {
-            try socket.setRecvTimeout(timeout_ms);
+        if (timeouts.read_ms > 0) {
+            try socket.setRecvTimeout(timeouts.read_ms);
         }
-        if (write_timeout_ms > 0) {
-            try socket.setSendTimeout(write_timeout_ms);
+        if (timeouts.write_ms > 0) {
+            try socket.setSendTimeout(timeouts.write_ms);
         }
 
         try socket.connect(addr);

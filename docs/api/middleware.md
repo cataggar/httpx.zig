@@ -1,180 +1,194 @@
 # Middleware API
 
-Middleware functions sit between the incoming request and your route handlers. They are useful for logging, authentication, CORS, compression, and more.
+Middleware functions sit between the incoming request and your route handlers. They are useful for logging, authentication, CORS, compression, health probes, and more.
 
 ## Usage
 
 Global middleware is added using `server.use()`.
 
 ```zig
-// Add logging middleware
 try server.use(httpx.middleware.logger());
-
-// Add CORS middleware
 try server.use(httpx.middleware.cors(.{}));
 ```
 
 ## Built-in Middleware
 
-`httpx.zig` comes with several built-in middlewares in `httpx.middleware`.
+All middleware is in the `httpx.middleware` namespace.
 
 ### `logger`
 
-Logs request method, path, and detailed timing information to `std.debug` by default.
+Logs request method, path, and timing to `std.debug` by default.
 
 ```zig
 server.use(httpx.middleware.logger());
 ```
 
-To route logs into your own sink, use `loggerWithConfig`:
+To route logs to a custom sink:
 
 ```zig
-const httpx = @import("httpx");
-const std = @import("std");
-const allocator = std.heap.page_allocator;
-
-var server = httpx.Server.init(allocator);
-const CustomLogger = struct {
-    fn log(level: httpx.LogLevel, message: []const u8) void {
-        _ = level;
-        std.debug.print("{s}", .{message});
-    }
-};
-
-server.use(httpx.middleware.loggerWithConfig(.{ .log_fn = CustomLogger.log }));
+server.use(httpx.middleware.loggerWithConfig(.{
+    .log_fn = myLogFn,
+}));
 ```
-
-To disable request logging, simply do not install the logger middleware.
 
 ### `cors`
 
-Handles Cross-Origin Resource Sharing (CORS) headers.
+Handles Cross-Origin Resource Sharing (CORS) headers and `OPTIONS` preflight.
 
 ```zig
-const corsConfig = httpx.middleware.CorsConfig{
+server.use(httpx.middleware.cors(.{
     .allowed_origins = &[_][]const u8{"https://example.com"},
     .allowed_methods = &[_]Method{.GET, .POST},
     .allowed_headers = &[_][]const u8{"Content-Type", "Authorization"},
     .exposed_headers = &[_][]const u8{"X-Request-ID"},
     .allow_credentials = true,
     .max_age = 86400,
-};
-server.use(httpx.middleware.cors(corsConfig));
+}));
 ```
 
-The middleware automatically:
-
-- Applies `Access-Control-Allow-Origin` with origin-aware matching.
-- Sets `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` from config.
-- Sets `Access-Control-Expose-Headers` when configured.
-- Sets `Access-Control-Allow-Credentials: true` when enabled.
+- Sets `Access-Control-Allow-Origin` with origin-aware matching.
 - Handles preflight `OPTIONS` requests with `204 No Content`.
+- Sets `Access-Control-Allow-Credentials` when `allow_credentials = true`.
 
 ### `rateLimit`
 
-Basic in-memory rate limiting.
+In-memory rate limiting per client IP.
 
 ```zig
-const config = httpx.middleware.RateLimitConfig{
-    .max_requests = 100, // requests per window
-    .window_ms = 60_000, // 1 minute
-};
-server.use(httpx.middleware.rateLimit(config));
+server.use(httpx.middleware.rateLimit(.{
+    .max_requests = 100,
+    .window_ms = 60_000,
+}));
 ```
 
 ### `basicAuth`
 
-Implements HTTP Basic Authentication.
+HTTP Basic Authentication with a user-supplied validator.
 
 ```zig
-fn validateUser(user: []const u8, pass: []const u8) bool {
-    // Check credentials...
-    return true;
+fn validate(user: []const u8, pass: []const u8) bool {
+    return std.mem.eql(u8, user, "admin") and std.mem.eql(u8, pass, "secret");
 }
 
-server.use(httpx.middleware.basicAuth("My Realm", validateUser));
-```
-
-### `compression`
-
-Handles `Accept-Encoding` negotiation (implementation internal).
-
-```zig
-server.use(httpx.middleware.compression());
+server.use(httpx.middleware.basicAuth("My Realm", validate));
 ```
 
 ### `helmet`
 
-Adds various security headers (like HSTS, X-Frame-Options, etc.).
+Adds security headers: `X-Frame-Options`, `X-Content-Type-Options`, `X-XSS-Protection`, `Strict-Transport-Security`, and `Referrer-Policy`.
 
 ```zig
 server.use(httpx.middleware.helmet());
 ```
 
+### `compression`
+
+Handles `Accept-Encoding` negotiation and compresses response bodies.
+
+```zig
+server.use(httpx.middleware.compression());
+```
+
 ### `requestId`
 
-Generates and attaches a unique `X-Request-ID` to every request.
+Generates and attaches a unique `X-Request-ID` header to every request.
 
 ```zig
 server.use(httpx.middleware.requestId());
 ```
 
-### `healthCheck`
+### `timeout`
 
-Intercepts requests to the configured path (defaulting to `/health`) and returns a health status payload.
+Applies a per-request timeout.
 
 ```zig
-const config = httpx.middleware.HealthConfig{
+server.use(httpx.middleware.timeout(5_000)); // 5 seconds
+```
+
+### `bodyParser`
+
+Parses request body based on `Content-Type` (JSON, form-urlencoded).
+
+```zig
+server.use(httpx.middleware.bodyParser());
+```
+
+### `healthCheck`
+
+Intercepts requests to a configured path and returns a health status response. Useful for Kubernetes liveness probes.
+
+```zig
+server.use(httpx.middleware.healthCheck(.{
     .path = "/health",
     .body = "{\"status\":\"ok\"}",
     .status = 200,
-};
-server.use(httpx.middleware.healthCheck(config));
+}));
 ```
+
+`HealthConfig` fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `path` | `"/health"` | Path to intercept |
+| `body` | `"{\"status\":\"ok\"}"` | Response body |
+| `status` | `200` | HTTP status code |
 
 ### `readinessProbe`
 
-Configures liveness/readiness probes (defaulting to `/ready`) for Kubernetes or health checker deployments.
+Intercepts requests to a configured readiness path. Useful for Kubernetes readiness probes.
 
 ```zig
-const config = httpx.middleware.ReadinessConfig{
+server.use(httpx.middleware.readinessProbe(.{
     .path = "/ready",
     .body = "{\"ready\":true}",
-};
-server.use(httpx.middleware.readinessProbe(config));
+    .status = 200,
+}));
 ```
+
+`ReadinessConfig` fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `path` | `"/ready"` | Path to intercept |
+| `body` | `"{\"ready\":true}"` | Response body |
+| `status` | `200` | HTTP status code |
 
 ### `reverseProxy`
 
-Forwards incoming client requests on a matching path to another backend.
+Comptime reverse proxy that forwards all incoming requests to a fixed backend URL.
 
 ```zig
-// Forwards matching requests to a backend server
-server.use(httpx.middleware.reverseProxy("http://backend-server.local"));
+server.use(httpx.middleware.reverseProxy("http://backend.internal:8080"));
+```
+
+### `reverseProxyRuntime`
+
+Runtime-URL reverse proxy for cases where the target URL is not known at compile time.
+
+```zig
+const target = getTargetUrl(); // runtime value
+server.use(httpx.middleware.reverseProxyRuntime(target));
 ```
 
 ## Creating Custom Middleware
 
-A middleware is a struct with a `handler` function.
+A middleware is a struct with a `handler` function:
 
 ```zig
-const httpx = @import("httpx");
-
-pub fn myMiddleware() httpx.Middleware {
+pub fn timingMiddleware() httpx.Middleware {
     return .{
-        .name = "my_middleware",
+        .name = "timing",
         .handler = struct {
-            fn handler(ctx: *httpx.Context, next: httpx.server.middleware.Next) anyerror!httpx.Response {
-                // Pre-processing
-                std.debug.print("Before request\n", .{});
-
-                // Call next middleware
-                const response = try next(ctx);
-
-                // Post-processing
-                std.debug.print("After request\n", .{});
-
-                return response;
+            fn handler(ctx: *httpx.Context, next: httpx.NextFn) anyerror!httpx.Response {
+                const t0 = std.time.nanoTimestamp();
+                const resp = try next(ctx);
+                const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - t0, 1_000_000);
+                std.debug.print("{s} {s} — {d}ms\n", .{
+                    @tagName(ctx.request.method),
+                    ctx.request.uri.path,
+                    elapsed_ms,
+                });
+                return resp;
             }
         }.handler,
     };

@@ -1,6 +1,6 @@
 # Utilities API
 
-Common utilities for buffer management and encoding.
+Common utilities for buffer management, encoding, multipart, metrics, sessions, and mock testing.
 
 ## Shared Helpers
 
@@ -10,32 +10,18 @@ Common utilities for buffer management and encoding.
 - `parseSetCookiePair(set_cookie)`: Parse the first `name=value` pair from a `Set-Cookie` header value.
 - `cookieValue(cookie_header, name)`: Read a cookie value from a request `Cookie` header.
 - `buildSetCookieHeader(allocator, name, value, options)`: Build a `Set-Cookie` header value with RFC 6265 style attributes.
-- `mimeTypeFromPath(path)`: Resolve a best-effort MIME type from file extension for static/file responses.
-- `mimeTypeFromPathOr(path, fallback)`: Resolve MIME from extension with explicit custom fallback.
+- `mimeTypeFromPath(path)`: Resolve a best-effort MIME type from file extension.
+- `mimeTypeFromPathOr(path, fallback)`: Resolve MIME from extension with an explicit fallback.
 - `mimeTypeFromPathWith(path, mappings, fallback)`: Resolve MIME using caller-provided external mappings.
-- `MimeMapping`: Extension to MIME pair type for external mapping lists.
+- `MimeMapping`: Extension-to-MIME pair type for external mapping lists.
 - `MimeRegistry`: Reusable MIME resolver for custom mapping sets.
 - `defaultMimeMappings`: Built-in mapping table exported for extension/composition.
 - `CookieOptions`: Cookie attributes (`Path`, `Domain`, `Max-Age`, `SameSite`, `Secure`, `HttpOnly`).
 - `SameSite`: Enum values `lax`, `strict`, `none`.
 
-`mimeTypeFromPath(...)` is case-insensitive and includes common web/document/media/font/archive formats (`html`, `css`, `js`, `json`, `wasm`, `svg`, `png`, `jpg`, `webp`, `pdf`, `zip`, `woff2`, `mp4`, `mp3`, and more).
+`mimeTypeFromPath` is case-insensitive and covers common web, document, media, font, and archive formats.
 
-MIME helpers are actively used by server file/static response paths (for example `Context.file(...)`), so they are required functionality and should not be removed.
-
-External MIME extension example:
-
-```zig
-const custom = [_]httpx.MimeMapping{
-	.{ .ext = ".geojson", .mime = "application/geo+json" },
-	.{ .ext = ".glb", .mime = "model/gltf-binary" },
-};
-
-const fallback = httpx.mimeTypeFromPath(path);
-const content_type = httpx.mimeTypeFromPathWith(path, &custom, fallback);
-```
-
-Root-level aliases are also available:
+Root-level aliases:
 
 - `httpx.queryValue(...)`
 - `httpx.parseSetCookiePair(...)`
@@ -47,78 +33,249 @@ Root-level aliases are also available:
 - `httpx.defaultMimeMappings`
 - `httpx.CookieOptions`
 - `httpx.SameSite`
-
-Protocol utility aliases are also available at root-level:
-
 - `httpx.encodeVarInt(...)`
 - `httpx.decodeVarInt(...)`
 
-## WebSockets
+## WebSocket Protocol
 
-`httpx.websocket` provides RFC 6455 upgrade helpers and low-level framing models.
+See [Protocol API](/api/protocol) for the full WebSocket section. Root-level aliases:
 
-- `wsTextFrame(allocator, text)`: Encodes a text message payload into a WebSocket text frame.
-- `wsBinaryFrame(allocator, data)`: Encodes binary data into a WebSocket binary frame.
-- `wsCloseFrame(allocator, code, reason)`: Encodes a close control frame with status code and optional reason payload.
-- `computeHandshakeAcceptKey(allocator, client_key)`: Computes the standard base-64 SHA-1 WebSocket accept key from the client's `Sec-WebSocket-Key` header value.
-- `isWebSocketUpgrade(request)`: Checks whether a request contains valid WebSocket upgrade headers.
+- `httpx.isWebSocketUpgrade(req)` — checks upgrade headers
+- `httpx.wsExtractKey(req)` — returns `Sec-WebSocket-Key` value
+- `httpx.wsAcceptKey(key, allocator)` — computes `Sec-WebSocket-Accept`
+- `httpx.wsEncodeFrame(allocator, opcode, payload, fin, masked, mask_key)` — low-level frame encoder
+- `httpx.wsDecodeFrame(allocator, data)` — decode one frame, returns `WsDecodeResult`
+- `httpx.wsTextFrame(allocator, text)` — encode server text frame
+- `httpx.wsBinaryFrame(allocator, data)` — encode server binary frame
+- `httpx.wsPingFrame(allocator, data)` — encode ping frame
+- `httpx.wsPongFrame(allocator, data)` — encode pong frame
+- `httpx.wsCloseFrame(allocator, code, reason)` — encode close frame
+- `httpx.WsOpcode` — frame opcode enum
+- `httpx.WsFrame` — decoded frame struct
+- `httpx.WsCloseCode` — close status codes
+- `httpx.WsDecodeResult` — `{ frame, consumed }`
+- `httpx.WS_GUID` — RFC 6455 magic GUID
 
 ## Multipart Form Data
 
-`httpx` provides RFC 2046 utilities for building and parsing multipart payloads.
+RFC 2046 multipart/form-data builder and parser.
 
-- `MultipartBuilder`: Builder structure to serialize form fields and file attachments.
-- `extractMultipartBoundary(content_type)`: Extracts the boundary token from a `Content-Type: multipart/form-data; boundary=...` header.
-- `parseMultipart(allocator, body, boundary)`: Parses a raw multipart request payload into a list of key-value fields and files.
+### `MultipartBuilder`
 
-## Session Management
+| Method | Description |
+|--------|-------------|
+| `init(allocator, boundary)` | Create a builder with a boundary string |
+| `addField(name, value)` | Append a text form field part |
+| `addFile(name, filename, content_type, data)` | Append a file upload part |
+| `build()` | Finalize and return the complete body (caller owns) |
+| `contentType()` | Return the `Content-Type` header value (caller owns) |
+| `deinit()` | Release builder resources |
 
-`httpx` provides in-memory session tracking with cookie management.
+### `extractMultipartBoundary(content_type)`
 
-- `SessionStore`: Safe concurrent session manager supporting TTL eviction.
-- `Session`: Individual session object containing user state fields.
-- `SessionConfig`: Configuration for session duration and cookies.
+Extracts the boundary value from a `Content-Type` header. Returns `null` if no boundary is present. Handles both quoted and unquoted boundary parameters.
 
-## Metrics & Observability
+Root-level alias: `httpx.extractMultipartBoundary(...)`.
 
-`httpx` aggregates real-time traffic statistics.
+### `parseMultipart(allocator, body, boundary)`
 
-- `Metrics`: Observation registry that tracks request counts, status classifications (2xx/3xx/4xx/5xx), latency metrics, and success rates.
-- `MetricsSnapshot`: Snapshot payload for reporting traffic analytics.
+Parses a complete multipart body. Returns `ParsedParts`; call `.deinit()` when done.
+
+Root-level alias: `httpx.parseMultipart(...)`.
+
+### `Part`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `[]const u8` | Form field name |
+| `filename` | `?[]const u8` | File name for uploads, null for text fields |
+| `content_type` | `[]const u8` | Part content type (defaults to `"text/plain"`) |
+| `data` | `[]const u8` | Raw body bytes (slice into `ParsedParts` buffer) |
+| `headers` | `[]const [2][]const u8` | All raw header pairs |
+
+### `ParsedParts`
+
+| Member | Description |
+|--------|-------------|
+| `parts` | `[]Part` — parsed parts slice |
+| `deinit()` | Free all allocated memory |
+
+## Metrics and Observability
+
+Thread-safe, allocation-free request/response metrics using atomic operations.
+
+### `Metrics`
+
+| Method | Description |
+|--------|-------------|
+| `init()` | Create a zeroed Metrics instance |
+| `initWithCallback(fn)` | Create with a custom event callback |
+| `recordRequest()` | Increment total requests |
+| `recordResponse(status, bytes, latency_ns)` | Record response, update status buckets and latency |
+| `recordBytesSent(bytes)` | Increment bytes sent |
+| `recordError()` | Increment error counter |
+| `connectionOpened()` | Increment active connections |
+| `connectionClosed()` | Decrement active connections |
+| `reset()` | Reset all counters to zero |
+| `snapshot()` | Return a `MetricsSnapshot` |
+
+### `MetricsSnapshot`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_requests` | `u64` | Total requests recorded |
+| `total_responses` | `u64` | Total responses recorded |
+| `active_connections` | `i64` | Current open connections |
+| `errors` | `u64` | Total errors |
+| `bytes_sent` | `u64` | Total bytes sent |
+| `bytes_received` | `u64` | Total bytes received |
+| `responses_2xx` | `u64` | 2xx response count |
+| `responses_3xx` | `u64` | 3xx response count |
+| `responses_4xx` | `u64` | 4xx response count |
+| `responses_5xx` | `u64` | 5xx response count |
+| `avg_latency_ns` | `u64` | Average latency in nanoseconds |
+| `min_latency_ns` | `u64` | Minimum latency in nanoseconds |
+| `max_latency_ns` | `u64` | Maximum latency in nanoseconds |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `errorRate()` | `f64` | `errors / total_requests` |
+| `successRate()` | `f64` | `responses_2xx / total_responses` |
+| `print()` | `void` | Print a human-readable summary to stderr |
+
+### `MetricsEvent`
+
+Tagged union passed to the optional callback:
+
+- `.request` — a request was recorded
+- `.response` — `{ status: u16, bytes: u64, latency_ns: u64 }`
+- `.bytes_sent` — `u64`
+- `.err` — an error was recorded
+- `.connection_open` / `.connection_close`
+
+### `MetricsCallbackFn`
+
+`*const fn (event: MetricsEvent) void`
+
+Root-level aliases: `httpx.Metrics`, `httpx.MetricsSnapshot`, `httpx.MetricsEvent`, `httpx.MetricsCallbackFn`.
+
+## Session Store
+
+In-memory server-side sessions with TTL expiry.
+
+### `SessionStore`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `init(allocator, config)` | `SessionStore` | Create a store with the given config |
+| `deinit()` | `void` | Release all resources |
+| `create()` | `![SESSION_ID_LEN * 2]u8` | Create a new session, return hex ID |
+| `set(hex_id, key, value)` | `!void` | Set a key in the session (duplicates value) |
+| `get(hex_id, key)` | `?[]const u8` | Get a value; null if not found or expired |
+| `delete(hex_id)` | `void` | Remove a session |
+| `exists(hex_id)` | `bool` | True if session exists and is not expired |
+| `evictExpired()` | `usize` | Remove expired sessions, returns count removed |
+| `count()` | `usize` | Number of sessions in the store |
+
+### `SessionConfig`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `ttl_ms` | `1_800_000` | Session TTL in milliseconds since last access |
+| `cookie_name` | `"session_id"` | Cookie name for session ID |
+| `max_sessions` | `0` | Max sessions (0 = unlimited) |
+
+### Constants
+
+- `SESSION_ID_LEN = 32` — raw session ID byte length
+- `DEFAULT_TTL_MS = 1_800_000` — 30 minutes
+
+Root-level aliases: `httpx.SessionStore`, `httpx.SessionConfig`, `httpx.SESSION_ID_LEN`.
+
+## Mock Server
+
+In-process HTTP mock server for testing.
+
+### `MockServer`
+
+| Method | Description |
+|--------|-------------|
+| `init(allocator)` | Create and start mock server on a random free port |
+| `deinit()` | Stop server, release all resources |
+| `stub(method, path, status, content_type, body)` | Register a stub response |
+| `urlFor(path)` | Return `"http://127.0.0.1:{port}{path}"` |
+| `requestCount()` | Number of recorded requests |
+| `requestAt(index)` | Get a recorded request by index |
+| `clearRecorded()` | Clear all recorded requests |
+
+### `Stub`
+
+| Field | Description |
+|-------|-------------|
+| `method` | HTTP method |
+| `path` | Exact path to match |
+| `status` | Response status code |
+| `content_type` | Response `Content-Type` value |
+| `body` | Response body string |
+
+### `RecordedRequest`
+
+| Field | Description |
+|-------|-------------|
+| `method` | Request method |
+| `path` | Request path |
+| `body` | Request body, or null |
+
+```zig
+var mock = try httpx.MockServer.init(allocator);
+defer mock.deinit();
+
+mock.stub(.GET, "/api/data", 200, "application/json", "[1,2,3]");
+
+var client = httpx.Client.init(allocator);
+defer client.deinit();
+
+var resp = try client.get(mock.urlFor("/api/data"), .{});
+defer resp.deinit();
+// resp.status.code == 200
+// resp.text() == "[1,2,3]"
+```
+
+## IO Utilities
+
+Centralized in `src/util/any_io.zig`.
+
+- `defaultIo()` — returns the appropriate `std.Io` for test or runtime context
+- `sleepMs(ms: u64)` — sleep using the canonical IO
+- `sleepMsI(ms: i64)` — sleep using the canonical IO (signed)
+- `AnyReader` — type-erased reader with `read`, `readByte`, `readNoEof`
+- `AnyWriter` — type-erased writer with `write`, `writeAll`, `print`
 
 ## Buffers
 
 ### `Buffer`
 
-A dynamic, growable byte buffer.
+Dynamic, growable byte buffer.
 
-```zig
-const buf = try Buffer.init(allocator, 1024);
-defer buf.deinit();
-
-try buf.append("Hello");
-```
-
-- `append(bytes: []const u8) !void`
-- `toOwnedSlice() ![]u8`
-- `clear()`
+- `init(allocator, capacity)` — create buffer
+- `append(bytes)` — append bytes
+- `toOwnedSlice()` — return owned slice
+- `clear()` — reset without deallocating
+- `deinit()` — release memory
 
 ### `RingBuffer`
 
-Circular buffer optimized for streaming data.
+Circular buffer for streaming data.
 
-```zig
-var ring = try RingBuffer.init(allocator, 4096);
-```
-
-- `writeBytes(bytes: []const u8) !usize`
-- `readBytes(buffer: []u8) usize`
-- `getAvailable() usize`
-- `getFreeSpace() usize`
+- `init(allocator, size)` — create ring buffer
+- `writeBytes(bytes)` — write bytes, returns bytes written
+- `readBytes(buf)` — read available bytes
+- `getAvailable()` — bytes available to read
+- `getFreeSpace()` — bytes available to write
 
 ### `FixedBuffer`
 
-Stack-allocated fixed-size buffer.
+Stack-allocated fixed-size buffer with no heap allocation.
 
 ```zig
 var buf = FixedBuffer(64){};
@@ -128,49 +285,45 @@ var buf = FixedBuffer(64){};
 
 ### `Base64`
 
-Base64 encoding (RFC 4648) with support for standard and URL-safe alphabets.
+RFC 4648 base64 with standard and URL-safe alphabets.
 
-- `encode(allocator: Allocator, data: []const u8) ![]u8`
-- `decode(allocator: Allocator, data: []const u8) ![]u8`
-- `encodeUrl(allocator: Allocator, data: []const u8) ![]u8`
+- `encode(allocator, data)` — encode to base64
+- `decode(allocator, data)` — decode from base64
+- `encodeUrl(allocator, data)` — URL-safe encoding
 
 ### `Hex`
 
-Hexadecimal encoding/decoding.
-
-- `encode(allocator: Allocator, data: []const u8) ![]u8`
-- `decode(allocator: Allocator, data: []const u8) ![]u8`
+- `encode(allocator, data)` — hex encode
+- `decode(allocator, data)` — hex decode
 
 ### `PercentEncoding`
 
-URL encoding/decoding (RFC 3986).
+RFC 3986 URL encoding.
 
-- `encode(allocator: Allocator, input: []const u8) ![]u8`
-- `decode(allocator: Allocator, input: []const u8) ![]u8`
+- `encode(allocator, input)` — percent-encode
+- `decode(allocator, input)` — percent-decode
 
 ## JSON
 
-### `JsonBuilder`
+### `json.JsonBuilder`
 
-Fluent builder for constructing JSON strings efficiently.
+Fluent builder for constructing JSON strings.
 
 ```zig
-var jb = JsonBuilder.init(allocator);
+var jb = httpx.json.JsonBuilder.init(allocator);
 defer jb.deinit();
 
 try jb.beginObject();
 try jb.key("name");
-try jb.string("John");
+try jb.string("alice");
+try jb.key("age");
+try jb.number(30);
 try jb.endObject();
+
+const s = try jb.toSlice();
+defer allocator.free(s);
 ```
 
-- `beginObject() !void`
-- `endObject() !void`
-- `beginArray() !void`
-- `endArray() !void`
-- `key(name: []const u8) !void`
-- `string(val: []const u8) !void`
-- `number(val: anytype) !void`
-- `boolean(val: bool) !void`
-- `nullValue() !void`
-
+- `beginObject()` / `endObject()`
+- `beginArray()` / `endArray()`
+- `key(name)` / `string(val)` / `number(val)` / `boolean(val)` / `nullValue()`

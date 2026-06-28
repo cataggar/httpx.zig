@@ -29,6 +29,16 @@ pub const ConcurrencyConfig = struct {
 
 `ConcurrencyConfig` currently exposes request worker selection only. CPU affinity and per-thread pinning are not exposed as public APIs, so portable defaults remain the recommended path.
 
+For unreachable or slow hosts, set per-request timeouts on each `RequestSpec` so concurrent tests and production batch jobs fail fast instead of waiting on the default 30 second socket budgets:
+
+```zig
+const specs = [_]httpx.RequestSpec{
+    .{ .method = .GET, .url = "https://slow.example.com", .timeout_ms = 2_000 },
+};
+const results = try httpx.all(allocator, &client, &specs, .{ .mode = .multi_thread });
+defer allocator.free(results);
+```
+
 ## Parallel Requests
 
 Execute multiple HTTP requests simultaneously using the helpful wrapper functions.

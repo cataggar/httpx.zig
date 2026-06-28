@@ -8,8 +8,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// ─── Canonical IO selector ────────────────────────────────────────────────────
-
 /// Returns the appropriate `std.Io` for the current execution context.
 ///
 /// - In tests: `std.testing.io` (single-threaded, deterministic)
@@ -27,8 +25,6 @@ pub inline fn defaultIo() std.Io {
         std.Io.Threaded.global_single_threaded.io();
 }
 
-// ─── Sleep helper ─────────────────────────────────────────────────────────────
-
 /// Sleeps for `ms` milliseconds using the canonical IO.
 ///
 /// `ms` is `i64` to match `std.Io.Duration.fromMilliseconds`.
@@ -45,8 +41,6 @@ pub fn sleepMs(ms: u64) void {
     const clamped: i64 = @intCast(@min(ms, @as(u64, @intCast(std.math.maxInt(i64)))));
     sleepMsI(clamped);
 }
-
-// ─── Type-erased Reader / Writer adapters ─────────────────────────────────────
 
 /// A type-erased reader compatible with any `*anyopaque` backed source.
 pub const AnyReader = struct {
@@ -98,8 +92,6 @@ pub const AnyWriter = struct {
         try self.writeAll(text);
     }
 };
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 test "defaultIo returns a valid Io" {
     const io = defaultIo();

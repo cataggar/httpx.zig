@@ -93,6 +93,38 @@ defer client.deinit();
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
 
+### Timeouts (`Timeouts`)
+
+Client timeouts are configured through `ClientConfig.timeouts` or `ClientConfig.withTimeouts(...)`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `connect_ms` | `u64` | `30_000` | Maximum time to establish a TCP connection. |
+| `read_ms` | `u64` | `30_000` | Maximum time to wait for response data on the socket. |
+| `write_ms` | `u64` | `30_000` | Maximum time to wait while sending request data. |
+| `keep_alive_ms` | `u64` | `60_000` | Reserved keep-alive timeout budget. |
+| `idle_ms` | `u64` | `120_000` | Reserved idle timeout budget. |
+| `request_ms` | `u64` | `0` | Reserved total request budget (`0` = disabled). |
+
+Helpers:
+
+- `Timeouts.uniform(ms)` — set connect/read/write uniformly
+- `Timeouts.fast()` — 5 second connect/read/write defaults
+- `Timeouts.slow()` — 120 second connect/read/write defaults
+- `Timeouts.none()` — disable socket timeouts
+
+Per-request `RequestOptions.timeout_ms` overrides all three active phases (`connect_ms`, `read_ms`, `write_ms`) for that request.
+
+```zig
+var client = httpx.Client.initWithConfig(allocator, .{
+    .timeouts = httpx.Timeouts.fast(),
+});
+defer client.deinit();
+
+const res = try client.get("https://example.com/slow", .{ .timeout_ms = 2_000 });
+defer res.deinit();
+```
+
 ### Config Helper Methods
 
 | Helper | Description |
@@ -259,7 +291,7 @@ Per-request overrides for configuration.
 | `form_fields` | `?[]const [2][]const u8` | `null` | Form fields encoded as `application/x-www-form-urlencoded`. |
 | `bearer_token` | `?[]const u8` | `null` | Sets `Authorization: Bearer <token>`. |
 | `basic_auth` | `?BasicAuth` | `null` | Sets `Authorization: Basic ...` using username/password credentials. |
-| `timeout_ms` | `?u64` | `null` | Request-specific timeout. |
+| `timeout_ms` | `?u64` | `null` | Request-specific timeout override for connect, read, and write phases. |
 | `follow_redirects` | `?bool` | `null` | Override client redirect setting. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
 

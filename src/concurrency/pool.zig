@@ -718,12 +718,15 @@ test "RequestResult summary helpers" {
 
 test "ConcurrencyConfig modes execution" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.initWithConfig(allocator, .{
+        .timeouts = .uniform(250),
+        .keep_alive = false,
+    });
     defer client.deinit();
 
     const specs = [_]RequestSpec{
-        .{ .method = .GET, .url = "http://127.0.0.1:0" },
-        .{ .method = .GET, .url = "http://127.0.0.1:0" },
+        .{ .method = .GET, .url = "http://127.0.0.1:1", .timeout_ms = 250 },
+        .{ .method = .GET, .url = "http://127.0.0.1:1", .timeout_ms = 250 },
     };
 
     // 1. Test single_thread mode

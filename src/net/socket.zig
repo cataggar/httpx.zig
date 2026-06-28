@@ -60,6 +60,16 @@ const winsock = if (is_windows) struct {
     extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(s: SOCKET, name: *posix.sockaddr, namelen: *i32) callconv(.winapi) i32;
     extern "ws2_32" fn getpeername(s: SOCKET, name: *posix.sockaddr, namelen: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]u8, optlen: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: i32, argp: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(nfds: i32, readfds: ?*fd_set, writefds: ?*fd_set, exceptfds: ?*fd_set, timeout: ?*posix.timeval) callconv(.winapi) i32;
+
+    const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E));
+    const FD_SETSIZE: u32 = 64;
+    const fd_set = extern struct {
+        fd_count: u32,
+        fd_array: [FD_SETSIZE]usize,
+    };
 } else struct {};
 
 var winsock_initialized: bool = false;
@@ -119,6 +129,111 @@ fn posixConnect(sock: posix.socket_t, addr_ptr: *const posix.sockaddr, addr_len:
         .SUCCESS => return,
         else => return error.ConnectFailed,
     }
+}
+
+fn setSocketNonBlocking(sock: posix.socket_t, enable: bool) !void {
+    if (is_windows) {
+        var mode: u32 = if (enable) 1 else 0;
+        const rc = winsock.ioctlsocket(toWinsockSocket(sock), winsock.FIONBIO, &mode);
+        if (rc == winsock.SOCKET_ERROR) return error.SocketOptionFailed;
+        return;
+    }
+
+    const flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+    const nonblock: usize = posix.O.NONBLOCK;
+    const new_flags = if (enable) flags | nonblock else flags & ~nonblock;
+    _ = try posix.fcntl(sock, posix.F.SETFL, new_flags);
+}
+
+fn waitConnectWritable(sock: posix.socket_t, timeout_ms: u64) !void {
+    if (timeout_ms == 0) return;
+
+    if (is_windows) {
+        var write_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+        var except_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+        const handle = toWinsockSocket(sock);
+        write_set.fd_array[0] = handle;
+        write_set.fd_count = 1;
+        except_set.fd_array[0] = handle;
+        except_set.fd_count = 1;
+
+        var tv = posix.timeval{
+            .sec = @intCast(timeout_ms / 1000),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        const rc = winsock.select(0, null, &write_set, &except_set, &tv);
+        if (rc == 0) return error.ConnectionTimeout;
+        if (rc == winsock.SOCKET_ERROR) return error.ConnectFailed;
+        return;
+    }
+
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = sock,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const timeout = std.posix.timespec{
+        .sec = @intCast(timeout_ms / 1000),
+        .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
+    };
+    const rc = try std.posix.poll(&poll_fds, timeout);
+    if (rc == 0) return error.ConnectionTimeout;
+    if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
+        return error.ConnectFailed;
+    }
+}
+
+fn checkConnectCompleted(sock: posix.socket_t) !void {
+    var err_code: i32 = 0;
+    if (is_windows) {
+        var len: i32 = @sizeOf(i32);
+        const rc = winsock.getsockopt(
+            toWinsockSocket(sock),
+            @intCast(posix.SOL.SOCKET),
+            0x1007, // SO_ERROR
+            @ptrCast(&err_code),
+            &len,
+        );
+        if (rc == winsock.SOCKET_ERROR) return error.ConnectFailed;
+    } else {
+        var len: posix.socklen_t = @sizeOf(i32);
+        try posix.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_code), &len);
+    }
+
+    if (err_code != 0) return error.ConnectFailed;
+}
+
+fn posixConnectWithTimeout(sock: posix.socket_t, addr_ptr: *const posix.sockaddr, addr_len: posix.socklen_t, timeout_ms: u64) !void {
+    if (timeout_ms == 0) {
+        return posixConnect(sock, addr_ptr, addr_len);
+    }
+
+    try setSocketNonBlocking(sock, true);
+    errdefer setSocketNonBlocking(sock, true) catch {};
+
+    if (is_windows) {
+        const rc = winsock.connect(toWinsockSocket(sock), addr_ptr, @intCast(addr_len));
+        if (rc == 0) {
+            try setSocketNonBlocking(sock, false);
+            return;
+        }
+        const err = winsock.WSAGetLastError();
+        if (err != winsock.WSAEWOULDBLOCK) return error.ConnectFailed;
+    } else {
+        const rc = posix.system.connect(sock, addr_ptr, addr_len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                try setSocketNonBlocking(sock, false);
+                return;
+            },
+            .INPROGRESS, .ALREADY => {},
+            else => return error.ConnectFailed,
+        }
+    }
+
+    try waitConnectWritable(sock, timeout_ms);
+    try checkConnectCompleted(sock);
+    try setSocketNonBlocking(sock, false);
 }
 
 fn posixBind(sock: posix.socket_t, addr_ptr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
@@ -597,7 +712,13 @@ pub const Socket = struct {
 
     /// Connects to the specified address.
     pub fn connect(self: *Self, addr: net.Address) !void {
-        try posixConnect(self.handle, &addr.any, addr.getOsSockLen());
+        try self.connectWithTimeout(addr, 0);
+    }
+
+    /// Connects to the specified address with a connect-phase timeout in milliseconds.
+    /// A timeout of `0` disables the connect timeout and uses a blocking connect.
+    pub fn connectWithTimeout(self: *Self, addr: net.Address, timeout_ms: u64) !void {
+        try posixConnectWithTimeout(self.handle, &addr.any, addr.getOsSockLen(), timeout_ms);
         self.connected = true;
     }
 

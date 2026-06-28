@@ -207,6 +207,8 @@ pub const RequestSpec = struct {
 
 All `RequestSpec` fields beyond `url` are optional customizations.
 
+When `timeout_ms` is set, it overrides the client connect/read/write timeout budget for that batch entry. Use short values in tests and batch jobs against unreachable hosts to avoid waiting on the default 30 second socket limits.
+
 ### `RequestResult`
 
 Result wrapper for parallel requests.

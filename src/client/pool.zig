@@ -83,6 +83,7 @@ pub const PoolConfig = struct {
     idle_timeout_ms: i64 = 60_000,
     max_requests_per_connection: u32 = 1000,
     health_check_interval_ms: i64 = 30_000,
+    connect_timeout_ms: u64 = 30_000,
 };
 
 /// Snapshot statistics for the connection pool.
@@ -123,7 +124,7 @@ pub const ConnectionPool = struct {
     }
 
     /// Gets or creates a connection to the specified host.
-    pub fn getConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy) !*Connection {
+    pub fn getConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !*Connection {
         for (self.connections.items) |*conn| {
             if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
                 if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
@@ -141,11 +142,11 @@ pub const ConnectionPool = struct {
         }
         if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
 
-        return self.createConnection(host, port, proxy);
+        return self.createConnection(host, port, proxy, connect_timeout_ms);
     }
 
     /// Creates a new connection.
-    fn createConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy) !*Connection {
+    fn createConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !*Connection {
         const host_owned = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(host_owned);
 
@@ -155,7 +156,7 @@ pub const ConnectionPool = struct {
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
-        try socket.connect(addr);
+        try socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
 
         if (proxy) |p| {
             if (p.kind == .socks5h) {

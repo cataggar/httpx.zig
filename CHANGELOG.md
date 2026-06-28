@@ -23,6 +23,8 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 - Bumped project version to `0.1.1`.
+- Centralized canonical IO helpers in `src/util/any_io.zig` with re-exports from `src/util/common.zig` (`defaultIo`, `sleepMs`, `sleepMsI`) so library code shares one test/runtime IO selector.
+- Client TCP connects now honor `Timeouts.connect_ms` through `Socket.connectWithTimeout()`; connection pool creation uses the same connect timeout budget.
 - Cleaned up redundant and duplicate aliases to simplify the public API surface (removed type aliases `HttpClient`, `ReqOptions`, `HttpServer`, `Ctx`, utility function aliases `parseQueryValue`, `parseCookiePair`, `utils`, and client alias `httpOptions`).
 - Updated minimum Zig version to `0.16.0`.
 - Updated concurrent request functions (`all`, `allSettled`, `any`, `race`, `first`, `fastest`, `settled`) to accept a `ConcurrencyConfig`.
@@ -32,6 +34,8 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 - Fixed HTTPS client TLS handshakes on Zig `0.16` by honoring `std.Io.Reader.fillUnbuffered`'s empty-buffer `readVec` contract in `src/net/socket.zig`, resolving `error.TlsConnectionTruncated` on simple GET requests. This addresses [Issue #14](https://github.com/muhammad-fiaz/httpx.zig/issues/14).
+- Fixed client connect timeouts being ignored: `Timeouts.connect_ms` was documented but not applied during TCP `connect()`, which could leave concurrent tests and unreachable-host requests waiting up to the read timeout instead of failing promptly.
+- Fixed `concurrency.pool` `ConcurrencyConfig modes execution` test appearing to hang during `zig build test` by using short per-request timeouts and a closed local port instead of `127.0.0.1:0`.
 - Fixed thread join hangs and socket/listener deinitialization sequence deadlocks in all runtime examples on scope exit.
 - Added comprehensive end-to-end runnable `proxy_example` demonstrating client forward proxying and server reverse proxy middleware.
 - Added unit tests for client-side proxy request formatting and base64 proxy authentication encoding.
