@@ -87,7 +87,7 @@ fn listenSocket(fd: posix.socket_t, backlog: i32) !void {
         const rc = winsock.listen(fd, backlog);
         if (rc != 0) return error.ListenFailed;
     } else {
-        const rc = posix.system.listen(fd, backlog);
+        const rc = posix.system.listen(fd, @intCast(backlog));
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             else => return error.ListenFailed,
