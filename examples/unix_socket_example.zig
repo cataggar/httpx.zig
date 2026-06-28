@@ -55,8 +55,7 @@ pub fn main() !void {
     // 3. Initialize HTTP Client with unix_socket_path
     std.debug.print("Connecting client to Unix socket: {s}...\n", .{socket_path});
     var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
-        .withUnixSocket(socket_path)
-    );
+        .withUnixSocket(socket_path));
     defer client.deinit();
 
     // Make an HTTP GET request over the Unix socket

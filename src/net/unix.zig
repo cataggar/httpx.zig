@@ -298,8 +298,7 @@ test "Unix domain socket integration - Client & Server" {
     std.Io.sleep(io, dur, .real) catch {};
 
     var client = Client.initWithConfig(allocator, ClientConfig.defaults()
-        .withUnixSocket(socket_path)
-    );
+        .withUnixSocket(socket_path));
     defer client.deinit();
 
     var resp = client.get("http://localhost/hello", .{}) catch |err| {
