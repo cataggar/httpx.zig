@@ -38,14 +38,6 @@
 ⭐ If you build with httpx.zig, make sure to give it a star. ⭐
 
 
-> [!WARNING]
-> `v0.1.1` is the current release and targets Zig `0.16.0+`.
-> `v0.1.0` is the previous stable release for the immediate prior `0.1.x` line.
-> Zig `0.15` support is legacy and remains available only through `0.0.7`.
-> This release includes the HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads that caused `error.TlsConnectionTruncated` on simple GET requests.
-> If you are migrating from `0.0.7`, review the changelog and refresh your install pin/hash before upgrading.
-
-
 > [!NOTE]
 > **Project maturity:** This project aims to be production-ready and is actively maintained. It is still a new project and not yet widely adopted. Feel free to use it in your projects.
 >
