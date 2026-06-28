@@ -16,6 +16,14 @@ fn helloHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("Hello!");
 }
 
+fn pickFreeTcpPort() !u16 {
+    var listener = try httpx.TcpListener.init(try httpx.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const addr = try listener.getLocalAddress();
+    return addr.getPort();
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -23,7 +31,7 @@ pub fn main() !void {
 
     std.debug.print("=== Concurrent Requests Example ===\n\n", .{});
 
-    const port = 45235;
+    const port = try pickFreeTcpPort();
 
     // 1. Start a local loopback mock server
     var server = httpx.Server.initWithConfig(allocator, .{
@@ -38,17 +46,23 @@ pub fn main() !void {
     defer server_thread.join();
     defer server.stop();
 
-    sleepMs(20);
+    sleepMs(100);
 
     // 2. Build a batch of requests
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/data", .{port});
+    defer allocator.free(base_url);
+
     var builder = httpx.concurrency.BatchBuilder.init(allocator);
     defer builder.deinit();
 
-    _ = try builder.get("http://127.0.0.1:45235/data");
-    _ = try builder.get("http://127.0.0.1:45235/data");
-    _ = try builder.get("http://127.0.0.1:45235/data");
+    _ = try builder.get(base_url);
+    _ = try builder.get(base_url);
+    _ = try builder.get(base_url);
 
-    var client = httpx.Client.initWithConfig(allocator, .{ .keep_alive = false });
+    var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
+        .withTimeouts(httpx.Timeouts.fast())
+        .withRetryPolicy(httpx.RetryPolicy.noRetry())
+        .withKeepAlive(false));
     defer client.deinit();
 
     // 3. Mode: multi_thread (implicit background workers)

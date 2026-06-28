@@ -85,9 +85,11 @@ pub const hpack = @import("protocol/hpack.zig");
 pub const stream = @import("protocol/stream.zig");
 pub const qpack = @import("protocol/qpack.zig");
 pub const quic = @import("protocol/quic.zig");
+pub const websocket = @import("protocol/websocket.zig");
 
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
+pub const unix = @import("net/unix.zig");
 
 pub const tls = @import("tls/tls.zig");
 
@@ -103,6 +105,10 @@ pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const mime = @import("util/mime.zig");
 pub const common = @import("util/common.zig");
+pub const multipart = @import("util/multipart.zig");
+pub const metrics_mod = @import("util/metrics.zig");
+pub const session_mod = @import("util/session.zig");
+pub const mock = @import("util/mock.zig");
 
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
@@ -246,7 +252,54 @@ pub const rateLimit = middleware.rateLimit;
 pub const basicAuth = middleware.basicAuth;
 pub const helmet = middleware.helmet;
 pub const reverseProxy = middleware.reverseProxy;
+pub const reverseProxyRuntime = middleware.reverseProxyRuntime;
+pub const healthCheck = middleware.healthCheck;
+pub const readinessProbe = middleware.readinessProbe;
+pub const HealthConfig = middleware.HealthConfig;
+pub const ReadinessConfig = middleware.ReadinessConfig;
+pub const RateLimitConfig = middleware.RateLimitConfig;
+pub const CorsConfig = middleware.CorsConfig;
 
+// WebSocket exports (flat API — no httpx.websocket.WebSocket.X redundancy)
+pub const WsOpcode = websocket.WsOpcode;
+pub const WsFrame = websocket.WsFrame;
+pub const WsCloseCode = websocket.WsCloseCode;
+pub const WsDecodeResult = websocket.WsDecodeResult;
+pub const WS_GUID = websocket.WS_GUID;
+pub const isWebSocketUpgrade = websocket.isWebSocketUpgrade;
+pub const wsExtractKey = websocket.wsExtractKey;
+pub const wsAcceptKey = websocket.wsAcceptKey;
+pub const wsUpgradeHeaders = websocket.wsUpgradeHeaders;
+pub const wsEncodeFrame = websocket.wsEncodeFrame;
+pub const wsDecodeFrame = websocket.wsDecodeFrame;
+pub const wsTextFrame = websocket.wsTextFrame;
+pub const wsBinaryFrame = websocket.wsBinaryFrame;
+pub const wsPingFrame = websocket.wsPingFrame;
+pub const wsPongFrame = websocket.wsPongFrame;
+pub const wsCloseFrame = websocket.wsCloseFrame;
+
+// Multipart exports
+pub const MultipartBuilder = multipart.MultipartBuilder;
+pub const MultipartPart = multipart.Part;
+pub const MultipartParsed = multipart.ParsedParts;
+pub const extractMultipartBoundary = multipart.extractBoundary;
+pub const parseMultipart = multipart.parse;
+
+// Metrics exports
+pub const Metrics = metrics_mod.Metrics;
+pub const MetricsSnapshot = metrics_mod.MetricsSnapshot;
+pub const MetricsEvent = metrics_mod.MetricsEvent;
+pub const MetricsCallbackFn = metrics_mod.MetricsCallbackFn;
+
+// Session exports
+pub const SessionStore = session_mod.SessionStore;
+pub const SessionConfig = session_mod.SessionConfig;
+pub const SESSION_ID_LEN = session_mod.SESSION_ID_LEN;
+
+// Unix socket exports
+pub const UnixSocket = unix.UnixSocket;
+pub const UnixListener = unix.UnixListener;
+pub const UnixClient = unix.UnixClient;
 pub const Buffer = buffer.Buffer;
 pub const RingBuffer = buffer.RingBuffer;
 pub const FixedBuffer = buffer.FixedBuffer;

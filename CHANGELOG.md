@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file.
 ## [0.1.1] - 27-06-2026
 
 ### Added
+- Added RFC 6455 WebSocket support, including client/server upgrade detection, handshake key derivation, and low-level framing for control/data frames.
+- Added Unix domain socket (AF_UNIX) client-server integration, allowing HTTP clients to connect via custom Unix socket paths and HTTP servers to bind and listen on Unix sockets.
+- Added RFC 2046 Multipart Form Data support, offering a builder and parser for custom form fields and file uploads.
+- Added in-memory Session Store management with TTL expiration, auto-eviction, and cookie helpers.
+- Added Observability Metrics tracker supporting real-time traffic counts, status code classifications, latency metrics, and registering explicit custom callbacks (`MetricsCallbackFn` / `MetricsEvent`) to integrate with external/custom metrics services (e.g. Datadog or Prometheus).
+- Added Health Check and Readiness Probe middlewares to support standard liveness/readiness probe routes.
 - Added client-side forward proxy support (supporting HTTP/HTTPS proxies, custom proxy authentication, CONNECT tunnels for TLS/HTTP2, and absolute URLs for HTTP/1.x) for the request tracked in [Issue #15](https://github.com/muhammad-fiaz/httpx.zig/issues/15).
 - Added SOCKS5h client proxy support for remote hostname resolution through the proxy server.
 - Added server-side reverse proxy middleware `reverseProxy(comptime target_url: []const u8)` to forward incoming requests to backends.

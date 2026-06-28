@@ -53,6 +53,7 @@ var server = httpx.Server.initWithConfig(allocator, .{
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS frame defaults and limits. |
 | `http3_settings` | `Http3Settings` | `{}` | HTTP/3 SETTINGS defaults (QPACK/field section limits). |
 | `log_fn` | `?LogFn` | `null` | Optional server log callback. Leave unset to disable server-side logging output. |
+| `unix_path` | `?[]const u8` | `null` | Optional Unix Domain Socket (AF_UNIX) path to bind and listen on. |
 
 All `ServerConfig` fields are optional customizations. Omitted fields use the built-in defaults.
 

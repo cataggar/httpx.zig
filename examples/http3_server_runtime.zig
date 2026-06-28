@@ -33,7 +33,7 @@ pub fn main() !void {
     defer server_thread.join();
     defer server.stop();
 
-    sleepMs(50);
+    sleepMs(100);
 
     var client = httpx.Client.initWithConfig(allocator, .{
         .http3_enabled = true,
@@ -45,7 +45,7 @@ pub fn main() !void {
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/h3-server", .{port});
     defer allocator.free(url);
 
-    var response = try client.get(url, .{ .timeout_ms = 5000 });
+    var response = try client.get(url, .{ .timeout_ms = 10_000 });
     defer response.deinit();
 
     std.debug.print("\n=== HTTP/3 Server Runtime Example ===\n", .{});

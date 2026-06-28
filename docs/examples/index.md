@@ -44,3 +44,10 @@ zig build example-http3_example -Dtarget=aarch64-macos
 - [HTTP/3 Server Runtime](/examples/http3-server-runtime): End-to-end high-level HTTP/3 server route consumed by a local HTTP/3 client over UDP.
 - [TCP Local](/examples/tcp-local): Local TCP listener/client round trip.
 - [UDP Local](/examples/udp-local): Local UDP transport demo.
+- [WebSocket Example](/examples/websocket-example): Read upgrade headers, handshake keys, and process frame inputs.
+- [Multipart Form Data](/examples/multipart-example): Build and parse multipart payloads with text fields and file uploads.
+- [Session Store](/examples/session-example): Set/get session data, evict sessions on TTL, and integrate with servers.
+- [Metrics and Observability](/examples/metrics-example): Aggregate total requests, status codes, latency times, and success rates.
+- [Unix Domain Sockets](/examples/unix-socket-example): Bind servers and connect clients over AF_UNIX sockets.
+- [Health Check Probes](/examples/health-check-example): Configure liveness and readiness probe middlewares.
+- [Request Response Customization](/examples/request-response-customization): Customize request properties and response headers.

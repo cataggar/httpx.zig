@@ -38,9 +38,7 @@ const content_type = httpx.mimeTypeFromPathWith(path, &custom, fallback);
 Root-level aliases are also available:
 
 - `httpx.queryValue(...)`
-- `httpx.parseQueryValue(...)`
 - `httpx.parseSetCookiePair(...)`
-- `httpx.parseCookiePair(...)`
 - `httpx.mimeTypeFromPath(...)`
 - `httpx.mimeTypeFromPathOr(...)`
 - `httpx.mimeTypeFromPathWith(...)`
@@ -55,9 +53,38 @@ Protocol utility aliases are also available at root-level:
 - `httpx.encodeVarInt(...)`
 - `httpx.decodeVarInt(...)`
 
-Compatibility note:
+## WebSockets
 
-- `httpx.utils` remains available as an alias to `httpx.common`.
+`httpx.websocket` provides RFC 6455 upgrade helpers and low-level framing models.
+
+- `wsTextFrame(allocator, text)`: Encodes a text message payload into a WebSocket text frame.
+- `wsBinaryFrame(allocator, data)`: Encodes binary data into a WebSocket binary frame.
+- `wsCloseFrame(allocator, code, reason)`: Encodes a close control frame with status code and optional reason payload.
+- `computeHandshakeAcceptKey(allocator, client_key)`: Computes the standard base-64 SHA-1 WebSocket accept key from the client's `Sec-WebSocket-Key` header value.
+- `isWebSocketUpgrade(request)`: Checks whether a request contains valid WebSocket upgrade headers.
+
+## Multipart Form Data
+
+`httpx` provides RFC 2046 utilities for building and parsing multipart payloads.
+
+- `MultipartBuilder`: Builder structure to serialize form fields and file attachments.
+- `extractMultipartBoundary(content_type)`: Extracts the boundary token from a `Content-Type: multipart/form-data; boundary=...` header.
+- `parseMultipart(allocator, body, boundary)`: Parses a raw multipart request payload into a list of key-value fields and files.
+
+## Session Management
+
+`httpx` provides in-memory session tracking with cookie management.
+
+- `SessionStore`: Safe concurrent session manager supporting TTL eviction.
+- `Session`: Individual session object containing user state fields.
+- `SessionConfig`: Configuration for session duration and cookies.
+
+## Metrics & Observability
+
+`httpx` aggregates real-time traffic statistics.
+
+- `Metrics`: Observation registry that tracks request counts, status classifications (2xx/3xx/4xx/5xx), latency metrics, and success rates.
+- `MetricsSnapshot`: Snapshot payload for reporting traffic analytics.
 
 ## Buffers
 

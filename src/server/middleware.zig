@@ -16,6 +16,7 @@ const Context = @import("server.zig").Context;
 const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
 const list_writer = @import("../util/list_writer.zig");
+const status = @import("../core/status.zig");
 
 fn nowMillis() i64 {
     const io = if (builtin.is_test)
@@ -140,7 +141,7 @@ pub fn cors(comptime config: CorsConfig) Middleware {
                 try ctx.setHeader("Access-Control-Max-Age", max_age);
 
                 if (ctx.request.method == .OPTIONS) {
-                    return ctx.status(204).text("");
+                    return ctx.status(status.StatusCode.NO_CONTENT).text("");
                 }
 
                 return next(ctx);
@@ -230,11 +231,11 @@ pub fn basicAuth(realm: []const u8, validator: *const fn ([]const u8, []const u8
             fn handler(ctx: *Context, next: Next) anyerror!Response {
                 const auth = ctx.header("Authorization") orelse {
                     try ctx.setHeader("WWW-Authenticate", "Basic realm=\"Restricted\"");
-                    return ctx.status(401).text("Unauthorized");
+                    return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
                 };
 
                 if (!std.mem.startsWith(u8, auth, "Basic ")) {
-                    return ctx.status(401).text("Unauthorized");
+                    return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
                 }
 
                 return next(ctx);
@@ -330,6 +331,47 @@ pub fn reverseProxy(comptime target_url: []const u8) Middleware {
     };
 }
 
+/// Creates reverse proxy middleware with a runtime-known target URL.
+/// The target_url slice must remain valid for the lifetime of the middleware.
+pub fn reverseProxyRuntime(target_url: []const u8) Middleware {
+    const State = struct {
+        var url: []const u8 = "";
+    };
+    State.url = target_url;
+    return .{
+        .name = "reverse_proxy",
+        .handler = struct {
+            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                _ = next;
+                const client_mod = @import("../client/client.zig");
+                var client = client_mod.Client.init(ctx.allocator);
+                defer client.deinit();
+
+                const path = ctx.request.uri.path;
+                const query_str = ctx.request.uri.query;
+                const full_target = if (query_str) |q|
+                    try std.fmt.allocPrint(ctx.allocator, "{s}{s}?{s}", .{ State.url, path, q })
+                else
+                    try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ State.url, path });
+                defer ctx.allocator.free(full_target);
+
+                var headers_list = std.ArrayList([2][]const u8).empty;
+                defer headers_list.deinit(ctx.allocator);
+                for (ctx.request.headers.entries.items) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
+                    try headers_list.append(ctx.allocator, .{ h.name, h.value });
+                }
+
+                var req_opts = client_mod.RequestOptions.defaults();
+                req_opts.headers = headers_list.items;
+                req_opts.body = ctx.request.body;
+
+                return client.request(ctx.request.method, full_target, req_opts);
+            }
+        }.handler,
+    };
+}
+
 test "Middleware creation" {
     const mw = logger();
     try std.testing.expectEqualStrings("logger", mw.name);
@@ -380,7 +422,7 @@ test "loggerWithConfig middleware" {
     const NextMock = struct {
         fn next(c: *Context) anyerror!Response {
             _ = c;
-            return Response.init(std.testing.allocator);
+            return Response.init(std.testing.allocator, 200);
         }
     };
 
@@ -388,4 +430,105 @@ test "loggerWithConfig middleware" {
     defer res.deinit();
 
     try std.testing.expect(CustomLogger.logged);
+}
+
+/// Health check configuration.
+pub const HealthConfig = struct {
+    /// Path to serve the health check on.
+    path: []const u8 = "/health",
+    /// Optional custom status body (JSON-encodable string).
+    body: []const u8 = "{\"status\":\"ok\"}",
+    /// HTTP status code to return.
+    status: u16 = status.StatusCode.OK,
+};
+
+/// Creates a health check endpoint middleware.
+///
+/// Intercepts requests to the configured path and returns a health status
+/// response without passing to downstream handlers.
+pub fn healthCheck(comptime config: HealthConfig) Middleware {
+    return .{
+        .name = "health_check",
+        .handler = struct {
+            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                if (std.mem.eql(u8, ctx.request.uri.path, config.path)) {
+                    _ = try ctx.response.header("Content-Type", "application/json");
+                    _ = ctx.response.status(config.status);
+                    _ = ctx.response.body(config.body);
+                    return ctx.response.build();
+                }
+                return next(ctx);
+            }
+        }.handler,
+    };
+}
+
+/// Readiness probe configuration for Kubernetes-style health checks.
+pub const ReadinessConfig = struct {
+    /// Path to serve the readiness check on.
+    path: []const u8 = "/ready",
+    /// Custom body to return.
+    body: []const u8 = "{\"ready\":true}",
+};
+
+/// Creates a readiness probe endpoint middleware.
+pub fn readinessProbe(comptime config: ReadinessConfig) Middleware {
+    return .{
+        .name = "readiness_probe",
+        .handler = struct {
+            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                if (std.mem.eql(u8, ctx.request.uri.path, config.path)) {
+                    _ = try ctx.response.header("Content-Type", "application/json");
+                    _ = ctx.response.status(status.StatusCode.OK);
+                    _ = ctx.response.body(config.body);
+                    return ctx.response.build();
+                }
+                return next(ctx);
+            }
+        }.handler,
+    };
+}
+
+test "healthCheck middleware intercepts /health" {
+    var req = try @import("../core/request.zig").Request.init(std.testing.allocator, .GET, "/health");
+    defer req.deinit();
+
+    var ctx = Context.init(std.testing.allocator, &req);
+    defer ctx.deinit();
+
+    const mw = healthCheck(.{});
+    try std.testing.expectEqualStrings("health_check", mw.name);
+
+    const NextMock = struct {
+        fn next(c: *Context) anyerror!Response {
+            _ = c;
+            return Response.init(std.testing.allocator, 200);
+        }
+    };
+
+    var res = try mw.handler(&ctx, NextMock.next);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(u16, 200), res.status.code);
+}
+
+test "readinessProbe middleware intercepts /ready" {
+    var req = try @import("../core/request.zig").Request.init(std.testing.allocator, .GET, "/ready");
+    defer req.deinit();
+
+    var ctx = Context.init(std.testing.allocator, &req);
+    defer ctx.deinit();
+
+    const mw = readinessProbe(.{});
+    try std.testing.expectEqualStrings("readiness_probe", mw.name);
+
+    const NextMock = struct {
+        fn next(c: *Context) anyerror!Response {
+            _ = c;
+            return Response.init(std.testing.allocator, 200);
+        }
+    };
+
+    var res = try mw.handler(&ctx, NextMock.next);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(u16, 200), res.status.code);
 }

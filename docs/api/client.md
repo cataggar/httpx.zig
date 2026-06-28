@@ -89,6 +89,7 @@ defer client.deinit();
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
 | `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. Use `.kind = .socks5h` for SOCKS5h tunneling; the default kind is HTTP. |
+| `unix_socket_path` | `?[]const u8` | `null` | Optional Unix Domain Socket (AF_UNIX) path for client connections. |
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
 
@@ -113,6 +114,7 @@ If you do not set a field, the implicit default value is used. Builder helpers o
 | `withMaxResponseSize(bytes)` | Override maximum response body size. |
 | `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
 | `withProxy(proxy_or_null)` | Configure or clear a forward proxy. Set `.kind = .socks5h` for SOCKS5h tunneling. |
+| `withUnixSocket(path_or_null)` | Configure or clear a Unix Domain Socket (AF_UNIX) connection path. |
 
 ### Client Initialization Helpers
 

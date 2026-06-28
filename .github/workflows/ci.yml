@@ -15,6 +15,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -46,6 +47,7 @@ jobs:
     name: Run Examples Matrix (hostable targets)
     needs: build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +103,7 @@ jobs:
         run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache test -Dtarget=${{ matrix.target }} --summary all
 
       - name: Run all examples on ${{ matrix.target }}
+        timeout-minutes: 15
         run: |
           echo "Running examples for ${{ matrix.target }}"
           zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache run-all-examples -Dtarget=${{ matrix.target }}
@@ -109,6 +112,7 @@ jobs:
     name: Build Examples / Library Matrix (build-only for many targets)
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

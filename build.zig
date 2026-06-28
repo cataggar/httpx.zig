@@ -51,6 +51,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http3_client_runtime", .path = "examples/http3_client_runtime.zig" },
         .{ .name = "http3_server_runtime", .path = "examples/http3_server_runtime.zig" },
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
+        .{ .name = "websocket_example", .path = "examples/websocket_example.zig" },
+        .{ .name = "multipart_example", .path = "examples/multipart_example.zig" },
+        .{ .name = "metrics_example", .path = "examples/metrics_example.zig" },
+        .{ .name = "session_example", .path = "examples/session_example.zig" },
+        .{ .name = "health_check_example", .path = "examples/health_check_example.zig" },
+        .{ .name = "unix_socket_example", .path = "examples/unix_socket_example.zig" },
     };
 
     inline for (examples) |example| {

@@ -98,12 +98,12 @@ fn runAliasCalls(allocator: std.mem.Allocator, urls: DemoUrls) void {
         .json = "{\"ok\":true}",
     }));
 
-    printResult("httpx.fetch", httpx.fetch(urls.fetch, .{}));
-    printResult("httpx.send(GET)", httpx.send(.GET, urls.get, .{}));
-    printResult("httpx.delete", httpx.delete(urls.delete, .{}));
-    printResult("httpx.opts", httpx.opts(urls.get, .{}));
-    printResult("httpx.trace", httpx.trace(urls.trace, .{}));
-    printResult("httpx.connect", httpx.connect(urls.connect, .{}));
+    printResult("httpx.fetch", httpx.fetch(urls.fetch, .{ .timeout_ms = request_timeout }));
+    printResult("httpx.send(GET)", httpx.send(.GET, urls.get, .{ .timeout_ms = request_timeout }));
+    printResult("httpx.delete", httpx.delete(urls.delete, .{ .timeout_ms = request_timeout }));
+    printResult("httpx.opts", httpx.opts(urls.get, .{ .timeout_ms = request_timeout }));
+    printResult("httpx.trace", httpx.trace(urls.trace, .{ .timeout_ms = request_timeout }));
+    printResult("httpx.connect", httpx.connect(urls.connect, .{ .timeout_ms = request_timeout }));
 
     // Client aliases.
     const client_config = httpx.ClientConfig.defaults()
@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
     defer server_thread.join();
     defer server.stop();
 
-    sleepMs(50);
+    sleepMs(100);
     std.debug.print("Local demo server: http://127.0.0.1:{d}\n", .{port});
 
     const urls = try buildLocalUrls(allocator, port);

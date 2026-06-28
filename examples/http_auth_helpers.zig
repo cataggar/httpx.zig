@@ -78,7 +78,7 @@ pub fn main() !void {
     defer server_thread.join();
     defer server.stop();
 
-    sleepMs(50);
+    sleepMs(100);
 
     var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
         .withTimeouts(httpx.Timeouts.fast())

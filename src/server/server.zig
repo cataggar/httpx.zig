@@ -21,6 +21,7 @@ const ResponseBuilder = @import("../core/response.zig").ResponseBuilder;
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const Parser = @import("../protocol/parser.zig").Parser;
+const status_mod = @import("../core/status.zig");
 const http = @import("../protocol/http.zig");
 const hpack = @import("../protocol/hpack.zig");
 const h2stream = @import("../protocol/stream.zig");
@@ -94,6 +95,7 @@ pub const ServerConfig = struct {
     http2_settings: types.Http2Settings = .{},
     http3_settings: types.Http3Settings = .{},
     log_fn: ?LogFn = null,
+    unix_path: ?[]const u8 = null,
 };
 
 /// File-serving options used by `Context.fileWithOptions`.
@@ -262,7 +264,7 @@ pub const Context = struct {
     /// Sends a file response with production-oriented static-file options.
     pub fn fileWithOptions(self: *Self, path: []const u8, options: FileResponseOptions) !Response {
         const io = defaultIo();
-        var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return self.status(404).text("Not Found");
+        var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return self.status(status_mod.StatusCode.NOT_FOUND).text("Not Found");
         defer f.close(io);
 
         const stat = try f.stat(io);
@@ -392,6 +394,7 @@ pub const Server = struct {
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     udp_socket: ?UdpSocket = null,
+    unix_listener: ?@import("../net/unix.zig").UnixListener = null,
     running: bool = false,
 
     const Self = @This();
@@ -505,6 +508,10 @@ pub const Server = struct {
 
     /// Starts the server and begins accepting connections.
     pub fn listen(self: *Self) !void {
+        if (self.config.unix_path) |path| {
+            return self.listenUnix(path);
+        }
+
         if (self.config.http3_enabled) {
             return self.listenHttp3();
         }
@@ -669,6 +676,31 @@ pub const Server = struct {
         if (self.udp_socket) |*u| {
             u.close();
             self.udp_socket = null;
+        }
+        if (self.unix_listener) |*u| {
+            u.deinit();
+            self.unix_listener = null;
+        }
+    }
+
+    fn listenUnix(self: *Self, path: []const u8) !void {
+        const unix_mod = @import("../net/unix.zig");
+        self.unix_listener = try unix_mod.UnixListener.init(path);
+        self.running = true;
+
+        self.log(.info, "Server listening on Unix socket: {s}\n", .{path});
+
+        while (self.running) {
+            const conn = self.unix_listener.?.accept() catch |err| {
+                if (!self.running) break;
+                self.log(.err, "Unix Accept error: {}\n", .{err});
+                continue;
+            };
+
+            const socket_wrapper = Socket.fromHandle(conn.socket.fd);
+            self.handleConnection(socket_wrapper) catch |err| {
+                self.log(.err, "Handler error: {}\n", .{err});
+            };
         }
     }
 
@@ -1385,25 +1417,48 @@ pub const Server = struct {
             }
         }
 
-        var response: Response = undefined;
-        if (route_result) |r| {
-            response = try self.executeMiddleware(&ctx, r.handler);
-        } else {
-            var allow_methods: [16]types.Method = undefined;
-            const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
+        const FallbackHandler = struct {
+            server: *Self,
+            route_result: @TypeOf(self.router.find(.GET, "/")),
+            suppress_body: bool,
 
-            if (req.method == .OPTIONS and allow_count > 0) {
-                response = Response.init(self.allocator, 204);
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            } else if (allow_count > 0) {
-                response = Response.init(self.allocator, 405);
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            } else if (self.global_handler) |global_handler| {
-                response = try self.executeMiddleware(&ctx, global_handler);
-            } else {
-                response = Response.init(self.allocator, 404);
+            fn handle(c: *Context) anyerror!Response {
+                const self_ptr = @This();
+                const s = c.data.get("__fallback_state") orelse return error.MissingFallbackState;
+                const state: *const self_ptr = @ptrCast(@alignCast(s));
+
+                if (state.route_result) |r| {
+                    return r.handler(c);
+                }
+
+                var allow_methods: [16]types.Method = undefined;
+                const allow_count = state.server.router.allowedMethods(c.request.uri.path, &allow_methods);
+
+                if (c.request.method == .OPTIONS and allow_count > 0) {
+                    var response = Response.init(state.server.allocator, status_mod.StatusCode.NO_CONTENT);
+                    try state.server.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+                    return response;
+                } else if (allow_count > 0) {
+                    var response = Response.init(state.server.allocator, status_mod.StatusCode.METHOD_NOT_ALLOWED);
+                    try state.server.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+                    return response;
+                } else if (state.server.global_handler) |global_handler| {
+                    return global_handler(c);
+                } else {
+                    return Response.init(state.server.allocator, status_mod.StatusCode.NOT_FOUND);
+                }
             }
-        }
+        };
+
+        var fallback = FallbackHandler{
+            .server = self,
+            .route_result = route_result,
+            .suppress_body = suppress_body,
+        };
+        try ctx.data.put("__fallback_state", @ptrCast(&fallback));
+        defer _ = ctx.data.remove("__fallback_state");
+
+        var response = try self.executeMiddleware(&ctx, FallbackHandler.handle);
 
         if (suppress_body or req.method == .HEAD) {
             if (response.body_owned) {
@@ -1904,6 +1959,8 @@ fn reserveUdpPort() !struct { socket: UdpSocket, port: u16 } {
 }
 
 test "Server port conflict strategy fail for TCP" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
 
     var reserved = reserveTcpPort() catch |err| switch (err) {
@@ -1932,6 +1989,8 @@ test "Server port conflict strategy fail for TCP" {
 }
 
 test "Server port conflict strategy increment for TCP" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
 
     var reserved = reserveTcpPort() catch |err| switch (err) {

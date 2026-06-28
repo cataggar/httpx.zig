@@ -35,7 +35,7 @@ pub fn main() !void {
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/runtime", .{port});
     defer allocator.free(url);
 
-    var response = try client.get(url, .{});
+    var response = try client.get(url, .{ .timeout_ms = 10_000 });
     defer response.deinit();
 
     std.debug.print("\n=== HTTP/2 Client Runtime Example ===\n", .{});

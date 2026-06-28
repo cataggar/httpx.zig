@@ -71,6 +71,7 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     proxy: ?types.Proxy = null,
+    unix_socket_path: ?[]const u8 = null,
 
     /// Returns default client configuration.
     pub fn defaults() ClientConfig {
@@ -135,6 +136,13 @@ pub const ClientConfig = struct {
     pub fn withFollowRedirects(self: ClientConfig, follow_redirects: bool) ClientConfig {
         var out = self;
         out.follow_redirects = follow_redirects;
+        return out;
+    }
+
+    /// Returns a copy with a Unix domain socket path configured.
+    pub fn withUnixSocket(self: ClientConfig, path: ?[]const u8) ClientConfig {
+        var out = self;
+        out.unix_socket_path = path;
         return out;
     }
 
@@ -588,10 +596,31 @@ pub const Client = struct {
     }
 
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
-        const host = req.uri.host orelse return error.InvalidUri;
-        const port = req.uri.effectivePort();
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.read_ms;
         const write_timeout_ms = timeout_override_ms orelse self.config.timeouts.write_ms;
+
+        if (self.config.unix_socket_path) |path| {
+            const unix_mod = @import("../net/unix.zig");
+            const unix_sock = try unix_mod.UnixClient.connect(path);
+            var socket = Socket.fromHandle(unix_sock.fd);
+            defer socket.close();
+
+            if (timeout_ms > 0) {
+                try socket.setRecvTimeout(timeout_ms);
+            }
+            if (write_timeout_ms > 0) {
+                try socket.setSendTimeout(write_timeout_ms);
+            }
+
+            const request_data = try http.formatRequest(req, self.allocator);
+            defer self.allocator.free(request_data);
+
+            try socket.sendAll(request_data);
+            return self.readResponseFromTcp(&socket);
+        }
+
+        const host = req.uri.host orelse return error.InvalidUri;
+        const port = req.uri.effectivePort();
 
         const wants_http2 = self.config.http2_enabled or req.version == .HTTP_2;
         const wants_http3 = self.config.http3_enabled or req.version == .HTTP_3;

@@ -92,6 +92,12 @@
 | **Security** | Security headers (Helmet) and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **No External Dependencies** | Pure Zig implementation for maximum portability and ease of build. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
 | **Shared Common Helpers** | Reusable query/cookie helpers plus MIME resolution with explicit fallback and external mapping support. | https://muhammad-fiaz.github.io/httpx.zig/api/utils |
+| **WebSockets** | RFC 6455 upgrade checks, handshake accept key computations, and frame encoding/decoding. | https://muhammad-fiaz.github.io/httpx.zig/examples/websocket-example |
+| **Multipart Form Data** | RFC 2046 multipart body builder and parser for text fields and file uploads. | https://muhammad-fiaz.github.io/httpx.zig/examples/multipart-example |
+| **Session Management** | TTL-based secure in-memory session store and cookie integration. | https://muhammad-fiaz.github.io/httpx.zig/examples/session-example |
+| **Observability & Metrics** | Real-time traffic counters, per-class status tracking, and latency measuring. | https://muhammad-fiaz.github.io/httpx.zig/examples/metrics-example |
+| **Unix Domain Sockets** | High-performance client-server IPC over AF_UNIX sockets. | https://muhammad-fiaz.github.io/httpx.zig/examples/unix-socket-example |
+| **Health Checks** | Built-in liveness and readiness probe middlewares for deployments. | https://muhammad-fiaz.github.io/httpx.zig/examples/health-check-example |
 
 </details>
 
@@ -394,25 +400,19 @@ try server.listen();
 - `server.listeningPort()`: returns the effective bound port.
  
 ## Examples
- 
-The `examples/` directory contains comprehensive examples for all major features:
- 
-- **Basic Client**: `simple_get.zig`, `post_json.zig`
-- **JSON Parse**: `simple_get_deserialize.zig` (GET + typed JSON deserialization)
-- **Advanced Client**: `custom_headers.zig`, `connection_pool.zig`, `interceptors.zig`
-- **Cookies**: `cookies_demo.zig`
-- **Simplified API**: `simplified_api_aliases.zig`
-- **Concurrency**: `concurrent_requests.zig` (Parallel/Race/All patterns)
-- **Streaming**: `streaming.zig`
-- **Server Core**: `simple_server.zig`, `router_example.zig`, `middleware_example.zig`
-- **Static Assets Demo**: `static_files.zig` (file-based static routes + directory-based wildcard mounts for CSS/JS/images)
-- **Website Demo**: `multi_page_website.zig` (full multi-page website serving `index/about/contact` with static assets)
-- **Protocol Demos**: `http2_example.zig`, `http2_client_runtime.zig`, `http2_server_runtime.zig`, `http3_example.zig`, `http3_client_runtime.zig`, `http3_server_runtime.zig`
-- **Networking Utility**: `tcp_local.zig`, `udp_local.zig`
- 
-To run an example:
+
+The `examples/` directory contains comprehensive, runnable examples demonstrating all features of `httpx.zig`:
+
+- **Client**: Basic GET requests, POST with JSON, custom headers, connection pooling, proxy usage, request interceptors, and cookies.
+- **Server**: Pattern-based routing, middleware configurations, static file serving, and multi-page web applications.
+- **Protocols**: Multiplexed HTTP/2 client/server runtime and UDP-based HTTP/3 client/server runtime.
+- **Advanced Capabilities**: RFC 6455 WebSockets, multipart form data building/parsing, session management, metrics dashboards with external callback event handlers, Unix domain socket IPC, and health/readiness probes.
+
+To run any example:
 ```bash
-zig build run-simple_get
+zig build run-<example_name>
+# e.g., zig build run-simple_get
+# e.g., zig build run-websocket_example
 ```
 
 ## Validation Matrix

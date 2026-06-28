@@ -119,6 +119,40 @@ Generates and attaches a unique `X-Request-ID` to every request.
 server.use(httpx.middleware.requestId());
 ```
 
+### `healthCheck`
+
+Intercepts requests to the configured path (defaulting to `/health`) and returns a health status payload.
+
+```zig
+const config = httpx.middleware.HealthConfig{
+    .path = "/health",
+    .body = "{\"status\":\"ok\"}",
+    .status = 200,
+};
+server.use(httpx.middleware.healthCheck(config));
+```
+
+### `readinessProbe`
+
+Configures liveness/readiness probes (defaulting to `/ready`) for Kubernetes or health checker deployments.
+
+```zig
+const config = httpx.middleware.ReadinessConfig{
+    .path = "/ready",
+    .body = "{\"ready\":true}",
+};
+server.use(httpx.middleware.readinessProbe(config));
+```
+
+### `reverseProxy`
+
+Forwards incoming client requests on a matching path to another backend.
+
+```zig
+// Forwards matching requests to a backend server
+server.use(httpx.middleware.reverseProxy("http://backend-server.local"));
+```
+
 ## Creating Custom Middleware
 
 A middleware is a struct with a `handler` function.

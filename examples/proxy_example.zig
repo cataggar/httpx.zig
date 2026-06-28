@@ -1,8 +1,7 @@
 //! Proxy Client & Reverse Proxy Server Example
 //!
 //! Demonstrates:
-//! 1. Starting a loopback HTTP server configured with a reverse proxy middleware
-//!    forwarding requests to a mock backend.
+//! 1. Starting a loopback HTTP backend server and a separate proxy-forwarding server.
 //! 2. Making client requests using a Client configured to route through a proxy.
 
 const std = @import("std");
@@ -17,6 +16,13 @@ fn mockBackendHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("Hello from Mock Backend!");
 }
 
+fn pickFreeTcpPort() !u16 {
+    var listener = try httpx.TcpListener.init(try httpx.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const addr = try listener.getLocalAddress();
+    return addr.getPort();
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -24,10 +30,10 @@ pub fn main() !void {
 
     std.debug.print("=== Proxy Support Example ===\n\n", .{});
 
-    const backend_port = 45233;
-    const proxy_port = 45234;
+    const backend_port = try pickFreeTcpPort();
+    const proxy_port = try pickFreeTcpPort();
 
-    // 1. Start the mock backend server
+    // 1. Start the mock backend server.
     var backend_server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = backend_port,
@@ -40,9 +46,12 @@ pub fn main() !void {
     defer backend_thread.join();
     defer backend_server.stop();
 
-    sleepMs(20);
+    sleepMs(100);
 
-    // 2. Start the proxy server. We will use the reverseProxy middleware pointing to the mock backend.
+    // 2. Start a proxy-forwarding server.
+    //    We use the high-level httpx.reverseProxy comptime middleware.
+    //    A fixed comptime URL cannot hold the dynamic port, so we use
+    //    a direct-client forwarding handler via server.global() instead.
     var proxy_server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = proxy_port,
@@ -50,16 +59,42 @@ pub fn main() !void {
     });
     defer proxy_server.deinit();
 
-    // Register reverse proxy middleware
-    try proxy_server.use(httpx.reverseProxy("http://127.0.0.1:45233"));
+    // Build the backend base URL as a fixed buffer so it is available to the handler.
+    var backend_url_buf: [64]u8 = undefined;
+    const backend_url = try std.fmt.bufPrint(&backend_url_buf, "http://127.0.0.1:{d}", .{backend_port});
+
+    // Register reverse proxy using comptime-known local address via global handler.
+    // The handler closes over backend_url_buf which lives on main's stack frame.
+    const ForwardCtx = struct {
+        var target: []const u8 = "";
+    };
+    ForwardCtx.target = backend_url;
+
+    // Register the forwarding handler as the global fallback so all
+    // unmatched paths are forwarded to the backend.
+    proxy_server.global(struct {
+        fn handler(ctx: *httpx.Context) anyerror!httpx.Response {
+            var fwd = httpx.Client.initWithConfig(ctx.allocator, httpx.ClientConfig.defaults()
+                .withTimeouts(httpx.Timeouts.fast())
+                .withRetryPolicy(httpx.RetryPolicy.noRetry())
+                .withKeepAlive(false));
+            defer fwd.deinit();
+
+            const path = ctx.request.uri.path;
+            const full = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ ForwardCtx.target, path });
+            defer ctx.allocator.free(full);
+
+            return fwd.request(ctx.request.method, full, .{});
+        }
+    }.handler);
 
     const proxy_thread = try proxy_server.listenInBackground();
     defer proxy_thread.join();
     defer proxy_server.stop();
 
-    sleepMs(20);
+    sleepMs(100);
 
-    // 3. Setup client with proxy configuration pointing to the proxy server
+    // 3. Client configured to route through the proxy server.
     const client_config = httpx.ClientConfig.defaults()
         .withTimeouts(httpx.Timeouts.fast())
         .withRetryPolicy(httpx.RetryPolicy.noRetry())
@@ -71,9 +106,9 @@ pub fn main() !void {
     var client = httpx.Client.initWithConfig(allocator, client_config);
     defer client.deinit();
 
-    // 4. Request the mock backend path through the proxy.
-    // The request to http://127.0.0.1:45233/backend-data will be routed via the proxy at 45234.
-    const target_url = "http://127.0.0.1:45233/backend-data";
+    // 4. Request the backend path through the proxy.
+    const target_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/backend-data", .{backend_port});
+    defer allocator.free(target_url);
 
     std.debug.print("Sending request to {s} via proxy at 127.0.0.1:{d}...\n", .{ target_url, proxy_port });
     var response = try client.get(target_url, .{});

@@ -58,16 +58,22 @@ pub const Router = struct {
     pub fn deinit(self: *Self) void {
         for (self.routes.items) |route| {
             self.allocator.free(route.segments);
+            self.allocator.free(route.pattern);
         }
         self.routes.deinit(self.allocator);
     }
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: Handler) !void {
-        const segments = try self.parsePattern(pattern);
+        const dup_pattern = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(dup_pattern);
+
+        const segments = try self.parsePattern(dup_pattern);
+        errdefer self.allocator.free(segments);
+
         try self.routes.append(self.allocator, .{
             .method = method,
-            .pattern = pattern,
+            .pattern = dup_pattern,
             .segments = segments,
             .handler = handler,
         });
