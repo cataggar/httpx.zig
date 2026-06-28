@@ -12,16 +12,10 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const posix = std.posix;
-const builtin = @import("builtin");
 
 const http = @import("http.zig");
-
-fn defaultIo() std.Io {
-    return if (builtin.is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
+const io_util = @import("../util/any_io.zig");
+const defaultIo = io_util.defaultIo;
 
 /// QUIC version identifiers
 pub const Version = enum(u32) {

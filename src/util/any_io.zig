@@ -1,5 +1,54 @@
-const std = @import("std");
+//! IO Utilities for httpx.zig
+//!
+//! Centralizes:
+//! - `defaultIo()`: single canonical std.Io selector (test vs runtime)
+//! - `sleepMs()`:   sleep helper that uses the canonical IO
+//! - `AnyReader` / `AnyWriter`: type-erased streaming adapters
 
+const std = @import("std");
+const builtin = @import("builtin");
+
+// ─── Canonical IO selector ────────────────────────────────────────────────────
+
+/// Returns the appropriate `std.Io` for the current execution context.
+///
+/// - In tests: `std.testing.io` (single-threaded, deterministic)
+/// - Otherwise: `std.Io.Threaded.global_single_threaded.io()`
+///
+/// Import and call this from any module instead of duplicating the logic:
+/// ```zig
+/// const io_util = @import("../util/any_io.zig");
+/// const io = io_util.defaultIo();
+/// ```
+pub inline fn defaultIo() std.Io {
+    return if (builtin.is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+// ─── Sleep helper ─────────────────────────────────────────────────────────────
+
+/// Sleeps for `ms` milliseconds using the canonical IO.
+///
+/// `ms` is `i64` to match `std.Io.Duration.fromMilliseconds`.
+/// Errors from `std.Io.sleep` are silently ignored (non-critical).
+pub fn sleepMsI(ms: i64) void {
+    const io = defaultIo();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
+}
+
+/// Sleeps for `ms` milliseconds using the canonical IO.
+///
+/// `ms` is `u64`. Values larger than `i64.max` are clamped.
+pub fn sleepMs(ms: u64) void {
+    const clamped: i64 = @intCast(@min(ms, @as(u64, @intCast(std.math.maxInt(i64)))));
+    sleepMsI(clamped);
+}
+
+// ─── Type-erased Reader / Writer adapters ─────────────────────────────────────
+
+/// A type-erased reader compatible with any `*anyopaque` backed source.
 pub const AnyReader = struct {
     context: *anyopaque,
     readFn: *const fn (ctx: *anyopaque, buffer: []u8) anyerror!usize,
@@ -25,6 +74,7 @@ pub const AnyReader = struct {
     }
 };
 
+/// A type-erased writer compatible with any `*anyopaque` backed sink.
 pub const AnyWriter = struct {
     context: *anyopaque,
     writeFn: *const fn (ctx: *anyopaque, data: []const u8) anyerror!usize,
@@ -48,3 +98,15 @@ pub const AnyWriter = struct {
         try self.writeAll(text);
     }
 };
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+test "defaultIo returns a valid Io" {
+    const io = defaultIo();
+    _ = io; // compile + no panic
+}
+
+test "sleepMs zero does not panic" {
+    sleepMs(0);
+    sleepMsI(0);
+}

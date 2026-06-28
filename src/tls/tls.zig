@@ -19,13 +19,8 @@ const builtin = @import("builtin");
 const Socket = @import("../net/socket.zig").Socket;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
-
-fn defaultIo() std.Io {
-    return if (builtin.is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
+const io_util = @import("../util/any_io.zig");
+const defaultIo = io_util.defaultIo;
 
 /// Minimum TLS version configuration.
 pub const TlsVersion = enum {

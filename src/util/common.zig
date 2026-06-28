@@ -4,7 +4,17 @@ const std = @import("std");
 const mem = std.mem;
 const list_writer = @import("list_writer.zig");
 const mime = @import("mime.zig");
+const io_util = @import("any_io.zig");
 const HeaderName = @import("../core/headers.zig").HeaderName;
+
+/// Returns the canonical `std.Io` for the current execution context.
+pub const defaultIo = io_util.defaultIo;
+
+/// Sleeps for `ms` milliseconds using the canonical IO (`u64`, clamped to `i64.max`).
+pub const sleepMs = io_util.sleepMs;
+
+/// Sleeps for `ms` milliseconds using the canonical IO (`i64`).
+pub const sleepMsI = io_util.sleepMsI;
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.
 pub const CookiePair = struct {

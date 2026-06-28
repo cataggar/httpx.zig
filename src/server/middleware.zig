@@ -11,18 +11,15 @@
 //! - Body parsing
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Context = @import("server.zig").Context;
+const io_util = @import("../util/any_io.zig");
 const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
 const list_writer = @import("../util/list_writer.zig");
 const status = @import("../core/status.zig");
 
 fn nowMillis() i64 {
-    const io = if (builtin.is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
+    const io = io_util.defaultIo();
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 

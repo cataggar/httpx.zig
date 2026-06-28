@@ -1,7 +1,8 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
+const io_util = @import("../util/any_io.zig");
+const defaultIo = io_util.defaultIo;
 
 pub const Ip4Address = Io.net.Ip4Address;
 pub const Ip6Address = Io.net.Ip6Address;
@@ -97,13 +98,6 @@ pub const AddressList = struct {
         self.* = undefined;
     }
 };
-
-fn defaultIo() Io {
-    return if (builtin.is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
 
 fn fromIpAddress(ip: Io.net.IpAddress) Address {
     return switch (ip) {

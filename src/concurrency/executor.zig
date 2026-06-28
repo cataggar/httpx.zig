@@ -11,12 +11,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
-fn defaultIo() std.Io {
-    return if (@import("builtin").is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
+const io_util = @import("../util/any_io.zig");
+const defaultIo = io_util.defaultIo;
 
 fn sleepNs(ns: i96) void {
     const io = defaultIo();

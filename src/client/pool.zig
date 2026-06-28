@@ -12,16 +12,14 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
 const Socket = @import("../net/socket.zig").Socket;
+const io_util = @import("../util/any_io.zig");
 const address_mod = @import("../net/address.zig");
 const types = @import("../core/types.zig");
 const proxy_mod = @import("proxy.zig");
 const Proxy = types.Proxy;
 
 fn nowMillis() i64 {
-    const io = if (builtin.is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
+    const io = io_util.defaultIo();
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 

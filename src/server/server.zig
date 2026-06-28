@@ -34,18 +34,10 @@ const Router = @import("router.zig").Router;
 const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../util/common.zig");
 const list_writer = @import("../util/list_writer.zig");
+const io_util = @import("../util/any_io.zig");
 
-fn defaultIo() std.Io {
-    return if (@import("builtin").is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
-
-fn sleepMs(ms: i64) void {
-    const io = defaultIo();
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
-}
+const defaultIo = io_util.defaultIo;
+const sleepMs = io_util.sleepMsI;
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;

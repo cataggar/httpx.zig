@@ -340,6 +340,13 @@ pub const isIp4Address = address.isIp4Address;
 /// Returns true if input is an IPv6 literal.
 pub const isIp6Address = address.isIp6Address;
 
+/// Returns the canonical `std.Io` for the current execution context.
+pub const defaultIo = common.defaultIo;
+
+/// Sleeps for `ms` milliseconds using the canonical IO.
+pub const sleepMs = common.sleepMs;
+pub const sleepMsI = common.sleepMsI;
+
 /// Returns a query parameter value from a raw query string.
 pub const queryValue = common.queryValue;
 

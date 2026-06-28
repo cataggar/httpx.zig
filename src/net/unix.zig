@@ -9,6 +9,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const io_util = @import("../util/any_io.zig");
+const defaultIo = io_util.defaultIo;
 const is_windows = builtin.os.tag == .windows;
 
 const is_unix_available = true;
@@ -209,7 +211,7 @@ pub const UnixListener = struct {
 
         // Remove stale socket file
         {
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = defaultIo();
             const cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io, path) catch {};
         }
@@ -239,7 +241,7 @@ pub const UnixListener = struct {
     pub fn deinit(self: *Self) void {
         closesocket(self.fd);
         {
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = defaultIo();
             const cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io, self.path) catch {};
         }
@@ -269,7 +271,10 @@ test "Unix domain socket integration - Client & Server" {
     if (!is_unix_available) return;
 
     const allocator = std.testing.allocator;
-    const socket_path = "httpx-test.sock";
+    const io = defaultIo();
+    const ts = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    var socket_path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&socket_path_buf, "httpx-test-{d}.sock", .{ts});
 
     const Server = @import("../server/server.zig").Server;
     const Client = @import("../client/client.zig").Client;
@@ -279,6 +284,12 @@ test "Unix domain socket integration - Client & Server" {
 
     var server = Server.initWithConfig(allocator, .{
         .unix_path = socket_path,
+        .log_fn = struct {
+            fn log(level: @import("../server/server.zig").LogLevel, message: []const u8) void {
+                _ = level;
+                _ = message;
+            }
+        }.log,
     });
     defer server.deinit();
 
@@ -293,7 +304,6 @@ test "Unix domain socket integration - Client & Server" {
     defer server.stop();
 
     // Give the server a moment to start
-    const io = std.Io.Threaded.global_single_threaded.io();
     const dur = std.Io.Duration.fromMilliseconds(50);
     std.Io.sleep(io, dur, .real) catch {};
 

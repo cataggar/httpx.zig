@@ -21,7 +21,10 @@ pub fn main() !void {
 
     std.debug.print("=== Unix Domain Socket Example ===\n\n", .{});
 
-    const socket_path = "httpx-ipc.sock";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ts = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    var socket_path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&socket_path_buf, "httpx-ipc-{d}.sock", .{ts});
 
     // 1. Initialize and configure HTTP Server on Unix Socket
     std.debug.print("Initializing server on: {s}...\n", .{socket_path});

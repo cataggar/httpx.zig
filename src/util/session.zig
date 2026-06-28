@@ -29,13 +29,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-fn defaultIo() std.Io {
-    return if (@import("builtin").is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
+const io_util = @import("any_io.zig");
+const defaultIo = io_util.defaultIo;
 
 pub const SESSION_ID_LEN = 32;
 pub const DEFAULT_TTL_MS: u64 = 30 * 60 * 1000; // 30 minutes
@@ -107,12 +102,12 @@ pub const SessionStore = struct {
     };
 
     fn lock(self: *Self) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = defaultIo();
         self.mutex.lock(io) catch unreachable;
     }
 
     fn unlock(self: *Self) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = defaultIo();
         self.mutex.unlock(io);
     }
 

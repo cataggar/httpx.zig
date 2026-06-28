@@ -37,20 +37,10 @@ const proxy_mod = @import("proxy.zig");
 const PoolStats = @import("pool.zig").PoolStats;
 const common = @import("../util/common.zig");
 const list_writer = @import("../util/list_writer.zig");
+const io_util = @import("../util/any_io.zig");
 
-fn defaultIo() std.Io {
-    return if (@import("builtin").is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
-
-fn sleepMs(ms: u64) void {
-    const io = defaultIo();
-    const max_i64_u64: u64 = @intCast(std.math.maxInt(i64));
-    const dur = std.Io.Duration.fromMilliseconds(@intCast(@min(ms, max_i64_u64)));
-    std.Io.sleep(io, dur, .real) catch {};
-}
+const defaultIo = io_util.defaultIo;
+const sleepMs = io_util.sleepMs;
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
