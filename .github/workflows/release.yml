@@ -11,9 +11,11 @@ env:
 
 jobs:
   test:
-    name: Test on ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
@@ -21,14 +23,16 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Run Tests
+      - name: Run tests
         run: zig build test
 
   build-library:
-    name: Build Library (${{ matrix.target }})
+    name: Build (${{ matrix.target }})
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-windows
@@ -38,21 +42,15 @@ jobs:
           - aarch64-linux
           - x86_64-macos
           - aarch64-macos
-          - x86_64-freestanding
-          - x86-freestanding
-          - aarch64-freestanding
-          - riscv64-freestanding
-          - arm-freestanding
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      
-      - name: Build Library
+      - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
-      - name: Prepare Release Artifacts
+      - name: Prepare artifacts
         run: |
           mkdir -p release
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
@@ -61,14 +59,13 @@ jobs:
             cp zig-out/lib/libhttpx.a release/libhttpx-${{ matrix.target }}.a || true
           fi
 
-      - name: Upload Release Artifacts
-        run: |
-          gh release upload "${{ github.event.release.tag_name }}" release/* --clobber || true
+      - name: Upload artifacts
+        run: gh release upload "${{ github.event.release.tag_name }}" release/* --clobber || true
         env:
           GH_TOKEN: ${{ github.token }}
 
   update-release:
-    name: Update Release Description
+    name: Update Release
     needs: [test]
     runs-on: ubuntu-latest
     steps:
@@ -142,11 +139,6 @@ jobs:
             | Linux | aarch64 | [libhttpx-aarch64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-linux.a) |
             | macOS | x86_64 | [libhttpx-x86_64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-macos.a) |
             | macOS | aarch64 | [libhttpx-aarch64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-macos.a) |
-            | Bare Metal | x86_64 | [libhttpx-x86_64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-freestanding.a) |
-            | Bare Metal | x86 | [libhttpx-x86-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86-freestanding.a) |
-            | Bare Metal | aarch64 | [libhttpx-aarch64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-freestanding.a) |
-            | Bare Metal | RISC-V 64 | [libhttpx-riscv64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-riscv64-freestanding.a) |
-            | Bare Metal | ARM | [libhttpx-arm-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-arm-freestanding.a) |
 
             ### Using Prebuilt Libraries
 

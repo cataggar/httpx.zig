@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -14,136 +16,102 @@ env:
 
 jobs:
   build:
+    name: Build & Test (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Run Zig tests
-        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache test --summary all
+      - name: Run tests
+        run: zig build test --summary all
 
-      - name: Build library (Debug)
-        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Doptimize=Debug
+      - name: Build (Debug)
+        run: zig build -Doptimize=Debug
 
-      - name: Build library (ReleaseFast)
-        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Doptimize=ReleaseFast
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
 
-      - name: Run all examples (skipped here - run in matrix job)
-        run: echo "Examples are tested in a dedicated matrix job on Linux, macOS, and Windows runners"
-
-      - name: Zig format check
+      - name: Format check
         run: zig fmt --check src/ examples/ bench/ build.zig
 
-  examples-run:
-    name: Run Examples Matrix (hostable targets)
+  test-matrix:
+    name: Test (${{ matrix.target }})
     needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-linux
-            linux_setup: none
           - os: ubuntu-latest
             target: x86-linux
-            linux_setup: x86
+            setup: sudo apt-get update && sudo apt-get install -y gcc-multilib
           - os: ubuntu-latest
             target: aarch64-linux
-            linux_setup: aarch64
+            setup: sudo apt-get update && sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
           - os: macos-latest
             target: x86_64-macos
-            macos_rosetta: true
           - os: macos-latest
             target: aarch64-macos
-            macos_rosetta: false
           - os: windows-latest
             target: x86_64-windows
           - os: windows-latest
             target: x86-windows
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Install Multilib (Linux x86 runtime)
-        if: runner.os == 'Linux' && matrix.linux_setup == 'x86'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-multilib
+      - name: Install dependencies
+        if: matrix.setup != ''
+        run: ${{ matrix.setup }}
 
-      - name: Install QEMU + AArch64 Toolchain (Linux aarch64 runtime)
-        if: runner.os == 'Linux' && matrix.linux_setup == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
+      - name: Test
+        run: zig build test -Dtarget=${{ matrix.target }} --summary all
 
-      - name: Install Rosetta (macOS x86_64 runtime lane)
-        if: runner.os == 'macOS' && matrix.macos_rosetta == true
-        run: |
-          sudo softwareupdate --install-rosetta --agree-to-license || true
+      - name: Run examples
+        timeout-minutes: 10
+        run: zig build run-all-examples -Dtarget=${{ matrix.target }}
 
-      - name: Run Zig tests on ${{ matrix.target }}
-        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache test -Dtarget=${{ matrix.target }} --summary all
-
-      - name: Run all examples on ${{ matrix.target }}
-        timeout-minutes: 15
-        run: |
-          echo "Running examples for ${{ matrix.target }}"
-          zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache run-all-examples -Dtarget=${{ matrix.target }}
-
-  examples-build-only:
-    name: Build Examples / Library Matrix (build-only for many targets)
+  cross-build:
+    name: Cross Build (${{ matrix.target }})
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         target:
-          - x86_64-linux
-          - x86-linux
-          - aarch64-linux
           - x86_64-macos
           - aarch64-macos
           - x86_64-windows
           - x86-windows
-          - x86_64-freestanding
-          - aarch64-freestanding
-          - riscv64-freestanding
+          - aarch64-linux
           - riscv64-linux
-          - riscv32-linux
-          - powerpc64le-linux
-          - mips64-linux
-          - s390x-linux
-          - arm-freestanding
           - arm-linux-gnueabihf
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Build for ${{ matrix.target }} (build-only)
-        run: zig build --cache-dir .zig-cache --global-cache-dir .zig-global-cache -Dtarget=${{ matrix.target }} -Doptimize=Debug
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
