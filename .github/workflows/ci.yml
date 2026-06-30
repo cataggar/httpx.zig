@@ -29,6 +29,15 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: zig-linux-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-linux-
+
       - name: Run tests
         run: zig build test --summary all
 
@@ -76,6 +85,15 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ matrix.target }}-
+
       - name: Install dependencies
         if: matrix.setup != ''
         run: ${{ matrix.setup }}
@@ -112,6 +130,15 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ matrix.target }}-
 
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
