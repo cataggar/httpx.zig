@@ -139,10 +139,14 @@ fn setSocketNonBlocking(sock: posix.socket_t, enable: bool) !void {
         return;
     }
 
-    const flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+    const flags_rc = posix.system.fcntl(sock, posix.F.GETFL, @as(usize, 0));
+    const flags_err = posix.errno(flags_rc);
+    if (flags_err != .SUCCESS) return error.SocketOptionFailed;
+    const flags: usize = @intCast(flags_rc);
     const nonblock: usize = posix.O.NONBLOCK;
     const new_flags = if (enable) flags | nonblock else flags & ~nonblock;
-    _ = try posix.fcntl(sock, posix.F.SETFL, new_flags);
+    const setfl_rc = posix.system.fcntl(sock, posix.F.SETFL, new_flags);
+    if (posix.errno(setfl_rc) != .SUCCESS) return error.SocketOptionFailed;
 }
 
 fn waitConnectWritable(sock: posix.socket_t, timeout_ms: u64) !void {
