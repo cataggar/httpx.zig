@@ -143,7 +143,7 @@ fn setSocketNonBlocking(sock: posix.socket_t, enable: bool) !void {
     const flags_err = posix.errno(flags_rc);
     if (flags_err != .SUCCESS) return error.SocketOptionFailed;
     const flags: usize = @intCast(flags_rc);
-    const nonblock: usize = posix.O.NONBLOCK;
+    const nonblock: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
     const new_flags = if (enable) flags | nonblock else flags & ~nonblock;
     const setfl_rc = posix.system.fcntl(sock, posix.F.SETFL, new_flags);
     if (posix.errno(setfl_rc) != .SUCCESS) return error.SocketOptionFailed;
