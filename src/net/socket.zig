@@ -176,10 +176,7 @@ fn waitConnectWritable(sock: posix.socket_t, timeout_ms: u64) !void {
         .events = std.posix.POLL.OUT,
         .revents = 0,
     }};
-    const timeout = std.posix.timespec{
-        .sec = @intCast(timeout_ms / 1000),
-        .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
-    };
+    const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i32))));
     const rc = try std.posix.poll(&poll_fds, timeout);
     if (rc == 0) return error.ConnectionTimeout;
     if ((poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
