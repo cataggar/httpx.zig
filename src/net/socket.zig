@@ -198,7 +198,8 @@ fn checkConnectCompleted(sock: posix.socket_t) !void {
         if (rc == winsock.SOCKET_ERROR) return error.ConnectFailed;
     } else {
         var len: posix.socklen_t = @sizeOf(i32);
-        try posix.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_code), &len);
+        const rc = posix.system.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_code).ptr, &len);
+        if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
     }
 
     if (err_code != 0) return error.ConnectFailed;
