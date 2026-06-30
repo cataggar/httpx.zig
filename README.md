@@ -35,7 +35,8 @@
 - For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
 - For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
 
-⭐ If you build with httpx.zig, make sure to give it a star. ⭐
+> [!TIP]
+> If you build with httpx.zig, make sure to give it a star. ⭐
 
 
 > [!NOTE]
