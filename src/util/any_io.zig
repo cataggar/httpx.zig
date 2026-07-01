@@ -1,8 +1,9 @@
 //! IO Utilities for httpx.zig
 //!
 //! Centralizes:
-//! - `defaultIo()`: single canonical std.Io selector (test vs runtime)
-//! - `sleepMs()`:   sleep helper that uses the canonical IO
+//! - `defaultIo()`:    single-threaded std.Io for test contexts
+//! - `threadIo()`:     real thread-safe std.Io for multi-threaded code
+//! - `sleepMs()`:      sleep helper that uses the canonical IO
 //! - `AnyReader` / `AnyWriter`: type-erased streaming adapters
 
 const std = @import("std");
@@ -13,16 +14,24 @@ const builtin = @import("builtin");
 /// - In tests: `std.testing.io` (single-threaded, deterministic)
 /// - Otherwise: `std.Io.Threaded.global_single_threaded.io()`
 ///
-/// Import and call this from any module instead of duplicating the logic:
-/// ```zig
-/// const io_util = @import("../util/any_io.zig");
-/// const io = io_util.defaultIo();
-/// ```
+/// Use this for single-threaded test code. For code that spawns real OS
+/// threads (executors, thread pools), use `threadIo()` instead.
 pub inline fn defaultIo() std.Io {
     return if (builtin.is_test)
         std.testing.io
     else
         std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Returns a real thread-safe `std.Io` suitable for multi-threaded code.
+///
+/// Always returns `std.Io.Threaded.global_single_threaded.io()` regardless
+/// of whether we're in a test. This is required when code spawns real OS
+/// threads that share mutexes/conditions — `defaultIo()` returns
+/// `std.testing.io` in tests, which is single-threaded and deadlocks
+/// when used from real threads.
+pub inline fn threadIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
 }
 
 /// Sleeps for `ms` milliseconds using the canonical IO.

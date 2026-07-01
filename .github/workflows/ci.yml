@@ -28,6 +28,14 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          cache-key: build
+
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-build-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-build-${{ runner.os }}-
 
       - name: Run tests
         run: zig build test --summary all
@@ -75,6 +83,14 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          cache-key: test-${{ matrix.target }}
+
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ matrix.target }}-
 
       - name: Install dependencies
         if: matrix.setup != ''
@@ -112,6 +128,14 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          use-cache: false
+
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ matrix.target }}-
 
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug

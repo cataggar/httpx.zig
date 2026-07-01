@@ -12,10 +12,10 @@ const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
 const io_util = @import("../util/any_io.zig");
-const defaultIo = io_util.defaultIo;
+const threadIo = io_util.threadIo;
 
 fn sleepNs(ns: i96) void {
-    const io = defaultIo();
+    const io = threadIo();
     std.Io.sleep(io, std.Io.Duration.fromNanoseconds(ns), .real) catch {};
 }
 
@@ -81,7 +81,7 @@ pub const Executor = struct {
 
     /// Submits a task for execution.
     pub fn submit(self: *Self, task: Task) !void {
-        const io = defaultIo();
+        const io = threadIo();
         self.mutex.lock(io) catch unreachable;
         defer self.mutex.unlock(io);
 
@@ -90,7 +90,7 @@ pub const Executor = struct {
         }
 
         try self.tasks.append(self.allocator, task);
-        self.cond.signal(io);
+        self.cond.signal(threadIo());
     }
 
     /// Submits a function for execution.
@@ -120,7 +120,7 @@ pub const Executor = struct {
     /// Stops all executor threads.
     pub fn stop(self: *Self) void {
         if (!self.running) return;
-        const io = defaultIo();
+        const io = threadIo();
         self.mutex.lock(io) catch unreachable;
         self.running = false;
         self.cond.broadcast(io);
@@ -148,7 +148,7 @@ pub const Executor = struct {
     /// Runs all tasks synchronously.
     pub fn runAll(self: *Self) void {
         while (true) {
-            const io = defaultIo();
+            const io = threadIo();
             self.mutex.lock(io) catch unreachable;
             if (self.tasks.items.len == 0) {
                 self.mutex.unlock(io);
@@ -165,7 +165,7 @@ pub const Executor = struct {
 
     fn workerLoop(self: *Self) void {
         while (true) {
-            const io = defaultIo();
+            const io = threadIo();
             self.mutex.lock(io) catch unreachable;
             while (self.running and self.tasks.items.len == 0) {
                 self.cond.wait(io, &self.mutex) catch unreachable;

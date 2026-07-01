@@ -31,6 +31,13 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Cache Bun modules
+        uses: actions/cache@v6
+        with:
+          path: docs/node_modules
+          key: bun-${{ runner.os }}-${{ hashFiles('docs/bun.lock', 'docs/package.json') }}
+          restore-keys: bun-${{ runner.os }}-
+
       - name: Setup Pages
         uses: actions/configure-pages@v6
 
