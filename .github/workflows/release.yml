@@ -24,12 +24,6 @@ jobs:
         with:
           version: 0.16.0
           cache-key: test-${{ matrix.os }}
-      - name: Cache Zig build
-        uses: actions/cache@v6
-        with:
-          path: .zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ runner.os }}-
       - name: Run tests
         run: zig build test
 
@@ -55,12 +49,6 @@ jobs:
         with:
           version: 0.16.0
           cache-key: build-${{ matrix.target }}
-      - name: Cache Zig build
-        uses: actions/cache@v6
-        with:
-          path: .zig-cache
-          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ matrix.target }}-
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 

@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const io_util = @import("any_io.zig");
 const defaultIo = io_util.defaultIo;
+const threadIo = io_util.threadIo;
 
 pub const SESSION_ID_LEN = 32;
 pub const DEFAULT_TTL_MS: u64 = 30 * 60 * 1000; // 30 minutes
@@ -102,12 +103,12 @@ pub const SessionStore = struct {
     };
 
     fn lock(self: *Self) void {
-        const io = defaultIo();
+        const io = threadIo();
         self.mutex.lock(io) catch unreachable;
     }
 
     fn unlock(self: *Self) void {
-        const io = defaultIo();
+        const io = threadIo();
         self.mutex.unlock(io);
     }
 

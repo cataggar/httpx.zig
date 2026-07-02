@@ -25,12 +25,12 @@ pub inline fn defaultIo() std.Io {
 
 /// Returns a real thread-safe `std.Io` suitable for multi-threaded code.
 ///
-/// Always returns `std.Io.Threaded.global_single_threaded.io()` regardless
-/// of whether we're in a test. This is required when code spawns real OS
-/// threads that share mutexes/conditions — `defaultIo()` returns
-/// `std.testing.io` in tests, which is single-threaded and deadlocks
-/// when used from real threads.
+/// - In tests: `std.testing.io` (a real `Io.Threaded`, safe from any thread)
+/// - Otherwise: `std.Io.Threaded.global_single_threaded.io()`
 pub inline fn threadIo() std.Io {
+    if (comptime builtin.is_test) {
+        return std.testing.io;
+    }
     return std.Io.Threaded.global_single_threaded.io();
 }
 
