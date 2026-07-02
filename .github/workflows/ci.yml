@@ -27,7 +27,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          cache-key: lint
 
       - name: Format check
         run: zig fmt --check src/ examples/ bench/ build.zig
@@ -54,16 +53,31 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          cache-key: test-${{ matrix.os }}
+
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-build-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-build-${{ runner.os }}-
 
       - name: Run tests
         run: zig build test --summary all
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Build (Debug)
         run: zig build -Doptimize=Debug
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Build (ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
   cross-build:
     name: Cross Build (${{ matrix.target }})
@@ -89,7 +103,13 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          cache-key: cross-${{ matrix.target }}
+
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-cross-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-cross-${{ matrix.target }}-
 
       - name: Install cross-compilation deps
         if: contains(matrix.target, 'linux') && !startsWith(matrix.target, 'x86_64')
@@ -109,3 +129,6 @@ jobs:
 
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
