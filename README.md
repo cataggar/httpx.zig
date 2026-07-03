@@ -89,7 +89,7 @@
 | **Multipart Form Data** | RFC 2046 multipart body builder and parser for text fields and file uploads. | https://muhammad-fiaz.github.io/httpx.zig/examples/multipart-example |
 | **Session Management** | TTL-based secure in-memory session store and cookie integration. | https://muhammad-fiaz.github.io/httpx.zig/examples/session-example |
 | **Observability & Metrics** | Real-time traffic counters, per-class status tracking, and latency measuring. | https://muhammad-fiaz.github.io/httpx.zig/examples/metrics-example |
-| **Unix Domain Sockets** | High-performance client-server IPC over AF_UNIX sockets. | https://muhammad-fiaz.github.io/httpx.zig/examples/unix-socket-example |
+| **Unix Domain Sockets** | High-performance client-server IPC over AF_UNIX sockets. Available on Linux, macOS, and Windows 10 build 17061+ (requires Developer Mode). | https://muhammad-fiaz.github.io/httpx.zig/examples/unix-socket-example |
 | **Health Checks** | Built-in liveness and readiness probe middlewares for deployments. | https://muhammad-fiaz.github.io/httpx.zig/examples/health-check-example |
 
 </details>
@@ -240,6 +240,13 @@ pub fn main() !void {
  
     if (response.ok()) {
         std.debug.print("Response: {s}\n", .{response.text() orelse ""});
+
+        // Parse response as JSON (safely managed via std.json.Parsed)
+        const User = struct { id: u32, name: []const u8 };
+        if (response.json(User, .{})) |parsed| {
+            defer parsed.deinit();
+            std.debug.print("User: {s}\n", .{parsed.value.name});
+        } else |_| {}
     }
  
     // POST with JSON
@@ -415,7 +422,7 @@ Validate host functionality and cross-target compatibility with these commands:
 ```bash
 # Host runtime validation
 zig build test
-zig build run-all-examples
+zig build run-all-examples  # Runs sequentially to prevent parallel compiler OOM / PC crashes
 
 # Cross-target library compile validation
 zig build build-all-targets

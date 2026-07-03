@@ -4,6 +4,11 @@
 //! - Running an HTTP server listening on a Unix domain socket path
 //! - Connecting an HTTP client to the Unix domain socket path
 //! - Executing GET requests and parsing responses
+//!
+//! Unix domain sockets are available on:
+//!   - Linux (all versions)
+//!   - macOS (all versions)
+//!   - Windows 10 build 17061+ (requires Developer Mode or elevated privileges)
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -20,6 +25,25 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("=== Unix Domain Socket Example ===\n\n", .{});
+    std.debug.print("Platform: {s}\n", .{@tagName(builtin.os.tag)});
+
+    // Unix domain sockets (AF_UNIX) require Windows 10 build 17061+ with
+    // Developer Mode enabled. On most Windows builds the Winsock AF_UNIX
+    // socket creation fails inside the server's background thread which
+    // causes an unhandled panic. Skip gracefully at compile-time.
+    if (comptime builtin.os.tag == .windows) {
+        std.debug.print(
+            \\Unix domain sockets require Windows 10 build 17061+ with Developer Mode.
+            \\AF_UNIX is not available on this Windows build. Skipping example.
+            \\
+            \\To run this example: enable Developer Mode in Windows Settings,
+            \\or run on Linux/macOS where AF_UNIX is always available.
+            \\
+            \\=== Unix Domain Socket Example Skipped (Windows) ===
+            \\
+        , .{});
+        return;
+    }
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const ts = std.Io.Timestamp.now(io, .real).toMilliseconds();
@@ -46,7 +70,13 @@ pub fn main() !void {
 
     // 2. Start the server asynchronously
     const thread = server.listenInBackground() catch |err| {
-        std.debug.print("AF_UNIX sockets are not supported or bound on this platform/runner: {}\nSkipping example.\n", .{err});
+        std.debug.print("\nServer failed to start: {s}\n", .{@errorName(err)});
+        if (builtin.os.tag == .windows) {
+            std.debug.print("On Windows, AF_UNIX requires Windows 10 build 17061+ with Developer Mode enabled.\n", .{});
+            std.debug.print("Skipping Unix domain socket example.\n", .{});
+        } else {
+            std.debug.print("Skipping.\n", .{});
+        }
         return;
     };
     defer thread.join();
@@ -64,7 +94,12 @@ pub fn main() !void {
     // Make an HTTP GET request over the Unix socket
     std.debug.print("Sending GET request over Unix socket...\n", .{});
     var resp = client.get("http://localhost/ipc-status", .{}) catch |err| {
-        std.debug.print("Failed to execute request over Unix socket: {}\nAF_UNIX is likely not supported on this OS version/runner. Skipping.\n", .{err});
+        std.debug.print("Request failed: {s}\n", .{@errorName(err)});
+        if (builtin.os.tag == .windows) {
+            std.debug.print("Windows AF_UNIX requires build 17061+. Skipping.\n", .{});
+        } else {
+            std.debug.print("Skipping.\n", .{});
+        }
         return;
     };
     defer resp.deinit();

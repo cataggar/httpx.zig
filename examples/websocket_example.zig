@@ -44,8 +44,8 @@ pub fn main() !void {
     std.debug.print("isWebSocketUpgrade: {}\n", .{httpx.isWebSocketUpgrade(&req)});
     std.debug.print("wsExtractKey:       {s}\n\n", .{httpx.wsExtractKey(&req).?});
 
-    // 3. wsTextFrame convenience (server→client, unmasked)
-    std.debug.print("--- Text frame (server→client) ---\n", .{});
+    // 3. wsTextFrame convenience (server->client, unmasked)
+    std.debug.print("--- Text frame (server->client) ---\n", .{});
     const tf = try httpx.wsTextFrame(allocator, "Hello, WebSocket!");
     defer allocator.free(tf);
     var tr = try httpx.wsDecodeFrame(allocator, tf);
@@ -55,8 +55,8 @@ pub fn main() !void {
     std.debug.print("payload: \"{s}\"\n", .{tr.frame.payload});
     std.debug.print("match:   {}\n\n", .{std.mem.eql(u8, tr.frame.payload, "Hello, WebSocket!")});
 
-    // 4. wsEncodeFrame with masking (client→server, masked)
-    std.debug.print("--- Binary frame (client→server, masked) ---\n", .{});
+    // 4. wsEncodeFrame with masking (client->server, masked)
+    std.debug.print("--- Binary frame (client->server, masked) ---\n", .{});
     const bin_data: []const u8 = &.{ 0xDE, 0xAD, 0xBE, 0xEF };
     const mask_key: [4]u8 = .{ 0x37, 0xfa, 0x21, 0x3d };
     const bf = try httpx.wsEncodeFrame(allocator, .binary, bin_data, true, true, mask_key);

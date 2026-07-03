@@ -23,9 +23,9 @@ httpx.zig supports Linux, Windows, and macOS across 32-bit and 64-bit builds:
 
 | OS | Status | Notes |
 |----|--------|-------|
-| Linux | Full support | All major distributions |
-| Windows | Full support | Windows 10/11, Server 2019+ |
-| macOS | Full support | macOS 11+ (Big Sur and later) |
+| Linux | Full support | All major distributions. Unix domain sockets fully supported. |
+| Windows | Full support | Windows 10/11, Server 2019+. Unix domain sockets require build 17061+ with Developer Mode. |
+| macOS | Full support | macOS 11+ (Big Sur and later). Unix domain sockets fully supported. |
 
 ### Architectures
 
@@ -176,7 +176,7 @@ Run these commands from the repository root to verify functionality:
 ```bash
 # Host tests and runnable examples
 zig build test
-zig build run-all-examples
+zig build run-all-examples  # Runs sequentially to prevent parallel compiler OOM / PC crashes
 
 # Cross-target library compile matrix
 zig build build-all-targets

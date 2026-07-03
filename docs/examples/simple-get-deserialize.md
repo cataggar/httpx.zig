@@ -66,8 +66,8 @@ pub fn main(init: std.process.Init) !void {
     var res = try client.request(.GET, "https://httpbin.org/get", .{ .timeout_ms = 5_000 });
     defer res.deinit();
 
-    const body = res.text() orelse return;
-    const parsed = try std.json.parseFromSlice(HttpbinResponse, allocator, body, .{});
+    // Use response.json() helper for clean automatic JSON deserialization
+    const parsed = try res.json(HttpbinResponse, .{});
     defer parsed.deinit();
     std.debug.print("url={s}\n", .{parsed.value.url});
 }

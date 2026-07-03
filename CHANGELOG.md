@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file.
 
 
+## [Unreleased]
+
+### Fixed
+- Fixed mojibake console output on Windows (`ΓåÆ` instead of `→`) in `websocket_example.zig`, `session_example.zig`, and `health_check_example.zig` by replacing multi-byte UTF-8 arrow characters with ASCII `->`. Windows PowerShell/cmd default to codepage 1252 which cannot render U+2192.
+- Fixed `udp_local.zig` printing raw Zig struct for the UDP source address. The sender address is now formatted as a human-readable `ip:port` string using `Address.format`.
+- Fixed `multipart_example.zig` printing raw binary bytes (PNG magic header) as text for non-text MIME parts. Binary parts are now displayed as `<N bytes binary>` instead of garbage characters.
+- Fixed `unix.zig` `INVALID_SOCKET` comparison on Windows using pointer equality which could fail with certain Zig pointer-sized `socket_t` types. The comparison now uses integer arithmetic matching `socket.zig`'s approach.
+- Improved `unix_socket_example.zig` error messages to distinguish Windows-specific AF_UNIX limitations (build 17061+ / Developer Mode) from generic socket failures.
+
+### Changed
+- `unix_socket_example.zig` now prints the current platform name and gives platform-specific guidance when Unix domain sockets are unavailable.
+- Updated README.md feature table to note that Unix domain sockets on Windows require build 17061+ with Developer Mode.
+- Updated `docs/index.md` examples list with all examples and the Unix socket platform note.
+- Updated `docs/guide/installation.md` platform support table to document per-OS Unix domain socket availability.
+
+
+
 ## [0.1.1] - 27-06-2026
 
 ### Added
@@ -33,6 +50,7 @@ All notable changes to this project are documented in this file.
 - Updated the docs home page SEO title/description, canonical handling, and sitemap coverage.
 
 ### Fixed
+- Fixed HTTPS GET requests hanging and returning `ReadFailed` error. The buffered request data in the TLS writer is now explicitly flushed to the network. This addresses [Issue #19](https://github.com/muhammad-fiaz/httpx.zig/issues/19).
 - Fixed HTTPS client TLS handshakes on Zig `0.16` by honoring `std.Io.Reader.fillUnbuffered`'s empty-buffer `readVec` contract in `src/net/socket.zig`, resolving `error.TlsConnectionTruncated` on simple GET requests. This addresses [Issue #14](https://github.com/muhammad-fiaz/httpx.zig/issues/14).
 - Fixed client connect timeouts being ignored: `Timeouts.connect_ms` was documented but not applied during TCP `connect()`, which could leave concurrent tests and unreachable-host requests waiting up to the read timeout instead of failing promptly.
 - Fixed `concurrency.pool` `ConcurrencyConfig modes execution` test appearing to hang during `zig build test` by using short per-request timeouts and a closed local port instead of `127.0.0.1:0`.

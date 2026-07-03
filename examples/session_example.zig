@@ -147,13 +147,13 @@ pub fn main() !void {
 
     var login_resp = try client.post(login_url, .{});
     defer login_resp.deinit();
-    std.debug.print("POST /login  → {d} {s}\n", .{ login_resp.status.code, login_resp.text().? });
+    std.debug.print("POST /login  -> {d} {s}\n", .{ login_resp.status.code, login_resp.text().? });
 
     const profile_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/profile", .{port});
     defer allocator.free(profile_url);
     var profile_resp = try client.get(profile_url, .{});
     defer profile_resp.deinit();
-    std.debug.print("GET  /profile → {d} {s}\n", .{ profile_resp.status.code, profile_resp.text().? });
+    std.debug.print("GET  /profile -> {d} {s}\n", .{ profile_resp.status.code, profile_resp.text().? });
 
     std.debug.print("\n=== Session Example Complete ===\n", .{});
 }

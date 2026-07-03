@@ -207,7 +207,7 @@ pub const TlsSession = struct {
             else
                 .{ .no_verification = {} },
             .ssl_key_log = null,
-            .allow_truncation_attacks = false,
+            .allow_truncation_attacks = true,
             .write_buffer = self.tls_write_buf.?,
             .read_buffer = self.tls_read_buf.?,
             .entropy = &entropy,
@@ -223,11 +223,7 @@ pub const TlsSession = struct {
     /// Reads decrypted data from the session.
     pub fn read(self: *Self, buffer: []u8) !usize {
         const c = if (self.client) |*c| c else return error.NotConnected;
-        var iov = [_][]u8{buffer};
-        return c.reader.readVec(&iov) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => err,
-        };
+        return c.reader.readSliceShort(buffer);
     }
 
     /// Writes data to be encrypted and sent.
@@ -235,6 +231,15 @@ pub const TlsSession = struct {
         const c = if (self.client) |*c| c else return error.NotConnected;
         try c.writer.writeAll(data);
         return data.len;
+    }
+
+    /// Flushes any buffered encrypted data to the underlying transport.
+    pub fn flush(self: *Self) !void {
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        try c.writer.flush();
+        if (self.net_out) |*out| {
+            try out.writer.flush();
+        }
     }
 
     /// Returns an I/O reader for decrypted TLS payload.

@@ -85,7 +85,7 @@ pub fn main() !void {
         defer allocator.free(url);
         var resp = try client.get(url, .{});
         defer resp.deinit();
-        std.debug.print("{s: <18} GET {s: <14} → {d} {s}\n", .{
+        std.debug.print("{s: <18} GET {s: <14} -> {d} {s}\n", .{
             ep.label, ep.path, resp.status.code, resp.text().?,
         });
     }

@@ -10,7 +10,7 @@ const httpx = @import("httpx");
 const HttpbinResponse = struct {
     args: std.json.Value,
     headers: Headers,
-    origin: []const u8,
+    origin: ?[]const u8 = null,
     url: []const u8,
 
     const Headers = struct {
@@ -46,16 +46,9 @@ fn shouldUseLiveNetwork(environ: std.process.Environ, allocator: std.mem.Allocat
     return std.mem.eql(u8, value, "1");
 }
 
-fn parseAndPrint(body: []const u8, allocator: std.mem.Allocator) void {
-    const parsed = std.json.parseFromSlice(HttpbinResponse, allocator, body, .{}) catch |err| {
-        std.debug.print("JSON parse failed: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer parsed.deinit();
-    const data = parsed.value;
-
+fn printResponse(data: HttpbinResponse) void {
     std.debug.print("\nDeserialized response:\n", .{});
-    std.debug.print("  origin:       {s}\n", .{data.origin});
+    std.debug.print("  origin:       {s}\n", .{data.origin orelse "(missing)"});
     std.debug.print("  url:          {s}\n", .{data.url});
     std.debug.print("  User-Agent:   {s}\n", .{data.headers.@"User-Agent" orelse "(missing)"});
     std.debug.print("  Host:         {s}\n", .{data.headers.Host orelse "(missing)"});
@@ -73,7 +66,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (!live_mode) {
         std.debug.print("Offline-safe mode: parsing embedded sample payload.\n", .{});
-        parseAndPrint(offline_sample_json, allocator);
+        const parsed = std.json.parseFromSlice(HttpbinResponse, allocator, offline_sample_json, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.debug.print("JSON parse failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        printResponse(parsed.value);
         std.debug.print("\nSet HTTPX_EXAMPLE_ONLINE=1 to run a live request.\n", .{});
         return;
     }
@@ -85,9 +83,9 @@ pub fn main(init: std.process.Init) !void {
     var client = httpx.Client.initWithConfig(allocator, client_config);
     defer client.deinit();
 
-    std.debug.print("Making GET request to https://httpbin.org/get...\n", .{});
+    std.debug.print("Making GET request to https://postman-echo.com/get...\n", .{});
 
-    var response = client.request(.GET, "https://httpbin.org/get", .{
+    var response = client.request(.GET, "https://postman-echo.com/get", .{
         .timeout_ms = 5_000,
         .headers = &.{
             .{ "Accept", "application/json" },
@@ -95,16 +93,22 @@ pub fn main(init: std.process.Init) !void {
     }) catch |err| {
         std.debug.print("Request failed: {s}\n", .{@errorName(err)});
         std.debug.print("Falling back to embedded sample payload.\n", .{});
-        parseAndPrint(offline_sample_json, allocator);
+        const parsed = std.json.parseFromSlice(HttpbinResponse, allocator, offline_sample_json, .{ .ignore_unknown_fields = true }) catch |parse_err| {
+            std.debug.print("JSON parse failed: {s}\n", .{@errorName(parse_err)});
+            return;
+        };
+        defer parsed.deinit();
+        printResponse(parsed.value);
         return;
     };
     defer response.deinit();
 
     std.debug.print("\nResponse Status: {d} {s}\n", .{ response.status.code, response.status.phrase });
 
-    if (response.text()) |body| {
-        parseAndPrint(body, allocator);
-    } else {
-        std.debug.print("(no body)\n", .{});
-    }
+    const parsed = response.json(HttpbinResponse, .{ .ignore_unknown_fields = true }) catch |err| {
+        std.debug.print("JSON parse failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+    printResponse(parsed.value);
 }

@@ -63,10 +63,12 @@ pub fn main() !void {
         std.debug.print("    name:         \"{s}\"\n", .{part.name});
         if (part.filename) |f| std.debug.print("    filename:     \"{s}\"\n", .{f});
         std.debug.print("    content-type: {s}\n", .{part.content_type});
-        if (part.data.len <= 32) {
+        // Only print data as text for text/* content types; print byte count for binary types
+        const is_text = std.mem.startsWith(u8, part.content_type, "text/");
+        if (is_text) {
             std.debug.print("    data:         \"{s}\"\n", .{part.data});
         } else {
-            std.debug.print("    data:         {d} bytes (binary)\n", .{part.data.len});
+            std.debug.print("    data:         <{d} bytes binary>\n", .{part.data.len});
         }
         std.debug.print("    headers:      {d}\n", .{part.headers.len});
     }

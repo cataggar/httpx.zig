@@ -57,10 +57,20 @@ fn closesocket(fd: posix.socket_t) void {
     }
 }
 
+// On Windows, INVALID_SOCKET is ULONG_PTR(~0) which equals maxInt(usize)
+const WIN_INVALID_SOCKET: usize = ~@as(usize, 0);
+
 fn createSocket() !posix.socket_t {
     if (is_windows) {
-        const fd = winsock.socket(1, 1, 0); // AF_UNIX=1, SOCK_STREAM=1
-        if (fd == winsock.INVALID_SOCKET) return error.SocketCreateFailed;
+        // AF_UNIX = 1 on Windows (same as POSIX); SOCK_STREAM = 1
+        // WSAStartup must have been called by socket.zig init() already.
+        const fd = winsock.socket(1, 1, 0);
+        // Compare via integer since posix.socket_t is a pointer on Windows
+        const fd_int = if (@typeInfo(posix.socket_t) == .pointer)
+            @intFromPtr(fd)
+        else
+            @as(usize, @intCast(fd));
+        if (fd_int == WIN_INVALID_SOCKET) return error.SocketCreateFailed;
         return fd;
     } else {
         const rc = posix.system.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
@@ -101,7 +111,12 @@ fn acceptConnection(fd: posix.socket_t, addr: *posix.sockaddr.un, len: *posix.so
     if (is_windows) {
         var len_i32: i32 = @intCast(len.*);
         const client_fd = winsock.accept(fd, @ptrCast(addr), &len_i32);
-        if (client_fd == winsock.INVALID_SOCKET) return error.AcceptFailed;
+        // Compare via integer since posix.socket_t is a pointer on Windows
+        const client_int = if (@typeInfo(posix.socket_t) == .pointer)
+            @intFromPtr(client_fd)
+        else
+            @as(usize, @intCast(client_fd));
+        if (client_int == WIN_INVALID_SOCKET) return error.AcceptFailed;
         len.* = @intCast(len_i32);
         return client_fd;
     } else {

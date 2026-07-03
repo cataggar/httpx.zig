@@ -181,7 +181,19 @@ Available examples (see the `/examples` folder):
 - `http3_client_runtime.zig`: local end-to-end high-level HTTP/3 client runtime demo
 - `http3_server_runtime.zig`: local end-to-end high-level HTTP/3 server runtime demo
 - `tcp_local.zig`: local TCP listener/client round trip
-- `udp_local.zig`: UDP local networking utility
+- `udp_local.zig`: UDP local networking utility (prints human-readable `ip:port` for source address)
+- `unix_socket_example.zig`: Unix domain socket IPC client/server (Linux, macOS; Windows 10 build 17061+ only)
+- `websocket_example.zig`: WebSocket frame encoding/decoding and handshake helpers
+- `multipart_example.zig`: multipart/form-data builder and parser
+- `metrics_example.zig`: observability counters and latency tracking
+- `session_example.zig`: TTL-based session store with server integration
+- `health_check_example.zig`: liveness and readiness probe middleware
+- `proxy_example.zig`: HTTP proxy and SOCKS5h tunneling
+- `request_response_customization.zig`: request and response builder patterns
+- `http_auth_helpers.zig`: Bearer and Basic auth helpers
+
+> **Platform note — Unix domain sockets:** `unix_socket_example.zig` requires Linux, macOS, or Windows 10 build 17061+ with Developer Mode. On unsupported Windows builds the example prints a clear message and exits gracefully.
+
 
 ## Configuration
 
@@ -195,7 +207,7 @@ Use these commands to validate host runtime behavior and cross-target compatibil
 
 ```bash
 zig build test
-zig build run-all-examples
+zig build run-all-examples   # Runs sequentially to prevent parallel compiler OOM / PC crashes
 zig build build-all-targets
 ```
 

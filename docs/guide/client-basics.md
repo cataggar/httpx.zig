@@ -229,7 +229,12 @@ if (response.ok()) { ... }
 // Get headers
 if (response.headers.get("Content-Type")) |ct| { ... }
 
-// Parse JSON response
+// Parse JSON response safely (returns std.json.Parsed(T), caller owns memory)
 const MyStruct = struct { id: u32, name: []const u8 };
-const data = try response.json(MyStruct);
+const parsed = try response.json(MyStruct, .{ .ignore_unknown_fields = true });
+defer parsed.deinit();
+const data = parsed.value;
+
+// Or use leaky JSON parsing directly into the struct (useful for simple structs)
+const data_leaky = try response.jsonLeaky(MyStruct, .{});
 ```

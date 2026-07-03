@@ -30,5 +30,10 @@ pub fn main() !void {
 
     std.debug.print("Sent: {s}\n", .{msg});
     std.debug.print("Recv: {s}\n", .{buf[0..got.n]});
-    std.debug.print("From: {}\n", .{got.addr});
+
+    // Format the source address as human-readable "ip:port"
+    var addr_buf: [64]u8 = undefined;
+    var addr_writer = std.Io.Writer.fixed(&addr_buf);
+    got.addr.format(&addr_writer) catch {};
+    std.debug.print("From: {s}\n", .{addr_writer.buffered()});
 }

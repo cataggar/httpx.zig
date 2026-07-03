@@ -98,12 +98,17 @@ pub fn build(b: *std.Build) void {
         linkPlatformLibs(exe, target);
 
         const install_exe = b.addInstallArtifact(exe, .{});
+        // Fully serialize: each example's COMPILE step depends on the previous
+        // example's RUN step having completed. This prevents the Zig compiler
+        // from being launched in parallel for multiple examples, which would
+        // exhaust memory and cause exit code 253 crashes.
+        if (previous_run_step) |prev| {
+            exe.step.dependOn(prev);
+            install_exe.step.dependOn(prev);
+        }
         const run_exe = b.addRunArtifact(exe);
         run_exe.step.dependOn(&install_exe.step);
 
-        if (previous_run_step) |prev| {
-            run_exe.step.dependOn(prev);
-        }
         previous_run_step = &run_exe.step;
     }
 

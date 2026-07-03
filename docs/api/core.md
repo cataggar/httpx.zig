@@ -62,7 +62,8 @@ Represents an HTTP response.
   - `ok()`: Returns true if status is 2xx.
   - `isRedirect()`: Returns true if status is 3xx.
   - `isError()`: Returns true if status is 4xx or 5xx.
-  - `json(T)`: Parses body as JSON.
+  - `json(T, options)`: Parses body as JSON, returning `std.json.Parsed(T)`.
+  - `jsonLeaky(T, options)`: Leaky parsing directly into type `T`.
   - `text()`: Returns body as string.
   - `redirect(status_code, location)`: Build redirect response with `Location` header.
   - `fromText(status_code, body)`: Build text response with headers.

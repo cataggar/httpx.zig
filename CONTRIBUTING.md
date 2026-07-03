@@ -48,7 +48,7 @@ zig build bench
 - Run all runnable examples:
 
 ```bash
-zig build run-all-examples
+zig build run-all-examples  # Runs sequentially to prevent parallel compiler OOM / PC crashes
 ```
 
 ## Contribution Workflow

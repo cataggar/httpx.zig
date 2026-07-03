@@ -355,7 +355,8 @@ pub const Response = struct {
     pub fn isRedirect(self: *const Response) bool
     pub fn isError(self: *const Response) bool
     pub fn text(self: *const Response) ?[]const u8
-    pub fn json(self: *const Response, comptime T: type) !T
+    pub fn json(self: *const Response, comptime T: type, options: std.json.ParseOptions) !std.json.Parsed(T)
+    pub fn jsonLeaky(self: *const Response, comptime T: type, options: std.json.ParseOptions) !T
     pub fn location(self: *const Response) ?[]const u8
     pub fn contentType(self: *const Response) ?[]const u8
     pub fn contentLength(self: *const Response) ?u64
@@ -374,7 +375,8 @@ pub const Response = struct {
 | `isRedirect()` | Status 300-399 |
 | `isError()` | Status 400-599 |
 | `text()` | Get response body text |
-| `json(T)` | Parse response body as JSON |
+| `json(T, options)` | Parse response body as JSON, returning `std.json.Parsed(T)` |
+| `jsonLeaky(T, options)` | Parse response body as JSON directly into type `T` (leaky) |
 
 ## Interceptors
 

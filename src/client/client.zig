@@ -667,6 +667,7 @@ pub const Client = struct {
             if (timeouts.write_ms > 0) {
                 try socket.setSendTimeout(timeouts.write_ms);
             }
+            try socket.setNoDelay(true);
 
             try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
@@ -1335,6 +1336,7 @@ pub const Client = struct {
 
         const w = try session.getWriter();
         try w.writeAll(request_data);
+        try session.flush();
 
         const r = try session.getReader();
         return self.readResponseFromIo(r);
@@ -1364,18 +1366,20 @@ pub const Client = struct {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
 
-        var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
         while (!parser.isComplete()) {
-            var iov = [_][]u8{buf[0..]};
-            const n = r.readVec(&iov) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => return err,
-            };
-            if (n == 0) break;
-            total_read += n;
+            const buffered = r.buffered();
+            if (buffered.len == 0) {
+                r.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                continue;
+            }
+            total_read += buffered.len;
             if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
-            _ = try parser.feed(buf[0..n]);
+            const consumed = try parser.feed(buffered);
+            r.toss(consumed);
         }
 
         parser.finishEof();
@@ -1612,6 +1616,7 @@ const TlsHttp2Transport = struct {
             if (n == 0) return error.UnexpectedEof;
             written += n;
         }
+        try self.session.flush();
     }
 
     fn readNoEof(self: *TlsHttp2Transport, out: []u8) !void {

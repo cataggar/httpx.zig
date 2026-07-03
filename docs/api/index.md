@@ -102,6 +102,6 @@ The root module re-exports core types and convenience helpers so most apps can i
 - Client interceptors for request/response hooks: `addInterceptor(...)`
 - Server logging sinks via `ServerConfig.log_fn`
 - Middleware logger customization via `loggerWithConfig(.{ .log_fn = ... })`
-- Request and response JSON helpers: `RequestOptions.withJson(...)`, `Response.json(T)`
+- Request and response JSON helpers: `RequestOptions.withJson(...)`, `Response.json(T, options)`, `Response.jsonLeaky(T, options)`
 - Socket and UDP primitives: `Socket`, `UdpSocket`, `SocketIoReader`, `SocketIoWriter`
 - Custom middleware structs with `handler` functions

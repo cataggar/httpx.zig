@@ -72,9 +72,18 @@ pub const Response = struct {
     }
 
     /// Parses the response body as JSON into the given type.
-    pub fn json(self: *const Self, comptime T: type) !T {
+    /// The caller must call `deinit()` on the returned `std.json.Parsed(T)`.
+    pub fn json(self: *const Self, comptime T: type, options: std.json.ParseOptions) !std.json.Parsed(T) {
         const body = self.body orelse return error.NoBody;
-        return std.json.parseFromSlice(T, self.allocator, body, .{});
+        return std.json.parseFromSlice(T, self.allocator, body, options);
+    }
+
+    /// Parses the response body as JSON into the given type, using leaky parsing.
+    /// Useful for types that do not own internal allocated slices or maps, or where the
+    /// memory will be handled separately.
+    pub fn jsonLeaky(self: *const Self, comptime T: type, options: std.json.ParseOptions) !T {
+        const body = self.body orelse return error.NoBody;
+        return std.json.parseFromSliceLeaky(T, self.allocator, body, options);
     }
 
     /// Returns the Location header value for redirects.
