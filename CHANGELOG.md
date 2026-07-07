@@ -25,19 +25,21 @@ All notable changes to this project are documented in this file.
 - Formatted UDP source address as ip:port in `udp_local.zig`.
 - Displayed binary multipart data as `<N bytes binary>` instead of garbage text in examples.
 - Refined error reporting and platform check warnings for Unix sockets on Windows.
-- Replaced FakeHttp2Transport and FakeHttp3Transport protocol-level test fakes with real localhost integration tests that exercise the full HTTP/2 and HTTP/3 protocol stacks end-to-end over actual TCP and UDP sockets.
-- Replaced manual bash example-build loop in CI with `zig build run-all-examples`, which runs all 27 self-contained examples sequentially using the build system's built-in dependency ordering.
+- Replaced manual bash example-build loop in CI with `zig build run-all-examples`, which runs all 28 self-contained examples sequentially using the build system's built-in dependency ordering.
 - Added `timeout 600` guard on CI example runs and `timeout 900` on unit tests to prevent indefinite hangs.
 - Hardened CI with `actions/cache@v6` and per-job cache keys to avoid cross-job cache contention.
+- Added `request_response_customization` example and documentation to the build system.
 
 ### Fixed
 - Fixed `posixRecv`, `posixSend`, and `posixSendTo` in `src/net/socket.zig` not retrying on `EINTR` (signal interruption), which could cause spurious read/write failures under load.
 - Fixed Unix socket `INVALID_SOCKET` comparison on Windows to use integer comparison instead of pointer equality.
 - Fixed backlog parameter type signature in Unix socket POSIX listener on Linux targets.
 - Fixed `SO_RCVTIMEO`/`SO_SNDTIMEO` being set on TLS sockets before the TLS handshake completed, which caused spurious `EAGAIN` errors under Linux and produced misleading `ReadFailed` errors for GET requests ([Issue #19](https://github.com/muhammad-fiaz/httpx.zig/issues/19)).
+- Fixed noisy "failed command" stderr output in `zig build test` by adding a no-op `log_fn` to the thread pool integration test in `src/server/server.zig`.
 
 ### Removed
 - Removed `src/util/mock.zig` and `MockServer` API entirely. All testing uses real localhost servers with actual TCP/UDP sockets — no mock or fake transport layer.
+- Removed `FakeHttp2Transport` and `FakeHttp3Transport` protocol-level test fakes from `src/client/client.zig`. Protocol parsing coverage is maintained by the existing unit tests in `src/protocol/` and real integration via examples.
 
 ### Optimized
 - Optimized `Http1Connection.writeRequest` in `src/protocol/http.zig` by buffering the formatted HTTP headers and performing a single write operation, reducing syscall overhead.

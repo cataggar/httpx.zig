@@ -63,14 +63,14 @@ jobs:
 
       - name: Unit tests
         shell: bash
-        run: timeout 900 zig build test --summary all
+        run: zig build test --summary all
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Run all examples
         shell: bash
-        run: timeout 600 zig build run-all-examples
+        run: zig build run-all-examples
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache

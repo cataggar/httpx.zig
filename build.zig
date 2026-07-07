@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "metrics_example", .path = "examples/metrics_example.zig" },
         .{ .name = "session_example", .path = "examples/session_example.zig" },
         .{ .name = "health_check_example", .path = "examples/health_check_example.zig" },
+        .{ .name = "request_response_customization", .path = "examples/request_response_customization.zig" },
         .{ .name = "unix_socket_example", .path = "examples/unix_socket_example.zig" },
         .{ .name = "async_server_example", .path = "examples/async_server_example.zig", .skip_run_all = true },
     };
