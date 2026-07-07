@@ -146,7 +146,7 @@ pub fn main() !void {
     std.debug.print("Render response content-type: {s}\n", .{render_response.contentType().?});
     std.debug.print("Render response body: {s}\n", .{render_response.text().?});
 
-    var redirect_response = try client.get(redirect_url, .{});
+    var redirect_response = try client.get(redirect_url, httpx.RequestOptions.defaults().withFollowRedirects(false));
     defer redirect_response.deinit();
     std.debug.print("Redirect? {} location={s}\n", .{
         redirect_response.isRedirect(),
