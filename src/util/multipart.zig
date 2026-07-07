@@ -198,13 +198,7 @@ pub const MultipartBuilder = struct {
 
     /// Appends a text field part.
     pub fn addField(self: *Self, name: []const u8, value: []const u8) !void {
-        const seg = try std.fmt.allocPrint(
-            self.allocator,
-            "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
-            .{ self.boundary, name, value },
-        );
-        defer self.allocator.free(seg);
-        try self.buf.appendSlice(self.allocator, seg);
+        try self.buf.print(self.allocator, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n", .{ self.boundary, name, value });
     }
 
     /// Appends a file upload part.
@@ -215,22 +209,14 @@ pub const MultipartBuilder = struct {
         content_type: []const u8,
         data: []const u8,
     ) !void {
-        const hdr = try std.fmt.allocPrint(
-            self.allocator,
-            "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n",
-            .{ self.boundary, name, filename, content_type },
-        );
-        defer self.allocator.free(hdr);
-        try self.buf.appendSlice(self.allocator, hdr);
+        try self.buf.print(self.allocator, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ self.boundary, name, filename, content_type });
         try self.buf.appendSlice(self.allocator, data);
         try self.buf.appendSlice(self.allocator, "\r\n");
     }
 
     /// Finalizes and returns the complete body. Caller owns the result.
     pub fn build(self: *Self) ![]u8 {
-        const final = try std.fmt.allocPrint(self.allocator, "--{s}--\r\n", .{self.boundary});
-        defer self.allocator.free(final);
-        try self.buf.appendSlice(self.allocator, final);
+        try self.buf.print(self.allocator, "--{s}--\r\n", .{self.boundary});
         return self.buf.toOwnedSlice(self.allocator);
     }
 

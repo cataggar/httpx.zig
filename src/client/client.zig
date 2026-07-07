@@ -200,6 +200,20 @@ pub const BasicAuth = struct {
     password: []const u8,
 };
 
+/// Representation of a multipart form field.
+pub const MultipartField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Representation of a multipart upload file.
+pub const MultipartFile = struct {
+    name: []const u8,
+    filename: []const u8,
+    content_type: ?[]const u8 = null,
+    data: []const u8,
+};
+
 /// Per-request options.
 pub const RequestOptions = struct {
     headers: ?[]const [2][]const u8 = null,
@@ -212,6 +226,13 @@ pub const RequestOptions = struct {
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
     version: ?types.Version = null,
+    multipart_fields: ?[]const MultipartField = null,
+    multipart_files: ?[]const MultipartFile = null,
+    multipart_boundary: ?[]const u8 = null,
+    proxy: ?types.Proxy = null,
+    verify_ssl: ?bool = null,
+    keep_alive: ?bool = null,
+    unix_socket_path: ?[]const u8 = null,
 
     /// Returns default request options.
     pub fn defaults() RequestOptions {
@@ -222,6 +243,55 @@ pub const RequestOptions = struct {
     pub fn withHeaders(self: RequestOptions, headers: []const [2][]const u8) RequestOptions {
         var out = self;
         out.headers = headers;
+        return out;
+    }
+
+    /// Returns a copy with a custom proxy configuration for this request.
+    pub fn withProxy(self: RequestOptions, proxy: ?types.Proxy) RequestOptions {
+        var out = self;
+        out.proxy = proxy;
+        return out;
+    }
+
+    /// Returns a copy with explicit SSL verification behavior for this request.
+    pub fn withSslVerification(self: RequestOptions, verify_ssl: bool) RequestOptions {
+        var out = self;
+        out.verify_ssl = verify_ssl;
+        return out;
+    }
+
+    /// Returns a copy with explicit keep-alive behavior for this request.
+    pub fn withKeepAlive(self: RequestOptions, keep_alive: bool) RequestOptions {
+        var out = self;
+        out.keep_alive = keep_alive;
+        return out;
+    }
+
+    /// Returns a copy with a custom Unix domain socket path for this request.
+    pub fn withUnixSocket(self: RequestOptions, path: ?[]const u8) RequestOptions {
+        var out = self;
+        out.unix_socket_path = path;
+        return out;
+    }
+
+    /// Returns a copy with multipart fields.
+    pub fn withMultipartFields(self: RequestOptions, fields: []const MultipartField) RequestOptions {
+        var out = self;
+        out.multipart_fields = fields;
+        return out;
+    }
+
+    /// Returns a copy with multipart files.
+    pub fn withMultipartFiles(self: RequestOptions, files: []const MultipartFile) RequestOptions {
+        var out = self;
+        out.multipart_files = files;
+        return out;
+    }
+
+    /// Returns a copy with a custom boundary for multipart request.
+    pub fn withMultipartBoundary(self: RequestOptions, boundary: []const u8) RequestOptions {
+        var out = self;
+        out.multipart_boundary = boundary;
         return out;
     }
 
@@ -434,6 +504,32 @@ pub const Client = struct {
             try req.setJson(json_body);
         } else if (reqOpts.form_fields) |fields| {
             try req.setFormUrlEncoded(fields);
+        } else if (reqOpts.multipart_fields != null or reqOpts.multipart_files != null) {
+            const boundary = reqOpts.multipart_boundary orelse "----httpxBoundary1234567890";
+            var builder = @import("../util/multipart.zig").MultipartBuilder.init(self.allocator, boundary);
+            defer builder.deinit();
+
+            if (reqOpts.multipart_fields) |fields| {
+                for (fields) |field| {
+                    try builder.addField(field.name, field.value);
+                }
+            }
+
+            if (reqOpts.multipart_files) |files| {
+                for (files) |file| {
+                    const resolved_mime = file.content_type orelse common.mimeTypeFromPathOr(file.filename, "application/octet-stream");
+
+                    try builder.addFile(file.name, file.filename, resolved_mime, file.data);
+                }
+            }
+
+            const body = try builder.build();
+            defer self.allocator.free(body);
+            try req.setBody(body);
+
+            const ct = try builder.contentType();
+            defer self.allocator.free(ct);
+            try req.headers.set(HeaderName.CONTENT_TYPE, ct);
         }
 
         if (reqOpts.basic_auth) |basic| {
@@ -451,7 +547,7 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms);
+        var response = try self.executeRequest(&req, reqOpts);
         try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
@@ -484,13 +580,13 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+    fn executeRequest(self: *Self, req: *Request, reqOpts: RequestOptions) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
-            var res = self.executeRequestOnce(req, timeout_override_ms) catch |err| {
+            var res = self.executeRequestOnce(req, reqOpts) catch |err| {
                 if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries and isRetryableRequestError(err)) {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
@@ -603,10 +699,14 @@ pub const Client = struct {
         };
     }
 
-    fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
-        const timeouts = self.resolveRequestTimeouts(timeout_override_ms);
+    fn executeRequestOnce(self: *Self, req: *Request, reqOpts: RequestOptions) !Response {
+        const timeouts = self.resolveRequestTimeouts(reqOpts.timeout_ms);
+        const proxy = reqOpts.proxy orelse self.config.proxy;
+        const keep_alive = reqOpts.keep_alive orelse self.config.keep_alive;
+        const verify_ssl = reqOpts.verify_ssl orelse self.config.verify_ssl;
+        const unix_socket_path = reqOpts.unix_socket_path orelse self.config.unix_socket_path;
 
-        if (self.config.unix_socket_path) |path| {
+        if (unix_socket_path) |path| {
             const unix_mod = @import("../net/unix.zig");
             const unix_sock = try unix_mod.UnixClient.connect(path);
             var socket = Socket.fromHandle(unix_sock.fd);
@@ -633,18 +733,18 @@ pub const Client = struct {
         const wants_http3 = self.config.http3_enabled or req.version == .HTTP_3;
 
         if (wants_http3) {
-            if (self.config.proxy != null) return error.ProxyNotSupported;
-            return self.executeRequestHttp3(req, host, port, timeouts);
+            if (proxy != null) return error.ProxyNotSupported;
+            return self.executeRequestHttp3(req, host, port, timeouts, reqOpts);
         }
 
         if (wants_http2) {
-            return self.executeRequestHttp2(req, host, port, timeouts);
+            return self.executeRequestHttp2(req, host, port, timeouts, reqOpts);
         }
 
         var request_data: []u8 = undefined;
-        if (self.config.proxy) |proxy| {
-            if (proxy.kind == .http and !req.uri.isTls()) {
-                request_data = try self.formatProxyRequest(req, proxy);
+        if (proxy) |p| {
+            if (p.kind == .http and !req.uri.isTls()) {
+                request_data = try self.formatProxyRequest(req, p);
             } else {
                 request_data = try http.formatRequest(req, self.allocator);
             }
@@ -654,8 +754,8 @@ pub const Client = struct {
         defer self.allocator.free(request_data);
 
         if (req.uri.isTls()) {
-            const connect_host = if (self.config.proxy) |p| p.host else host;
-            const connect_port = if (self.config.proxy) |p| p.port else port;
+            const connect_host = if (proxy) |p| p.host else host;
+            const connect_port = if (proxy) |p| p.port else port;
             const addr = try address_mod.resolve(connect_host, connect_port);
 
             var socket = try Socket.createForAddress(addr);
@@ -671,19 +771,19 @@ pub const Client = struct {
 
             try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
-            if (self.config.proxy) |proxy| {
-                if (proxy.kind == .socks5h) {
-                    try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+            if (proxy) |p| {
+                if (p.kind == .socks5h) {
+                    try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
                 } else {
-                    try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+                    try self.establishProxyTlsTunnel(&socket, host, port, p);
                 }
             }
 
-            return self.executeTlsHttp(&socket, host, request_data);
+            return self.executeTlsHttp(&socket, host, request_data, verify_ssl);
         }
 
-        if (self.config.keep_alive) {
-            var conn = try self.pool.getConnection(host, port, self.config.proxy, timeouts.connect_ms);
+        if (keep_alive) {
+            var conn = try self.pool.getConnection(host, port, proxy, timeouts.connect_ms);
             errdefer conn.close();
             defer self.pool.releaseConnection(conn);
 
@@ -703,8 +803,8 @@ pub const Client = struct {
             return res;
         }
 
-        const connect_host = if (self.config.proxy) |p| p.host else host;
-        const connect_port = if (self.config.proxy) |p| p.port else port;
+        const connect_host = if (proxy) |p| p.host else host;
+        const connect_port = if (proxy) |p| p.port else port;
         const addr = try address_mod.resolve(connect_host, connect_port);
 
         var socket = try Socket.createForAddress(addr);
@@ -719,9 +819,9 @@ pub const Client = struct {
 
         try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
-        if (self.config.proxy) |proxy| {
-            if (proxy.kind == .socks5h) {
-                try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+        if (proxy) |p| {
+            if (p.kind == .socks5h) {
+                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
             }
         }
 
@@ -735,9 +835,13 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         timeouts: RequestTimeouts,
+        reqOpts: RequestOptions,
     ) !Response {
-        const connect_host = if (self.config.proxy) |p| p.host else host;
-        const connect_port = if (self.config.proxy) |p| p.port else port;
+        const proxy = reqOpts.proxy orelse self.config.proxy;
+        const verify_ssl = reqOpts.verify_ssl orelse self.config.verify_ssl;
+
+        const connect_host = if (proxy) |p| p.host else host;
+        const connect_port = if (proxy) |p| p.port else port;
         const addr = try address_mod.resolve(connect_host, connect_port);
 
         var socket = try Socket.createForAddress(addr);
@@ -752,16 +856,16 @@ pub const Client = struct {
 
         try socket.connectWithTimeout(addr, timeouts.connect_ms);
 
-        if (self.config.proxy) |proxy| {
-            if (proxy.kind == .socks5h) {
-                try proxy_mod.establishSocks5hTunnel(&socket, host, port, proxy);
+        if (proxy) |p| {
+            if (p.kind == .socks5h) {
+                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
             } else {
-                try self.establishProxyTlsTunnel(&socket, host, port, proxy);
+                try self.establishProxyTlsTunnel(&socket, host, port, p);
             }
         }
 
         if (req.uri.isTls()) {
-            const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            const tls_cfg = if (verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
             var session = TlsSession.init(tls_cfg);
             defer session.deinit();
             session.attachSocket(&socket);
@@ -781,7 +885,9 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         timeouts: RequestTimeouts,
+        reqOpts: RequestOptions,
     ) !Response {
+        _ = reqOpts;
         const addr = try address_mod.resolve(host, port);
 
         var socket = try UdpSocket.createForAddress(addr);
@@ -1326,8 +1432,8 @@ pub const Client = struct {
         return .{ .header = header, .payload = payload };
     }
 
-    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8, verify_ssl: bool) !Response {
+        const tls_cfg = if (verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
 
         var session = TlsSession.init(tls_cfg);
         defer session.deinit();
@@ -2403,4 +2509,85 @@ test "Client proxy request formatting" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "GET http://example.com:80/api/v1/users?active=true HTTP/1.1\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "Accept: application/json\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n") != null);
+}
+
+test "Client multipart options and MIME resolution" {
+    const allocator = std.testing.allocator;
+
+    var client = Client.init(allocator);
+    defer client.deinit();
+
+    const fields = [_]MultipartField{
+        .{ .name = "username", .value = "bob" },
+    };
+    const files = [_]MultipartFile{
+        .{ .name = "doc", .filename = "notes.html", .data = "some content", .content_type = null },
+        .{ .name = "custom", .filename = "data.bin", .data = "binary data", .content_type = "application/x-custom" },
+    };
+
+    var req = try Request.init(allocator, .POST, "http://localhost/");
+    defer req.deinit();
+
+    const reqOpts = RequestOptions.defaults()
+        .withMultipartFields(&fields)
+        .withMultipartFiles(&files);
+
+    if (reqOpts.multipart_fields != null or reqOpts.multipart_files != null) {
+        const boundary = reqOpts.multipart_boundary orelse "----httpxBoundary1234567890";
+        var builder = @import("../util/multipart.zig").MultipartBuilder.init(allocator, boundary);
+        defer builder.deinit();
+
+        if (reqOpts.multipart_fields) |flds| {
+            for (flds) |field| {
+                try builder.addField(field.name, field.value);
+            }
+        }
+
+        if (reqOpts.multipart_files) |fls| {
+            for (fls) |file| {
+                const resolved_mime = file.content_type orelse common.mimeTypeFromPathOr(file.filename, "application/octet-stream");
+                try builder.addFile(file.name, file.filename, resolved_mime, file.data);
+            }
+        }
+
+        const body = try builder.build();
+        defer allocator.free(body);
+        try req.setBody(body);
+
+        const ct = try builder.contentType();
+        defer allocator.free(ct);
+        try req.headers.set(HeaderName.CONTENT_TYPE, ct);
+    }
+
+    try std.testing.expect(req.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body.?, "text/html; charset=utf-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body.?, "application/x-custom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body.?, "name=\"username\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body.?, "bob") != null);
+
+    const ct = req.headers.get("Content-Type").?;
+    try std.testing.expect(std.mem.startsWith(u8, ct, "multipart/form-data; boundary=----httpxBoundary1234567890"));
+}
+
+test "RequestOptions per-request overrides" {
+    const proxy = types.Proxy{
+        .kind = .http,
+        .host = "127.0.0.1",
+        .port = 8888,
+        .username = null,
+        .password = null,
+    };
+    
+    const opts = RequestOptions.defaults()
+        .withProxy(proxy)
+        .withSslVerification(false)
+        .withKeepAlive(false)
+        .withUnixSocket("/tmp/test.sock");
+        
+    try std.testing.expect(opts.proxy != null);
+    try std.testing.expectEqualStrings("127.0.0.1", opts.proxy.?.host);
+    try std.testing.expectEqual(@as(u16, 8888), opts.proxy.?.port);
+    try std.testing.expectEqual(false, opts.verify_ssl.?);
+    try std.testing.expectEqual(false, opts.keep_alive.?);
+    try std.testing.expectEqualStrings("/tmp/test.sock", opts.unix_socket_path.?);
 }

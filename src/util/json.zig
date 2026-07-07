@@ -32,16 +32,16 @@ pub const Json = struct {
     }
 
     /// Validates that a string is valid JSON.
-    pub fn validate(data: []const u8) bool {
-        var scanner = std.json.Scanner.initCompleteInput(std.testing.allocator, data);
-        defer scanner.deinit();
-
-        while (true) {
-            const token = scanner.next() catch return false;
-            if (token == .end_of_document) return true;
-        }
+    pub fn validate(allocator: Allocator, data: []const u8) bool {
+        return std.json.validate(allocator, data) catch false;
     }
 };
+
+test "Json.validate" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(Json.validate(allocator, "{\"ok\": true}"));
+    try std.testing.expect(!Json.validate(allocator, "{\"ok\": true"));
+}
 
 /// Dynamic JSON builder for constructing JSON objects.
 pub const JsonBuilder = struct {

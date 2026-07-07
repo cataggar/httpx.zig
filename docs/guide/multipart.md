@@ -139,6 +139,28 @@ var resp = try client.post("https://example.com/upload", opts);
 defer resp.deinit();
 ```
 
+### Fluent Client-Side API
+
+Instead of manually building and cleaning up the body, you can pass fields and files directly using `RequestOptions` for automatic formatting and optional MIME type resolution:
+
+```zig
+const fields = [_]httpx.MultipartField{
+    .{ .name = "name", .value = "alice" },
+};
+const files = [_]httpx.MultipartFile{
+    .{ .name = "avatar", .filename = "photo.png", .data = png_bytes },
+};
+
+const opts = httpx.RequestOptions.defaults()
+    .withMultipartFields(&fields)
+    .withMultipartFiles(&files);
+
+var resp = try client.post("https://example.com/upload", opts);
+defer resp.deinit();
+```
+
+If the file's `content_type` is omitted, it will automatically resolve the extension using built-in mapping defaults out-of-the-box.
+
 ## Full Server-Side Example
 
 ```zig

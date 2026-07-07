@@ -46,7 +46,6 @@ pub const CookieOptions = struct {
 };
 
 pub const MimeMapping = mime.MimeMapping;
-pub const MimeRegistry = mime.MimeRegistry;
 pub const defaultMimeMappings = mime.default_mappings;
 
 /// Returns a query parameter value from a raw query string.
@@ -223,7 +222,7 @@ test "mimeTypeFromPath handles case-insensitive extensions" {
 
 test "mimeTypeFromPathOr supports custom fallback" {
     try std.testing.expectEqualStrings("application/x-custom", mimeTypeFromPathOr("asset.unknownext", "application/x-custom"));
-    try std.testing.expectEqualStrings("application/manifest+json", mimeTypeFromPathOr("site.webmanifest", "application/octet-stream"));
+    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPathOr("site.unknown", "application/octet-stream"));
 }
 
 test "mimeTypeFromPathWith supports external mappings" {

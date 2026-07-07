@@ -8,6 +8,7 @@
 //! provide compile-time string conversion for maximum performance.
 
 const std = @import("std");
+const status_mod = @import("status.zig");
 
 /// HTTP request methods as defined in RFC 7231 and RFC 5789.
 /// Supports all standard methods plus a CUSTOM variant for extensions.
@@ -346,9 +347,9 @@ pub const RedirectPolicy = struct {
     pub fn getRedirectMethod(self: RedirectPolicy, status: u16, original: Method) Method {
         if (self.preserve_method) return original;
         return switch (status) {
-            301, 302 => .GET,
-            303 => .GET,
-            307, 308 => original,
+            status_mod.StatusCode.MOVED_PERMANENTLY, status_mod.StatusCode.FOUND => .GET,
+            status_mod.StatusCode.SEE_OTHER => .GET,
+            status_mod.StatusCode.TEMPORARY_REDIRECT, status_mod.StatusCode.PERMANENT_REDIRECT => original,
             else => original,
         };
     }

@@ -126,6 +126,27 @@ Submits a `Task` struct.
 pub fn submit(self: *Self, task: Task) !void
 ```
 
+#### `trySubmit`
+
+Submits a `Task` struct without blocking. Returns `error.WouldBlock` if the queue mutex is currently locked, or `error.TaskQueueFull` if the task queue has reached its maximum size.
+
+```zig
+pub fn trySubmit(self: *Self, task: Task) !void
+```
+
+#### `submitWithCallback`
+
+Submits a `Task` and registers a callback to be run on completion of the task.
+
+```zig
+pub fn submitWithCallback(
+    self: *Self,
+    task: Task,
+    callback: *const fn (?*anyopaque) void,
+    cb_context: ?*anyopaque,
+) !void
+```
+
 #### `runAll`
 
 Runs all pending tasks synchronously (useful for testing).

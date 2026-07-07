@@ -296,6 +296,11 @@ pub const SessionStore = session_mod.SessionStore;
 pub const SessionConfig = session_mod.SessionConfig;
 pub const SESSION_ID_LEN = session_mod.SESSION_ID_LEN;
 
+// Mock server exports
+pub const MockServer = mock.MockServer;
+pub const MockStub = mock.Stub;
+pub const RecordedRequest = mock.RecordedRequest;
+
 // Unix socket exports
 pub const UnixSocket = unix.UnixSocket;
 pub const UnixListener = unix.UnixListener;
@@ -309,8 +314,9 @@ pub const Hex = encoding.Hex;
 pub const PercentEncoding = encoding.PercentEncoding;
 pub const CookiePair = common.CookiePair;
 pub const MimeMapping = mime.MimeMapping;
-pub const MimeRegistry = mime.MimeRegistry;
 pub const defaultMimeMappings = mime.default_mappings;
+pub const MultipartField = client_mod.MultipartField;
+pub const MultipartFile = client_mod.MultipartFile;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;

@@ -43,6 +43,22 @@ pub fn main() !void {
             part.name, part.content_type, part.data.len,
         });
     }
+
+    // Client-side RequestOptions Integration
+    var client = httpx.Client.init(allocator);
+    defer client.deinit();
+
+    const fields = [_]httpx.MultipartField{
+        .{ .name = "user", .value = "bob" },
+    };
+    const files = [_]httpx.MultipartFile{
+        .{ .name = "attachment", .filename = "resume.html", .data = "resumedata" },
+    };
+
+    const reqOpts = httpx.RequestOptions.defaults()
+        .withMultipartFields(&fields)
+        .withMultipartFiles(&files)
+        .withMultipartBoundary("clientBoundary999");
 }
 ```
 

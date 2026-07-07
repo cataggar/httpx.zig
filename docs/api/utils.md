@@ -14,12 +14,9 @@ Common utilities for buffer management, encoding, multipart, metrics, sessions, 
 - `mimeTypeFromPathOr(path, fallback)`: Resolve MIME from extension with an explicit fallback.
 - `mimeTypeFromPathWith(path, mappings, fallback)`: Resolve MIME using caller-provided external mappings.
 - `MimeMapping`: Extension-to-MIME pair type for external mapping lists.
-- `MimeRegistry`: Reusable MIME resolver for custom mapping sets.
 - `defaultMimeMappings`: Built-in mapping table exported for extension/composition.
 - `CookieOptions`: Cookie attributes (`Path`, `Domain`, `Max-Age`, `SameSite`, `Secure`, `HttpOnly`).
 - `SameSite`: Enum values `lax`, `strict`, `none`.
-
-`mimeTypeFromPath` is case-insensitive and covers common web, document, media, font, and archive formats.
 
 Root-level aliases:
 
@@ -29,7 +26,6 @@ Root-level aliases:
 - `httpx.mimeTypeFromPathOr(...)`
 - `httpx.mimeTypeFromPathWith(...)`
 - `httpx.MimeMapping`
-- `httpx.MimeRegistry`
 - `httpx.defaultMimeMappings`
 - `httpx.CookieOptions`
 - `httpx.SameSite`

@@ -35,6 +35,7 @@ const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../util/common.zig");
 const list_writer = @import("../util/list_writer.zig");
 const io_util = @import("../util/any_io.zig");
+const Executor = @import("../concurrency/executor.zig").Executor;
 
 const defaultIo = io_util.defaultIo;
 const sleepMs = io_util.sleepMsI;
@@ -106,6 +107,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(*anyopaque),
+    server: ?*Server = null,
 
     const Self = @This();
 
@@ -285,7 +287,7 @@ pub const Context = struct {
             if (options.conditional_get) {
                 if (self.request.headers.get(HeaderName.IF_NONE_MATCH)) |if_none_match| {
                     if (ifNoneMatchMatches(if_none_match, etag_value.?)) {
-                        _ = self.response.status(304);
+                        _ = self.response.status(status_mod.StatusCode.NOT_MODIFIED);
                         return self.response.build();
                     }
                 }
@@ -368,7 +370,7 @@ pub const Context = struct {
 
     /// Sends a 204 No Content response.
     pub fn noContent(self: *Self) !Response {
-        _ = self.response.status(204);
+        _ = self.response.status(status_mod.StatusCode.NO_CONTENT);
         return self.response.build();
     }
 };
@@ -388,6 +390,7 @@ pub const Server = struct {
     udp_socket: ?UdpSocket = null,
     unix_listener: ?@import("../net/unix.zig").UnixListener = null,
     running: bool = false,
+    executor: ?Executor = null,
 
     const Self = @This();
 
@@ -404,10 +407,16 @@ pub const Server = struct {
         if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
         if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
 
+        var executor: ?Executor = null;
+        if (cfg.threads > 0) {
+            executor = Executor.initWithConfig(allocator, .{ .num_threads = cfg.threads });
+        }
+
         return .{
             .allocator = allocator,
             .config = cfg,
             .router = Router.init(allocator),
+            .executor = executor,
         };
     }
 
@@ -418,6 +427,9 @@ pub const Server = struct {
         self.pre_route_hooks.deinit(self.allocator);
         if (self.listener) |*l| l.deinit();
         if (self.udp_socket) |*u| u.close();
+        if (self.executor) |*e| {
+            e.deinit();
+        }
     }
 
     /// Adds middleware to the server.
@@ -514,6 +526,16 @@ pub const Server = struct {
     /// Spawns a background thread to run the server's listening loop.
     /// The caller is responsible for joining the returned Thread.
     pub fn listenInBackground(self: *Self) !std.Thread {
+        if (self.config.unix_path == null and !self.config.http3_enabled and self.listener == null) {
+            const backlog_u32: u32 = @max(self.config.max_connections, 1);
+            const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
+            try self.bindTcpListener(backlog);
+        } else if (self.config.unix_path) |path| {
+            if (self.unix_listener == null) {
+                const unix_mod = @import("../net/unix.zig");
+                self.unix_listener = try unix_mod.UnixListener.init(path);
+            }
+        }
         return std.Thread.spawn(.{}, struct {
             fn run(s: *Self) void {
                 s.listen() catch |err| {
@@ -577,7 +599,8 @@ pub const Server = struct {
             };
 
             self.listener = listener;
-            self.config.port = candidate_port;
+            const actual_addr = try self.listener.?.getLocalAddress();
+            self.config.port = actual_addr.getPort();
             return;
         }
 
@@ -602,7 +625,8 @@ pub const Server = struct {
                 }
 
                 self.udp_socket = socket;
-                self.config.port = candidate_port;
+                const actual_addr = try self.udp_socket.?.getLocalAddress();
+                self.config.port = actual_addr.getPort();
                 return;
             } else |err| {
                 socket.close();
@@ -617,10 +641,16 @@ pub const Server = struct {
     }
 
     fn listenTcp(self: *Self) !void {
-        const backlog_u32: u32 = @max(self.config.max_connections, 1);
-        const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        try self.bindTcpListener(backlog);
+        if (self.listener == null) {
+            const backlog_u32: u32 = @max(self.config.max_connections, 1);
+            const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
+            try self.bindTcpListener(backlog);
+        }
         self.running = true;
+
+        if (self.executor) |*e| {
+            try e.start();
+        }
 
         self.log(.info, "Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
@@ -631,14 +661,48 @@ pub const Server = struct {
                 continue;
             };
 
-            self.handleConnection(conn.socket) catch |err| {
-                self.log(.err, "Handler error: {}\n", .{err});
-            };
+            if (self.executor) |*e| {
+                const ConnJob = struct {
+                    server: *Self,
+                    socket: Socket,
+                    fn run(ctx_ptr: ?*anyopaque) void {
+                        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                        ctx.server.handleConnection(ctx.socket) catch |err| {
+                            ctx.server.log(.err, "Handler error: {}\n", .{err});
+                        };
+                        ctx.server.allocator.destroy(ctx);
+                    }
+                };
+                const job_ctx = self.allocator.create(ConnJob) catch {
+                    var s = conn.socket;
+                    s.close();
+                    continue;
+                };
+                job_ctx.* = .{
+                    .server = self,
+                    .socket = conn.socket,
+                };
+                e.submit(.{
+                    .func = ConnJob.run,
+                    .context = job_ctx,
+                }) catch |err| {
+                    self.log(.err, "Executor submission failed: {s}\n", .{@errorName(err)});
+                    var s = conn.socket;
+                    s.close();
+                    self.allocator.destroy(job_ctx);
+                };
+            } else {
+                self.handleConnection(conn.socket) catch |err| {
+                    self.log(.err, "Handler error: {}\n", .{err});
+                };
+            }
         }
     }
 
     fn listenHttp3(self: *Self) !void {
-        try self.bindUdpSocket();
+        if (self.udp_socket == null) {
+            try self.bindUdpSocket();
+        }
         self.running = true;
 
         self.log(.info, "Server listening (HTTP/3) on {s}:{d}\n", .{ self.config.host, self.config.port });
@@ -673,12 +737,21 @@ pub const Server = struct {
             u.deinit();
             self.unix_listener = null;
         }
+        if (self.executor) |*e| {
+            e.stop();
+        }
     }
 
     fn listenUnix(self: *Self, path: []const u8) !void {
-        const unix_mod = @import("../net/unix.zig");
-        self.unix_listener = try unix_mod.UnixListener.init(path);
+        if (self.unix_listener == null) {
+            const unix_mod = @import("../net/unix.zig");
+            self.unix_listener = try unix_mod.UnixListener.init(path);
+        }
         self.running = true;
+
+        if (self.executor) |*e| {
+            try e.start();
+        }
 
         self.log(.info, "Server listening on Unix socket: {s}\n", .{path});
 
@@ -689,10 +762,40 @@ pub const Server = struct {
                 continue;
             };
 
-            const socket_wrapper = Socket.fromHandle(conn.socket.fd);
-            self.handleConnection(socket_wrapper) catch |err| {
-                self.log(.err, "Handler error: {}\n", .{err});
-            };
+            var socket_wrapper = Socket.fromHandle(conn.socket.fd);
+            if (self.executor) |*e| {
+                const ConnJob = struct {
+                    server: *Self,
+                    socket: Socket,
+                    fn run(ctx_ptr: ?*anyopaque) void {
+                        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                        ctx.server.handleConnection(ctx.socket) catch |err| {
+                            ctx.server.log(.err, "Handler error: {}\n", .{err});
+                        };
+                        ctx.server.allocator.destroy(ctx);
+                    }
+                };
+                const job_ctx = self.allocator.create(ConnJob) catch {
+                    socket_wrapper.close();
+                    continue;
+                };
+                job_ctx.* = .{
+                    .server = self,
+                    .socket = socket_wrapper,
+                };
+                e.submit(.{
+                    .func = ConnJob.run,
+                    .context = job_ctx,
+                }) catch |err| {
+                    self.log(.err, "Executor submission failed: {s}\n", .{@errorName(err)});
+                    socket_wrapper.close();
+                    self.allocator.destroy(job_ctx);
+                };
+            } else {
+                self.handleConnection(socket_wrapper) catch |err| {
+                    self.log(.err, "Handler error: {}\n", .{err});
+                };
+            }
         }
     }
 
@@ -744,7 +847,7 @@ pub const Server = struct {
 
             var response = self.executeServerRequest(&req) catch |err| {
                 self.log(.err, "Handler error: {}\n", .{err});
-                return self.sendError(&sock, 500);
+                return self.sendError(&sock, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             };
 
             defer response.deinit();
@@ -1045,7 +1148,7 @@ pub const Server = struct {
         }
 
         var response = self.executeServerRequest(&req) catch {
-            var internal = Response.init(self.allocator, 500);
+            var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             defer internal.deinit();
             internal.version = .HTTP_2;
             try self.sendHttp2Response(&conn, &stream_manager, stream_id, &internal);
@@ -1284,7 +1387,7 @@ pub const Server = struct {
         }
 
         var response = self.executeServerRequest(&req) catch {
-            var internal = Response.init(self.allocator, 500);
+            var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             defer internal.deinit();
             internal.version = .HTTP_3;
             try self.sendHttp3Response(peer_addr, dst_cid, stream_id, &internal);
@@ -1387,6 +1490,7 @@ pub const Server = struct {
 
     fn executeServerRequest(self: *Self, req: *Request) !Response {
         var ctx = Context.init(self.allocator, req);
+        ctx.server = self;
         defer ctx.deinit();
 
         for (self.pre_route_hooks.items) |hook| {
@@ -1481,8 +1585,8 @@ pub const Server = struct {
         if (response.headers.get(HeaderName.CONTENT_LENGTH) != null) return;
         if (response.headers.isChunked()) return;
         if ((response.status.code >= 100 and response.status.code < 200) or
-            response.status.code == 204 or
-            response.status.code == 304)
+            response.status.code == status_mod.StatusCode.NO_CONTENT or
+            response.status.code == status_mod.StatusCode.NOT_MODIFIED)
         {
             return;
         }
@@ -2067,4 +2171,71 @@ test "Server custom log callback" {
     });
     server.log(.info, "this is a {s} message", .{"test log message"});
     try std.testing.expect(CustomLogger.logged);
+}
+
+test "Server with thread pool handles connections" {
+    const allocator = std.testing.allocator;
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .threads = 2,
+    });
+    defer server.deinit();
+
+    const handler = struct {
+        fn h(ctx: *Context) anyerror!Response {
+            return ctx.text("hello from worker pool");
+        }
+    }.h;
+
+    try server.get("/hello", handler);
+
+    // Get an ephemeral port assigned
+    const backlog_u32: u32 = @max(server.config.max_connections, 1);
+    const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
+    try server.bindTcpListener(backlog);
+
+    const port = server.listeningPort();
+
+    // Start server in background
+    server.running = true;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listenTcp() catch |err| {
+                if (s.running) {
+                    s.log(.err, "server error: {s}\n", .{@errorName(err)});
+                }
+            };
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    // Give it a tiny bit to spin up
+    sleepMs(50);
+
+    // Make a client request using our client
+    const client_addr = try net.Address.parseIp("127.0.0.1", port);
+    var client_sock = try Socket.createForAddress(client_addr);
+    defer client_sock.close();
+
+    try client_sock.connectWithTimeout(client_addr, 1000);
+
+    const req_str = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    try client_sock.sendAll(req_str);
+
+    var response_buf: [2048]u8 = undefined;
+    var total_read: usize = 0;
+    while (true) {
+        const n = try client_sock.recv(response_buf[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    const response_text = response_buf[0..total_read];
+    try std.testing.expect(std.mem.indexOf(u8, response_text, "hello from worker pool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response_text, "200 OK") != null);
 }

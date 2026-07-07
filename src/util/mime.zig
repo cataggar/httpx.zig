@@ -64,41 +64,12 @@ pub const default_mappings = [_]MimeMapping{
     .{ .ext = ".aac", .mime = "audio/aac" },
 };
 
-pub const MimeRegistry = struct {
-    mappings: []const MimeMapping,
-    fallback: []const u8 = "application/octet-stream",
-
-    pub fn init(mappings: []const MimeMapping, fallback: []const u8) MimeRegistry {
-        return .{
-            .mappings = mappings,
-            .fallback = fallback,
-        };
-    }
-
-    pub fn withDefaultFallback(mappings: []const MimeMapping) MimeRegistry {
-        return .{
-            .mappings = mappings,
-            .fallback = "application/octet-stream",
-        };
-    }
-
-    pub fn resolve(self: MimeRegistry, path: []const u8) []const u8 {
-        return resolveWith(path, self.mappings, self.fallback);
-    }
-
-    pub fn resolveOr(self: MimeRegistry, path: []const u8, fallback: []const u8) []const u8 {
-        return resolveWith(path, self.mappings, fallback);
-    }
-};
-
-pub const default_registry = MimeRegistry.withDefaultFallback(&default_mappings);
-
 pub fn resolve(path: []const u8) []const u8 {
-    return default_registry.resolve(path);
+    return resolveOr(path, "application/octet-stream");
 }
 
 pub fn resolveOr(path: []const u8, fallback: []const u8) []const u8 {
-    return default_registry.resolveOr(path, fallback);
+    return resolveWith(path, &default_mappings, fallback);
 }
 
 pub fn resolveWith(path: []const u8, mappings: []const MimeMapping, fallback: []const u8) []const u8 {
@@ -114,20 +85,30 @@ pub fn resolveWith(path: []const u8, mappings: []const MimeMapping, fallback: []
     return fallback;
 }
 
-test "mime registry resolves from default mapping" {
+test "mimeTypeFromPath maps known extensions" {
     try std.testing.expectEqualStrings("text/html; charset=utf-8", resolve("index.html"));
-    try std.testing.expectEqualStrings("application/octet-stream", resolve("asset.bin"));
+    try std.testing.expectEqualStrings("application/json", resolve("api.json"));
+    try std.testing.expectEqualStrings("image/png", resolve("logo.png"));
+    try std.testing.expectEqualStrings("application/octet-stream", resolve("archive.bin"));
 }
 
-test "mime registry supports external mappings" {
+test "mimeTypeFromPath handles case-insensitive extensions" {
+    try std.testing.expectEqualStrings("image/webp", resolve("cover.WEBP"));
+    try std.testing.expectEqualStrings("application/wasm", resolve("runtime.WaSm"));
+}
+
+test "mimeTypeFromPathOr supports custom fallback" {
+    try std.testing.expectEqualStrings("application/x-custom", resolveOr("asset.unknownext", "application/x-custom"));
+    try std.testing.expectEqualStrings("application/octet-stream", resolveOr("site.unknown", "application/octet-stream"));
+}
+
+test "mimeTypeFromPathWith supports external mappings" {
     const custom = [_]MimeMapping{
         .{ .ext = ".zig", .mime = "text/x-zig" },
         .{ .ext = ".tmpl", .mime = "text/x-template" },
     };
 
-    const registry = MimeRegistry.withDefaultFallback(&custom);
-
-    try std.testing.expectEqualStrings("text/x-zig", registry.resolve("main.zig"));
-    try std.testing.expectEqualStrings("text/x-template", registry.resolve("view.TMPL"));
-    try std.testing.expectEqualStrings("application/octet-stream", registry.resolve("blob.unknown"));
+    try std.testing.expectEqualStrings("text/x-zig", resolveWith("main.zig", &custom, "application/octet-stream"));
+    try std.testing.expectEqualStrings("text/x-template", resolveWith("view.TMPL", &custom, "application/octet-stream"));
+    try std.testing.expectEqualStrings("application/octet-stream", resolveWith("asset.unknown", &custom, "application/octet-stream"));
 }

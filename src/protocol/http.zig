@@ -79,24 +79,9 @@ pub const Http1Connection = struct {
 
     /// Serializes and writes the request to the underlying connection.
     fn writeRequest(self: *Self, req: *const Request) !void {
-        const method_str = req.method.toString();
-        const path = req.uri.path;
-        const version_str = req.version.toString();
-
-        try self.writer.print("{s} {s}", .{ method_str, path });
-        if (req.uri.query) |q| {
-            try self.writer.print("?{s}", .{q});
-        }
-        try self.writer.print(" {s}\r\n", .{version_str});
-
-        for (req.headers.entries.items) |h| {
-            try self.writer.print("{s}: {s}\r\n", .{ h.name, h.value });
-        }
-        try self.writer.writeAll("\r\n");
-
-        if (req.body) |body| {
-            try self.writer.writeAll(body);
-        }
+        const formatted = try formatRequest(req, self.allocator);
+        defer self.allocator.free(formatted);
+        try self.writer.writeAll(formatted);
     }
 
     /// parse and construct the response object from the network stream.

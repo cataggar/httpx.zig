@@ -19,7 +19,7 @@
     - JSON helpers.
 - **Concurrency**: Built-in thread pool and async primitives (`all`, `any`, `race`).
 - **Security**: TLS/SSL support (via `std.crypto` or system libraries) with custom CA handling.
-- **Explicit Root Helpers**: Top-level aliases for requests (`fetch/send/...`), concurrency (`first/fastest/settled`), networking (`resolveAddress`, `parseAndResolveAddress`, `netInit/netDeinit`), and MIME detection (`mimeTypeFromPath`, `mimeTypeFromPathOr`, `mimeTypeFromPathWith`) with external mapping support via `MimeMapping`/`MimeRegistry`.
+- **Explicit Root Helpers**: Top-level aliases for requests (`fetch/send/...`), concurrency (`first/fastest/settled`), networking (`resolveAddress`, `parseAndResolveAddress`, `netInit/netDeinit`), and MIME detection (`mimeTypeFromPath`, `mimeTypeFromPathOr`, `mimeTypeFromPathWith`) with external mapping support via `MimeMapping`.
 
 ::: warning Custom HTTP/2 & HTTP/3 Implementation
 Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx.zig implements these protocols entirely from scratch**, including HPACK (RFC 7541), QPACK (RFC 9204), HTTP/2 framing (RFC 7540), and QUIC transport (RFC 9000).
@@ -30,9 +30,9 @@ Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx
 - **Zig Version**: 0.16.0 or later
 - **Operating System**: Windows, Linux, or macOS
 
-::: warning v0.1.1 release and Zig 0.15 deprecation
-`v0.1.1` is the current release and targets Zig `0.16.0+`.
-`v0.1.0` is the previous stable release for the immediate prior `0.1.x` line.
+::: warning v0.1.2 release and Zig 0.15 deprecation
+`v0.1.2` is the current release and targets Zig `0.16.0+`.
+`v0.1.1` is the previous stable release for the immediate prior `0.1.x` line.
 Zig `0.15` support is legacy and remains available only through `0.0.7`.
 The HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads is included in this release.
 If you are upgrading from `0.0.7`, review `/CHANGELOG` before migration.

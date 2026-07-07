@@ -31,6 +31,7 @@ zig build example-http3_example -Dtarget=aarch64-macos
 - [SOCKS5h Proxy](/examples/socks5h-proxy): Understand remote DNS resolution through a SOCKS5h proxy.
 - [Simplified API Aliases](/examples/simplified-api-aliases): Use short top-level helper APIs with local loopback success mode by default.
 - [Simple Server](/examples/simple-server): Start a minimal HTTP server.
+- [Thread Pool / Async Server](/examples/async-server-example): Start a concurrent HTTP server with thread pool connection dispatching.
 - [Router Example](/examples/router-example): Route params and grouped endpoints.
 - [Middleware Example](/examples/middleware-example): Chain middleware with shared behavior.
 - [Streaming](/examples/streaming): Stream data responses.

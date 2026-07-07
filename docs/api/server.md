@@ -47,7 +47,7 @@ var server = httpx.Server.initWithConfig(allocator, .{
 | `keep_alive_timeout_ms` | `u64` | `60000` | Timeout for subsequent requests on a keep-alive connection. |
 | `keep_alive` | `bool` | `true` | Enable HTTP Keep-Alive. |
 | `max_connections` | `u32` | `1000` | Max concurrent connections. |
-| `threads` | `u32` | `0` | Reserved for future thread configuration. |
+| `threads` | `u32` | `0` | Number of worker threads. `0` runs requests sequentially (single-threaded). `> 0` routes accepted connections through a task `Executor` thread pool of the specified size. |
 | `http2_enabled` | `bool` | `false` | Enable HTTP/2 server runtime path. |
 | `http3_enabled` | `bool` | `false` | Enable HTTP/3 server runtime path (UDP transport). |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS frame defaults and limits. |

@@ -71,7 +71,7 @@ The root module re-exports core types and convenience helpers so most apps can i
 - `httpx.mimeTypeFromPath(...)`
 - `httpx.mimeTypeFromPathOr(...)`
 - `httpx.mimeTypeFromPathWith(...)`
-- `httpx.MimeMapping` / `httpx.MimeRegistry`
+- `httpx.MimeMapping`
 - `httpx.defaultMimeMappings`
 - `httpx.encodeVarInt(...)`
 - `httpx.decodeVarInt(...)`

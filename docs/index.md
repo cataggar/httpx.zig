@@ -60,9 +60,9 @@ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 ## Install
 
-::: warning v0.1.1 release and Zig 0.15 deprecation
-`v0.1.1` is the current release and targets Zig `0.16.0+`.
-`v0.1.0` is the previous stable release for the immediate prior `0.1.x` line.
+::: warning v0.1.2 release and Zig 0.15 deprecation
+`v0.1.2` is the current release and targets Zig `0.16.0+`.
+`v0.1.1` is the previous stable release for the immediate prior `0.1.x` line.
 Zig `0.15` support is legacy and remains available only through `0.0.7`.
 The HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads is included in this release.
 If you are upgrading from `0.0.7`, review `/CHANGELOG` first and refresh your dependency pin/hash.
@@ -70,16 +70,16 @@ If you are upgrading from `0.0.7`, review `/CHANGELOG` first and refresh your de
 
 Choose one of these installation methods:
 
-1. Latest release (0.1.1)
+1. Latest release (0.1.2)
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
+```
+
+2. Previous stable release (0.1.1)
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
-```
-
-2. Previous stable release (0.1.0)
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.0.tar.gz
 ```
 
 3. Legacy Zig 0.15 support (0.0.7)
@@ -103,7 +103,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz",
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz",
     .hash = "...",
   },
 },
@@ -114,8 +114,20 @@ httpx.zig is built with production-readiness as a core goal. It is still a relat
 :::
 
 ::: tip Related Zig Projects
+- For **env.zig** (.env parsing), check out **[env.zig](https://github.com/muhammad-fiaz/env.zig)**.
+- For **TUI** support, check out **[tui.zig](https://github.com/muhammad-fiaz/tui.zig)**.
+- For **ZON file format** support, check out **[zon.zig](https://github.com/muhammad-fiaz/zon.zig)**.
+- For **spinners/loading/progress bar** support, check out **[loaders.zig](https://github.com/muhammad-fiaz/loaders.zig)**.
+- For **MCP** support, check out **[mcp.zig](https://github.com/muhammad-fiaz/mcp.zig)**.
+- For **args parsing** support, check out **[args.zig](https://github.com/muhammad-fiaz/args.zig)**.
+- For **HTTP client/server** support, check out **[httpx.zig](https://github.com/muhammad-fiaz/httpx.zig)**.
 - For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
 - For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
+- For **archive/compression** support, check out **[archive.zig](https://github.com/muhammad-fiaz/archive.zig)**.
+- For **compression file format** support, check out **[zigx](https://github.com/muhammad-fiaz/zigx)**.
+- For **file downloading** support, check out **[downloader.zig](https://github.com/muhammad-fiaz/downloader.zig)**.
+- For **update checker/auto-updater** support, check out **[updater.zig](https://github.com/muhammad-fiaz/updater.zig)**.
+- For **numerical computing** support, check out **[num.zig](https://github.com/muhammad-fiaz/num.zig)**.
 - For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
 - For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
 :::
@@ -189,6 +201,7 @@ Available examples (see the `/examples` folder):
 - `session_example.zig`: TTL-based session store with server integration
 - `health_check_example.zig`: liveness and readiness probe middleware
 - `proxy_example.zig`: HTTP proxy and SOCKS5h tunneling
+- `async_server_example.zig`: server thread pool concurrency and request handling on background workers
 - `request_response_customization.zig`: request and response builder patterns
 - `http_auth_helpers.zig`: Bearer and Basic auth helpers
 

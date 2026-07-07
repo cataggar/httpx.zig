@@ -214,7 +214,7 @@ gtag('config', '${GA_ID}');`,
           "priceCurrency": "USD"
         },
         "downloadUrl": "https://github.com/muhammad-fiaz/httpx.zig",
-        "softwareVersion": "0.1.0",
+        "softwareVersion": "0.1.2",
         "license": "https://opensource.org/licenses/MIT"
       });
     } else {
@@ -355,6 +355,7 @@ gtag('config', '${GA_ID}');`,
           { text: "SOCKS5h Proxy", link: "/examples/socks5h-proxy" },
           { text: "Simplified API Aliases", link: "/examples/simplified-api-aliases" },
           { text: "Simple Server", link: "/examples/simple-server" },
+          { text: "Thread Pool / Async Server", link: "/examples/async-server-example" },
           { text: "Router Example", link: "/examples/router-example" },
           { text: "Middleware Example", link: "/examples/middleware-example" },
           { text: "Streaming", link: "/examples/streaming" },

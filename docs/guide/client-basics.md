@@ -185,10 +185,14 @@ pub const RequestOptions = struct {
     timeout_ms: ?u64 = null,                   // Request-specific timeout
     follow_redirects: ?bool = null,            // Override redirect policy
     version: ?httpx.Version = null,            // Optional per-request protocol override
+    proxy: ?httpx.Proxy = null,                // Per-request forward proxy override
+    verify_ssl: ?bool = null,                  // Per-request SSL verification toggle
+    keep_alive: ?bool = null,                  // Per-request connection reuse control
+    unix_socket_path: ?[]const u8 = null,      // Per-request Unix Domain Socket path
 };
 ```
 
-All fields are optional customizations. Passing `.{}` keeps defaults implicit.
+All fields are optional customizations. Per-request overrides allow complete control over proxy routing, security verification, connection persistence, and socket routing on a per-request basis without modifying the shared client config. Passing `.{}` keeps defaults implicit.
 
 ## Proxy Configuration
 

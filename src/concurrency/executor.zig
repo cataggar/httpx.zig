@@ -93,6 +93,62 @@ pub const Executor = struct {
         self.cond.signal(threadIo());
     }
 
+    /// Tries to submit a task without blocking.
+    /// Returns error.WouldBlock if the mutex is locked,
+    /// or error.TaskQueueFull if the queue is full.
+    pub fn trySubmit(self: *Self, task: Task) !void {
+        if (!self.mutex.tryLock()) {
+            return error.WouldBlock;
+        }
+        defer self.mutex.unlock(threadIo());
+
+        if (self.tasks.items.len >= self.config.task_queue_size) {
+            return ExecutorError.TaskQueueFull;
+        }
+
+        try self.tasks.append(self.allocator, task);
+        self.cond.signal(threadIo());
+    }
+
+    /// Submits a task and triggers a callback when completed.
+    pub fn submitWithCallback(
+        self: *Self,
+        task: Task,
+        callback: *const fn (?*anyopaque) void,
+        cb_context: ?*anyopaque,
+    ) !void {
+        const WrappedContext = struct {
+            original_task: Task,
+            callback: *const fn (?*anyopaque) void,
+            cb_context: ?*anyopaque,
+            allocator: Allocator,
+
+            fn wrapper(ctx: ?*anyopaque) void {
+                const self_ctx: *@This() = @ptrCast(@alignCast(ctx.?));
+                self_ctx.original_task.func(self_ctx.original_task.context);
+                self_ctx.callback(self_ctx.cb_context);
+                self_ctx.allocator.destroy(self_ctx);
+            }
+        };
+
+        const wrapped = try self.allocator.create(WrappedContext);
+        wrapped.* = .{
+            .original_task = task,
+            .callback = callback,
+            .cb_context = cb_context,
+            .allocator = self.allocator,
+        };
+
+        self.submit(.{
+            .func = WrappedContext.wrapper,
+            .context = wrapped,
+            .priority = task.priority,
+        }) catch |err| {
+            self.allocator.destroy(wrapped);
+            return err;
+        };
+    }
+
     /// Submits a function for execution.
     pub fn execute(self: *Self, func: TaskFn, context: ?*anyopaque) !void {
         try self.submit(.{ .func = func, .context = context });
@@ -296,4 +352,59 @@ test "Executor executeAll and helpers" {
 
     exec.runAll();
     try std.testing.expectEqual(@as(u32, 2), counter);
+}
+
+test "Executor trySubmit" {
+    const allocator = std.testing.allocator;
+    var exec = Executor.initWithConfig(allocator, .{ .task_queue_size = 2 });
+    defer exec.deinit();
+
+    var counter: u32 = 0;
+    const Counter = struct {
+        fn increment(ctx: ?*anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(ctx.?));
+            c.* += 1;
+        }
+    };
+
+    try exec.trySubmit(.{ .func = Counter.increment, .context = &counter });
+    try exec.trySubmit(.{ .func = Counter.increment, .context = &counter });
+
+    // third submission should fail with TaskQueueFull
+    const err = exec.trySubmit(.{ .func = Counter.increment, .context = &counter });
+    try std.testing.expectError(error.TaskQueueFull, err);
+
+    exec.runAll();
+    try std.testing.expectEqual(@as(u32, 2), counter);
+}
+
+test "Executor submitWithCallback" {
+    const allocator = std.testing.allocator;
+    var exec = Executor.init(allocator);
+    defer exec.deinit();
+
+    var task_counter: u32 = 0;
+    var cb_counter: u32 = 0;
+
+    const Work = struct {
+        fn run(ctx: ?*anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(ctx.?));
+            c.* += 1;
+        }
+        fn callback(ctx: ?*anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(ctx.?));
+            c.* += 1;
+        }
+    };
+
+    try exec.submitWithCallback(
+        .{ .func = Work.run, .context = &task_counter },
+        Work.callback,
+        &cb_counter,
+    );
+
+    exec.runAll();
+
+    try std.testing.expectEqual(@as(u32, 1), task_counter);
+    try std.testing.expectEqual(@as(u32, 1), cb_counter);
 }

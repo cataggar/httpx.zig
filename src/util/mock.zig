@@ -39,6 +39,7 @@ pub const Stub = struct {
     status: u16,
     content_type: []const u8,
     body: []const u8,
+    headers: ?[]const @import("../core/headers.zig").Header = null,
 };
 
 /// A recorded incoming request.
@@ -79,9 +80,6 @@ pub const MockServer = struct {
         self.server.global(globalHandler);
 
         self.thread = try self.server.listenInBackground();
-
-        // Wait briefly for the server to bind
-        std.Thread.sleep(50_000_000); // 50ms
         self.port = self.server.listeningPort();
 
         // Store self reference for the handler (via a comptime global)
@@ -115,6 +113,27 @@ pub const MockServer = struct {
             .status = status_code,
             .content_type = content_type,
             .body = body,
+            .headers = null,
+        }) catch {};
+    }
+
+    /// Registers a stub response with custom headers.
+    pub fn stubWithHeaders(
+        self: *Self,
+        method: types.Method,
+        path: []const u8,
+        status_code: u16,
+        content_type: []const u8,
+        body: []const u8,
+        headers: []const @import("../core/headers.zig").Header,
+    ) void {
+        self.stubs.append(.{
+            .method = method,
+            .path = path,
+            .status = status_code,
+            .content_type = content_type,
+            .body = body,
+            .headers = headers,
         }) catch {};
     }
 
@@ -159,6 +178,11 @@ fn globalHandler(ctx: *server_mod.Context) anyerror!server_mod.Response {
             _ = try ctx.response.header("Content-Type", s.content_type);
             _ = ctx.response.status(s.status);
             _ = ctx.response.body(s.body);
+            if (s.headers) |hdrs| {
+                for (hdrs) |h| {
+                    _ = try ctx.response.header(h.name, h.value);
+                }
+            }
             return ctx.response.build();
         }
     }
@@ -170,4 +194,31 @@ test "MockServer types compile" {
     _ = MockServer;
     _ = Stub;
     _ = RecordedRequest;
+}
+
+test "MockServer with custom headers" {
+    const allocator = std.testing.allocator;
+    var mock = try MockServer.init(allocator);
+    defer mock.deinit();
+
+    const custom_headers = [_]@import("../core/headers.zig").Header{
+        .{ .name = "X-Mock-Header", .value = "Value1" },
+        .{ .name = "Server", .value = "MockServer/1.2" },
+    };
+
+    mock.stubWithHeaders(.GET, "/custom", 200, "text/plain", "OK", &custom_headers);
+
+    const client_mod = @import("../client/client.zig");
+    var client = client_mod.Client.init(allocator);
+    defer client.deinit();
+
+    const url = mock.urlFor("/custom");
+    defer allocator.free(url);
+
+    var resp = try client.get(url, .{});
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("Value1", resp.headers.get("X-Mock-Header").?);
+    try std.testing.expectEqualStrings("MockServer/1.2", resp.headers.get("Server").?);
 }

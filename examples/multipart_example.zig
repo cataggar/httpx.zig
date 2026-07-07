@@ -104,5 +104,53 @@ pub fn main() !void {
     std.debug.print("Input:    \"{s}\"\n", .{quoted_ct});
     std.debug.print("Boundary: \"{s}\"\n", .{quoted_b orelse "(none)"});
 
+    // 6. Client-Side RequestOptions Multipart upload integration
+    std.debug.print("\n--- Client RequestOptions Integration ---\n", .{});
+
+    var client = httpx.Client.init(allocator);
+    defer client.deinit();
+
+    const fields = [_]httpx.MultipartField{
+        .{ .name = "user", .value = "bob" },
+    };
+    const files = [_]httpx.MultipartFile{
+        .{ .name = "attachment", .filename = "resume.html", .data = "resumedata" },
+    };
+
+    const reqOpts = httpx.RequestOptions.defaults()
+        .withMultipartFields(&fields)
+        .withMultipartFiles(&files)
+        .withMultipartBoundary("clientBoundary999");
+    
+    // Demonstrate how the client parses/formats this request options internally
+    var req = try httpx.Request.init(allocator, .POST, "http://localhost/upload");
+    defer req.deinit();
+
+    const boundary_opts = reqOpts.multipart_boundary orelse "----httpxBoundary1234567890";
+    var cli_builder = httpx.MultipartBuilder.init(allocator, boundary_opts);
+    defer cli_builder.deinit();
+
+    if (reqOpts.multipart_fields) |flds| {
+        for (flds) |field| {
+            try cli_builder.addField(field.name, field.value);
+        }
+    }
+    if (reqOpts.multipart_files) |fls| {
+        for (fls) |file| {
+            const resolved_mime = file.content_type orelse httpx.mimeTypeFromPathOr(file.filename, "application/octet-stream");
+            try cli_builder.addFile(file.name, file.filename, resolved_mime, file.data);
+        }
+    }
+    const cli_body = try cli_builder.build();
+    defer allocator.free(cli_body);
+    try req.setBody(cli_body);
+
+    const cli_ct = try cli_builder.contentType();
+    defer allocator.free(cli_ct);
+    try req.headers.set("Content-Type", cli_ct);
+
+    std.debug.print("Formatted Content-Type: {s}\n", .{req.headers.get("Content-Type").?});
+    std.debug.print("Formatted Body contents:\n{s}", .{req.body.?});
+
     std.debug.print("\n=== Multipart Example Complete ===\n", .{});
 }

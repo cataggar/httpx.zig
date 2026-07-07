@@ -28,13 +28,6 @@
 
 `httpx.zig` is a modern, high-performance HTTP library for Zig, providing everything needed to build fast and reliable networked applications, including HTTP clients, servers, APIs, web services, reverse proxies, and full-featured websites.
 
-**Related Zig projects:**
-
-- For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
-- For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
-- For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
-- For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
-
 > [!TIP]
 > If you build with httpx.zig, make sure to give it a star. ⭐
 
@@ -51,6 +44,25 @@
 > - **QUIC** transport framing (RFC 9000) for HTTP/3
 > - **HTTP/3 high-level client and server runtime paths** over UDP + QUIC/HTTP3/QPACK primitives
 > - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
+
+**Related Zig projects:**
+
+- For **env.zig** (.env parsing), check out **[env.zig](https://github.com/muhammad-fiaz/env.zig)**.
+- For **TUI** support, check out **[tui.zig](https://github.com/muhammad-fiaz/tui.zig)**.
+- For **ZON file format** support, check out **[zon.zig](https://github.com/muhammad-fiaz/zon.zig)**.
+- For **spinners/loading/progress bar** support, check out **[loaders.zig](https://github.com/muhammad-fiaz/loaders.zig)**.
+- For **MCP** support, check out **[mcp.zig](https://github.com/muhammad-fiaz/mcp.zig)**.
+- For **args parsing** support, check out **[args.zig](https://github.com/muhammad-fiaz/args.zig)**.
+- For **HTTP client/server** support, check out **[httpx.zig](https://github.com/muhammad-fiaz/httpx.zig)**.
+- For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
+- For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
+- For **archive/compression** support, check out **[archive.zig](https://github.com/muhammad-fiaz/archive.zig)**.
+- For **compression file format** support, check out **[zigx](https://github.com/muhammad-fiaz/zigx)**.
+- For **file downloading** support, check out **[downloader.zig](https://github.com/muhammad-fiaz/downloader.zig)**.
+- For **update checker/auto-updater** support, check out **[updater.zig](https://github.com/muhammad-fiaz/updater.zig)**.
+- For **numerical computing** support, check out **[num.zig](https://github.com/muhammad-fiaz/num.zig)**.
+- For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
+- For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
 
 ---
 
@@ -148,20 +160,20 @@ zig build -Dtarget=x86-windows
 
 ### Method 1: Zig Fetch (Recommended)
 
-**Latest Release (v0.1.1)**
+**Latest Release (v0.1.2)**
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
+```
+
+**Previous Stable Release (v0.1.1)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
 ```
 
-**Previous Stable Release (v0.1.0)**
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.0.tar.gz
-```
-
 > [!WARNING]
-> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.1**.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.2**.
 
 ### Method 2: Zig Fetch (Main Branch)
 
@@ -178,7 +190,7 @@ Add the dependency to your `build.zig.zon` file.
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz",
         .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
     },
 },

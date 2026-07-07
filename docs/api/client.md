@@ -77,7 +77,7 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.1.1"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.1.2"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
@@ -294,6 +294,10 @@ Per-request overrides for configuration.
 | `timeout_ms` | `?u64` | `null` | Request-specific timeout override for connect, read, and write phases. |
 | `follow_redirects` | `?bool` | `null` | Override client redirect setting. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
+| `proxy` | `?Proxy` | `null` | Per-request forward proxy override. |
+| `verify_ssl` | `?bool` | `null` | Per-request SSL verification toggle override. |
+| `keep_alive` | `?bool` | `null` | Per-request connection pool reuse toggle override. |
+| `unix_socket_path` | `?[]const u8` | `null` | Per-request Unix Domain Socket path routing override. |
 
 Unset request-option fields stay `null`, meaning client-level defaults are used implicitly.
 
@@ -317,7 +321,9 @@ const opts = httpx.RequestOptions.defaults()
     .withQueryParams(&.{ .{ "page", "1" } })
     .withTimeoutMs(10_000)
     .withHttp2()
-    .withFollowRedirects(true);
+    .withFollowRedirects(true)
+    .withSslVerification(false)
+    .withKeepAlive(false);
 
 var res = try client.get("/users", opts);
 defer res.deinit();
@@ -338,6 +344,10 @@ Available helpers:
 - `withVersion(version)`
 - `withHttp2()`
 - `withHttp3()`
+- `withProxy(proxy)`
+- `withSslVerification(bool)`
+- `withKeepAlive(bool)`
+- `withUnixSocket(path)`
 
 ## Response
 

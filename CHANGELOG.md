@@ -6,18 +6,42 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- Fixed mojibake console output on Windows (`ΓåÆ` instead of `→`) in `websocket_example.zig`, `session_example.zig`, and `health_check_example.zig` by replacing multi-byte UTF-8 arrow characters with ASCII `->`. Windows PowerShell/cmd default to codepage 1252 which cannot render U+2192.
-- Fixed `udp_local.zig` printing raw Zig struct for the UDP source address. The sender address is now formatted as a human-readable `ip:port` string using `Address.format`.
-- Fixed `multipart_example.zig` printing raw binary bytes (PNG magic header) as text for non-text MIME parts. Binary parts are now displayed as `<N bytes binary>` instead of garbage characters.
-- Fixed `unix.zig` `INVALID_SOCKET` comparison on Windows using pointer equality which could fail with certain Zig pointer-sized `socket_t` types. The comparison now uses integer arithmetic matching `socket.zig`'s approach.
-- Improved `unix_socket_example.zig` error messages to distinguish Windows-specific AF_UNIX limitations (build 17061+ / Developer Mode) from generic socket failures.
+
 
 ### Changed
-- `unix_socket_example.zig` now prints the current platform name and gives platform-specific guidance when Unix domain sockets are unavailable.
-- Updated README.md feature table to note that Unix domain sockets on Windows require build 17061+ with Developer Mode.
-- Updated `docs/index.md` examples list with all examples and the Unix socket platform note.
-- Updated `docs/guide/installation.md` platform support table to document per-OS Unix domain socket availability.
 
+
+## [0.1.2] - 07-07-2026
+
+### Added
+- Added client-side `RequestOptions` multipart helpers (`withMultipartFields`, `withMultipartFiles`, `withMultipartBoundary`), enabling simple, python-like fluent syntax for form fields and file uploads with automatic out-of-the-box MIME type guessing.
+- Added client-side `RequestOptions` configuration overrides (`withProxy`, `withSslVerification`, `withKeepAlive`, `withUnixSocket`) to customize connections, proxies, socket routing, and TLS validation behavior on a per-request basis.
+- Added `trySubmit` non-blocking task submission and `submitWithCallback` asynchronous completion callbacks to the task `Executor` in `src/concurrency/executor.zig`.
+- Added a full `async_server_example.zig` demonstrating server thread pool concurrency and request handling on background workers.
+- Added custom headers support in `MockServer` stubs and request matching, allowing integration tests to stub responses with custom response header fields using `stubWithHeaders`.
+
+### Changed
+- Bumped project version to `0.1.2`.
+- Advanced the previous stable release version configuration from `0.1.0` to `0.1.1` across README, API, and installation guides.
+- Expanded the Related Zig Projects list across README.md and documentation index.
+- Simplified GitHub Actions `release.yml` workflow by removing testing and platform builds, relying on automatic release notes generation.
+- Re-architected MIME resolution to be simple, direct, and zero-config out-of-the-box. Reverted the complex `MimeRegistry` and `DynamicMimeRegistry` class abstractions.
+- Restored fast, zero-allocation root helpers `mimeTypeFromPath`, `mimeTypeFromPathOr`, and `mimeTypeFromPathWith` for out-of-the-box static-file serving and file resolution.
+- Integrated the task `Executor` thread pool directly into `src/server/server.zig` connection listeners. When `config.threads > 0`, the server now routes connection tasks through the thread pool instead of spawning raw unbounded threads, preventing thread starvation and improving connection latency under high concurrency.
+- Enhanced server listener loops to avoid rebinding sockets/listeners if already bound/initialized, enabling pre-bound testing patterns.
+- Pre-bound server TCP/Unix listeners directly on caller thread in `listenInBackground()`, avoiding background thread binding race conditions and eliminating hardcoded sleep latency in test server initializations.
+- Replaced multi-byte UTF-8 arrows with ASCII `->` in console example outputs to fix mojibake on Windows.
+- Formatted UDP source address as ip:port in `udp_local.zig`.
+- Displayed binary multipart data as `<N bytes binary>` instead of garbage text in examples.
+- Refined error reporting and platform check warnings for Unix sockets on Windows.
+
+### Fixed
+- Fixed Unix socket `INVALID_SOCKET` comparison on Windows to use integer comparison instead of pointer equality.
+- Fixed backlog parameter type signature in Unix socket POSIX listener on Linux targets.
+
+### Optimized
+- Optimized `Http1Connection.writeRequest` in `src/protocol/http.zig` by buffering the formatted HTTP headers and performing a single write operation, reducing syscall overhead.
+- Optimized `MultipartBuilder` to perform direct formatted writes using Zig 0.16.0 standard library `ArrayList.print` method, eliminating all temporary heap allocations (`allocPrint` followed by `appendSlice` and `free`) when compiling boundaries, fields, and headers.
 
 
 ## [0.1.1] - 27-06-2026
@@ -48,6 +72,10 @@ All notable changes to this project are documented in this file.
 - Aligned top-level package request wrappers (`get`, `getWithAllocator`, `fetch`, `fetchWithAllocator`) to accept `RequestOptions` for consistency with all other HTTP verb wrappers.
 - Expanded documentation coverage for client/server/network/protocol/sockets, proxy support, JSON helpers, logging callbacks, and the new `0.1.0` install path.
 - Updated the docs home page SEO title/description, canonical handling, and sitemap coverage.
+- `unix_socket_example.zig` now prints the current platform name and gives platform-specific guidance when Unix domain sockets are unavailable.
+- Updated README.md feature table to note that Unix domain sockets on Windows require build 17061+ with Developer Mode.
+- Updated `docs/index.md` examples list with all examples and the Unix socket platform note.
+- Updated `docs/guide/installation.md` platform support table to document per-OS Unix domain socket availability.
 
 ### Fixed
 - Fixed HTTPS GET requests hanging and returning `ReadFailed` error. The buffered request data in the TLS writer is now explicitly flushed to the network. This addresses [Issue #19](https://github.com/muhammad-fiaz/httpx.zig/issues/19).
@@ -57,6 +85,11 @@ All notable changes to this project are documented in this file.
 - Fixed thread join hangs and socket/listener deinitialization sequence deadlocks in all runtime examples on scope exit.
 - Added comprehensive end-to-end runnable `proxy_example` demonstrating client forward proxying and server reverse proxy middleware.
 - Added unit tests for client-side proxy request formatting and base64 proxy authentication encoding.
+- Fixed mojibake console output on Windows (`ΓåÆ` instead of `→`) in `websocket_example.zig`, `session_example.zig`, and `health_check_example.zig` by replacing multi-byte UTF-8 arrow characters with ASCII `->`. Windows PowerShell/cmd default to codepage 1252 which cannot render U+2192.
+- Fixed `udp_local.zig` printing raw Zig struct for the UDP source address. The sender address is now formatted as a human-readable `ip:port` string using `Address.format`.
+- Fixed `multipart_example.zig` printing raw binary bytes (PNG magic header) as text for non-text MIME parts. Binary parts are now displayed as `<N bytes binary>` instead of garbage characters.
+- Fixed `unix.zig` `INVALID_SOCKET` comparison on Windows using pointer equality which could fail with certain Zig pointer-sized `socket_t` types. The comparison now uses integer arithmetic matching `socket.zig`'s approach.
+- Improved `unix_socket_example.zig` error messages to distinguish Windows-specific AF_UNIX limitations (build 17061+ / Developer Mode) from generic socket failures.
 
 ## [0.1.0] - 18-04-2026
 

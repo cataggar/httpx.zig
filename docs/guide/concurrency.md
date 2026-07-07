@@ -142,6 +142,33 @@ var data = MyData{ .val = 123 };
 try exec.execute(heavyWork, &data);
 ```
 
+#### Non-blocking task submission (`trySubmit`)
+
+To submit a task without blocking if the task queue is locked or full, use `trySubmit`:
+
+```zig
+try exec.trySubmit(.{
+    .func = heavyWork,
+    .context = &data,
+});
+```
+
+#### Task completion callbacks (`submitWithCallback`)
+
+You can submit a task and register a completion callback function using `submitWithCallback`:
+
+```zig
+fn callback(ctx: ?*anyopaque) void {
+    // Runs after heavyWork completes
+}
+
+try exec.submitWithCallback(
+    .{ .func = heavyWork, .context = &data },
+    callback,
+    &callback_data_context,
+);
+```
+
 ### Using Executor as Explicit Concurrency Workers
 
 You can pass the `Executor` directly to concurrent request calls:

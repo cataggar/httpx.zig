@@ -10,81 +10,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Cache Zig build
-        uses: actions/cache@v6
-        with:
-          path: .zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ runner.os }}-
-      - name: Run tests
-        run: zig build test
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
-          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
-
-  build-library:
-    name: Build (${{ matrix.target }})
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-windows
-          - x86-windows
-          - x86_64-linux
-          - x86-linux
-          - aarch64-linux
-          - x86_64-macos
-          - aarch64-macos
-    steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Cache Zig build
-        uses: actions/cache@v6
-        with:
-          path: .zig-cache
-          key: zig-${{ matrix.target }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ matrix.target }}-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
-          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
-
-      - name: Prepare artifacts
-        run: |
-          mkdir -p release
-          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
-            cp zig-out/lib/httpx.lib release/httpx-${{ matrix.target }}.lib || true
-          else
-            cp zig-out/lib/libhttpx.a release/libhttpx-${{ matrix.target }}.a || true
-          fi
-
-      - name: Upload artifacts
-        run: gh release upload "${{ github.event.release.tag_name }}" release/* --clobber || true
-        env:
-          GH_TOKEN: ${{ github.token }}
-
   update-release:
     name: Update Release
-    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -106,9 +33,8 @@ jobs:
       - name: Update Release Body
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           body: |
-            ${{ github.event.release.body }}
-
             ## Documentation
 
             Full documentation is available at https://muhammad-fiaz.github.io/httpx.zig/
@@ -144,27 +70,4 @@ jobs:
 
             ```zig
             .hash = "${{ steps.calc_hash.outputs.hash }}"
-            ```
-
-            ## Downloads (Prebuilt Library)
-
-            | Platform | Architecture | File |
-            |----------|--------------|------|
-            | Windows | x86_64 | [httpx-x86_64-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/httpx-x86_64-windows.lib) |
-            | Windows | x86 | [httpx-x86-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/httpx-x86-windows.lib) |
-            | Linux | x86_64 | [libhttpx-x86_64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-linux.a) |
-            | Linux | x86 | [libhttpx-x86-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86-linux.a) |
-            | Linux | aarch64 | [libhttpx-aarch64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-linux.a) |
-            | macOS | x86_64 | [libhttpx-x86_64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-macos.a) |
-            | macOS | aarch64 | [libhttpx-aarch64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-macos.a) |
-
-            ### Using Prebuilt Libraries
-
-            1. Download the library for your platform.
-            2. Place it in your project (for example, in a `libs/` folder).
-            3. Update your `build.zig`:
-
-            ```zig
-            exe.addLibraryPath(b.path("libs"));
-            exe.linkSystemLibrary("httpx");
             ```
