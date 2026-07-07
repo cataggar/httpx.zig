@@ -2180,6 +2180,9 @@ test "Server with thread pool handles connections" {
         .host = "127.0.0.1",
         .port = 0,
         .threads = 2,
+        .log_fn = &struct {
+            fn log_fn(_: LogLevel, _: []const u8) void {}
+        }.log_fn,
     });
     defer server.deinit();
 

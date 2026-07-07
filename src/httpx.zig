@@ -108,7 +108,6 @@ pub const common = @import("util/common.zig");
 pub const multipart = @import("util/multipart.zig");
 pub const metrics_mod = @import("util/metrics.zig");
 pub const session_mod = @import("util/session.zig");
-pub const mock = @import("util/mock.zig");
 
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
@@ -295,11 +294,6 @@ pub const MetricsCallbackFn = metrics_mod.MetricsCallbackFn;
 pub const SessionStore = session_mod.SessionStore;
 pub const SessionConfig = session_mod.SessionConfig;
 pub const SESSION_ID_LEN = session_mod.SESSION_ID_LEN;
-
-// Mock server exports
-pub const MockServer = mock.MockServer;
-pub const MockStub = mock.Stub;
-pub const RecordedRequest = mock.RecordedRequest;
 
 // Unix socket exports
 pub const UnixSocket = unix.UnixSocket;

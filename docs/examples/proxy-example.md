@@ -23,8 +23,8 @@ With `http`, the client keeps the current forward-proxy behavior and still suppo
 const std = @import("std");
 const httpx = @import("httpx");
 
-fn mockBackendHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    return ctx.text("Hello from Mock Backend!");
+fn backendHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.text("Hello from Backend!");
 }
 
 pub fn main() !void {
@@ -35,14 +35,14 @@ pub fn main() !void {
     const backend_port = 45233;
     const proxy_port = 45234;
 
-    // 1. Start the mock backend server
+    // 1. Start the backend server
     var backend_server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = backend_port,
         .keep_alive = false,
     });
     defer backend_server.deinit();
-    try backend_server.get("/backend-data", mockBackendHandler);
+    try backend_server.get("/backend-data", backendHandler);
 
     const backend_thread = try std.Thread.spawn(.{}, struct {
         fn run(server: *httpx.Server) void {
@@ -85,7 +85,7 @@ pub fn main() !void {
     var client = httpx.Client.initWithConfig(allocator, client_config);
     defer client.deinit();
 
-    // 4. Request the mock backend path through the proxy.
+    // 4. Request the backend path through the proxy.
     const target_url = "http://127.0.0.1:45233/backend-data";
     var response = try client.get(target_url, .{});
     defer response.deinit();
@@ -104,5 +104,5 @@ zig build run-proxy_example
 ## What to Verify
 
 - Client requests are intercepted and successfully routed through the proxy server.
-- The reverse proxy middleware forwards the request to the target mock backend server.
-- Response body text returned matches the mock backend response.
+- The reverse proxy middleware forwards the request to the target backend server.
+- Response body text returned matches the backend response.

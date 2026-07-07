@@ -8,7 +8,7 @@ Execute multiple requests in parallel using dynamic thread workers, sequential e
 const std = @import("std");
 const httpx = @import("httpx");
 
-fn mockHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+fn dataHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text("Hello!");
 }
 
@@ -24,7 +24,7 @@ pub fn main() !void {
         .keep_alive = false,
     });
     defer server.deinit();
-    try server.get("/data", mockHandler);
+    try server.get("/data", dataHandler);
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(s: *httpx.Server) void {

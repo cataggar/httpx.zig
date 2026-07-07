@@ -1,6 +1,6 @@
 # Utilities API
 
-Common utilities for buffer management, encoding, multipart, metrics, sessions, and mock testing.
+Common utilities for buffer management, encoding, multipart, metrics, and sessions.
 
 ## Shared Helpers
 
@@ -187,55 +187,6 @@ In-memory server-side sessions with TTL expiry.
 - `DEFAULT_TTL_MS = 1_800_000` — 30 minutes
 
 Root-level aliases: `httpx.SessionStore`, `httpx.SessionConfig`, `httpx.SESSION_ID_LEN`.
-
-## Mock Server
-
-In-process HTTP mock server for testing.
-
-### `MockServer`
-
-| Method | Description |
-|--------|-------------|
-| `init(allocator)` | Create and start mock server on a random free port |
-| `deinit()` | Stop server, release all resources |
-| `stub(method, path, status, content_type, body)` | Register a stub response |
-| `urlFor(path)` | Return `"http://127.0.0.1:{port}{path}"` |
-| `requestCount()` | Number of recorded requests |
-| `requestAt(index)` | Get a recorded request by index |
-| `clearRecorded()` | Clear all recorded requests |
-
-### `Stub`
-
-| Field | Description |
-|-------|-------------|
-| `method` | HTTP method |
-| `path` | Exact path to match |
-| `status` | Response status code |
-| `content_type` | Response `Content-Type` value |
-| `body` | Response body string |
-
-### `RecordedRequest`
-
-| Field | Description |
-|-------|-------------|
-| `method` | Request method |
-| `path` | Request path |
-| `body` | Request body, or null |
-
-```zig
-var mock = try httpx.MockServer.init(allocator);
-defer mock.deinit();
-
-mock.stub(.GET, "/api/data", 200, "application/json", "[1,2,3]");
-
-var client = httpx.Client.init(allocator);
-defer client.deinit();
-
-var resp = try client.get(mock.urlFor("/api/data"), .{});
-defer resp.deinit();
-// resp.status.code == 200
-// resp.text() == "[1,2,3]"
-```
 
 ## IO Utilities
 

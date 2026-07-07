@@ -32,7 +32,7 @@ jobs:
         run: zig fmt --check src/ examples/ bench/ build.zig
 
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -58,11 +58,19 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .zig-cache
-          key: zig-build-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-build-${{ runner.os }}-
+          key: zig-${{ runner.os }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-
 
-      - name: Run tests
-        run: zig build test --summary all
+      - name: Unit tests
+        shell: bash
+        run: timeout 900 zig build test --summary all
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+
+      - name: Run all examples
+        shell: bash
+        run: timeout 600 zig build run-all-examples
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
@@ -92,6 +100,7 @@ jobs:
           - x86_64-windows
           - x86-windows
           - aarch64-linux
+          - x86-linux
           - riscv64-linux
           - arm-linux-gnueabihf
 
@@ -112,7 +121,7 @@ jobs:
           restore-keys: zig-cross-${{ matrix.target }}-
 
       - name: Install cross-compilation deps
-        if: contains(matrix.target, 'linux') && !startsWith(matrix.target, 'x86_64')
+        if: contains(matrix.target, 'linux') && !startsWith(matrix.target, 'x86')
         run: |
           sudo apt-get update
           case "${{ matrix.target }}" in

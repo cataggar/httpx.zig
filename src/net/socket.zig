@@ -297,11 +297,14 @@ fn posixSend(sock: posix.socket_t, data: []const u8, flags: u32) !usize {
         return @intCast(rc);
     }
 
-    const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), null, 0);
-    if (isNegativeResult(rc)) return error.SendFailed;
-    switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        else => return error.SendFailed,
+    while (true) {
+        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), null, 0);
+        if (isNegativeResult(rc)) return error.SendFailed;
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.SendFailed,
+        }
     }
 }
 
@@ -313,11 +316,14 @@ fn posixRecv(sock: posix.socket_t, buffer: []u8, flags: u32) !usize {
         return @intCast(rc);
     }
 
-    const rc = posix.system.recvfrom(sock, buffer.ptr, buffer.len, @intCast(flags), null, null);
-    if (isNegativeResult(rc)) return error.RecvFailed;
-    switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        else => return error.RecvFailed,
+    while (true) {
+        const rc = posix.system.recvfrom(sock, buffer.ptr, buffer.len, @intCast(flags), null, null);
+        if (isNegativeResult(rc)) return error.RecvFailed;
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.RecvFailed,
+        }
     }
 }
 
@@ -329,11 +335,14 @@ fn posixSendTo(sock: posix.socket_t, data: []const u8, flags: u32, addr_ptr: *co
         return @intCast(rc);
     }
 
-    const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), addr_ptr, addr_len);
-    if (isNegativeResult(rc)) return error.SendFailed;
-    switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        else => return error.SendFailed,
+    while (true) {
+        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), addr_ptr, addr_len);
+        if (isNegativeResult(rc)) return error.SendFailed;
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.SendFailed,
+        }
     }
 }
 

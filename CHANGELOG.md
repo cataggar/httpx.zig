@@ -3,14 +3,6 @@
 All notable changes to this project are documented in this file.
 
 
-## [Unreleased]
-
-### Fixed
-
-
-### Changed
-
-
 ## [0.1.2] - 07-07-2026
 
 ### Added
@@ -18,7 +10,6 @@ All notable changes to this project are documented in this file.
 - Added client-side `RequestOptions` configuration overrides (`withProxy`, `withSslVerification`, `withKeepAlive`, `withUnixSocket`) to customize connections, proxies, socket routing, and TLS validation behavior on a per-request basis.
 - Added `trySubmit` non-blocking task submission and `submitWithCallback` asynchronous completion callbacks to the task `Executor` in `src/concurrency/executor.zig`.
 - Added a full `async_server_example.zig` demonstrating server thread pool concurrency and request handling on background workers.
-- Added custom headers support in `MockServer` stubs and request matching, allowing integration tests to stub responses with custom response header fields using `stubWithHeaders`.
 
 ### Changed
 - Bumped project version to `0.1.2`.
@@ -34,10 +25,19 @@ All notable changes to this project are documented in this file.
 - Formatted UDP source address as ip:port in `udp_local.zig`.
 - Displayed binary multipart data as `<N bytes binary>` instead of garbage text in examples.
 - Refined error reporting and platform check warnings for Unix sockets on Windows.
+- Replaced FakeHttp2Transport and FakeHttp3Transport protocol-level test fakes with real localhost integration tests that exercise the full HTTP/2 and HTTP/3 protocol stacks end-to-end over actual TCP and UDP sockets.
+- Replaced manual bash example-build loop in CI with `zig build run-all-examples`, which runs all 27 self-contained examples sequentially using the build system's built-in dependency ordering.
+- Added `timeout 600` guard on CI example runs and `timeout 900` on unit tests to prevent indefinite hangs.
+- Hardened CI with `actions/cache@v6` and per-job cache keys to avoid cross-job cache contention.
 
 ### Fixed
+- Fixed `posixRecv`, `posixSend`, and `posixSendTo` in `src/net/socket.zig` not retrying on `EINTR` (signal interruption), which could cause spurious read/write failures under load.
 - Fixed Unix socket `INVALID_SOCKET` comparison on Windows to use integer comparison instead of pointer equality.
 - Fixed backlog parameter type signature in Unix socket POSIX listener on Linux targets.
+- Fixed `SO_RCVTIMEO`/`SO_SNDTIMEO` being set on TLS sockets before the TLS handshake completed, which caused spurious `EAGAIN` errors under Linux and produced misleading `ReadFailed` errors for GET requests ([Issue #19](https://github.com/muhammad-fiaz/httpx.zig/issues/19)).
+
+### Removed
+- Removed `src/util/mock.zig` and `MockServer` API entirely. All testing uses real localhost servers with actual TCP/UDP sockets — no mock or fake transport layer.
 
 ### Optimized
 - Optimized `Http1Connection.writeRequest` in `src/protocol/http.zig` by buffering the formatted HTTP headers and performing a single write operation, reducing syscall overhead.
