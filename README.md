@@ -284,7 +284,7 @@ pub fn main() !void {
 ```zig
 // Top-level aliases for concise client code.
 // Allocator is implicit by default.
-var response = try httpx.fetch("https://httpbin.org/get");
+var response = try httpx.fetch("https://httpbin.org/get", .{});
 defer response.deinit();
 
 // Defaults are implicit; pass .{} for default request options.
