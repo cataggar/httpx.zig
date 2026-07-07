@@ -283,7 +283,7 @@ pub const UnixClient = struct {
 };
 
 test "Unix domain socket integration - Client & Server" {
-    if (!is_unix_available) return;
+    if (is_windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = defaultIo();
@@ -293,7 +293,6 @@ test "Unix domain socket integration - Client & Server" {
 
     const Server = @import("../server/server.zig").Server;
     const Client = @import("../client/client.zig").Client;
-    const ClientConfig = @import("../client/client.zig").ClientConfig;
     const Context = @import("../server/server.zig").Context;
     const Response = @import("../core/response.zig").Response;
 
@@ -322,8 +321,10 @@ test "Unix domain socket integration - Client & Server" {
     const dur = std.Io.Duration.fromMilliseconds(50);
     std.Io.sleep(io, dur, .real) catch {};
 
-    var client = Client.initWithConfig(allocator, ClientConfig.defaults()
-        .withUnixSocket(socket_path));
+    var client = Client.initWithConfig(allocator, .{
+        .timeouts = .{ .connect_ms = 5000, .read_ms = 5000, .write_ms = 5000 },
+        .unix_socket_path = socket_path,
+    });
     defer client.deinit();
 
     var resp = client.get("http://localhost/hello", .{}) catch |err| {

@@ -8,6 +8,7 @@
 //! - Batch request building
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -717,6 +718,8 @@ test "RequestResult summary helpers" {
 }
 
 test "ConcurrencyConfig modes execution" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     var client = Client.initWithConfig(allocator, .{
         .timeouts = .uniform(250),

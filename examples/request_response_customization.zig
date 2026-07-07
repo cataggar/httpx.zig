@@ -127,7 +127,9 @@ pub fn main() !void {
     var inspect_response = try client.post(inspect_url, inspect_options);
     defer inspect_response.deinit();
 
-    const inspect_data = try inspect_response.json(InspectResponse, .{});
+    const parsed_inspect = try inspect_response.json(InspectResponse, .{});
+    defer parsed_inspect.deinit();
+    const inspect_data = parsed_inspect.value;
     std.debug.print("Inspect response: method={s} path={s} query={s} accept_json={} is_json={} header={s}\n", .{
         inspect_data.method,
         inspect_data.path,

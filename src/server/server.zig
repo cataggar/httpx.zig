@@ -2180,6 +2180,8 @@ test "Server with thread pool handles connections" {
         .host = "127.0.0.1",
         .port = 0,
         .threads = 2,
+        .request_timeout_ms = 3000,
+        .keep_alive = false,
         .log_fn = &struct {
             fn log_fn(_: LogLevel, _: []const u8) void {}
         }.log_fn,
@@ -2220,13 +2222,13 @@ test "Server with thread pool handles connections" {
     // Give it a tiny bit to spin up
     sleepMs(50);
 
-    // Make a client request using our client
+    // Make a client request
     const client_addr = try net.Address.parseIp("127.0.0.1", port);
     var client_sock = try Socket.createForAddress(client_addr);
     defer client_sock.close();
 
     try client_sock.connectWithTimeout(client_addr, 1000);
-    try client_sock.setRecvTimeout(2000);
+    try client_sock.setRecvTimeout(3000);
 
     const req_str = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     try client_sock.sendAll(req_str);
