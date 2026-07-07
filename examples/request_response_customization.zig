@@ -69,7 +69,7 @@ pub fn main() !void {
     });
     defer server.deinit();
 
-    try server.get("/inspect", inspectHandler);
+    try server.post("/inspect", inspectHandler);
     try server.get("/render", renderHandler);
     try server.get("/redirect", redirectHandler);
 

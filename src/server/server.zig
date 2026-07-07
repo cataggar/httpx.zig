@@ -2175,12 +2175,12 @@ test "Server custom log callback" {
 
 test "Server with thread pool handles connections" {
     const allocator = std.testing.allocator;
+    const Client = @import("../client/client.zig").Client;
 
     var server = Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .threads = 2,
-        .request_timeout_ms = 3000,
         .keep_alive = false,
         .log_fn = &struct {
             fn log_fn(_: LogLevel, _: []const u8) void {}
@@ -2196,52 +2196,27 @@ test "Server with thread pool handles connections" {
 
     try server.get("/hello", handler);
 
-    // Get an ephemeral port assigned
-    const backlog_u32: u32 = @max(server.config.max_connections, 1);
-    const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-    try server.bindTcpListener(backlog);
-
-    const port = server.listeningPort();
-
-    // Start server in background
-    server.running = true;
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(s: *Server) void {
-            s.listenTcp() catch |err| {
-                if (s.running) {
-                    s.log(.err, "server error: {s}\n", .{@errorName(err)});
-                }
-            };
-        }
-    }.run, .{&server});
+    const thread = try server.listenInBackground();
     defer {
         server.stop();
         thread.join();
     }
 
-    // Give it a tiny bit to spin up
     sleepMs(50);
 
-    // Make a client request
-    const client_addr = try net.Address.parseIp("127.0.0.1", port);
-    var client_sock = try Socket.createForAddress(client_addr);
-    defer client_sock.close();
+    const port = server.listeningPort();
+    var client = Client.initWithConfig(allocator, .{
+        .timeouts = .uniform(5000),
+        .keep_alive = false,
+    });
+    defer client.deinit();
 
-    try client_sock.connectWithTimeout(client_addr, 1000);
-    try client_sock.setRecvTimeout(3000);
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/hello", .{port});
+    defer allocator.free(url);
 
-    const req_str = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    try client_sock.sendAll(req_str);
+    var resp = try client.get(url, .{});
+    defer resp.deinit();
 
-    var response_buf: [2048]u8 = undefined;
-    var total_read: usize = 0;
-    for (0..128) |_| {
-        const n = client_sock.recv(response_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-    }
-
-    const response_text = response_buf[0..total_read];
-    try std.testing.expect(std.mem.indexOf(u8, response_text, "hello from worker pool") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response_text, "200 OK") != null);
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("hello from worker pool", resp.text().?);
 }

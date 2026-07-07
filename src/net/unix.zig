@@ -298,6 +298,7 @@ test "Unix domain socket integration - Client & Server" {
 
     var server = Server.initWithConfig(allocator, .{
         .unix_path = socket_path,
+        .keep_alive = false,
         .log_fn = struct {
             fn log(level: @import("../server/server.zig").LogLevel, message: []const u8) void {
                 _ = level;
