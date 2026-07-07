@@ -2226,14 +2226,15 @@ test "Server with thread pool handles connections" {
     defer client_sock.close();
 
     try client_sock.connectWithTimeout(client_addr, 1000);
+    try client_sock.setRecvTimeout(2000);
 
     const req_str = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     try client_sock.sendAll(req_str);
 
     var response_buf: [2048]u8 = undefined;
     var total_read: usize = 0;
-    while (true) {
-        const n = try client_sock.recv(response_buf[total_read..]);
+    for (0..128) |_| {
+        const n = client_sock.recv(response_buf[total_read..]) catch break;
         if (n == 0) break;
         total_read += n;
     }

@@ -108,7 +108,7 @@ fn parseIp6(str: []const u8) ?[16]u8 {
         return null;
     }
 
-    var groups: [8]u16 = .{0} ** 8;
+    var groups: [8]u16 = std.mem.zeroes([8]u16);
     var group_count: usize = 0;
     var abbreviated_at: ?usize = null;
 

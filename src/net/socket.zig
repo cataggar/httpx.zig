@@ -1238,6 +1238,7 @@ test "UdpSocket send/recv localhost" {
     defer recv_sock.close();
 
     try recv_sock.setReuseAddr(true);
+    try recv_sock.setRecvTimeout(2000);
     try recv_sock.bind(try net.Address.parseIp("127.0.0.1", 0));
     const recv_addr = try recv_sock.getLocalAddress();
 
