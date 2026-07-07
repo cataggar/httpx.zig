@@ -2577,13 +2577,13 @@ test "RequestOptions per-request overrides" {
         .username = null,
         .password = null,
     };
-    
+
     const opts = RequestOptions.defaults()
         .withProxy(proxy)
         .withSslVerification(false)
         .withKeepAlive(false)
         .withUnixSocket("/tmp/test.sock");
-        
+
     try std.testing.expect(opts.proxy != null);
     try std.testing.expectEqualStrings("127.0.0.1", opts.proxy.?.host);
     try std.testing.expectEqual(@as(u16, 8888), opts.proxy.?.port);

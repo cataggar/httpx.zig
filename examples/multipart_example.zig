@@ -121,7 +121,7 @@ pub fn main() !void {
         .withMultipartFields(&fields)
         .withMultipartFiles(&files)
         .withMultipartBoundary("clientBoundary999");
-    
+
     // Demonstrate how the client parses/formats this request options internally
     var req = try httpx.Request.init(allocator, .POST, "http://localhost/upload");
     defer req.deinit();
