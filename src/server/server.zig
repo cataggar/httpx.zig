@@ -646,7 +646,6 @@ pub const Server = struct {
             const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
             try self.bindTcpListener(backlog);
         }
-        if (!self.running) return;
         self.running = true;
 
         if (self.executor) |*e| {
@@ -727,6 +726,7 @@ pub const Server = struct {
     pub fn stop(self: *Self) void {
         self.running = false;
         if (self.listener) |*l| {
+            l.socket.shutdownBoth() catch {};
             l.deinit();
             self.listener = null;
         }
@@ -735,6 +735,7 @@ pub const Server = struct {
             self.udp_socket = null;
         }
         if (self.unix_listener) |*u| {
+            u.socket.shutdownBoth() catch {};
             u.deinit();
             self.unix_listener = null;
         }
@@ -748,7 +749,6 @@ pub const Server = struct {
             const unix_mod = @import("../net/unix.zig");
             self.unix_listener = try unix_mod.UnixListener.init(path);
         }
-        if (!self.running) return;
         self.running = true;
 
         if (self.executor) |*e| {
