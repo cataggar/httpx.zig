@@ -21,6 +21,7 @@ All notable changes to this project are documented in this file.
 - Integrated the task `Executor` thread pool directly into `src/server/server.zig` connection listeners. When `config.threads > 0`, the server now routes connection tasks through the thread pool instead of spawning raw unbounded threads, preventing thread starvation and improving connection latency under high concurrency.
 - Enhanced server listener loops to avoid rebinding sockets/listeners if already bound/initialized, enabling pre-bound testing patterns.
 - Pre-bound server TCP/Unix listeners directly on caller thread in `listenInBackground()`, avoiding background thread binding race conditions and eliminating hardcoded sleep latency in test server initializations.
+- Enhanced `Server.stop()` to shut down TCP listener via `Socket.shutdownBoth()` and Unix listener via `Socket.fromHandle().shutdownBoth()` before `deinit()`, ensuring blocking `accept()` calls are interrupted across all platforms.
 - Replaced multi-byte UTF-8 arrows with ASCII `->` in console example outputs to fix mojibake on Windows.
 - Formatted UDP source address as ip:port in `udp_local.zig`.
 - Displayed binary multipart data as `<N bytes binary>` instead of garbage text in examples.
@@ -36,6 +37,8 @@ All notable changes to this project are documented in this file.
 - Fixed backlog parameter type signature in Unix socket POSIX listener on Linux targets.
 - Fixed `SO_RCVTIMEO`/`SO_SNDTIMEO` being set on TLS sockets before the TLS handshake completed, which caused spurious `EAGAIN` errors under Linux and produced misleading `ReadFailed` errors for GET requests ([Issue #19](https://github.com/muhammad-fiaz/httpx.zig/issues/19)).
 - Fixed noisy "failed command" stderr output in `zig build test` by adding a no-op `log_fn` to the thread pool integration test in `src/server/server.zig`.
+- Fixed server `stop()` not interrupting blocking `accept()` calls on background listener threads. TCP and Unix listener sockets are now shut down before closing, preventing test hangs on Linux/macOS.
+- Fixed `request_response_customization.zig` example: corrected POST/GET method mismatch in the redirect assertion and disabled automatic redirect following to match expected 302 response.
 
 ### Removed
 - Removed `src/util/mock.zig` and `MockServer` API entirely. All testing uses real localhost servers with actual TCP/UDP sockets — no mock or fake transport layer.
