@@ -656,8 +656,7 @@ pub const Server = struct {
         self.log(.info, "Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
         while (self.running) {
-            const listener = self.listener orelse break;
-            const conn = listener.accept() catch |err| {
+            const conn = self.listener.?.accept() catch |err| {
                 if (!self.running) break;
                 self.log(.err, "Accept error: {}\n", .{err});
                 continue;
@@ -759,8 +758,7 @@ pub const Server = struct {
         self.log(.info, "Server listening on Unix socket: {s}\n", .{path});
 
         while (self.running) {
-            const listener = self.unix_listener orelse break;
-            const conn = listener.accept() catch |err| {
+            const conn = self.unix_listener.?.accept() catch |err| {
                 if (!self.running) break;
                 self.log(.err, "Unix Accept error: {}\n", .{err});
                 continue;
