@@ -646,6 +646,7 @@ pub const Server = struct {
             const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
             try self.bindTcpListener(backlog);
         }
+        if (!self.running) return;
         self.running = true;
 
         if (self.executor) |*e| {
@@ -655,7 +656,8 @@ pub const Server = struct {
         self.log(.info, "Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
         while (self.running) {
-            const conn = self.listener.?.accept() catch |err| {
+            const listener = self.listener orelse break;
+            const conn = listener.accept() catch |err| {
                 if (!self.running) break;
                 self.log(.err, "Accept error: {}\n", .{err});
                 continue;
@@ -747,6 +749,7 @@ pub const Server = struct {
             const unix_mod = @import("../net/unix.zig");
             self.unix_listener = try unix_mod.UnixListener.init(path);
         }
+        if (!self.running) return;
         self.running = true;
 
         if (self.executor) |*e| {
@@ -756,7 +759,8 @@ pub const Server = struct {
         self.log(.info, "Server listening on Unix socket: {s}\n", .{path});
 
         while (self.running) {
-            const conn = self.unix_listener.?.accept() catch |err| {
+            const listener = self.unix_listener orelse break;
+            const conn = listener.accept() catch |err| {
                 if (!self.running) break;
                 self.log(.err, "Unix Accept error: {}\n", .{err});
                 continue;
