@@ -735,7 +735,8 @@ pub const Server = struct {
             self.udp_socket = null;
         }
         if (self.unix_listener) |*u| {
-            std.posix.shutdown(u.fd, .{ .send = true, .recv = true }) catch {};
+            var sock = Socket.fromHandle(u.fd);
+            sock.shutdownBoth() catch {};
             u.deinit();
             self.unix_listener = null;
         }
