@@ -16,5 +16,5 @@ test "version has numeric semver core" {
     const parsed = try std.SemanticVersion.parse(version);
     try std.testing.expectEqual(@as(u64, 0), parsed.major);
     try std.testing.expectEqual(@as(u64, 1), parsed.minor);
-    try std.testing.expectEqual(@as(u64, 2), parsed.patch);
+    try std.testing.expectEqual(@as(u64, 3), parsed.patch);
 }

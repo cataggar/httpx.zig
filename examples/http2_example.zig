@@ -197,8 +197,10 @@ fn framingExample(allocator: std.mem.Allocator) !void {
 
     // HTTP/2 frame types
     std.debug.print("\nHTTP/2 frame types:\n", .{});
-    inline for (@typeInfo(httpx.Http2FrameType).@"enum".fields) |field| {
-        std.debug.print("  0x{x:0>2}: {s}\n", .{ field.value, field.name });
+    const ft_names = @typeInfo(httpx.Http2FrameType).@"enum".field_names;
+    const ft_values = @typeInfo(httpx.Http2FrameType).@"enum".field_values;
+    inline for (ft_names, ft_values) |name, value| {
+        std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
     }
 
     std.debug.print("\n", .{});
@@ -243,8 +245,10 @@ fn flowControlExample(allocator: std.mem.Allocator) !void {
 
     // HTTP/2 error codes
     std.debug.print("\nHTTP/2 error codes:\n", .{});
-    inline for (@typeInfo(httpx.Http2ErrorCode).@"enum".fields) |field| {
-        std.debug.print("  0x{x}: {s}\n", .{ field.value, field.name });
+    const ec_names = @typeInfo(httpx.Http2ErrorCode).@"enum".field_names;
+    const ec_values = @typeInfo(httpx.Http2ErrorCode).@"enum".field_values;
+    inline for (ec_names, ec_values) |name, value| {
+        std.debug.print("  0x{x}: {s}\n", .{ value, name });
     }
 
     std.debug.print("\n", .{});

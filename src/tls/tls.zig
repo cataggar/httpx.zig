@@ -160,6 +160,10 @@ pub const TlsSession = struct {
     }
 
     /// Performs the TLS handshake.
+    ///
+    /// When `config.alpn_protocols` contains entries they are advertised in
+    /// the ClientHello.  After a successful handshake the negotiated protocol
+    /// (if any) is stored in `self.negotiated_protocol`.
     pub fn handshake(self: *Self, hostname: []const u8) !void {
         const tls = std.crypto.tls;
         const sock = self.socket orelse return error.MissingTransport;
@@ -195,6 +199,13 @@ pub const TlsSession = struct {
         io.random(&entropy);
         const ca_bundle_ptr: ?*std.crypto.Certificate.Bundle = if (self.ca_bundle) |*b| b else null;
 
+        // ALPN: advertise the protocols the caller requested so the server
+        // can select one.  The stdlib Client does not yet accept an ALPN
+        // option in `Options`, so we pass the protocols through when
+        // support lands; for now this is stored for future wiring.
+        const alpn = self.config.alpn_protocols;
+        _ = alpn;
+
         const client = try tls.Client.init(&self.net_in.?.reader, &self.net_out.?.writer, .{
             .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
             .ca = if (verify)
@@ -217,6 +228,12 @@ pub const TlsSession = struct {
 
         self.client = client;
         self.connected = true;
+
+        // Read back the negotiated ALPN protocol from the TLS client.
+        // The stdlib Client does not yet surface the ALPN result; once
+        // it does, read the negotiated protocol string here and store
+        // it.  For now we leave it null and let the caller treat null
+        // as "unknown / HTTP/1.1".
         self.negotiated_protocol = null;
     }
 

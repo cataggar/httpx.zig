@@ -473,6 +473,8 @@ pub const Http3FrameType = enum(u64) {
     push_promise = 0x05,
     goaway = 0x07,
     max_push_id = 0x0D,
+    max_data = 0x10,
+    max_stream_data = 0x11,
 };
 
 /// Configuration parameters for HTTP/3 connections.
@@ -898,4 +900,29 @@ test "isH2cUpgradeRequest detects valid h2c headers" {
     try headers.set("HTTP2-Settings", "AAMAAABkAAQCAAAAAAIAAAAA");
 
     try std.testing.expect(isH2cUpgradeRequest(&headers));
+}
+
+test "HTTP/2 SETTINGS payload roundtrip with custom values" {
+    const allocator = std.testing.allocator;
+    const settings = Http2Connection.Http2ConnectionSettings{
+        .header_table_size = 8192,
+        .enable_push = false,
+        .max_concurrent_streams = 200,
+        .initial_window_size = 65535,
+        .max_frame_size = 32768,
+        .max_header_list_size = 65535,
+    };
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try encodeSettingsPayload(settings, allocator, &buf);
+
+    var decoded = Http2Connection.Http2ConnectionSettings{};
+    try applySettingsPayload(&decoded, buf.items);
+
+    try std.testing.expectEqual(@as(u32, 8192), decoded.header_table_size);
+    try std.testing.expect(!decoded.enable_push);
+    try std.testing.expectEqual(@as(u32, 200), decoded.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 65535), decoded.initial_window_size);
+    try std.testing.expectEqual(@as(u32, 32768), decoded.max_frame_size);
+    try std.testing.expectEqual(@as(u32, 65535), decoded.max_header_list_size);
 }

@@ -61,6 +61,7 @@ pub const ClientConfig = struct {
     verify_ssl: bool = true,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
+    allow_push: bool = true,
     http2_settings: types.Http2Settings = .{},
     http3_settings: types.Http3Settings = .{},
     keep_alive: bool = true,
@@ -147,6 +148,13 @@ pub const ClientConfig = struct {
         var out = self;
         out.http2_enabled = http2_enabled;
         out.http3_enabled = http3_enabled;
+        return out;
+    }
+
+    /// Returns a copy with HTTP/2 server push allow/deny behavior.
+    pub fn withAllowPush(self: ClientConfig, allow_push: bool) ClientConfig {
+        var out = self;
+        out.allow_push = allow_push;
         return out;
     }
 
@@ -862,17 +870,51 @@ pub const Client = struct {
         }
 
         if (req.uri.isTls()) {
-            const tls_cfg = if (verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            var tls_cfg = if (verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
             var session = TlsSession.init(tls_cfg);
             defer session.deinit();
             session.attachSocket(&socket);
             try session.handshake(host);
 
-            var transport = TlsHttp2Transport{ .session = &session };
-            return self.executeHttp2WithTransport(req, &transport);
+            // Set recv timeout after TLS handshake completes so the
+            // HTTP/2 preface exchange does not hang indefinitely.
+            if (timeouts.read_ms > 0) {
+                try socket.setRecvTimeout(timeouts.read_ms);
+            }
+
+            const negotiated = http.negotiateVersion(session.negotiated_protocol);
+            switch (negotiated) {
+                .http_2 => {
+                    var transport = TlsHttp2Transport{ .session = &session };
+                    return self.executeHttp2WithTransport(req, &transport);
+                },
+                .http_1_1, .http_1_0 => {
+                    // Server selected http/1.1 via ALPN (or ALPN was
+                    // unavailable).  Fall back to HTTP/1.1 over the
+                    // already-established TLS session.
+                    const request_data = try http.formatRequest(req, self.allocator);
+                    defer self.allocator.free(request_data);
+
+                    const w = try session.getWriter();
+                    try w.writeAll(request_data);
+                    try session.flush();
+
+                    const r = try session.getReader();
+                    return self.readResponseFromIo(r);
+                },
+                else => return error.UnsupportedHttpVersion,
+            }
         }
 
         var transport = SocketHttp2Transport{ .socket = &socket };
+
+        // Set recv timeout for the HTTP/2 preface exchange so we
+        // do not hang if the server never responds.
+        if (timeouts.read_ms > 0) {
+            try socket.setRecvTimeout(timeouts.read_ms);
+        }
+
         return self.executeHttp2WithTransport(req, &transport);
     }
 
@@ -917,6 +959,12 @@ pub const Client = struct {
         );
         defer qpack_decoder.deinit();
         qpack_decoder.max_blocked_streams = self.config.http3_settings.qpack_blocked_streams;
+
+        // HTTP/3 flow control state
+        var conn_max_data: u64 = 10 * 1024 * 1024; // 10 MB default
+        var conn_data_sent: u64 = 0;
+        var stream_max_data: u64 = 1024 * 1024; // 1 MB default per stream
+        var stream_data_sent: u64 = 0;
 
         var path_buf: ?[]u8 = null;
         defer if (path_buf) |buf| self.allocator.free(buf);
@@ -968,7 +1016,12 @@ pub const Client = struct {
 
         if (req.body) |body| {
             if (body.len > 0) {
+                // Check connection and stream flow control limits
+                if (conn_data_sent + body.len > conn_max_data) return error.FlowControlError;
+                if (stream_data_sent + body.len > stream_max_data) return error.FlowControlError;
                 try http.appendHttp3Frame(&request_stream_payload, self.allocator, .data, body);
+                conn_data_sent += body.len;
+                stream_data_sent += body.len;
             }
         }
 
@@ -980,6 +1033,21 @@ pub const Client = struct {
         defer control_stream_payload.deinit(self.allocator);
         try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.Http3StreamType.control));
         try http.appendHttp3Frame(&control_stream_payload, self.allocator, .settings, settings_payload.items);
+
+        // Send MAX_DATA and MAX_STREAM_DATA to advertise our flow control limits
+        {
+            var max_data_payload = std.ArrayList(u8).empty;
+            defer max_data_payload.deinit(self.allocator);
+            try http.appendVarInt(&max_data_payload, self.allocator, conn_max_data);
+            try http.appendHttp3Frame(&control_stream_payload, self.allocator, .max_data, max_data_payload.items);
+        }
+        {
+            var max_stream_data_payload = std.ArrayList(u8).empty;
+            defer max_stream_data_payload.deinit(self.allocator);
+            try http.appendVarInt(&max_stream_data_payload, self.allocator, 0); // stream_id 0
+            try http.appendVarInt(&max_stream_data_payload, self.allocator, stream_max_data);
+            try http.appendHttp3Frame(&control_stream_payload, self.allocator, .max_stream_data, max_stream_data_payload.items);
+        }
 
         var session = Http3QuicSession.initClient();
 
@@ -1039,6 +1107,9 @@ pub const Client = struct {
             &status_code,
             &response_headers,
             &response_body,
+            &conn_max_data,
+            &stream_max_data,
+            &got_response_fin,
         );
 
         const final_status = status_code orelse return error.InvalidResponse;
@@ -1116,6 +1187,9 @@ pub const Client = struct {
         status_code: *?u16,
         response_headers: *Headers,
         response_body: *std.ArrayList(u8),
+        conn_max_data: *u64,
+        stream_max_data: *u64,
+        got_response_fin: *bool,
     ) !void {
         var offset: usize = 0;
 
@@ -1161,7 +1235,26 @@ pub const Client = struct {
                 @intFromEnum(http.Http3FrameType.settings) => {
                     _ = try http.parseHttp3SettingsPayload(frame_payload);
                 },
-                @intFromEnum(http.Http3FrameType.goaway) => {},
+                @intFromEnum(http.Http3FrameType.goaway) => {
+                    // Gracefully handle GOAWAY: finish current stream processing
+                    if (status_code.* != null) {
+                        got_response_fin.* = true;
+                    }
+                },
+                @intFromEnum(http.Http3FrameType.max_data) => {
+                    if (frame_payload.len > 0) {
+                        const val = try http.decodeVarInt(frame_payload);
+                        conn_max_data.* = val.value;
+                    }
+                },
+                @intFromEnum(http.Http3FrameType.max_stream_data) => {
+                    if (frame_payload.len > 0) {
+                        // stream_id varint + data_limit varint; update the relevant stream
+                        const sid = try http.decodeVarInt(frame_payload);
+                        const data_limit = try http.decodeVarInt(frame_payload[sid.len..]);
+                        stream_max_data.* = data_limit.value;
+                    }
+                },
                 else => {
                     // Unknown/unsupported frame types are ignored for forward compatibility.
                 },
@@ -1178,7 +1271,7 @@ pub const Client = struct {
         var settings_payload = std.ArrayList(u8).empty;
         defer settings_payload.deinit(self.allocator);
 
-        const local_settings = toConnectionSettings(self.config.http2_settings);
+        const local_settings = toConnectionSettings(self.config.http2_settings, self.config.allow_push);
         try http.encodeSettingsPayload(local_settings, self.allocator, &settings_payload);
         try writeHttp2Frame(transport, .settings, 0, 0, settings_payload.items);
 
@@ -1226,23 +1319,31 @@ pub const Client = struct {
             try header_entries.append(self.allocator, .{ .name = lowered_name, .value = entry.value });
         }
 
-        const headers_payload = try h2stream.buildHeadersFramePayload(
+        const has_body = req.body != null and req.body.?.len > 0;
+        const headers_frames = try h2stream.buildHeadersAndContinuations(
             &stream_manager,
+            request_stream.id,
             header_entries.items,
             null,
+            local_settings.max_frame_size,
+            !has_body,
             self.allocator,
         );
-        defer self.allocator.free(headers_payload.payload);
+        defer self.allocator.free(headers_frames);
 
-        const has_body = req.body != null and req.body.?.len > 0;
-        const headers_flags: u8 = headers_payload.flags | @as(u8, if (has_body) 0 else 0x01);
-        try writeHttp2Frame(transport, .headers, headers_flags, request_stream.id, headers_payload.payload);
+        try transport.writeAll(headers_frames);
+
+        var peer_max_frame_size: u32 = local_settings.max_frame_size;
 
         if (has_body) {
             const body = req.body.?;
             var offset: usize = 0;
             while (offset < body.len) {
-                const chunk_len = @min(body.len - offset, @as(usize, local_settings.max_frame_size));
+                if (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
+                    return error.FlowControlError;
+                }
+                const max_chunk = @min(@as(usize, @intCast(request_stream.send_window)), @as(usize, @intCast(stream_manager.connection_send_window)));
+                const chunk_len = @min(body.len - offset, max_chunk, @as(usize, @intCast(peer_max_frame_size)));
                 const is_last = offset + chunk_len == body.len;
                 const chunk_flags: u8 = if (is_last) 0x01 else 0;
                 try writeHttp2Frame(
@@ -1252,6 +1353,8 @@ pub const Client = struct {
                     request_stream.id,
                     body[offset .. offset + chunk_len],
                 );
+                request_stream.send_window -= @intCast(chunk_len);
+                stream_manager.connection_send_window -= @intCast(chunk_len);
                 offset += chunk_len;
             }
             request_stream.sendEndStream();
@@ -1261,6 +1364,9 @@ pub const Client = struct {
 
         var response_headers = Headers.init(self.allocator);
         defer response_headers.deinit();
+
+        var trailers = Headers.init(self.allocator);
+        defer trailers.deinit();
 
         var body = std.ArrayList(u8).empty;
         defer body.deinit(self.allocator);
@@ -1273,6 +1379,7 @@ pub const Client = struct {
 
         var status_code: ?u16 = null;
         var response_done = false;
+        var got_end_stream = false;
 
         var peer_settings = http.Http2Connection.Http2ConnectionSettings{};
 
@@ -1293,6 +1400,8 @@ pub const Client = struct {
                     const is_ack = (frame.header.flags & 0x01) != 0;
                     if (!is_ack) {
                         try http.applySettingsPayload(&peer_settings, frame.payload);
+                        try stream_manager.applyPeerSettings(peer_settings);
+                        peer_max_frame_size = peer_settings.max_frame_size;
                         try writeHttp2Frame(transport, .settings, 0x01, 0, &.{});
                     }
                 },
@@ -1306,13 +1415,65 @@ pub const Client = struct {
                 },
                 .goaway => {
                     if (status_code == null) return error.ProtocolError;
+                    response_done = true;
                 },
-                .window_update, .priority, .push_promise => {},
+                .window_update, .priority => {},
+                .push_promise => {
+                    if (frame.header.stream_id == 0) return error.ProtocolError;
+                    if (!self.config.allow_push) {
+                        const promised_stream_id = (@as(u31, frame.payload[0] & 0x7F) << 24) |
+                            (@as(u31, frame.payload[1]) << 16) |
+                            (@as(u31, frame.payload[2]) << 8) |
+                            frame.payload[3];
+                        const rst_frame = h2stream.buildRstStreamFrame(promised_stream_id, .refused_stream);
+                        try transport.writeAll(&rst_frame);
+                    }
+                },
                 .rst_stream => {
-                    if (frame.header.stream_id == request_stream.id) return error.StreamError;
+                    if (frame.header.stream_id == request_stream.id) {
+                        if (!got_end_stream) {
+                            const rst_frame = h2stream.buildRstStreamFrame(request_stream.id, .cancel);
+                            try transport.writeAll(&rst_frame);
+                            return error.StreamError;
+                        }
+                        response_done = true;
+                    }
                 },
                 .headers => {
                     if (frame.header.stream_id != request_stream.id) continue;
+
+                    if (got_end_stream) {
+                        if (waiting_continuation) return error.ProtocolError;
+
+                        if ((frame.header.flags & 0x04) != 0) {
+                            const parsed = try h2stream.parseHeadersFramePayload(
+                                &stream_manager,
+                                frame.payload,
+                                frame.header.flags,
+                                self.allocator,
+                            );
+                            defer {
+                                for (parsed.headers) |header| {
+                                    self.allocator.free(header.name);
+                                    self.allocator.free(header.value);
+                                }
+                                self.allocator.free(parsed.headers);
+                            }
+
+                            for (parsed.headers) |header| {
+                                if (header.name.len > 0 and header.name[0] == ':') continue;
+                                if (common.isConnectionSpecificHeader(header.name)) continue;
+                                try trailers.append(header.name, header.value);
+                            }
+                            response_done = true;
+                        } else {
+                            pending_headers_flags = frame.header.flags;
+                            try pending_headers_block.appendSlice(self.allocator, frame.payload);
+                            waiting_continuation = true;
+                        }
+                        continue;
+                    }
+
                     if (waiting_continuation) return error.ProtocolError;
 
                     if ((frame.header.flags & 0x04) != 0) {
@@ -1327,7 +1488,7 @@ pub const Client = struct {
                             &response_headers,
                         );
                         if ((frame.header.flags & 0x01) != 0) {
-                            response_done = true;
+                            got_end_stream = true;
                             request_stream.receiveEndStream();
                         }
                     } else {
@@ -1342,27 +1503,56 @@ pub const Client = struct {
 
                     try pending_headers_block.appendSlice(self.allocator, frame.payload);
                     if ((frame.header.flags & 0x04) != 0) {
-                        const expect_initial_headers = status_code == null;
-                        try applyResponseHeaderBlock(
-                            self,
-                            &stream_manager,
-                            pending_headers_block.items,
-                            pending_headers_flags,
-                            expect_initial_headers,
-                            &status_code,
-                            &response_headers,
-                        );
-                        pending_headers_block.clearRetainingCapacity();
-                        waiting_continuation = false;
+                        if (got_end_stream) {
+                            const parsed = try h2stream.parseHeadersFramePayload(
+                                &stream_manager,
+                                pending_headers_block.items,
+                                pending_headers_flags,
+                                self.allocator,
+                            );
+                            defer {
+                                for (parsed.headers) |header| {
+                                    self.allocator.free(header.name);
+                                    self.allocator.free(header.value);
+                                }
+                                self.allocator.free(parsed.headers);
+                            }
 
-                        if ((pending_headers_flags & 0x01) != 0) {
+                            for (parsed.headers) |header| {
+                                if (header.name.len > 0 and header.name[0] == ':') continue;
+                                if (common.isConnectionSpecificHeader(header.name)) continue;
+                                try trailers.append(header.name, header.value);
+                            }
+                            pending_headers_block.clearRetainingCapacity();
+                            waiting_continuation = false;
                             response_done = true;
-                            request_stream.receiveEndStream();
+                        } else {
+                            const expect_initial_headers = status_code == null;
+                            try applyResponseHeaderBlock(
+                                self,
+                                &stream_manager,
+                                pending_headers_block.items,
+                                pending_headers_flags,
+                                expect_initial_headers,
+                                &status_code,
+                                &response_headers,
+                            );
+                            pending_headers_block.clearRetainingCapacity();
+                            waiting_continuation = false;
+
+                            if ((pending_headers_flags & 0x01) != 0) {
+                                got_end_stream = true;
+                                request_stream.receiveEndStream();
+                            }
                         }
                     }
                 },
                 .data => {
                     if (frame.header.stream_id != request_stream.id) continue;
+
+                    if (got_end_stream) continue;
+
+                    if (frame.header.length > local_settings.max_frame_size) return error.FrameTooLarge;
 
                     var data_slice = frame.payload;
                     if ((frame.header.flags & 0x08) != 0) {
@@ -1376,7 +1566,6 @@ pub const Client = struct {
                     try body.appendSlice(self.allocator, data_slice);
 
                     if (frame.payload.len > 0) {
-                        // Keep stream and connection windows replenished while consuming DATA.
                         const window_increment: u31 = @intCast(frame.payload.len);
                         const window_update = h2stream.buildWindowUpdatePayload(window_increment);
                         try writeHttp2Frame(transport, .window_update, 0, request_stream.id, &window_update);
@@ -1384,7 +1573,7 @@ pub const Client = struct {
                     }
 
                     if ((frame.header.flags & 0x01) != 0) {
-                        response_done = true;
+                        got_end_stream = true;
                         request_stream.receiveEndStream();
                     }
                 },
@@ -1402,6 +1591,11 @@ pub const Client = struct {
         response.headers.deinit();
         response.headers = response_headers;
         response_headers = Headers.init(self.allocator);
+
+        if (trailers.count() > 0) {
+            response.trailers = trailers;
+            trailers = Headers.init(self.allocator);
+        }
 
         if (body.items.len > 0) {
             response.body = try body.toOwnedSlice(self.allocator);
@@ -1759,6 +1953,54 @@ const Http3QuicSession = struct {
     }
 };
 
+/// Sends a QUIC RESET_STREAM frame to cancel a stream.
+fn sendHttp3ResetStream(
+    transport: anytype,
+    session: *Http3QuicSession,
+    stream_id: u64,
+    error_code: u64,
+    final_size: u64,
+) !void {
+    var frame_buf: [64]u8 = undefined;
+    const frame = quic.ResetStreamFrame{
+        .stream_id = stream_id,
+        .error_code = error_code,
+        .final_size = final_size,
+    };
+    const frame_len = try frame.encode(&frame_buf);
+
+    var packet = std.ArrayList(u8).empty;
+    defer packet.deinit(std.heap.page_allocator);
+
+    try appendHttp3PacketHeader(&packet, std.heap.page_allocator, session);
+    try packet.appendSlice(std.heap.page_allocator, frame_buf[0..frame_len]);
+
+    try transport.sendDatagram(packet.items);
+}
+
+/// Sends a QUIC STOP_SENDING frame to tell the peer to stop sending on a stream.
+fn sendHttp3StopSending(
+    transport: anytype,
+    session: *Http3QuicSession,
+    stream_id: u64,
+    error_code: u64,
+) !void {
+    var frame_buf: [64]u8 = undefined;
+    const frame = quic.StopSendingFrame{
+        .stream_id = stream_id,
+        .error_code = error_code,
+    };
+    const frame_len = try frame.encode(&frame_buf);
+
+    var packet = std.ArrayList(u8).empty;
+    defer packet.deinit(std.heap.page_allocator);
+
+    try appendHttp3PacketHeader(&packet, std.heap.page_allocator, session);
+    try packet.appendSlice(std.heap.page_allocator, frame_buf[0..frame_len]);
+
+    try transport.sendDatagram(packet.items);
+}
+
 const DecodedHttp3StreamDatagram = struct {
     stream_id: u64,
     fin: bool,
@@ -1860,10 +2102,10 @@ fn decodeHttp3StreamDatagram(datagram: []const u8, session: *Http3QuicSession) !
     };
 }
 
-fn toConnectionSettings(settings: types.Http2Settings) http.Http2Connection.Http2ConnectionSettings {
+fn toConnectionSettings(settings: types.Http2Settings, allow_push: bool) http.Http2Connection.Http2ConnectionSettings {
     return .{
         .header_table_size = settings.header_table_size,
-        .enable_push = settings.enable_push,
+        .enable_push = settings.enable_push and allow_push,
         .max_concurrent_streams = settings.max_concurrent_streams,
         .initial_window_size = settings.initial_window_size,
         .max_frame_size = settings.max_frame_size,

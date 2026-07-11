@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http3_client_runtime", .path = "examples/http3_client_runtime.zig" },
         .{ .name = "http3_server_runtime", .path = "examples/http3_server_runtime.zig" },
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
+        .{ .name = "http2_advanced", .path = "examples/http2_advanced.zig" },
+        .{ .name = "http3_advanced", .path = "examples/http3_advanced.zig" },
         .{ .name = "websocket_example", .path = "examples/websocket_example.zig" },
         .{ .name = "multipart_example", .path = "examples/multipart_example.zig" },
         .{ .name = "metrics_example", .path = "examples/metrics_example.zig" },

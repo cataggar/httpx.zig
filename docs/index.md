@@ -192,6 +192,8 @@ Available examples (see the `/examples` folder):
 - `http3_example.zig`: HTTP/3 QPACK compression and QUIC framing
 - `http3_client_runtime.zig`: local end-to-end high-level HTTP/3 client runtime demo
 - `http3_server_runtime.zig`: local end-to-end high-level HTTP/3 server runtime demo
+- `http2_advanced.zig`: HTTP/2 production features (SETTINGS enforcement, GOAWAY/RST_STREAM, HPACK security, trailers)
+- `http3_advanced.zig`: HTTP/3 production features (QPACK stream instructions, QUIC stream cancellation, transport parameters)
 - `tcp_local.zig`: local TCP listener/client round trip
 - `udp_local.zig`: UDP local networking utility (prints human-readable `ip:port` for source address)
 - `unix_socket_example.zig`: Unix domain socket IPC client/server (Linux, macOS; Windows 10 build 17061+ only)

@@ -448,6 +448,70 @@ pub const CryptoFrame = struct {
     }
 };
 
+/// RESET_STREAM frame structure (type 0x04)
+pub const ResetStreamFrame = struct {
+    stream_id: u64,
+    error_code: u64,
+    final_size: u64,
+
+    /// Encodes a RESET_STREAM frame.
+    pub fn encode(self: ResetStreamFrame, out: []u8) !usize {
+        var offset: usize = 0;
+        out[offset] = 0x04;
+        offset += 1;
+        offset += try encodeVarInt(self.stream_id, out[offset..]);
+        offset += try encodeVarInt(self.error_code, out[offset..]);
+        offset += try encodeVarInt(self.final_size, out[offset..]);
+        return offset;
+    }
+
+    /// Decodes a RESET_STREAM frame.
+    pub fn decode(data: []const u8) !struct { frame: ResetStreamFrame, len: usize } {
+        if (data.len < 2 or data[0] != 0x04) return error.InvalidFrameType;
+        var offset: usize = 1;
+        const sid = try decodeVarInt(data[offset..]);
+        offset += sid.len;
+        const ec = try decodeVarInt(data[offset..]);
+        offset += ec.len;
+        const fs = try decodeVarInt(data[offset..]);
+        offset += fs.len;
+        return .{
+            .frame = .{ .stream_id = sid.value, .error_code = ec.value, .final_size = fs.value },
+            .len = offset,
+        };
+    }
+};
+
+/// STOP_SENDING frame structure (type 0x05)
+pub const StopSendingFrame = struct {
+    stream_id: u64,
+    error_code: u64,
+
+    /// Encodes a STOP_SENDING frame.
+    pub fn encode(self: StopSendingFrame, out: []u8) !usize {
+        var offset: usize = 0;
+        out[offset] = 0x05;
+        offset += 1;
+        offset += try encodeVarInt(self.stream_id, out[offset..]);
+        offset += try encodeVarInt(self.error_code, out[offset..]);
+        return offset;
+    }
+
+    /// Decodes a STOP_SENDING frame.
+    pub fn decode(data: []const u8) !struct { frame: StopSendingFrame, len: usize } {
+        if (data.len < 2 or data[0] != 0x05) return error.InvalidFrameType;
+        var offset: usize = 1;
+        const sid = try decodeVarInt(data[offset..]);
+        offset += sid.len;
+        const ec = try decodeVarInt(data[offset..]);
+        offset += ec.len;
+        return .{
+            .frame = .{ .stream_id = sid.value, .error_code = ec.value },
+            .len = offset,
+        };
+    }
+};
+
 /// ACK frame structure
 pub const AckFrame = struct {
     largest_acknowledged: u64,
@@ -624,11 +688,13 @@ pub const TransportParameters = struct {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(allocator);
 
-        inline for (@typeInfo(TransportParameters).@"struct".fields) |field| {
-            const param_id = @intFromEnum(@field(TransportParameter, field.name));
-            const value = @field(self, field.name);
+        const field_names = @typeInfo(TransportParameters).@"struct".field_names;
+        const field_types = @typeInfo(TransportParameters).@"struct".field_types;
+        inline for (field_names, 0..) |name, i| {
+            const param_id = @intFromEnum(@field(TransportParameter, name));
+            const value = @field(self, name);
 
-            if (field.type == bool) {
+            if (field_types[i] == bool) {
                 if (value) {
                     var buf: [16]u8 = undefined;
                     const id_len = try encodeVarInt(param_id, &buf);
@@ -863,4 +929,44 @@ test "TransportParameters encode/decode" {
     try std.testing.expectEqual(params.initial_max_data, decoded.initial_max_data);
     try std.testing.expectEqual(params.disable_active_migration, decoded.disable_active_migration);
     try std.testing.expectEqual(params.active_connection_id_limit, decoded.active_connection_id_limit);
+}
+
+test "RESET_STREAM frame encode/decode" {
+    const frame = ResetStreamFrame{
+        .stream_id = 4,
+        .error_code = 0x06, // H3_REQUEST_CANCELLED
+        .final_size = 1024,
+    };
+    var buf: [64]u8 = undefined;
+    const len = try frame.encode(&buf);
+
+    const decoded = try ResetStreamFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+    try std.testing.expectEqual(frame.final_size, decoded.frame.final_size);
+}
+
+test "STOP_SENDING frame encode/decode" {
+    const frame = StopSendingFrame{
+        .stream_id = 8,
+        .error_code = 0x01, // H3_NO_ERROR
+    };
+    var buf: [64]u8 = undefined;
+    const len = try frame.encode(&buf);
+
+    const decoded = try StopSendingFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+}
+
+test "RESET_STREAM rejects wrong frame type" {
+    var buf: [64]u8 = undefined;
+    buf[0] = 0x06; // wrong type (CRYPTO)
+    try std.testing.expectError(error.InvalidFrameType, ResetStreamFrame.decode(buf[0..2]));
+}
+
+test "STOP_SENDING rejects wrong frame type" {
+    var buf: [64]u8 = undefined;
+    buf[0] = 0x04; // wrong type (RESET_STREAM)
+    try std.testing.expectError(error.InvalidFrameType, StopSendingFrame.decode(buf[0..2]));
 }

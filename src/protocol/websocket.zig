@@ -110,7 +110,7 @@ pub fn isWebSocketUpgrade(req: *const Request) bool {
     const connection = req.headers.get("Connection") orelse return false;
     const key = req.headers.get("Sec-WebSocket-Key") orelse return false;
     return std.ascii.eqlIgnoreCase(upgrade, "websocket") and
-        std.ascii.indexOfIgnoreCase(connection, "upgrade") != null and
+        std.ascii.findIgnoreCase(connection, "upgrade") != null and
         key.len > 0;
 }
 
@@ -301,6 +301,185 @@ pub fn wsDecodeFrame(allocator: Allocator, data: []const u8) !WsDecodeResult {
     };
 }
 
+// Message reassembly
+
+/// Errors that can occur during WebSocket message reassembly.
+pub const MessageError = error{
+    /// Received a continuation frame without a preceding initial opcode.
+    UnexpectedContinuation,
+    /// Received an unexpected data opcode while a fragmented message is in progress.
+    UnexpectedOpcode,
+    /// The assembled message exceeds the configured size limit.
+    MessageTooLarge,
+    /// Invalid opcode encountered during reassembly.
+    InvalidOpcode,
+};
+
+/// Configuration for WebSocket message assembly.
+pub const MessageAssemblerConfig = struct {
+    /// Maximum allowed message size in bytes. 0 means no limit.
+    max_message_size: usize = 0,
+};
+
+/// Tracks continuation frames across multiple WebSocket frames and
+/// reassembles them into complete messages.
+///
+/// Handles the fragmentation protocol defined in RFC 6455 §5.4:
+///   - A fragmented message starts with a data frame with FIN=0 and a non-continuation opcode.
+///   - Continuation frames (opcode 0x0) carry the remaining fragments.
+///   - The final fragment has FIN=1.
+///   - Control frames (ping, pong, close) may be interleaved between fragments.
+pub const MessageAssembler = struct {
+    allocator: Allocator,
+    config: MessageAssemblerConfig,
+
+    /// The accumulated payload data for the in-progress fragmented message.
+    buffer: std.ArrayList(u8) = .empty,
+    /// The opcode of the initial frame in the fragmented sequence.
+    initial_opcode: ?WsOpcode = null,
+    /// Whether we are currently assembling a fragmented message.
+    in_progress: bool = false,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, config: MessageAssemblerConfig) Self {
+        return .{
+            .allocator = allocator,
+            .config = config,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.buffer.deinit(self.allocator);
+    }
+
+    /// Processes a single decoded frame and returns the complete message
+    /// when the final fragment (FIN=1) is received.
+    ///
+    /// For control frames (ping, pong, close), returns them immediately
+    /// without affecting the fragmentation state.
+    ///
+    /// Returns `null` if the frame is an intermediate fragment (more data expected).
+    /// Returns the complete reassembled message when FIN is set.
+    pub fn feed(self: *Self, frame: WsFrame) MessageError!?WsCompleteMessage {
+        if (frame.opcode.isControl()) {
+            return .{
+                .opcode = frame.opcode,
+                .payload = try self.allocator.dupe(u8, frame.payload),
+                .allocator = self.allocator,
+            };
+        }
+
+        if (!self.in_progress) {
+            if (frame.opcode == .continuation) {
+                return error.UnexpectedContinuation;
+            }
+
+            if (frame.fin) {
+                return .{
+                    .opcode = frame.opcode,
+                    .payload = try self.allocator.dupe(u8, frame.payload),
+                    .allocator = self.allocator,
+                };
+            }
+
+            self.in_progress = true;
+            self.initial_opcode = frame.opcode;
+            try self.appendPayload(frame.payload);
+            return null;
+        }
+
+        if (frame.opcode != .continuation) {
+            return error.UnexpectedOpcode;
+        }
+
+        try self.appendPayload(frame.payload);
+
+        if (frame.fin) {
+            const msg = WsCompleteMessage{
+                .opcode = self.initial_opcode.?,
+                .payload = try self.buffer.toOwnedSlice(self.allocator),
+                .allocator = self.allocator,
+            };
+            self.buffer = .empty;
+            self.in_progress = false;
+            self.initial_opcode = null;
+            return msg;
+        }
+
+        return null;
+    }
+
+    fn appendPayload(self: *Self, payload: []const u8) MessageError!void {
+        if (self.config.max_message_size > 0) {
+            if (self.buffer.items.len + payload.len > self.config.max_message_size) {
+                self.buffer.clearRetainingCapacity();
+                self.in_progress = false;
+                self.initial_opcode = null;
+                return error.MessageTooLarge;
+            }
+        }
+        try self.buffer.appendSlice(self.allocator, payload);
+    }
+
+    /// Resets the assembler state, discarding any in-progress message.
+    pub fn reset(self: *Self) void {
+        self.buffer.clearRetainingCapacity();
+        self.in_progress = false;
+        self.initial_opcode = null;
+    }
+};
+
+/// A complete reassembled WebSocket message.
+pub const WsCompleteMessage = struct {
+    opcode: WsOpcode,
+    payload: []u8,
+    allocator: Allocator,
+
+    pub fn deinit(self: *WsCompleteMessage) void {
+        self.allocator.free(self.payload);
+    }
+};
+
+/// Decodes a stream of WebSocket frames into complete messages.
+///
+/// Processes each frame from the `data` slice, tracking continuation frames
+/// and reassembling fragmented messages. Control frames are yielded immediately.
+///
+/// Caller owns the returned messages; each message's payload and the
+/// messages array must be freed by the caller.
+pub fn decodeMessage(
+    allocator: Allocator,
+    data: []const u8,
+    config: MessageAssemblerConfig,
+) MessageError![]WsCompleteMessage {
+    var assembler = MessageAssembler.init(allocator, config);
+    defer assembler.deinit();
+
+    var messages = std.ArrayList(WsCompleteMessage).empty;
+    defer {
+        for (messages.items) |*msg| {
+            msg.deinit();
+        }
+        messages.deinit(allocator);
+    }
+
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const result = wsDecodeFrame(allocator, data[offset..]) catch |err| switch (err) {
+            error.NeedMoreData => break,
+            else => return error.InvalidOpcode,
+        };
+        offset += result.consumed;
+
+        if (try assembler.feed(result.frame)) |msg| {
+            try messages.append(allocator, msg);
+        }
+    }
+
+    return try messages.toOwnedSlice(allocator);
+}
+
 // Tests
 
 test "wsAcceptKey — RFC 6455 test vector" {
@@ -387,4 +566,140 @@ test "WsOpcode classification" {
     try std.testing.expect(!WsOpcode.ping.isData());
     try std.testing.expect(WsOpcode.ping.isControl());
     try std.testing.expect(WsOpcode.close.isControl());
+}
+
+test "MessageAssembler — single unfragmented text frame" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc = try wsEncodeFrame(allocator, .text, "hello", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc);
+    const result = try wsDecodeFrame(allocator, enc);
+    defer result.frame.deinit();
+
+    const msg = try assembler.feed(result.frame);
+    try std.testing.expect(msg != null);
+    try std.testing.expectEqual(WsOpcode.text, msg.?.opcode);
+    try std.testing.expectEqualStrings("hello", msg.?.payload);
+    msg.?.deinit();
+}
+
+test "MessageAssembler — fragmented text across 3 frames" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc1 = try wsEncodeFrame(allocator, .text, "hel", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc1);
+    const enc2 = try wsEncodeFrame(allocator, .continuation, "lo ", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc2);
+    const enc3 = try wsEncodeFrame(allocator, .continuation, "world", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc3);
+
+    const r1 = try wsDecodeFrame(allocator, enc1);
+    const r2 = try wsDecodeFrame(allocator, enc2);
+    const r3 = try wsDecodeFrame(allocator, enc3);
+
+    try std.testing.expect((try assembler.feed(r1.frame)) == null);
+    try std.testing.expect((try assembler.feed(r2.frame)) == null);
+
+    const msg = try assembler.feed(r3.frame);
+    try std.testing.expect(msg != null);
+    try std.testing.expectEqual(WsOpcode.text, msg.?.opcode);
+    try std.testing.expectEqualStrings("hello world", msg.?.payload);
+    msg.?.deinit();
+}
+
+test "MessageAssembler — control frame interleaved with fragments" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc1 = try wsEncodeFrame(allocator, .binary, "part1", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc1);
+    const ping = try wsEncodeFrame(allocator, .ping, "ping!", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(ping);
+    const enc2 = try wsEncodeFrame(allocator, .continuation, "part2", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc2);
+
+    const r1 = try wsDecodeFrame(allocator, enc1);
+    const rp = try wsDecodeFrame(allocator, ping);
+    const r2 = try wsDecodeFrame(allocator, enc2);
+
+    try std.testing.expect((try assembler.feed(r1.frame)) == null);
+
+    const control_msg = try assembler.feed(rp.frame);
+    try std.testing.expect(control_msg != null);
+    try std.testing.expectEqual(WsOpcode.ping, control_msg.?.opcode);
+    control_msg.?.deinit();
+
+    const msg = try assembler.feed(r2.frame);
+    try std.testing.expect(msg != null);
+    try std.testing.expectEqual(WsOpcode.binary, msg.?.opcode);
+    try std.testing.expectEqualStrings("part1part2", msg.?.payload);
+    msg.?.deinit();
+}
+
+test "MessageAssembler — unexpected continuation without initial opcode" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc = try wsEncodeFrame(allocator, .continuation, "data", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc);
+    const r = try wsDecodeFrame(allocator, enc);
+
+    try std.testing.expectError(error.UnexpectedContinuation, assembler.feed(r.frame));
+}
+
+test "MessageAssembler — unexpected opcode during fragmentation" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc1 = try wsEncodeFrame(allocator, .text, "part", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc1);
+    const enc2 = try wsEncodeFrame(allocator, .binary, "other", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc2);
+
+    const r1 = try wsDecodeFrame(allocator, enc1);
+    const r2 = try wsDecodeFrame(allocator, enc2);
+
+    try std.testing.expect((try assembler.feed(r1.frame)) == null);
+    try std.testing.expectError(error.UnexpectedOpcode, assembler.feed(r2.frame));
+}
+
+test "MessageAssembler — message too large" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{ .max_message_size = 10 });
+    defer assembler.deinit();
+
+    const enc1 = try wsEncodeFrame(allocator, .text, "hello", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc1);
+    const enc2 = try wsEncodeFrame(allocator, .continuation, "world this is too long", true, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc2);
+
+    const r1 = try wsDecodeFrame(allocator, enc1);
+    const r2 = try wsDecodeFrame(allocator, enc2);
+
+    try std.testing.expect((try assembler.feed(r1.frame)) == null);
+    try std.testing.expectError(error.MessageTooLarge, assembler.feed(r2.frame));
+}
+
+test "MessageAssembler — reset clears state" {
+    const allocator = std.testing.allocator;
+    var assembler = MessageAssembler.init(allocator, .{});
+    defer assembler.deinit();
+
+    const enc = try wsEncodeFrame(allocator, .text, "partial", false, false, .{ 0, 0, 0, 0 });
+    defer allocator.free(enc);
+    const r = try wsDecodeFrame(allocator, enc);
+
+    try std.testing.expect((try assembler.feed(r.frame)) == null);
+    try std.testing.expect(assembler.in_progress);
+
+    assembler.reset();
+    try std.testing.expect(!assembler.in_progress);
+    try std.testing.expect(assembler.initial_opcode == null);
 }

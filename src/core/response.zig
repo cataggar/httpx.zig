@@ -29,6 +29,7 @@ pub const Response = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    trailers: ?Headers = null,
 
     const Self = @This();
 
@@ -48,6 +49,9 @@ pub const Response = struct {
             if (self.body) |b| {
                 self.allocator.free(b);
             }
+        }
+        if (self.trailers) |*t| {
+            t.deinit();
         }
     }
 
@@ -109,6 +113,14 @@ pub const Response = struct {
     /// Returns a specific header value.
     pub fn header(self: *const Self, name: []const u8) ?[]const u8 {
         return self.headers.get(name);
+    }
+
+    /// Sets the trailers for this response (used by HTTP/2).
+    pub fn setTrailers(self: *Self, trailers: Headers) void {
+        if (self.trailers) |*t| {
+            t.deinit();
+        }
+        self.trailers = trailers;
     }
 
     /// Creates a redirect response and sets the `Location` header.

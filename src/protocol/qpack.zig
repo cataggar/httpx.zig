@@ -343,13 +343,15 @@ pub fn encodeInsertLiteral(
     allocator: Allocator,
 ) !void {
     var buf: [10]u8 = undefined;
-    const name_len = try encodeInteger(name.len, 5, &buf);
+
+    const encoded_name = try hpack.HuffmanCodec.encode(name, allocator);
+    defer allocator.free(encoded_name);
+
+    const name_len = try encodeInteger(encoded_name.len, 5, &buf);
     buf[0] |= 0x40; // 01xxxxxx prefix
     buf[0] |= 0x20; // H bit (Huffman)
     try out.appendSlice(allocator, buf[0..name_len]);
 
-    const encoded_name = try hpack.HuffmanCodec.encode(name, allocator);
-    defer allocator.free(encoded_name);
     try out.appendSlice(allocator, encoded_name);
 
     try encodeString(value, true, allocator, out);
@@ -395,6 +397,189 @@ pub fn encodeInsertCountIncrement(increment: u64, out: *std.ArrayList(u8), alloc
     const len = try encodeInteger(increment, 6, &buf);
     // 00xxxxxx prefix (already 0)
     try out.appendSlice(allocator, buf[0..len]);
+}
+
+/// Result type for decoded Section Acknowledgment instruction.
+pub const SectionAck = struct {
+    stream_id: u64,
+};
+
+/// Decodes a Section Acknowledgment instruction from the decoder stream.
+///
+/// Wire format (RFC 9204 Section 5.3.1):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |1|                   StreamID  |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeSectionAck(data: []const u8) !struct { result: SectionAck, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0x80 == 0) return error.InvalidInstruction;
+    const decoded = try decodeInteger(data, 7);
+    return .{ .result = .{ .stream_id = decoded.value }, .len = decoded.len };
+}
+
+/// Result type for decoded Stream Cancellation instruction.
+pub const StreamCancel = struct {
+    stream_id: u64,
+};
+
+/// Decodes a Stream Cancellation instruction from the decoder stream.
+///
+/// Wire format (RFC 9204 Section 5.3.2):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |0|1|           StreamID        |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeStreamCancel(data: []const u8) !struct { result: StreamCancel, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0xC0 != 0x40) return error.InvalidInstruction;
+    const decoded = try decodeInteger(data, 6);
+    return .{ .result = .{ .stream_id = decoded.value }, .len = decoded.len };
+}
+
+/// Result type for decoded Insert Count Increment instruction.
+pub const InsertCountIncrement = struct {
+    increment: u64,
+};
+
+/// Decodes an Insert Count Increment instruction from the decoder stream.
+///
+/// Wire format (RFC 9204 Section 5.3.3):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |0|0|           Increment       |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeInsertCountIncrement(data: []const u8) !struct { result: InsertCountIncrement, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0xC0 != 0x00) return error.InvalidInstruction;
+    const decoded = try decodeInteger(data, 6);
+    return .{ .result = .{ .increment = decoded.value }, .len = decoded.len };
+}
+
+/// Result type for decoded Set Dynamic Table Capacity instruction.
+pub const SetCapacity = struct {
+    capacity: u64,
+};
+
+/// Decodes a Set Dynamic Table Capacity instruction (encoder stream).
+///
+/// Wire format (RFC 9204 Section 5.2.1):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |0|0|1|         Capacity        |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeSetCapacity(data: []const u8) !struct { result: SetCapacity, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0xE0 != 0x20) return error.InvalidInstruction;
+    const decoded = try decodeInteger(data, 5);
+    return .{ .result = .{ .capacity = decoded.value }, .len = decoded.len };
+}
+
+/// Result type for decoded Insert instruction (name reference or literal name).
+pub const Insert = struct {
+    is_static: bool = false,
+    name_index: u64 = 0,
+    /// Set for literal name inserts (caller must free).
+    name: ?[]const u8 = null,
+    value: []const u8,
+};
+
+/// Decodes an Insert with Name Reference instruction from the encoder stream.
+///
+/// Wire format (RFC 9204 Section 5.2.2):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |1| T|         Name Index        |
+/// +---+---+---+---+---+---+---+---+
+/// | H |     Value Length (n)        |
+/// +---+---+---+---+---+---+---+---+
+/// +---+---+---+---+---+---+---+---+
+/// | Value String (Length (n) bytes) |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeInsertWithNameRef(data: []const u8, allocator: Allocator) !struct { result: Insert, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0x80 == 0) return error.InvalidInstruction;
+
+    const is_static = (data[0] & 0x40) != 0;
+    const decoded = try decodeInteger(data, 6);
+    var offset = decoded.len;
+
+    const value_result = try decodeString(data[offset..], allocator);
+    offset += value_result.len;
+
+    return .{
+        .result = .{ .is_static = is_static, .name_index = decoded.value, .value = value_result.value },
+        .len = offset,
+    };
+}
+
+/// Decodes an Insert with Literal Name instruction from the encoder stream.
+///
+/// Wire format (RFC 9204 Section 5.2.3):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |0|1| H|      Name Length (n)    |
+/// +---+---+---+---+---+---+---+---+
+/// +---+---+---+---+---+---+---+---+
+/// |  Name String (Length (n) bytes) |
+/// +---+---+---+---+---+---+---+---+
+/// +---+---+---+---+---+---+---+---+
+/// | H|     Value Length (n)         |
+/// +---+---+---+---+---+---+---+---+
+/// +---+---+---+---+---+---+---+---+
+/// |  Value String (Length (n) bytes) |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeInsertLiteral(data: []const u8, allocator: Allocator) !struct { result: Insert, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0xC0 != 0x40) return error.InvalidInstruction;
+
+    const name_huffman = (data[0] & 0x20) != 0;
+    const len_result = try decodeInteger(data, 5);
+    var offset = len_result.len;
+
+    const str_len: usize = @intCast(len_result.value);
+    if (data.len < offset + str_len) return error.InvalidInstruction;
+
+    const name = if (name_huffman)
+        try hpack.HuffmanCodec.decode(data[offset .. offset + str_len], allocator)
+    else
+        try allocator.dupe(u8, data[offset .. offset + str_len]);
+    offset += str_len;
+
+    const value_result = try decodeString(data[offset..], allocator);
+    offset += value_result.len;
+
+    return .{
+        .result = .{ .name = name, .value = value_result.value },
+        .len = offset,
+    };
+}
+
+/// Decodes a Duplicate instruction from the encoder stream.
+///
+/// Wire format (RFC 9204 Section 5.2.4):
+///   0   1   2   3   4   5   6   7
+/// +---+---+---+---+---+---+---+---+
+/// |0|0|0|         Index           |
+/// +---+---+---+---+---+---+---+---+
+pub fn decodeDuplicate(data: []const u8) !struct { result: Duplicate, len: usize } {
+    if (data.len == 0) return error.InvalidInstruction;
+    if (data[0] & 0xE0 != 0x00) return error.InvalidInstruction;
+    const decoded = try decodeInteger(data, 5);
+    return .{ .result = .{ .index = decoded.value }, .len = decoded.len };
+}
+
+/// Result type for decoded Duplicate instruction.
+pub const Duplicate = struct {
+    index: u64,
+};
+
+/// Decodes a Set Dynamic Table Capacity instruction from the encoder stream.
+///
+/// This is identical in wire format to the decoder-stream variant but is
+/// provided for symmetry with the encoder-stream instruction set.
+pub fn decodeEncoderDataSetCapacity(data: []const u8) !struct { result: SetCapacity, len: usize } {
+    return decodeSetCapacity(data);
 }
 
 /// Header entry type for encoding
@@ -716,4 +901,106 @@ test "QPACK decode post-base indexed field" {
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
     try std.testing.expectEqualStrings("x-b", decoded[0].name);
     try std.testing.expectEqualStrings("v2", decoded[0].value);
+}
+
+test "decodeSectionAck roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeSectionAck(42, &out, std.testing.allocator);
+
+    const decoded = try decodeSectionAck(out.items);
+    try std.testing.expectEqual(@as(u64, 42), decoded.result.stream_id);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeStreamCancel roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeStreamCancel(7, &out, std.testing.allocator);
+
+    const decoded = try decodeStreamCancel(out.items);
+    try std.testing.expectEqual(@as(u64, 7), decoded.result.stream_id);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeInsertCountIncrement roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeInsertCountIncrement(10, &out, std.testing.allocator);
+
+    const decoded = try decodeInsertCountIncrement(out.items);
+    try std.testing.expectEqual(@as(u64, 10), decoded.result.increment);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeSetCapacity roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeSetCapacity(4096, &out, std.testing.allocator);
+
+    const decoded = try decodeSetCapacity(out.items);
+    try std.testing.expectEqual(@as(u64, 4096), decoded.result.capacity);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeInsertWithNameRef roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeInsertNameRef(true, 17, "GET", &out, std.testing.allocator);
+
+    const decoded = try decodeInsertWithNameRef(out.items, std.testing.allocator);
+    defer std.testing.allocator.free(decoded.result.value);
+    try std.testing.expect(decoded.result.is_static);
+    try std.testing.expectEqual(@as(u64, 17), decoded.result.name_index);
+    try std.testing.expectEqualStrings("GET", decoded.result.value);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeInsertLiteral roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeInsertLiteral("x-custom", "my-value", &out, std.testing.allocator);
+
+    const decoded = try decodeInsertLiteral(out.items, std.testing.allocator);
+    defer std.testing.allocator.free(decoded.result.name.?);
+    defer std.testing.allocator.free(decoded.result.value);
+    try std.testing.expect(decoded.result.name != null);
+    try std.testing.expectEqualStrings("x-custom", decoded.result.name.?);
+    try std.testing.expectEqualStrings("my-value", decoded.result.value);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeDuplicate roundtrip" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try encodeDuplicate(3, &out, std.testing.allocator);
+
+    const decoded = try decodeDuplicate(out.items);
+    try std.testing.expectEqual(@as(u64, 3), decoded.result.index);
+    try std.testing.expectEqual(out.items.len, decoded.len);
+}
+
+test "decodeSectionAck rejects wrong prefix" {
+    const data = [_]u8{0x00}; // prefix 0, not valid for section ack
+    try std.testing.expectError(error.InvalidInstruction, decodeSectionAck(&data));
+}
+
+test "decodeStreamCancel rejects wrong prefix" {
+    const data = [_]u8{0x80}; // prefix 10, not valid for stream cancel
+    try std.testing.expectError(error.InvalidInstruction, decodeStreamCancel(&data));
+}
+
+test "decodeInsertCountIncrement rejects wrong prefix" {
+    const data = [_]u8{0x80}; // prefix 10, not valid for insert count increment
+    try std.testing.expectError(error.InvalidInstruction, decodeInsertCountIncrement(&data));
+}
+
+test "decodeSetCapacity rejects wrong prefix" {
+    const data = [_]u8{0x00}; // prefix 000, not valid for set capacity
+    try std.testing.expectError(error.InvalidInstruction, decodeSetCapacity(&data));
+}
+
+test "decodeDuplicate rejects wrong prefix" {
+    const data = [_]u8{0x80}; // prefix 1, not valid for duplicate
+    try std.testing.expectError(error.InvalidInstruction, decodeDuplicate(&data));
 }

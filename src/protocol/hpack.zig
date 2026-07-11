@@ -503,6 +503,50 @@ pub const HeaderEntry = struct {
     representation: HeaderRepresentation = .incremental_indexing,
 };
 
+/// Encodes a literal header field without indexing (RFC 7541 Section 6.2.2).
+/// Prefix: 0000 (4-bit). Never added to dynamic table.
+/// For indexed name: 0000 iiii + value. For literal name: 0000 0000 + name + value.
+pub fn encodeHeaderWithoutIndexing(
+    name_index: ?usize,
+    name: []const u8,
+    value: []const u8,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+) !void {
+    if (name_index) |idx| {
+        var buf: [10]u8 = undefined;
+        const n = try encodeInteger(idx, 4, &buf);
+        try out.appendSlice(allocator, buf[0..n]);
+    } else {
+        try out.append(allocator, 0x00); // 0000 0000
+        try encodeString(name, true, allocator, out);
+    }
+    try encodeString(value, true, allocator, out);
+}
+
+/// Encodes a literal header field never indexed (RFC 7541 Section 6.2.3).
+/// Prefix: 0001 (4-bit). Never added to dynamic table.
+/// Signals to intermediaries that the value must never be compressed.
+/// For indexed name: 0001 iiii + value. For literal name: 0001 0000 + name + value.
+pub fn encodeHeaderNeverIndexed(
+    name_index: ?usize,
+    name: []const u8,
+    value: []const u8,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+) !void {
+    if (name_index) |idx| {
+        var buf: [10]u8 = undefined;
+        const n = try encodeInteger(idx, 4, &buf);
+        buf[0] |= 0x10; // Set never-indexed prefix
+        try out.appendSlice(allocator, buf[0..n]);
+    } else {
+        try out.append(allocator, 0x10); // 0001 0000
+        try encodeString(name, true, allocator, out);
+    }
+    try encodeString(value, true, allocator, out);
+}
+
 /// Encodes a header block using HPACK.
 pub fn encodeHeaders(
     ctx: *HpackContext,
@@ -520,20 +564,33 @@ pub fn encodeHeaders(
             const n = try encodeInteger(index, 7, &buf);
             buf[0] |= 0x80; // Set indexed bit
             try out.appendSlice(allocator, buf[0..n]);
-        } else if (StaticTable.findName(header.name)) |name_index| {
-            // Literal header with indexed name
-            var buf: [10]u8 = undefined;
-            const n = try encodeInteger(name_index, 6, &buf);
-            buf[0] |= 0x40; // Incremental indexing
-            try out.appendSlice(allocator, buf[0..n]);
-            try encodeString(header.value, true, allocator, &out);
-            try ctx.dynamic_table.add(header.name, header.value);
         } else {
-            // Literal header with literal name
-            try out.append(allocator, 0x40); // Incremental indexing, index=0
-            try encodeString(header.name, true, allocator, &out);
-            try encodeString(header.value, true, allocator, &out);
-            try ctx.dynamic_table.add(header.name, header.value);
+            const name_index = StaticTable.findName(header.name);
+
+            switch (header.representation) {
+                .incremental_indexing => {
+                    if (name_index) |idx| {
+                        // Literal header with indexed name, incremental indexing
+                        var buf: [10]u8 = undefined;
+                        const n = try encodeInteger(idx, 6, &buf);
+                        buf[0] |= 0x40;
+                        try out.appendSlice(allocator, buf[0..n]);
+                        try encodeString(header.value, true, allocator, &out);
+                    } else {
+                        // Literal header with literal name, incremental indexing
+                        try out.append(allocator, 0x40);
+                        try encodeString(header.name, true, allocator, &out);
+                        try encodeString(header.value, true, allocator, &out);
+                    }
+                    try ctx.dynamic_table.add(header.name, header.value);
+                },
+                .without_indexing => {
+                    try encodeHeaderWithoutIndexing(name_index, header.name, header.value, allocator, &out);
+                },
+                .never_indexed => {
+                    try encodeHeaderNeverIndexed(name_index, header.name, header.value, allocator, &out);
+                },
+            }
         }
     }
 
@@ -706,4 +763,195 @@ test "Huffman encode/decode roundtrip" {
     defer allocator.free(decoded);
 
     try std.testing.expectEqualStrings(original, decoded);
+}
+
+test "encode without indexing - indexed name" {
+    const allocator = std.testing.allocator;
+
+    // "authorization" is static table index 23, value ""
+    const headers = [_]HeaderEntry{
+        .{ .name = "authorization", .value = "Bearer secret123", .representation = .without_indexing },
+    };
+
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Should NOT be added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+
+    // First byte: 0x0F (4-bit prefix, value 15 = min(23, 15)), second byte: 0x08 (23-15=8)
+    try std.testing.expectEqual(@as(u8, 0x0F), encoded[0]);
+    try std.testing.expectEqual(@as(u8, 0x08), encoded[1]);
+
+    // Should be decodable
+    var ctx2 = HpackContext.init(allocator);
+    defer ctx2.deinit();
+    const decoded = try decodeHeaders(&ctx2, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("authorization", decoded[0].name);
+    try std.testing.expectEqualStrings("Bearer secret123", decoded[0].value);
+}
+
+test "encode without indexing - literal name" {
+    const allocator = std.testing.allocator;
+
+    const headers = [_]HeaderEntry{
+        .{ .name = "x-custom-header", .value = "some-value", .representation = .without_indexing },
+    };
+
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Should NOT be added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+
+    // First byte should be 0x00 (0000 0000 = literal name without indexing)
+    try std.testing.expectEqual(@as(u8, 0x00), encoded[0]);
+
+    // Should be decodable
+    var ctx2 = HpackContext.init(allocator);
+    defer ctx2.deinit();
+    const decoded = try decodeHeaders(&ctx2, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("x-custom-header", decoded[0].name);
+    try std.testing.expectEqualStrings("some-value", decoded[0].value);
+}
+
+test "encode never indexed - indexed name" {
+    const allocator = std.testing.allocator;
+
+    // "set-cookie" is static table index 55
+    const headers = [_]HeaderEntry{
+        .{ .name = "set-cookie", .value = "session=abc123", .representation = .never_indexed },
+    };
+
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Should NOT be added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+
+    // First byte: 0x1F (0001 prefix + value 15), second byte: 0x28 (55-15=40)
+    try std.testing.expectEqual(@as(u8, 0x1F), encoded[0]);
+    try std.testing.expectEqual(@as(u8, 0x28), encoded[1]);
+
+    // Should be decodable
+    var ctx2 = HpackContext.init(allocator);
+    defer ctx2.deinit();
+    const decoded = try decodeHeaders(&ctx2, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("set-cookie", decoded[0].name);
+    try std.testing.expectEqualStrings("session=abc123", decoded[0].value);
+}
+
+test "encode never indexed - literal name" {
+    const allocator = std.testing.allocator;
+
+    const headers = [_]HeaderEntry{
+        .{ .name = "x-secret", .value = "top-secret-data", .representation = .never_indexed },
+    };
+
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Should NOT be added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+
+    // First byte should be 0x10 (0001 0000 = literal name never indexed)
+    try std.testing.expectEqual(@as(u8, 0x10), encoded[0]);
+
+    // Should be decodable
+    var ctx2 = HpackContext.init(allocator);
+    defer ctx2.deinit();
+    const decoded = try decodeHeaders(&ctx2, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("x-secret", decoded[0].name);
+    try std.testing.expectEqualStrings("top-secret-data", decoded[0].value);
+}
+
+test "mixed representations in header block" {
+    const allocator = std.testing.allocator;
+
+    const headers = [_]HeaderEntry{
+        // Incremental indexing (default) - should add to dynamic table
+        .{ .name = ":method", .value = "GET" },
+        // Without indexing - should NOT add to dynamic table
+        .{ .name = "authorization", .value = "Bearer token", .representation = .without_indexing },
+        // Never indexed - should NOT add to dynamic table
+        .{ .name = "cookie", .value = "session=xyz", .representation = .never_indexed },
+        // Another incremental - should add to dynamic table
+        .{ .name = "content-type", .value = "text/html" },
+    };
+
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Only 2 entries should be in dynamic table (the incremental ones that didn't match static table exactly)
+    // ":method" "GET" matches static table index 2 exactly, so it's encoded as indexed (no dynamic table add)
+    // "content-type" "text/html" doesn't match static table value, so it gets added
+    try std.testing.expectEqual(@as(usize, 1), ctx.dynamic_table.len());
+
+    // Roundtrip decode
+    var ctx2 = HpackContext.init(allocator);
+    defer ctx2.deinit();
+    const decoded = try decodeHeaders(&ctx2, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 4), decoded.len);
+    try std.testing.expectEqualStrings(":method", decoded[0].name);
+    try std.testing.expectEqualStrings("GET", decoded[0].value);
+    try std.testing.expectEqualStrings("authorization", decoded[1].name);
+    try std.testing.expectEqualStrings("Bearer token", decoded[1].value);
+    try std.testing.expectEqualStrings("cookie", decoded[2].name);
+    try std.testing.expectEqualStrings("session=xyz", decoded[2].value);
+    try std.testing.expectEqualStrings("content-type", decoded[3].name);
+    try std.testing.expectEqualStrings("text/html", decoded[3].value);
 }

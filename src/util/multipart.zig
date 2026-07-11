@@ -59,7 +59,7 @@ pub const ParsedParts = struct {
 /// Returns null if no boundary is present.
 pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
     const marker = "boundary=";
-    const idx = std.ascii.indexOfIgnoreCase(content_type, marker) orelse return null;
+    const idx = std.ascii.findIgnoreCase(content_type, marker) orelse return null;
     var value = content_type[idx + marker.len ..];
     if (value.len > 0 and value[0] == '"') {
         value = value[1..];

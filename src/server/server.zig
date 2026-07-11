@@ -85,6 +85,7 @@ pub const ServerConfig = struct {
     threads: u32 = 0,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
+    enable_push: bool = true,
     http2_settings: types.Http2Settings = .{},
     http3_settings: types.Http3Settings = .{},
     log_fn: ?LogFn = null,
@@ -877,6 +878,8 @@ pub const Server = struct {
         var sock = socket;
         defer sock.close();
 
+        // Set recv timeout before reading the connection preface and
+        // initial SETTINGS frame so a silent peer does not hang us.
         if (self.config.request_timeout_ms > 0) {
             try sock.setRecvTimeout(self.config.request_timeout_ms);
         }
@@ -926,6 +929,9 @@ pub const Server = struct {
         var request_stream_id: ?u31 = null;
         var request_done = false;
 
+        var peer_max_frame_size: u32 = 16384;
+        var client_push_enabled: bool = self.config.enable_push;
+
         var pending_headers_block = std.ArrayList(u8).empty;
         defer pending_headers_block.deinit(self.allocator);
         var pending_headers_flags: u8 = 0;
@@ -940,6 +946,12 @@ pub const Server = struct {
             switch (frame.header.frame_type) {
                 .settings => {
                     if ((frame.header.flags & 0x01) == 0) {
+                        var parsed_settings = conn.peer_settings;
+                        try http.applySettingsPayload(&parsed_settings, frame.payload);
+                        try stream_manager.applyPeerSettings(parsed_settings);
+                        conn.peer_settings = parsed_settings;
+                        peer_max_frame_size = parsed_settings.max_frame_size;
+                        client_push_enabled = self.config.enable_push and parsed_settings.enable_push;
                         try conn.writeFrame(.{
                             .length = 0,
                             .frame_type = .settings,
@@ -1113,8 +1125,14 @@ pub const Server = struct {
                         request_done = true;
                     }
                 },
-                .rst_stream => return error.ProtocolError,
-                .goaway => return,
+                .rst_stream => {
+                    if (request_stream_id != null and frame.header.stream_id == request_stream_id.?) {
+                        request_done = true;
+                    }
+                },
+                .goaway => {
+                    return;
+                },
                 .window_update, .priority, .push_promise => {},
             }
         }
@@ -1155,12 +1173,20 @@ pub const Server = struct {
             defer internal.deinit();
             internal.version = .HTTP_2;
             try self.sendHttp2Response(&conn, &stream_manager, stream_id, &internal);
+            const goaway_frame = try h2stream.buildGoawayFrame(stream_id, .internal_error, null, self.allocator);
+            defer self.allocator.free(goaway_frame);
+            try conn.writer.writeAll(goaway_frame);
             return;
         };
         defer response.deinit();
         response.version = .HTTP_2;
 
         try self.sendHttp2Response(&conn, &stream_manager, stream_id, &response);
+
+        // Send GOAWAY to signal clean shutdown.
+        const goaway_frame = try h2stream.buildGoawayFrame(stream_id, .no_error, null, self.allocator);
+        defer self.allocator.free(goaway_frame);
+        try conn.writer.writeAll(goaway_frame);
 
         // Give the peer time to drain queued bytes before teardown.
         sock.shutdownWrite() catch {};
@@ -1200,31 +1226,29 @@ pub const Server = struct {
             try response_headers.append(self.allocator, .{ .name = lowered, .value = entry.value });
         }
 
-        const headers_payload = try h2stream.buildHeadersFramePayload(
+        const has_body = response.body != null and response.body.?.len > 0;
+        const max_frame_size: u32 = @max(conn.peer_settings.max_frame_size, 16 * 1024);
+
+        const headers_frames = try h2stream.buildHeadersAndContinuations(
             stream_manager,
+            stream_id,
             response_headers.items,
             null,
+            max_frame_size,
+            !has_body,
             self.allocator,
         );
-        defer self.allocator.free(headers_payload.payload);
+        defer self.allocator.free(headers_frames);
 
-        const has_body = response.body != null and response.body.?.len > 0;
-        const headers_flags: u8 = headers_payload.flags | @as(u8, if (has_body) 0 else 0x01);
-
-        try conn.writeFrame(.{
-            .length = @intCast(headers_payload.payload.len),
-            .frame_type = .headers,
-            .flags = headers_flags,
-            .stream_id = stream_id,
-        }, headers_payload.payload);
+        try conn.writer.writeAll(headers_frames);
 
         if (has_body) {
             const body = response.body.?;
-            const max_frame_size: usize = @intCast(@max(self.config.http2_settings.max_frame_size, @as(u32, 16 * 1024)));
+            const data_max_frame_size: usize = @intCast(max_frame_size);
 
             var offset: usize = 0;
             while (offset < body.len) {
-                const chunk_len = @min(body.len - offset, max_frame_size);
+                const chunk_len = @min(body.len - offset, data_max_frame_size);
                 const is_last = offset + chunk_len == body.len;
                 try conn.writeFrame(.{
                     .length = @intCast(chunk_len),
@@ -1237,6 +1261,154 @@ pub const Server = struct {
         }
     }
 
+    /// Sends HTTP/2 trailers for a stream.
+    /// Trailers are sent as a HEADERS frame with END_STREAM flag set.
+    pub fn sendHttp2Trailers(
+        self: *Self,
+        conn: *http.Http2Connection,
+        stream_manager: *h2stream.StreamManager,
+        stream_id: u31,
+        trailer_headers: *const Headers,
+    ) !void {
+        var hpack_entries = std.ArrayList(hpack.HeaderEntry).empty;
+        defer hpack_entries.deinit(self.allocator);
+
+        var owned_names = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_names.items) |name| {
+                self.allocator.free(name);
+            }
+            owned_names.deinit(self.allocator);
+        }
+
+        for (trailer_headers.entries.items) |entry| {
+            if (common.isConnectionSpecificHeader(entry.name)) continue;
+            if (entry.name.len > 0 and entry.name[0] == ':') continue;
+
+            const lowered = try common.dupLowerAscii(self.allocator, entry.name);
+            try owned_names.append(self.allocator, lowered);
+            try hpack_entries.append(self.allocator, .{ .name = lowered, .value = entry.value });
+        }
+
+        const max_frame_size: u32 = @max(conn.peer_settings.max_frame_size, 16 * 1024);
+
+        const headers_frames = try h2stream.buildHeadersAndContinuations(
+            stream_manager,
+            stream_id,
+            hpack_entries.items,
+            null,
+            max_frame_size,
+            true, // END_STREAM
+            self.allocator,
+        );
+        defer self.allocator.free(headers_frames);
+
+        try conn.writer.writeAll(headers_frames);
+    }
+
+    /// Sends an HTTP/2 PUSH_PROMISE frame to the client, then sends the
+    /// promised response on the new server-initiated stream.
+    ///
+    /// Returns the promised stream ID on success.
+    pub fn pushPromise(
+        self: *Self,
+        conn: *http.Http2Connection,
+        stream_manager: *h2stream.StreamManager,
+        original_stream_id: u31,
+        method: types.Method,
+        path: []const u8,
+        promise_headers: ?[]const hpack.HeaderEntry,
+    ) !u31 {
+        if (!self.config.enable_push) return error.PushDisabled;
+
+        var promised_stream = try stream_manager.createStream();
+        const promised_id = promised_stream.id;
+        try promised_stream.open();
+
+        var promise_header_block = std.ArrayList(hpack.HeaderEntry).empty;
+        defer promise_header_block.deinit(self.allocator);
+
+        try promise_header_block.append(self.allocator, .{ .name = ":method", .value = method.toString() });
+        try promise_header_block.append(self.allocator, .{ .name = ":path", .value = path });
+        try promise_header_block.append(self.allocator, .{ .name = ":scheme", .value = "https" });
+
+        if (promise_headers) |extra| {
+            for (extra) |h| {
+                try promise_header_block.append(self.allocator, h);
+            }
+        }
+
+        const max_frame_size: u32 = @max(conn.peer_settings.max_frame_size, 16 * 1024);
+
+        var promise_payload = std.ArrayList(u8).empty;
+        defer promise_payload.deinit(self.allocator);
+
+        const encoded_headers = try h2stream.hpack.encodeHeaders(
+            &stream_manager.hpack_ctx,
+            promise_header_block.items,
+            self.allocator,
+        );
+        defer self.allocator.free(encoded_headers);
+
+        const promised_id_buf: [4]u8 = .{
+            @intCast((promised_id >> 24) & 0x7F),
+            @intCast((promised_id >> 16) & 0xFF),
+            @intCast((promised_id >> 8) & 0xFF),
+            @intCast(promised_id & 0xFF),
+        };
+        try promise_payload.appendSlice(self.allocator, &promised_id_buf);
+        try promise_payload.appendSlice(self.allocator, encoded_headers);
+
+        const max_fragment: usize = if (max_frame_size > 9) @intCast(max_frame_size - 9) else 0;
+
+        if (promise_payload.items.len <= max_fragment) {
+            const frame_header = http.Http2FrameHeader{
+                .length = @intCast(promise_payload.items.len),
+                .frame_type = .push_promise,
+                .flags = 0x04,
+                .stream_id = original_stream_id,
+            };
+            const hdr = frame_header.serialize();
+            try conn.writer.writeAll(&hdr);
+            try conn.writer.writeAll(promise_payload.items);
+        } else {
+            const first_chunk_len = @min(promise_payload.items.len, max_fragment);
+            {
+                const frame_header = http.Http2FrameHeader{
+                    .length = @intCast(first_chunk_len),
+                    .frame_type = .push_promise,
+                    .flags = 0,
+                    .stream_id = original_stream_id,
+                };
+                const hdr = frame_header.serialize();
+                try conn.writer.writeAll(&hdr);
+                try conn.writer.writeAll(promise_payload.items[0..first_chunk_len]);
+            }
+
+            var offset = first_chunk_len;
+            while (offset < promise_payload.items.len) {
+                const chunk_len = @min(promise_payload.items.len - offset, max_fragment);
+                const is_last = (offset + chunk_len) == promise_payload.items.len;
+                const cont_flags: u8 = if (is_last) 0x04 else 0;
+
+                const frame_header = http.Http2FrameHeader{
+                    .length = @intCast(chunk_len),
+                    .frame_type = .continuation,
+                    .flags = cont_flags,
+                    .stream_id = original_stream_id,
+                };
+                const hdr = frame_header.serialize();
+                try conn.writer.writeAll(&hdr);
+                try conn.writer.writeAll(promise_payload.items[offset .. offset + chunk_len]);
+                offset += chunk_len;
+            }
+        }
+
+        promised_stream.sendEndStream();
+
+        return promised_id;
+    }
+
     fn handleHttp3Transaction(self: *Self, peer_addr: net.Address, first_datagram: []const u8) !void {
         var control_stream_payload = std.ArrayList(u8).empty;
         defer control_stream_payload.deinit(self.allocator);
@@ -1247,6 +1419,10 @@ pub const Server = struct {
         var request_stream_id: ?u64 = null;
         var request_done = false;
         var client_cid: ?quic.ConnectionId = null;
+
+        // HTTP/3 flow control state
+        var conn_max_data: u64 = 10 * 1024 * 1024; // 10 MB default
+        var stream_max_data: u64 = 1024 * 1024; // 1 MB default per stream
 
         var recv_buf: [64 * 1024]u8 = undefined;
         var packet_data: []const u8 = first_datagram;
@@ -1274,7 +1450,38 @@ pub const Server = struct {
         }
 
         if (control_stream_payload.items.len > 0) {
-            _ = parseHttp3ControlStream(control_stream_payload.items) catch {};
+            // Parse control stream frames, extracting flow control values
+            var cs_offset: usize = 0;
+            // Skip stream type byte
+            if (control_stream_payload.items.len > 0) {
+                const st = try http.decodeVarInt(control_stream_payload.items);
+                cs_offset = st.len;
+            }
+            var saw_settings = false;
+            while (cs_offset < control_stream_payload.items.len) {
+                const frame = try http.Http3FrameHeader.decode(control_stream_payload.items[cs_offset..]);
+                cs_offset += frame.len;
+                const plen: usize = @intCast(frame.header.length);
+                if (control_stream_payload.items.len < cs_offset + plen) break;
+                const payload = control_stream_payload.items[cs_offset .. cs_offset + plen];
+                cs_offset += plen;
+
+                if (frame.header.frame_type == @intFromEnum(http.Http3FrameType.settings)) {
+                    _ = try http.parseHttp3SettingsPayload(payload);
+                    saw_settings = true;
+                } else if (frame.header.frame_type == @intFromEnum(http.Http3FrameType.max_data)) {
+                    if (payload.len > 0) {
+                        const val = try http.decodeVarInt(payload);
+                        conn_max_data = val.value;
+                    }
+                } else if (frame.header.frame_type == @intFromEnum(http.Http3FrameType.max_stream_data)) {
+                    if (payload.len > 0) {
+                        const sid = try http.decodeVarInt(payload);
+                        const data_limit = try http.decodeVarInt(payload[sid.len..]);
+                        stream_max_data = data_limit.value;
+                    }
+                }
+            }
         }
 
         const stream_id = request_stream_id orelse return error.ProtocolError;
@@ -1390,16 +1597,18 @@ pub const Server = struct {
         }
 
         var response = self.executeServerRequest(&req) catch {
+            // Send CONNECTION_CLOSE (application) on unrecoverable handler error
+            self.sendHttp3ConnectionCloseApp(peer_addr, dst_cid, @intFromEnum(http.Http3ErrorCode.internal_error), "handler error") catch {};
             var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             defer internal.deinit();
             internal.version = .HTTP_3;
-            try self.sendHttp3Response(peer_addr, dst_cid, stream_id, &internal);
+            try self.sendHttp3Response(peer_addr, dst_cid, stream_id, &internal, conn_max_data, stream_max_data);
             return;
         };
         defer response.deinit();
         response.version = .HTTP_3;
 
-        try self.sendHttp3Response(peer_addr, dst_cid, stream_id, &response);
+        try self.sendHttp3Response(peer_addr, dst_cid, stream_id, &response, conn_max_data, stream_max_data);
     }
 
     fn sendHttp3Response(
@@ -1408,6 +1617,8 @@ pub const Server = struct {
         dst_cid: quic.ConnectionId,
         request_stream_id: u64,
         response: *Response,
+        conn_max_data: u64,
+        stream_max_data: u64,
     ) !void {
         try self.ensureContentLengthHeader(response);
 
@@ -1460,6 +1671,21 @@ pub const Server = struct {
         try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.Http3StreamType.control));
         try http.appendHttp3Frame(&control_stream_payload, self.allocator, .settings, settings_payload.items);
 
+        // Send MAX_DATA and MAX_STREAM_DATA to advertise our flow control limits
+        {
+            var max_data_payload = std.ArrayList(u8).empty;
+            defer max_data_payload.deinit(self.allocator);
+            try http.appendVarInt(&max_data_payload, self.allocator, conn_max_data);
+            try http.appendHttp3Frame(&control_stream_payload, self.allocator, .max_data, max_data_payload.items);
+        }
+        {
+            var max_stream_data_payload = std.ArrayList(u8).empty;
+            defer max_stream_data_payload.deinit(self.allocator);
+            try http.appendVarInt(&max_stream_data_payload, self.allocator, request_stream_id);
+            try http.appendVarInt(&max_stream_data_payload, self.allocator, stream_max_data);
+            try http.appendHttp3Frame(&control_stream_payload, self.allocator, .max_stream_data, max_stream_data_payload.items);
+        }
+
         const server_cid = quic.ConnectionId.random();
 
         const control_packet = try buildHttp3Datagram(
@@ -1489,6 +1715,191 @@ pub const Server = struct {
         const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
         _ = try udp.sendTo(peer_addr, control_packet);
         _ = try udp.sendTo(peer_addr, response_packet);
+    }
+
+    /// Sends an HTTP/3 GOAWAY frame on the control stream.
+    pub fn sendHttp3Goaway(
+        self: *Self,
+        peer_addr: net.Address,
+        dst_cid: quic.ConnectionId,
+        stream_id: u64,
+    ) !void {
+        var goaway_payload = std.ArrayList(u8).empty;
+        defer goaway_payload.deinit(self.allocator);
+        try http.appendVarInt(&goaway_payload, self.allocator, stream_id);
+
+        var control_stream_payload = std.ArrayList(u8).empty;
+        defer control_stream_payload.deinit(self.allocator);
+        try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.Http3StreamType.control));
+        try http.appendHttp3Frame(&control_stream_payload, self.allocator, .goaway, goaway_payload.items);
+
+        const server_cid = quic.ConnectionId.random();
+        const packet = try buildHttp3Datagram(
+            self.allocator,
+            dst_cid,
+            server_cid,
+            1,
+            3,
+            0,
+            false,
+            control_stream_payload.items,
+        );
+        defer self.allocator.free(packet);
+
+        const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
+        _ = try udp.sendTo(peer_addr, packet);
+    }
+
+    /// Sends a QUIC CONNECTION_CLOSE (application, type 0x1d) frame.
+    pub fn sendHttp3ConnectionCloseApp(
+        self: *Self,
+        peer_addr: net.Address,
+        dst_cid: quic.ConnectionId,
+        error_code: u64,
+        reason: []const u8,
+    ) !void {
+        var close_buf: [128]u8 = undefined;
+        const frame = quic.ConnectionCloseFrame{
+            .error_code = error_code,
+            .reason_phrase = reason,
+        };
+        const frame_len = try frame.encode(true, &close_buf);
+
+        var packet = std.ArrayList(u8).empty;
+        errdefer packet.deinit(self.allocator);
+
+        var header_buf: [128]u8 = undefined;
+        const server_cid = quic.ConnectionId.random();
+        const header_len = try (quic.LongHeader{
+            .packet_type = .initial,
+            .version = .v1,
+            .dcid = dst_cid,
+            .scid = server_cid,
+        }).encode(&header_buf);
+        try packet.appendSlice(self.allocator, header_buf[0..header_len]);
+
+        var pn_buf: [8]u8 = undefined;
+        const pn_len = try quic.encodeVarInt(0, &pn_buf);
+        try packet.appendSlice(self.allocator, pn_buf[0..pn_len]);
+        try packet.appendSlice(self.allocator, close_buf[0..frame_len]);
+
+        const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
+        _ = try udp.sendTo(peer_addr, packet.items);
+    }
+
+    /// Sends a QUIC RESET_STREAM frame to cancel a stream.
+    pub fn sendHttp3ResetStream(
+        self: *Self,
+        peer_addr: net.Address,
+        dst_cid: quic.ConnectionId,
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+    ) !void {
+        var frame_buf: [64]u8 = undefined;
+        const frame = quic.ResetStreamFrame{
+            .stream_id = stream_id,
+            .error_code = error_code,
+            .final_size = final_size,
+        };
+        const frame_len = try frame.encode(&frame_buf);
+
+        var packet = std.ArrayList(u8).empty;
+        errdefer packet.deinit(self.allocator);
+
+        var header_buf: [128]u8 = undefined;
+        const server_cid = quic.ConnectionId.random();
+        const header_len = try (quic.LongHeader{
+            .packet_type = .initial,
+            .version = .v1,
+            .dcid = dst_cid,
+            .scid = server_cid,
+        }).encode(&header_buf);
+        try packet.appendSlice(self.allocator, header_buf[0..header_len]);
+
+        var pn_buf: [8]u8 = undefined;
+        const pn_len = try quic.encodeVarInt(0, &pn_buf);
+        try packet.appendSlice(self.allocator, pn_buf[0..pn_len]);
+        try packet.appendSlice(self.allocator, frame_buf[0..frame_len]);
+
+        const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
+        _ = try udp.sendTo(peer_addr, packet.items);
+    }
+
+    /// Sends a QUIC STOP_SENDING frame to tell the peer to stop sending on a stream.
+    pub fn sendHttp3StopSending(
+        self: *Self,
+        peer_addr: net.Address,
+        dst_cid: quic.ConnectionId,
+        stream_id: u64,
+        error_code: u64,
+    ) !void {
+        var frame_buf: [64]u8 = undefined;
+        const frame = quic.StopSendingFrame{
+            .stream_id = stream_id,
+            .error_code = error_code,
+        };
+        const frame_len = try frame.encode(&frame_buf);
+
+        var packet = std.ArrayList(u8).empty;
+        errdefer packet.deinit(self.allocator);
+
+        var header_buf: [128]u8 = undefined;
+        const server_cid = quic.ConnectionId.random();
+        const header_len = try (quic.LongHeader{
+            .packet_type = .initial,
+            .version = .v1,
+            .dcid = dst_cid,
+            .scid = server_cid,
+        }).encode(&header_buf);
+        try packet.appendSlice(self.allocator, header_buf[0..header_len]);
+
+        var pn_buf: [8]u8 = undefined;
+        const pn_len = try quic.encodeVarInt(0, &pn_buf);
+        try packet.appendSlice(self.allocator, pn_buf[0..pn_len]);
+        try packet.appendSlice(self.allocator, frame_buf[0..frame_len]);
+
+        const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
+        _ = try udp.sendTo(peer_addr, packet.items);
+    }
+
+    /// Sends a QUIC CONNECTION_CLOSE (transport, type 0x1c) frame.
+    pub fn sendHttp3ConnectionCloseTransport(
+        self: *Self,
+        peer_addr: net.Address,
+        dst_cid: quic.ConnectionId,
+        error_code: u64,
+        frame_type: u64,
+        reason: []const u8,
+    ) !void {
+        var close_buf: [128]u8 = undefined;
+        const frame = quic.ConnectionCloseFrame{
+            .error_code = error_code,
+            .frame_type = frame_type,
+            .reason_phrase = reason,
+        };
+        const frame_len = try frame.encode(false, &close_buf);
+
+        var packet = std.ArrayList(u8).empty;
+        errdefer packet.deinit(self.allocator);
+
+        var header_buf: [128]u8 = undefined;
+        const server_cid = quic.ConnectionId.random();
+        const header_len = try (quic.LongHeader{
+            .packet_type = .initial,
+            .version = .v1,
+            .dcid = dst_cid,
+            .scid = server_cid,
+        }).encode(&header_buf);
+        try packet.appendSlice(self.allocator, header_buf[0..header_len]);
+
+        var pn_buf: [8]u8 = undefined;
+        const pn_len = try quic.encodeVarInt(0, &pn_buf);
+        try packet.appendSlice(self.allocator, pn_buf[0..pn_len]);
+        try packet.appendSlice(self.allocator, close_buf[0..frame_len]);
+
+        const udp = if (self.udp_socket) |*u| u else return error.ProtocolError;
+        _ = try udp.sendTo(peer_addr, packet.items);
     }
 
     fn executeServerRequest(self: *Self, req: *Request) !Response {

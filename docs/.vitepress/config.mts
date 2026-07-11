@@ -23,7 +23,7 @@ export default defineConfig({
   base: "/httpx.zig/",
   lastUpdated: true,
   cleanUrls: true,
-  
+
   sitemap: {
     hostname: SITE_URL,
   },
@@ -42,7 +42,7 @@ export default defineConfig({
     ["meta", { name: "language", content: "English" }],
     ["meta", { name: "revisit-after", content: "7 days" }],
     ["meta", { name: "generator", content: "VitePress" }],
-    
+
     // Open Graph
     ["meta", { property: "og:type", content: "website" }],
     ["meta", { property: "og:url", content: SITE_URL }],
@@ -154,7 +154,7 @@ gtag('config', '${GA_ID}');`,
     const lastUpdated = pageData.lastUpdated
       ? new Date(pageData.lastUpdated).toISOString()
       : new Date().toISOString();
-    
+
     // Base Graph
     const graph: any[] = [];
 
@@ -214,14 +214,14 @@ gtag('config', '${GA_ID}');`,
           "priceCurrency": "USD"
         },
         "downloadUrl": "https://github.com/muhammad-fiaz/httpx.zig",
-        "softwareVersion": "0.1.2",
+        "softwareVersion": "0.1.3",
         "license": "https://opensource.org/licenses/MIT"
       });
     } else {
       // Extract section from path (e.g. guide/getting-started -> Guide)
       const pathParts = pageData.relativePath.split('/');
-      const section = pathParts.length > 1 
-        ? pathParts[0].charAt(0).toUpperCase() + pathParts[0].slice(1) 
+      const section = pathParts.length > 1
+        ? pathParts[0].charAt(0).toUpperCase() + pathParts[0].slice(1)
         : 'Documentation';
 
       Object.assign(primarySchema, {
@@ -250,12 +250,12 @@ gtag('config', '${GA_ID}');`,
     if (!isHome) {
       const pathParts = pageData.relativePath.replace(/\.md$/, '').split('/');
       let currentPath = SITE_URL;
-      
+
       pathParts.forEach((part: string, index: number) => {
         currentPath += `/${part}`;
         // Best effort capitalization
         const name = part.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ');
-        
+
         breadcrumbs.push({
           "@type": "ListItem",
           "position": index + 2,
