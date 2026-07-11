@@ -41,7 +41,18 @@ pub const Request = struct {
         var headers = Headers.init(allocator);
 
         if (uri.host) |host| {
-            try headers.set(HeaderName.HOST, host);
+            const default_port: u16 = if (uri.isTls()) 443 else 80;
+            if (uri.port) |port| {
+                if (port != default_port) {
+                    const host_with_port = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+                    defer allocator.free(host_with_port);
+                    try headers.set(HeaderName.HOST, host_with_port);
+                } else {
+                    try headers.set(HeaderName.HOST, host);
+                }
+            } else {
+                try headers.set(HeaderName.HOST, host);
+            }
         }
 
         return .{

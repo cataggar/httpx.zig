@@ -479,8 +479,29 @@ pub const HuffmanCodec = struct {
     }
 };
 
+/// How a literal header should be encoded (RFC 7541 Section 6.2).
+pub const HeaderRepresentation = enum {
+    /// Incremental indexing (0100 xxxx prefix). Adds to dynamic table.
+    /// Use for stable headers that benefit from compression (e.g. :method, accept).
+    incremental_indexing,
+
+    /// Without indexing (0000 xxxx prefix). Never added to dynamic table.
+    /// Use for volatile headers that change per request (e.g. date, cookie).
+    without_indexing,
+
+    /// Never indexed (0001 xxxx prefix). Must never be added to dynamic table.
+    /// Use for security-sensitive headers that must not be compressed (e.g. authorization, set-cookie).
+    /// Signals to intermediaries that the value must not be compressed.
+    never_indexed,
+};
+
 /// Header entry for encoding.
-pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
+pub const HeaderEntry = struct {
+    name: []const u8,
+    value: []const u8,
+    /// How this header should be encoded. Defaults to incremental indexing.
+    representation: HeaderRepresentation = .incremental_indexing,
+};
 
 /// Encodes a header block using HPACK.
 pub fn encodeHeaders(

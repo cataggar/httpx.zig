@@ -559,8 +559,11 @@ pub const SocketIoReader = struct {
         return n;
     }
 
-    fn rebase(_: *Io.Reader, _: usize) Io.Reader.RebaseError!void {
-        // Sockets are not seekable; nothing to do.
+    fn rebase(r: *Io.Reader, _: usize) Io.Reader.RebaseError!void {
+        const data = r.buffer[r.seek..r.end];
+        @memmove(r.buffer[0..data.len], data);
+        r.seek = 0;
+        r.end = data.len;
     }
 
     const vtable: Io.Reader.VTable = .{

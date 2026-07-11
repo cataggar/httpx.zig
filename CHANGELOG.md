@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.3] - 11-07-2026
+
+### Changed
+- Bumped project version to `0.1.3`.
+
+### Fixed
+- Fixed HTTPS responses larger than ~16 KB (one TLS record) causing an infinite loop at 100% CPU. The `SocketIoReader.rebase` vtable function was a no-op, so after the internal buffer was fully consumed the reader never reclaimed buffer space and `readVec` kept returning zero bytes. `rebase` now compacts unread data to the front of the buffer, matching the standard library's `defaultRebase` behavior ([Issue #21](https://github.com/muhammad-fiaz/httpx.zig/issues/21)).
+- Fixed `Host` request header omitting non-default port numbers. `Request.init` now includes the port in the `Host` header when it differs from the scheme default (80 for HTTP, 443 for HTTPS), matching RFC 7230 semantics and aligning with the existing `buildAuthority` logic used by HTTP/2 ([Issue #22](https://github.com/muhammad-fiaz/httpx.zig/issues/22)).
+
+
 ## [0.1.2] - 07-07-2026
 
 ### Added

@@ -160,20 +160,20 @@ zig build -Dtarget=x86-windows
 
 ### Method 1: Zig Fetch (Recommended)
 
-**Latest Release (v0.1.2)**
+**Latest Release (v0.1.3)**
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz
+```
+
+**Previous Stable Release (v0.1.2)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
 ```
 
-**Previous Stable Release (v0.1.1)**
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
-```
-
 > [!WARNING]
-> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.2**.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.3**.
 
 ### Method 2: Zig Fetch (Main Branch)
 
@@ -190,7 +190,7 @@ Add the dependency to your `build.zig.zon` file.
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz",
         .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
     },
 },

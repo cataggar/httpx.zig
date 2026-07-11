@@ -60,9 +60,9 @@ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 ## Install
 
-::: warning v0.1.2 release and Zig 0.15 deprecation
-`v0.1.2` is the current release and targets Zig `0.16.0+`.
-`v0.1.1` is the previous stable release for the immediate prior `0.1.x` line.
+::: warning v0.1.3 release and Zig 0.15 deprecation
+`v0.1.3` is the current release and targets Zig `0.16.0+`.
+`v0.1.2` is the previous stable release for the immediate prior `0.1.x` line.
 Zig `0.15` support is legacy and remains available only through `0.0.7`.
 The HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads is included in this release.
 If you are upgrading from `0.0.7`, review `/CHANGELOG` first and refresh your dependency pin/hash.
@@ -70,16 +70,16 @@ If you are upgrading from `0.0.7`, review `/CHANGELOG` first and refresh your de
 
 Choose one of these installation methods:
 
-1. Latest release (0.1.2)
+1. Latest release (0.1.3)
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz
+```
+
+2. Previous stable release (0.1.2)
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
-```
-
-2. Previous stable release (0.1.1)
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.1.tar.gz
 ```
 
 3. Legacy Zig 0.15 support (0.0.7)
@@ -103,7 +103,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz",
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz",
     .hash = "...",
   },
 },
