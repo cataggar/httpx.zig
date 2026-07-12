@@ -7,8 +7,9 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-fn sleepMs(ms: u64) void {
-    std.Thread.sleep(std.time.ns_per_ms * ms);
+fn sleepMs(ms: i64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
 }
 
 pub fn main() !void {
@@ -187,8 +188,7 @@ fn runServer(listener: *httpx.TcpListener) !void {
         .stream_id = 0,
     }, &goaway_payload);
 
-    // Small delay so queued bytes reach the client before we close the socket.
-    std.Thread.sleep(std.time.ns_per_ms * 100);
+    sleepMs(100);
 }
 
 fn readNoEofSocket(socket: *httpx.Socket, out: []u8) !void {

@@ -1389,7 +1389,17 @@ pub const Client = struct {
             if (frame_counter > 10_000) return error.ProtocolError;
 
             const frame = self.readHttp2Frame(transport) catch |err| switch (err) {
-                error.UnexpectedEof => return error.InvalidResponse,
+                error.UnexpectedEof => {
+                    // RFC 7540 section 6.8: a server may close the connection
+                    // after sending the final frame. If we already received a
+                    // complete response (END_STREAM seen, status code present),
+                    // treat the clean close as end-of-response rather than error.
+                    if (got_end_stream and status_code != null) {
+                        response_done = true;
+                        continue;
+                    }
+                    return error.InvalidResponse;
+                },
                 else => return err,
             };
             defer self.allocator.free(frame.payload);
