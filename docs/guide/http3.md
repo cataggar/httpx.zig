@@ -24,7 +24,12 @@ HTTP/3 support is validated across Linux, Windows, and macOS targets:
 - **QUIC Transport Framing** - All QUIC frame types (STREAM, CRYPTO, ACK, etc.)
 - **Variable-Length Integers** - QUIC varint encoding/decoding
 - **Connection IDs** - Full connection ID management
-- **Transport Parameters** - QUIC transport parameter encoding
+- **Transport Parameters** - QUIC transport parameter encoding and decoding
+- **Flow Control** - MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows
+- **GOAWAY and CONNECTION_CLOSE** - Both client and server handle incoming GOAWAY gracefully and can send GOAWAY or CONNECTION_CLOSE on errors
+- **Stream Cancellation** - RESET_STREAM and STOP_SENDING frames for graceful stream teardown without connection disruption
+- **QPACK Decoder Stream** - Decode functions for Section Ack, Stream Cancel, Insert Count Increment, Set Capacity, and encoder stream instructions
+- **Connection Preface Timeout** - Detects missing initial SETTINGS frame from peer
 
 ## High-level Client Usage
 
@@ -367,9 +372,85 @@ const encoded = try params.encode(allocator);
 defer allocator.free(encoded);
 ```
 
+## Flow Control
+
+HTTP/3 uses MAX_DATA and MAX_STREAM_DATA frames for flow control:
+
+```zig
+// Connection-level flow control
+// Server sends MAX_DATA to increase the client's send window
+const max_data_frame = httpx.quic.MaxDataFrame{
+    .maximum_data = 10485760, // 10MB
+};
+
+// Per-stream flow control
+const max_stream_data_frame = httpx.quic.MaxStreamDataFrame{
+    .stream_id = 4,
+    .maximum_stream_data = 1048576, // 1MB per stream
+};
+```
+
+## GOAWAY and CONNECTION_CLOSE
+
+Both client and server handle incoming GOAWAY gracefully:
+
+```zig
+// Server sends GOAWAY on clean shutdown
+const goaway = httpx.quic.ConnectionCloseFrame{
+    .error_code = @intFromEnum(httpx.quic.TransportError.no_error),
+    .frame_type = null,
+    .reason_phrase = "server shutting down",
+};
+
+// CONNECTION_CLOSE (transport vs application)
+const transport_close = httpx.quic.ConnectionCloseFrame{
+    .error_code = @intFromEnum(httpx.quic.TransportError.no_error),
+    .frame_type = null,
+    .reason_phrase = "graceful shutdown",
+};
+const len = try transport_close.encode(false, &buf); // false = transport close
+```
+
+## Stream Cancellation
+
+Cancel individual streams without tearing down the connection:
+
+```zig
+// RESET_STREAM: abruptly terminates a send stream
+const reset = httpx.quic.ResetStreamFrame{
+    .stream_id = 4,
+    .error_code = @intFromEnum(httpx.quic.StreamError.cancel),
+    .final_size = 1024,
+};
+
+// STOP_SENDING: ask the peer to stop sending on a receive stream
+const stop = httpx.quic.StopSendingFrame{
+    .stream_id = 8,
+    .error_code = @intFromEnum(httpx.quic.StreamError.cancel),
+};
+```
+
+## QPACK Decoder Stream
+
+Decoder stream instructions can be decoded:
+
+```zig
+// Section Ack
+const ack = try httpx.qpack.decodeSectionAck(data);
+
+// Stream Cancel
+const cancel = try httpx.qpack.decodeStreamCancel(data);
+
+// Insert Count Increment
+const increment = try httpx.qpack.decodeInsertCountIncrement(data);
+
+// Set Capacity
+const capacity = try httpx.qpack.decodeSetCapacity(data);
+```
+
 ## Running the Example
 
-Run the low-level protocol and high-level runtime HTTP/3 examples with:
+Run the low-level protocol, high-level runtime, and advanced HTTP/3 examples with:
 
 ```bash
 zig build example-http3_example
@@ -377,6 +458,7 @@ zig build example-http3_example
 
 zig build run-http3_client_runtime
 zig build run-http3_server_runtime
+zig build run-http3_advanced
 ```
 
 ## See Also

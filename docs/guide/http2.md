@@ -25,6 +25,14 @@ HTTP/2 support is validated across Linux, Windows, and macOS targets:
 - **Flow Control** - Per-stream and connection-level flow control with WINDOW_UPDATE
 - **Stream Priority** - Dependency-based prioritization
 - **Frame Encoding/Decoding** - All HTTP/2 frame types supported
+- **CONTINUATION Frames** - Header blocks exceeding `MAX_FRAME_SIZE` are automatically split across HEADERS + CONTINUATION frames
+- **SETTINGS Enforcement** - Peer `MAX_CONCURRENT_STREAMS`, `MAX_FRAME_SIZE`, and `INITIAL_WINDOW_SIZE` values are parsed and enforced
+- **GOAWAY/RST_STREAM** - Graceful connection shutdown and stream cancellation with proper error codes
+- **HPACK Security** - `Without Indexing` / `Never Indexed` representations for volatile headers like `Authorization` and `Cookie`
+- **Trailer Support** - Server sends trailers via `sendHttp2Trailers()`; client decodes trailers after END_STREAM
+- **Connection Preface Timeout** - Detects missing initial SETTINGS frame from peer
+- **ALPN Negotiation** - Client and server advertise `["h2", "http/1.1"]` during TLS handshake
+- **Connection Pooling** - HTTP/2 connections are pooled and reused across requests
 
 ## High-level Client Usage
 
@@ -335,9 +343,116 @@ HTTP/2 defines error codes for RST_STREAM and GOAWAY frames:
 | INADEQUATE_SECURITY | 0xc | TLS requirements not met |
 | HTTP_1_1_REQUIRED | 0xd | HTTP/1.1 required |
 
+## CONTINUATION Frames
+
+When header blocks exceed `MAX_FRAME_SIZE`, httpx.zig automatically splits them across HEADERS + CONTINUATION frames:
+
+```zig
+// Headers are automatically split when they exceed max_frame_size
+const result = try httpx.stream.buildHeadersAndContinuations(
+    &stream_manager,
+    &headers,
+    .{
+        .max_frame_size = 16384,
+        .stream_id = 1,
+    },
+    allocator,
+);
+defer {
+    allocator.free(result.headers_payload);
+    for (result.continuation_payloads) |p| allocator.free(p.payload);
+    allocator.free(result.continuation_payloads);
+}
+```
+
+## SETTINGS Enforcement
+
+Peer SETTINGS values are parsed and enforced:
+
+```zig
+// Apply peer settings
+const settings = httpx.Http2Settings{
+    .max_concurrent_streams = 100,
+    .max_frame_size = 16384,
+    .initial_window_size = 65535,
+};
+try manager.applyPeerSettings(settings);
+
+// Check before opening streams
+if (!manager.canOpenStream()) {
+    std.debug.print("Max concurrent streams reached\n", .{});
+}
+
+// Validate frame sizes
+if (!manager.validateFrameSize(frame_length)) {
+    std.debug.print("Frame too large for peer\n", .{});
+}
+```
+
+## GOAWAY and RST_STREAM
+
+Both sending and receiving are supported:
+
+```zig
+// Build GOAWAY frame for clean shutdown
+const goaway = try httpx.stream.buildGoawayFrame(
+    last_stream_id,
+    .no_error,
+    "server shutting down",
+    allocator,
+);
+defer allocator.free(goaway);
+
+// Build RST_STREAM frame to cancel a specific stream
+const rst = httpx.stream.buildRstStreamFrame(.cancel);
+```
+
+## HPACK Security: Without Indexing / Never Indexed
+
+For volatile headers like `Authorization` and `Cookie`, use non-indexing representations to prevent HPACK bomb attacks:
+
+```zig
+// Without Indexing: don't add to dynamic table
+const encoded = try httpx.hpack.encodeHeaderWithoutIndexing(
+    &ctx, "Authorization", "Bearer token123", allocator,
+);
+defer allocator.free(encoded);
+
+// Never Indexed: explicitly tell decoder to never index
+const encoded = try httpx.hpack.encodeHeaderNeverIndexed(
+    &ctx, "Cookie", "session=abc123", allocator,
+);
+defer allocator.free(encoded);
+```
+
+::: tip Security Note
+Using incremental indexing for `Authorization` or `Cookie` headers can pollute the dynamic table and enable HPACK bomb attacks. Always use `Without Indexing` or `Never Indexed` for sensitive headers.
+:::
+
+## Trailer Support
+
+Servers can send HTTP/2 trailers after the response body:
+
+```zig
+fn handler(ctx: *httpx.Context) anyerror!httpx.Response {
+    var resp = ctx.text("hello");
+    // Send trailers after the response body
+    try resp.sendHttp2Trailers(&.{
+        .{ "x-checksum", "abc123" },
+    });
+    return resp;
+}
+```
+
+Client receives trailers in the `Response.trailers` field after the response body is fully read.
+
+## Connection Preface Timeout
+
+Both client and server detect if the peer never sends its initial SETTINGS frame after the connection preface, preventing indefinite hangs.
+
 ## Running the Example
 
-Run the low-level protocol and high-level runtime HTTP/2 examples with:
+Run the low-level protocol, high-level runtime, and advanced HTTP/2 examples with:
 
 ```bash
 zig build example-http2_example
@@ -345,6 +460,7 @@ zig build example-http2_example
 
 zig build run-http2_client_runtime
 zig build run-http2_server_runtime
+zig build run-http2_advanced
 ```
 
 ## See Also

@@ -530,19 +530,19 @@ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 | Benchmark | Avg (ns/op) | Throughput (ops/sec) |
 |-----------|-------------|----------------------|
-| headers_parse | 17143.40 | 58331 |
-| uri_parse | 30.54 | 32742548 |
-| status_lookup | 0.87 | 1153375931 |
-| method_lookup | 14.33 | 69779969 |
-| base64_encode | 5740.49 | 174201 |
-| base64_decode | 5647.98 | 177054 |
-| json_builder | 5886.02 | 169894 |
-| request_build | 28003.02 | 35710 |
-| response_builders | 27856.15 | 35898 |
-| executor_run_all | 178.57 | 5599956 |
-| proxy_request_build | 46943.72 | 21302 |
-| h2_frame_header | 0.96 | 1041362935 |
-| h3_varint_encode | 0.97 | 1025960914 |
+| headers_parse | 12575.61 | 79519 |
+| uri_parse | 34.35 | 29114200 |
+| status_lookup | 1.42 | 703135986 |
+| method_lookup | 16.68 | 59947509 |
+| base64_encode | 4258.48 | 234825 |
+| base64_decode | 4137.80 | 241674 |
+| json_builder | 4169.33 | 239846 |
+| request_build | 35594.77 | 28094 |
+| response_builders | 43972.07 | 22741 |
+| executor_run_all | 347.83 | 2874951 |
+| proxy_request_build | 60041.22 | 16655 |
+| h2_frame_header | 1.58 | 632095269 |
+| h3_varint_encode | 1.88 | 531229946 |
  
 ## Contributing
  
