@@ -9,6 +9,7 @@
 //! - Low-latency connection establishment (0-RTT)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const posix = std.posix;
@@ -688,28 +689,52 @@ pub const TransportParameters = struct {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(allocator);
 
-        const field_names = @typeInfo(TransportParameters).@"struct".field_names;
-        const field_types = @typeInfo(TransportParameters).@"struct".field_types;
-        inline for (field_names, 0..) |name, i| {
-            const param_id = @intFromEnum(@field(TransportParameter, name));
-            const value = @field(self, name);
+        const ti = @typeInfo(TransportParameters).@"struct";
+        if (comptime builtin.zig_version.minor >= 17) {
+            inline for (ti.field_names, 0..) |name, i| {
+                const param_id = @intFromEnum(@field(TransportParameter, name));
+                const value = @field(self, name);
 
-            if (field_types[i] == bool) {
-                if (value) {
-                    var buf: [16]u8 = undefined;
+                if (ti.field_types[i] == bool) {
+                    if (value) {
+                        var buf: [16]u8 = undefined;
+                        const id_len = try encodeVarInt(param_id, &buf);
+                        try out.appendSlice(allocator, buf[0..id_len]);
+                        try out.append(allocator, 0); // Zero-length value
+                    }
+                } else {
+                    var buf: [32]u8 = undefined;
                     const id_len = try encodeVarInt(param_id, &buf);
                     try out.appendSlice(allocator, buf[0..id_len]);
-                    try out.append(allocator, 0); // Zero-length value
-                }
-            } else {
-                var buf: [32]u8 = undefined;
-                const id_len = try encodeVarInt(param_id, &buf);
-                try out.appendSlice(allocator, buf[0..id_len]);
 
-                const val_len = try encodeVarInt(value, buf[16..]);
-                const len_len = try encodeVarInt(val_len, buf[8..16]);
-                try out.appendSlice(allocator, buf[8 .. 8 + len_len]);
-                try out.appendSlice(allocator, buf[16 .. 16 + val_len]);
+                    const val_len = try encodeVarInt(value, buf[16..]);
+                    const len_len = try encodeVarInt(val_len, buf[8..16]);
+                    try out.appendSlice(allocator, buf[8 .. 8 + len_len]);
+                    try out.appendSlice(allocator, buf[16 .. 16 + val_len]);
+                }
+            }
+        } else {
+            inline for (ti.fields) |field| {
+                const param_id = @intFromEnum(@field(TransportParameter, field.name));
+                const value = @field(self, field.name);
+
+                if (field.type == bool) {
+                    if (value) {
+                        var buf: [16]u8 = undefined;
+                        const id_len = try encodeVarInt(param_id, &buf);
+                        try out.appendSlice(allocator, buf[0..id_len]);
+                        try out.append(allocator, 0); // Zero-length value
+                    }
+                } else {
+                    var buf: [32]u8 = undefined;
+                    const id_len = try encodeVarInt(param_id, &buf);
+                    try out.appendSlice(allocator, buf[0..id_len]);
+
+                    const val_len = try encodeVarInt(value, buf[16..]);
+                    const len_len = try encodeVarInt(val_len, buf[8..16]);
+                    try out.appendSlice(allocator, buf[8 .. 8 + len_len]);
+                    try out.appendSlice(allocator, buf[16 .. 16 + val_len]);
+                }
             }
         }
 

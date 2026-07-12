@@ -11,6 +11,7 @@
 //! implementation following RFC 9000, RFC 9114, and RFC 9204.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpx = @import("httpx");
 
 pub fn main() !void {
@@ -208,10 +209,15 @@ fn quicFrameExample(_: std.mem.Allocator) !void {
 
     // Frame types
     std.debug.print("\nQUIC frame types:\n", .{});
-    const qft_names = @typeInfo(httpx.quic.FrameType).@"enum".field_names;
-    const qft_values = @typeInfo(httpx.quic.FrameType).@"enum".field_values;
-    inline for (qft_names, qft_values) |name, value| {
-        std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+    const qft_info = @typeInfo(httpx.quic.FrameType).@"enum";
+    if (comptime builtin.zig_version.minor >= 17) {
+        inline for (qft_info.field_names, qft_info.field_values) |name, value| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+        }
+    } else {
+        inline for (qft_info.fields) |field| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ field.value, field.name });
+        }
     }
 
     std.debug.print("\n", .{});
@@ -249,10 +255,15 @@ fn http3FrameExample(allocator: std.mem.Allocator) !void {
 
     // HTTP/3 uses QUIC streams, with special unidirectional streams
     std.debug.print("HTTP/3 unidirectional stream types:\n", .{});
-    const h3st_names = @typeInfo(httpx.quic.Http3StreamType).@"enum".field_names;
-    const h3st_values = @typeInfo(httpx.quic.Http3StreamType).@"enum".field_values;
-    inline for (h3st_names, h3st_values) |name, value| {
-        std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+    const h3st_info = @typeInfo(httpx.quic.Http3StreamType).@"enum";
+    if (comptime builtin.zig_version.minor >= 17) {
+        inline for (h3st_info.field_names, h3st_info.field_values) |name, value| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+        }
+    } else {
+        inline for (h3st_info.fields) |field| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ field.value, field.name });
+        }
     }
 
     // HTTP/3 frame types (from http.zig)
@@ -273,10 +284,15 @@ fn http3FrameExample(allocator: std.mem.Allocator) !void {
 
     // Transport parameters
     std.debug.print("\nQUIC transport parameters:\n", .{});
-    const tp_names = @typeInfo(httpx.quic.TransportParameter).@"enum".field_names[0..10];
-    const tp_values = @typeInfo(httpx.quic.TransportParameter).@"enum".field_values[0..10];
-    inline for (tp_names, tp_values) |name, value| {
-        std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+    const tp_info = @typeInfo(httpx.quic.TransportParameter).@"enum";
+    if (comptime builtin.zig_version.minor >= 17) {
+        inline for (tp_info.field_names[0..10], tp_info.field_values[0..10]) |name, value| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+        }
+    } else {
+        inline for (tp_info.fields[0..10]) |field| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ field.value, field.name });
+        }
     }
 
     std.debug.print("\n", .{});

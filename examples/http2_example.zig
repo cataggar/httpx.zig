@@ -11,6 +11,7 @@
 //! following RFC 7540 and RFC 7541.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpx = @import("httpx");
 
 pub fn main() !void {
@@ -197,10 +198,15 @@ fn framingExample(allocator: std.mem.Allocator) !void {
 
     // HTTP/2 frame types
     std.debug.print("\nHTTP/2 frame types:\n", .{});
-    const ft_names = @typeInfo(httpx.Http2FrameType).@"enum".field_names;
-    const ft_values = @typeInfo(httpx.Http2FrameType).@"enum".field_values;
-    inline for (ft_names, ft_values) |name, value| {
-        std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+    const ft_info = @typeInfo(httpx.Http2FrameType).@"enum";
+    if (comptime builtin.zig_version.minor >= 17) {
+        inline for (ft_info.field_names, ft_info.field_values) |name, value| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ value, name });
+        }
+    } else {
+        inline for (ft_info.fields) |field| {
+            std.debug.print("  0x{x:0>2}: {s}\n", .{ field.value, field.name });
+        }
     }
 
     std.debug.print("\n", .{});
@@ -245,10 +251,15 @@ fn flowControlExample(allocator: std.mem.Allocator) !void {
 
     // HTTP/2 error codes
     std.debug.print("\nHTTP/2 error codes:\n", .{});
-    const ec_names = @typeInfo(httpx.Http2ErrorCode).@"enum".field_names;
-    const ec_values = @typeInfo(httpx.Http2ErrorCode).@"enum".field_values;
-    inline for (ec_names, ec_values) |name, value| {
-        std.debug.print("  0x{x}: {s}\n", .{ value, name });
+    const ec_info = @typeInfo(httpx.Http2ErrorCode).@"enum";
+    if (comptime builtin.zig_version.minor >= 17) {
+        inline for (ec_info.field_names, ec_info.field_values) |name, value| {
+            std.debug.print("  0x{x}: {s}\n", .{ value, name });
+        }
+    } else {
+        inline for (ec_info.fields) |field| {
+            std.debug.print("  0x{x}: {s}\n", .{ field.value, field.name });
+        }
     }
 
     std.debug.print("\n", .{});
