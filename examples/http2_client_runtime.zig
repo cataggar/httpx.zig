@@ -7,9 +7,8 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-fn sleepMs(ms: i64) void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
+fn sleepMs(ms: u64) void {
+    std.Thread.sleep(std.time.ns_per_ms * ms);
 }
 
 pub fn main() !void {
@@ -171,9 +170,25 @@ fn runServer(listener: *httpx.TcpListener) !void {
         .stream_id = request_stream_id,
     }, response_body);
 
-    // Allow a graceful close so queued response bytes are delivered reliably.
-    accepted.socket.shutdownWrite() catch {};
-    sleepMs(25);
+    // Send GOAWAY so the client knows no more frames will follow.
+    var goaway_payload: [8]u8 = undefined;
+    goaway_payload[0] = @intCast((request_stream_id >> 24) & 0x7F);
+    goaway_payload[1] = @intCast((request_stream_id >> 16) & 0xFF);
+    goaway_payload[2] = @intCast((request_stream_id >> 8) & 0xFF);
+    goaway_payload[3] = @intCast(request_stream_id & 0xFF);
+    goaway_payload[4] = 0; // error code: no_error
+    goaway_payload[5] = 0;
+    goaway_payload[6] = 0;
+    goaway_payload[7] = 0;
+    try h2_conn.writeFrame(.{
+        .length = 8,
+        .frame_type = .goaway,
+        .flags = 0,
+        .stream_id = 0,
+    }, &goaway_payload);
+
+    // Small delay so queued bytes reach the client before we close the socket.
+    std.Thread.sleep(std.time.ns_per_ms * 100);
 }
 
 fn readNoEofSocket(socket: *httpx.Socket, out: []u8) !void {

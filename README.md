@@ -37,12 +37,12 @@
 >
 > **Custom HTTP/2 & HTTP/3 implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
-> - **HPACK** header compression (RFC 7541) for HTTP/2
-> - **HTTP/2 high-level client and server runtime paths** (preface/settings/headers/data flow)
-> - **HTTP/2** stream multiplexing and flow control (RFC 7540)
-> - **QPACK** header compression (RFC 9204) for HTTP/3
-> - **QUIC** transport framing (RFC 9000) for HTTP/3
-> - **HTTP/3 high-level client and server runtime paths** over UDP + QUIC/HTTP3/QPACK primitives
+> - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
+> - **HTTP/2** ALPN negotiation, CONTINUATION frames, SETTINGS enforcement, GOAWAY/RST_STREAM, trailers, and connection pooling
+> - **HTTP/2** stream multiplexing, flow control, and connection preface timeout (RFC 7540)
+> - **QPACK** header compression (RFC 9204) with decoder/encoder stream instructions for HTTP/3
+> - **QUIC** transport framing (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation and transport parameters for HTTP/3
+> - **HTTP/3** flow control (MAX_DATA/MAX_STREAM_DATA), GOAWAY, and CONNECTION_CLOSE handling
 > - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 
 **Related Zig projects:**
@@ -72,9 +72,10 @@
 | Feature | Description | Documentation |
 |---------|-------------|---------------|
 | **Protocol Support** | Full runtime support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2**, and **HTTP/3** in high-level client/server APIs, plus low-level protocol primitives. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
-| **Header Compression** | HPACK (RFC 7541) for HTTP/2 and QPACK (RFC 9204) for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
-| **Stream Multiplexing** | HTTP/2 stream state machine with flow control and priority handling. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
-| **Connection Pooling** | Automatic reuse of TCP connections with keep-alive and health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
+| **Header Compression** | HPACK (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2; QPACK (RFC 9204) with decoder/encoder stream instructions for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
+| **HTTP/2 ALPN** | Automatic protocol negotiation during TLS handshake with HTTP/1.1 fallback. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
+| **Stream Multiplexing** | HTTP/2 stream state machine with flow control, SETTINGS enforcement, GOAWAY/RST_STREAM, and trailer support. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
+| **Connection Pooling** | Automatic reuse of TCP connections (including HTTP/2 connections) with keep-alive and health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
 | **Pool Introspection** | Built-in connection pool stats and per-host connection counts. | https://muhammad-fiaz.github.io/httpx.zig/api/pool |
 | **Pattern-based Routing** | Intuitive server routing with dynamic path parameters and groups. | https://muhammad-fiaz.github.io/httpx.zig/guide/routing |
 | **Port Conflict Handling** | Explicit startup strategy to fail fast or auto-increment to the next free port. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
@@ -90,9 +91,11 @@
 | **Config Builder Helpers** | Chainable optional customization helpers for `ClientConfig` and `RequestOptions` (defaults remain implicit). | https://muhammad-fiaz.github.io/httpx.zig/api/client |
 | **JSON and HTML** | Helpers for easy JSON serialization and HTML response generation. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **Core Convenience APIs** | Request query-param helpers and response constructors for redirect/text/json. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
-| **TLS/SSL** | Secure connections via TLS 1.3 support. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
+| **TLS/SSL** | Secure connections via TLS 1.3 with ALPN protocol negotiation for HTTP/2. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
 | **Static Files** | Efficient static file serving capabilities. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Streaming and Realtime** | Chunked transfer responses with optional trailers and SSE response helpers. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
+| **HTTP/3 Flow Control** | MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
+| **Stream Cancellation** | RESET_STREAM and STOP_SENDING frames for graceful HTTP/3 stream teardown without connection disruption. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Cookie APIs** | First-class request/response cookie helpers for both client and server contexts. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Security** | Security headers (Helmet) and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **No External Dependencies** | Pure Zig implementation for maximum portability and ease of build. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
@@ -413,12 +416,50 @@ try server.listen();
  
 ## Examples
 
-The `examples/` directory contains comprehensive, runnable examples demonstrating all features of `httpx.zig`:
+The `examples/` directory contains **35 comprehensive, runnable examples** demonstrating all features of `httpx.zig`:
 
-- **Client**: Basic GET requests, POST with JSON, custom headers, connection pooling, proxy usage, request interceptors, and cookies.
-- **Server**: Pattern-based routing, middleware configurations, static file serving, and multi-page web applications.
-- **Protocols**: Multiplexed HTTP/2 client/server runtime and UDP-based HTTP/3 client/server runtime.
-- **Advanced Capabilities**: RFC 6455 WebSockets, multipart form data building/parsing, session management, metrics dashboards with external callback event handlers, Unix domain socket IPC, and health/readiness probes.
+**Client:**
+- [`simple_get`](examples/simple_get.zig) - Basic GET requests
+- [`simple_get_deserialize`](examples/simple_get_deserialize.zig) - GET with JSON deserialization
+- [`post_json`](examples/post_json.zig) - POST with JSON body
+- [`custom_headers`](examples/custom_headers.zig) - Custom header management
+- [`http_auth_helpers`](examples/http_auth_helpers.zig) - Bearer and Basic auth helpers
+- [`connection_pool`](examples/connection_pool.zig) - Connection pooling and stats
+- [`proxy_example`](examples/proxy_example.zig) - HTTP forward proxy and SOCKS5h
+- [`interceptors`](examples/interceptors.zig) - Request/response interceptors
+- [`cookies_demo`](examples/cookies_demo.zig) - Cookie jar management
+- [`concurrent_requests`](examples/concurrent_requests.zig) - Parallel request patterns
+- [`simplified_api_aliases`](examples/simplified_api_aliases.zig) - Top-level API aliases
+
+**Server:**
+- [`simple_server`](examples/simple_server.zig) - Minimal HTTP server
+- [`router_example`](examples/router_example.zig) - Pattern-based routing
+- [`middleware_example`](examples/middleware_example.zig) - Middleware stack
+- [`static_files`](examples/static_files.zig) - Static file serving
+- [`multi_page_website`](examples/multi_page_website.zig) - Multi-page web app
+- [`streaming`](examples/streaming.zig) - Chunked transfer and SSE
+- [`health_check_example`](examples/health_check_example.zig) - Liveness/readiness probes
+- [`request_response_customization`](examples/request_response_customization.zig) - Request/response customization
+- [`async_server_example`](examples/async_server_example.zig) - Thread pool concurrency
+
+**Protocol:**
+- [`http2_example`](examples/http2_example.zig) - HTTP/2 protocol primitives
+- [`http2_client_runtime`](examples/http2_client_runtime.zig) - HTTP/2 client runtime
+- [`http2_server_runtime`](examples/http2_server_runtime.zig) - HTTP/2 server runtime
+- [`http2_advanced`](examples/http2_advanced.zig) - HTTP/2 SETTINGS enforcement, GOAWAY, HPACK security, trailers
+- [`http3_example`](examples/http3_example.zig) - HTTP/3 protocol primitives
+- [`http3_client_runtime`](examples/http3_client_runtime.zig) - HTTP/3 client runtime
+- [`http3_server_runtime`](examples/http3_server_runtime.zig) - HTTP/3 server runtime
+- [`http3_advanced`](examples/http3_advanced.zig) - QPACK stream instructions, QUIC cancellation, transport parameters
+
+**Advanced Capabilities:**
+- [`websocket_example`](examples/websocket_example.zig) - RFC 6455 WebSockets
+- [`multipart_example`](examples/multipart_example.zig) - RFC 2046 multipart form data
+- [`session_example`](examples/session_example.zig) - TTL-based session store
+- [`metrics_example`](examples/metrics_example.zig) - Observability metrics
+- [`unix_socket_example`](examples/unix_socket_example.zig) - AF_UNIX domain sockets
+- [`tcp_local`](examples/tcp_local.zig) - TCP socket helpers
+- [`udp_local`](examples/udp_local.zig) - UDP socket helpers
 
 To run any example:
 ```bash
