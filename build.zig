@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "custom_headers", .path = "examples/custom_headers.zig" },
         .{ .name = "tcp_local", .path = "examples/tcp_local.zig" },
         .{ .name = "udp_local", .path = "examples/udp_local.zig" },
-        .{ .name = "simple_server", .path = "examples/simple_server.zig", .skip_run_all = true },
+        .{ .name = "simple_server", .path = "examples/simple_server.zig" },
         .{ .name = "router_example", .path = "examples/router_example.zig" },
         .{ .name = "middleware_example", .path = "examples/middleware_example.zig" },
         .{ .name = "streaming", .path = "examples/streaming.zig" },
@@ -43,8 +43,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "cookies_demo", .path = "examples/cookies_demo.zig" },
         .{ .name = "proxy_example", .path = "examples/proxy_example.zig" },
         .{ .name = "simplified_api_aliases", .path = "examples/simplified_api_aliases.zig" },
-        .{ .name = "static_files", .path = "examples/static_files.zig", .skip_run_all = true },
-        .{ .name = "multi_page_website", .path = "examples/multi_page_website.zig", .skip_run_all = true },
+        .{ .name = "static_files", .path = "examples/static_files.zig" },
+        .{ .name = "multi_page_website", .path = "examples/multi_page_website.zig" },
         .{ .name = "http2_example", .path = "examples/http2_example.zig" },
         .{ .name = "http2_client_runtime", .path = "examples/http2_client_runtime.zig" },
         .{ .name = "http2_server_runtime", .path = "examples/http2_server_runtime.zig" },
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "health_check_example", .path = "examples/health_check_example.zig" },
         .{ .name = "request_response_customization", .path = "examples/request_response_customization.zig" },
         .{ .name = "unix_socket_example", .path = "examples/unix_socket_example.zig" },
-        .{ .name = "async_server_example", .path = "examples/async_server_example.zig", .skip_run_all = true },
+        .{ .name = "async_server_example", .path = "examples/async_server_example.zig" },
     };
 
     inline for (examples) |example| {

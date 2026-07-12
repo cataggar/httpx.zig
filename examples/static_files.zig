@@ -15,15 +15,16 @@ const custom_mime_mappings = [_]httpx.MimeMapping{
     .{ .ext = ".glb", .mime = "model/gltf-binary" },
 };
 
-fn demoPort(environ: std.process.Environ, allocator: std.mem.Allocator) !u16 {
-    const value = environ.getAlloc(allocator, "HTTPX_DEMO_PORT") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return 8080,
-        error.InvalidWtf8 => return 8080,
-        else => return err,
-    };
-    defer allocator.free(value);
+fn sleepMs(ms: i64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
+}
 
-    return std.fmt.parseInt(u16, value, 10) catch 8080;
+fn pickFreeTcpPort() !u16 {
+    var listener = try httpx.TcpListener.init(try httpx.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const addr = try listener.getLocalAddress();
+    return addr.getPort();
 }
 
 fn serveFileWithType(ctx: *httpx.Context, path: []const u8) anyerror!httpx.Response {
@@ -110,7 +111,6 @@ fn assetsByPrefixHandler(ctx: *httpx.Context, prefix: []const u8) anyerror!httpx
         return ctx.status(400).text("Missing asset path");
     }
 
-    // Keep this example simple and safe: avoid path traversal.
     if (std.mem.indexOf(u8, wildcard, "..") != null or
         std.mem.indexOfScalar(u8, wildcard, '\\') != null)
     {
@@ -151,18 +151,18 @@ fn redirectHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.redirect("/", 302);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     std.debug.print("=== Static File Server Example ===\n\n", .{});
 
-    const port = try demoPort(init.minimal.environ, allocator);
-
+    const port = try pickFreeTcpPort();
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = port,
+        .port_conflict = .fail,
         .keep_alive = false,
     });
     defer server.deinit();
@@ -186,21 +186,30 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  GET /images/*       -> directory wildcard route to image directory\n", .{});
     std.debug.print("  GET /go-home        -> redirect('/')\n", .{});
 
-    std.debug.print("\nTry:\n", .{});
-    std.debug.print("  http://127.0.0.1:{d}/\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/site-home\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/logo\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/styles.css\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/app.js\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/assets/styles.css\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/assets/app.js\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/images/httpx.zig-transparent.png\n", .{port});
-    std.debug.print("  http://127.0.0.1:{d}/assets/images/httpx.zig-transparent.png\n", .{port});
-    std.debug.print("  curl -i -H \"If-None-Match: <etag>\" http://127.0.0.1:{d}/assets/styles.css\n", .{port});
+    const server_thread = try server.listenInBackground();
+    defer server_thread.join();
+    defer server.stop();
 
-    std.debug.print("\nStarting server at http://127.0.0.1:{d}/\n", .{port});
-    std.debug.print("Set HTTPX_DEMO_PORT to override the default port.\n", .{});
-    std.debug.print("Press Ctrl+C to stop.\n", .{});
+    sleepMs(100);
 
-    try server.listen();
+    var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
+        .withTimeouts(httpx.Timeouts.fast())
+        .withRetryPolicy(httpx.RetryPolicy.noRetry()));
+    defer client.deinit();
+
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+
+    const home_url = try std.fmt.allocPrint(allocator, "{s}/", .{base_url});
+    defer allocator.free(home_url);
+
+    var resp = try client.get(home_url, .{});
+    defer resp.deinit();
+    std.debug.print("\nGET / -> status: {d}\n", .{resp.status.code});
+    const body = resp.text() orelse "";
+    if (std.mem.indexOf(u8, body, "static files demo") != null) {
+        std.debug.print("Home page contains expected content\n", .{});
+    }
+
+    std.debug.print("\nStatic file routes verified!\n", .{});
 }

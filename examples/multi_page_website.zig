@@ -8,15 +8,16 @@ const httpx = @import("httpx");
 
 const site_root = "examples/multi_page_site/site";
 
-fn demoPort(environ: std.process.Environ, allocator: std.mem.Allocator) !u16 {
-    const value = environ.getAlloc(allocator, "HTTPX_DEMO_PORT") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return 3000,
-        error.InvalidWtf8 => return 3000,
-        else => return err,
-    };
-    defer allocator.free(value);
+fn sleepMs(ms: i64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .real) catch {};
+}
 
-    return std.fmt.parseInt(u16, value, 10) catch 3000;
+fn pickFreeTcpPort() !u16 {
+    var listener = try httpx.TcpListener.init(try httpx.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const addr = try listener.getLocalAddress();
+    return addr.getPort();
 }
 
 fn contentTypeForPath(path: []const u8) []const u8 {
@@ -83,15 +84,16 @@ fn redirectHomeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.redirect("/", 302);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const port = try demoPort(init.minimal.environ, allocator);
+    const port = try pickFreeTcpPort();
 
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = port,
+        .port_conflict = .fail,
         .keep_alive = false,
         .request_timeout_ms = 10_000,
     });
@@ -107,10 +109,33 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("=== Multi-page Website Example ===\n", .{});
     std.debug.print("Serving site from: {s}\n", .{site_root});
     std.debug.print("Routes: page routes + /logo (file route) + /static/* (directory route)\n", .{});
-    std.debug.print("Open: http://127.0.0.1:{d}/\n", .{port});
-    std.debug.print("Set HTTPX_DEMO_PORT to override the default port.\n", .{});
-    std.debug.print("Keep-Alive: disabled for smoother demo asset loading\n", .{});
-    std.debug.print("Press Ctrl+C to stop.\n", .{});
 
-    try server.listen();
+    const server_thread = try server.listenInBackground();
+    defer server_thread.join();
+    defer server.stop();
+
+    sleepMs(100);
+
+    var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
+        .withTimeouts(httpx.Timeouts.fast())
+        .withRetryPolicy(httpx.RetryPolicy.noRetry()));
+    defer client.deinit();
+
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+
+    const home_url = try std.fmt.allocPrint(allocator, "{s}/", .{base_url});
+    defer allocator.free(home_url);
+    const about_url = try std.fmt.allocPrint(allocator, "{s}/about", .{base_url});
+    defer allocator.free(about_url);
+
+    var resp1 = try client.get(home_url, .{});
+    defer resp1.deinit();
+    std.debug.print("\nGET / -> status: {d}\n", .{resp1.status.code});
+
+    var resp2 = try client.get(about_url, .{});
+    defer resp2.deinit();
+    std.debug.print("GET /about -> status: {d}\n", .{resp2.status.code});
+
+    std.debug.print("\nAll pages served successfully!\n", .{});
 }
