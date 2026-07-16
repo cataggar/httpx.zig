@@ -22,7 +22,7 @@ export default defineConfig({
   description: SITE_DESCRIPTION,
   base: "/httpx.zig/",
   lastUpdated: true,
-  cleanUrls: true,
+  cleanUrls: false,
 
   sitemap: {
     hostname: SITE_URL,
