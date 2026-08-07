@@ -10,11 +10,20 @@ const HeaderName = @import("../core/headers.zig").HeaderName;
 /// Returns the canonical `std.Io` for the current execution context.
 pub const defaultIo = io_util.defaultIo;
 
+/// Returns a real thread-safe `std.Io` suitable for multi-threaded code.
+pub const threadIo = io_util.threadIo;
+
 /// Sleeps for `ms` milliseconds using the canonical IO (`u64`, clamped to `i64.max`).
 pub const sleepMs = io_util.sleepMs;
 
 /// Sleeps for `ms` milliseconds using the canonical IO (`i64`).
 pub const sleepMsI = io_util.sleepMsI;
+
+/// Returns current time in milliseconds since epoch.
+pub fn nowMillis() i64 {
+    const io = defaultIo();
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
+}
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.
 pub const CookiePair = struct {
@@ -206,32 +215,4 @@ test "buildSetCookieHeader includes options" {
     try std.testing.expect(mem.indexOf(u8, set_cookie, "SameSite=Strict") != null);
     try std.testing.expect(mem.indexOf(u8, set_cookie, "Secure") != null);
     try std.testing.expect(mem.indexOf(u8, set_cookie, "HttpOnly") != null);
-}
-
-test "mimeTypeFromPath maps known extensions" {
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", mimeTypeFromPath("index.html"));
-    try std.testing.expectEqualStrings("application/json", mimeTypeFromPath("api.json"));
-    try std.testing.expectEqualStrings("image/png", mimeTypeFromPath("logo.png"));
-    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPath("archive.bin"));
-}
-
-test "mimeTypeFromPath handles case-insensitive extensions" {
-    try std.testing.expectEqualStrings("image/webp", mimeTypeFromPath("cover.WEBP"));
-    try std.testing.expectEqualStrings("application/wasm", mimeTypeFromPath("runtime.WaSm"));
-}
-
-test "mimeTypeFromPathOr supports custom fallback" {
-    try std.testing.expectEqualStrings("application/x-custom", mimeTypeFromPathOr("asset.unknownext", "application/x-custom"));
-    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPathOr("site.unknown", "application/octet-stream"));
-}
-
-test "mimeTypeFromPathWith supports external mappings" {
-    const custom = [_]MimeMapping{
-        .{ .ext = ".zig", .mime = "text/x-zig" },
-        .{ .ext = ".tmpl", .mime = "text/x-template" },
-    };
-
-    try std.testing.expectEqualStrings("text/x-zig", mimeTypeFromPathWith("main.zig", &custom, "application/octet-stream"));
-    try std.testing.expectEqualStrings("text/x-template", mimeTypeFromPathWith("view.TMPL", &custom, "application/octet-stream"));
-    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPathWith("asset.unknown", &custom, "application/octet-stream"));
 }

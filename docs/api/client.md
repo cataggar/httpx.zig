@@ -1,6 +1,6 @@
 # Client API
 
-The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3. HTTPS is supported via Zig's standard library TLS (`std.crypto.tls`) for HTTP/1.x and HTTP/2.
+The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3. HTTPS is supported via a fully custom TLS 1.2/1.3 implementation built on `std.crypto` primitives (AES-GCM, ChaCha20-Poly1305, X25519, P-256, P-384, HKDF, SHA-256/384/512) with ALPN negotiation for HTTP/2 and HTTP/3.
 
 ## Protocol Support
 
@@ -77,7 +77,7 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.1.3"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.1.4"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
@@ -90,6 +90,7 @@ defer client.deinit();
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
 | `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. Use `.kind = .socks5h` for SOCKS5h tunneling; the default kind is HTTP. |
 | `unix_socket_path` | `?[]const u8` | `null` | Optional Unix Domain Socket (AF_UNIX) path for client connections. |
+| `log_fn` | `?LogFn` | `null` | Optional logging callback. When set, `Client.log()` delegates formatted messages to this function. Leave unset to disable client-side logging. |
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
 
@@ -147,6 +148,7 @@ defer res.deinit();
 | `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
 | `withProxy(proxy_or_null)` | Configure or clear a forward proxy. Set `.kind = .socks5h` for SOCKS5h tunneling. |
 | `withUnixSocket(path_or_null)` | Configure or clear a Unix Domain Socket (AF_UNIX) connection path. |
+| `withLogFn(log_fn)` | Set a custom logging callback for client-side log output. |
 
 ### Client Initialization Helpers
 
@@ -202,6 +204,7 @@ pub fn opts(self: *Self, url: []const u8, options: RequestOptions) !Response
 | `cleanupIdleConnections()` | Evict idle/exhausted pooled connections |
 | `poolStats()` | Snapshot total/active/idle pool counts |
 | `hostPoolConnectionCount(host, port)` | Count pooled connections for one host:port |
+| `log(level, format, args)` | Log a formatted message. If `config.log_fn` is set, delegates to it. |
 
 ### Cookie Jar API
 

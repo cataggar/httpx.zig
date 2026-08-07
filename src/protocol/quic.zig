@@ -199,7 +199,7 @@ pub const LongHeader = struct {
         const first = data[offset];
         header.form = @intCast((first >> 7) & 1);
         header.fixed_bit = @intCast((first >> 6) & 1);
-        header.packet_type = @enumFromInt((first >> 4) & 3);
+        header.packet_type = @as(LongPacketType, @enumFromInt(@as(u2, @intCast((first >> 4) & 3))));
         header.type_specific = @intCast(first & 0x0F);
         offset += 1;
 
@@ -806,7 +806,7 @@ pub const StreamType = enum(u2) {
     server_uni = 3,
 
     pub fn fromId(stream_id: u64) StreamType {
-        return @enumFromInt(stream_id & 0x03);
+        return @as(StreamType, @enumFromInt(@as(u2, @intCast(stream_id & 0x03))));
     }
 
     pub fn isBidirectional(self: StreamType) bool {

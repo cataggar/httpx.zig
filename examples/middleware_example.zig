@@ -30,7 +30,7 @@ pub fn main() !void {
         .window_ms = 60_000,
     }));
     try server.use(httpx.helmet());
-    try server.use(httpx.compression());
+    try server.use(httpx.middleware.compression());
 
     try server.get("/api/data", apiHandler);
 

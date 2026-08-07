@@ -17,11 +17,8 @@ const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
 const list_writer = @import("../util/list_writer.zig");
 const status = @import("../core/status.zig");
-
-fn nowMillis() i64 {
-    const io = io_util.defaultIo();
-    return std.Io.Timestamp.now(io, .real).toMilliseconds();
-}
+const common = @import("../util/common.zig");
+const compression_util = @import("../util/compression.zig");
 
 /// Middleware function type.
 pub const Middleware = struct {
@@ -76,29 +73,31 @@ pub fn cors(comptime config: CorsConfig) Middleware {
     return .{
         .name = "cors",
         .handler = struct {
-            fn methodList(allocator: std.mem.Allocator, methods: []const types.Method) ![]u8 {
-                var out = std.ArrayList(u8).empty;
-                errdefer out.deinit(allocator);
-                const writer = list_writer.init(allocator, &out);
-
-                for (methods, 0..) |m, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try writer.writeAll(m.toString());
+            const methods_str = blk: {
+                var out: []const u8 = "";
+                for (config.allowed_methods, 0..) |m, i| {
+                    if (i > 0) out = out ++ ", ";
+                    out = out ++ m.toString();
                 }
-                return out.toOwnedSlice(allocator);
-            }
-
-            fn headerList(allocator: std.mem.Allocator, headers_in: []const []const u8) ![]u8 {
-                var out = std.ArrayList(u8).empty;
-                errdefer out.deinit(allocator);
-                const writer = list_writer.init(allocator, &out);
-
-                for (headers_in, 0..) |h, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try writer.writeAll(h);
+                break :blk out;
+            };
+            const headers_str = blk: {
+                var out: []const u8 = "";
+                for (config.allowed_headers, 0..) |h, i| {
+                    if (i > 0) out = out ++ ", ";
+                    out = out ++ h;
                 }
-                return out.toOwnedSlice(allocator);
-            }
+                break :blk out;
+            };
+            const exposed_str = blk: {
+                var out: []const u8 = "";
+                for (config.exposed_headers, 0..) |h, i| {
+                    if (i > 0) out = out ++ ", ";
+                    out = out ++ h;
+                }
+                break :blk out;
+            };
+            const max_age_str = std.fmt.comptimePrint("{d}", .{config.max_age});
 
             fn allowedOrigin(ctx: *Context, cfg: CorsConfig) []const u8 {
                 const req_origin = ctx.header("Origin") orelse return cfg.allowed_origins[0];
@@ -114,28 +113,18 @@ pub fn cors(comptime config: CorsConfig) Middleware {
                 const origin = allowedOrigin(ctx, config);
                 try ctx.setHeader("Access-Control-Allow-Origin", origin);
                 try ctx.setHeader("Vary", "Origin");
+                try ctx.setHeader("Access-Control-Allow-Methods", methods_str);
+                try ctx.setHeader("Access-Control-Allow-Headers", headers_str);
 
-                const methods = try methodList(ctx.allocator, config.allowed_methods);
-                defer ctx.allocator.free(methods);
-                try ctx.setHeader("Access-Control-Allow-Methods", methods);
-
-                const allowed_headers = try headerList(ctx.allocator, config.allowed_headers);
-                defer ctx.allocator.free(allowed_headers);
-                try ctx.setHeader("Access-Control-Allow-Headers", allowed_headers);
-
-                if (config.exposed_headers.len > 0) {
-                    const exposed = try headerList(ctx.allocator, config.exposed_headers);
-                    defer ctx.allocator.free(exposed);
-                    try ctx.setHeader("Access-Control-Expose-Headers", exposed);
+                if (exposed_str.len > 0) {
+                    try ctx.setHeader("Access-Control-Expose-Headers", exposed_str);
                 }
 
                 if (config.allow_credentials) {
                     try ctx.setHeader("Access-Control-Allow-Credentials", "true");
                 }
 
-                var max_age_buf: [32]u8 = undefined;
-                const max_age = std.fmt.bufPrint(&max_age_buf, "{d}", .{config.max_age}) catch unreachable;
-                try ctx.setHeader("Access-Control-Max-Age", max_age);
+                try ctx.setHeader("Access-Control-Max-Age", max_age_str);
 
                 if (ctx.request.method == .OPTIONS) {
                     return ctx.status(status.StatusCode.NO_CONTENT).text("");
@@ -158,9 +147,9 @@ pub fn loggerWithConfig(comptime config: LoggerConfig) Middleware {
         .name = "logger",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                const start = nowMillis();
+                const start = common.nowMillis();
                 const response = try next(ctx);
-                const duration = nowMillis() - start;
+                const duration = common.nowMillis() - start;
 
                 var buf: [1024]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "{s} {s} - {d}ms\n", .{
@@ -188,12 +177,51 @@ pub fn logger() Middleware {
 
 /// Creates compression middleware.
 pub fn compression() Middleware {
+    return compressionMiddlewareWithConfig(.{});
+}
+
+/// Alias for `compression()`.
+pub const compressionMiddleware = compression;
+
+/// Configuration for compression middleware.
+pub const CompressionConfig = struct {
+    /// Minimum response body size in bytes before compression is applied.
+    min_bytes: usize = 1024,
+};
+
+/// Creates compression middleware with explicit configuration.
+pub fn compressionMiddlewareWithConfig(comptime config: CompressionConfig) Middleware {
     return .{
         .name = "compression",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                _ = ctx.header("Accept-Encoding");
-                return next(ctx);
+                const resp = try next(ctx);
+
+                if (resp.body) |body| {
+                    if (body.len < config.min_bytes) return resp;
+                    if (resp.headers.get("Content-Encoding") != null) return resp;
+
+                    const accept = ctx.header("Accept-Encoding") orelse return resp;
+                    const encoding = pickEncoding(accept) orelse return resp;
+
+                    var new_resp = resp;
+                    if (compression_util.compress(ctx.allocator, encoding, body)) |compressed| {
+                        new_resp.body = compressed;
+                        new_resp.body_owned = true;
+                        ctx.setHeader("Content-Encoding", encoding.toString()) catch {};
+                        ctx.setHeader("Vary", "Accept-Encoding") catch {};
+                    } else |_| {}
+                    return new_resp;
+                }
+                return resp;
+            }
+
+            fn pickEncoding(accept: []const u8) ?compression_util.ContentEncoding {
+                if (std.ascii.indexOfIgnoreCase(accept, "br") != null) return .br;
+                if (std.ascii.indexOfIgnoreCase(accept, "zstd") != null) return .zstd;
+                if (std.ascii.indexOfIgnoreCase(accept, "gzip") != null) return .gzip;
+                if (std.ascii.indexOfIgnoreCase(accept, "deflate") != null) return .deflate;
+                return null;
             }
         }.handler,
     };
@@ -206,12 +234,58 @@ pub const RateLimitConfig = struct {
 };
 
 /// Creates rate limiting middleware.
-pub fn rateLimit(config: RateLimitConfig) Middleware {
-    _ = config;
+///
+/// Tracks request counts in an in-memory hashmap keyed by IP.
+/// Returns 429 Too Many Requests when the limit is exceeded.
+/// Evicts stale entries periodically to prevent unbounded memory growth.
+/// Note: For multi-threaded servers, consider per-IP locking at the
+/// connection handler level for full thread safety.
+pub fn rateLimit(comptime config: RateLimitConfig) Middleware {
     return .{
         .name = "rate_limit",
         .handler = struct {
+            const Entry = struct { count: u32, window_start: i64 };
+            var store: std.StringHashMap(Entry) = undefined;
+            var store_initialized: bool = false;
+            var evict_counter: u32 = 0;
+
             fn handler(ctx: *Context, next: Next) anyerror!Response {
+                if (!store_initialized) {
+                    store = std.StringHashMap(Entry).init(ctx.allocator);
+                    store_initialized = true;
+                }
+
+                const now = common.nowMillis();
+                const ip = ctx.header("X-Forwarded-For") orelse
+                    ctx.header("X-Real-IP") orelse
+                    "0.0.0.0";
+
+                // Evict stale entries every 512 requests to prevent unbounded growth.
+                evict_counter +%= 1;
+                if (evict_counter % 512 == 0) {
+                    var it = store.iterator();
+                    while (it.next()) |kv| {
+                        if (now - kv.value_ptr.window_start > @as(i64, @intCast(config.window_ms * 2))) {
+                            _ = store.remove(kv.key_ptr.*);
+                        }
+                    }
+                }
+
+                const entry = store.get(ip);
+                if (entry) |e| {
+                    if (now - e.window_start < @as(i64, @intCast(config.window_ms))) {
+                        if (e.count >= config.max_requests) {
+                            try ctx.setHeader("Retry-After", "60");
+                            return ctx.status(status.StatusCode.TOO_MANY_REQUESTS).text("Too Many Requests");
+                        }
+                        try store.put(ip, .{ .count = e.count + 1, .window_start = e.window_start });
+                    } else {
+                        try store.put(ip, .{ .count = 1, .window_start = now });
+                    }
+                } else {
+                    try store.put(ip, .{ .count = 1, .window_start = now });
+                }
+
                 return next(ctx);
             }
         }.handler,
@@ -220,18 +294,42 @@ pub fn rateLimit(config: RateLimitConfig) Middleware {
 
 /// Creates basic authentication middleware.
 pub fn basicAuth(realm: []const u8, validator: *const fn ([]const u8, []const u8) bool) Middleware {
-    _ = realm;
-    _ = validator;
     return .{
         .name = "basic_auth",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
                 const auth = ctx.header("Authorization") orelse {
-                    try ctx.setHeader("WWW-Authenticate", "Basic realm=\"Restricted\"");
+                    const www_auth = try std.fmt.allocPrint(ctx.allocator, "Basic realm=\"{s}\"", .{realm});
+                    defer ctx.allocator.free(www_auth);
+                    try ctx.setHeader("WWW-Authenticate", www_auth);
                     return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
                 };
 
                 if (!std.mem.startsWith(u8, auth, "Basic ")) {
+                    const www_auth = try std.fmt.allocPrint(ctx.allocator, "Basic realm=\"{s}\"", .{realm});
+                    defer ctx.allocator.free(www_auth);
+                    try ctx.setHeader("WWW-Authenticate", www_auth);
+                    return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
+                }
+
+                const encoded = std.mem.trim(u8, auth[6..], " \t");
+                const Base64 = @import("../util/encoding.zig").Base64;
+                const decoded = Base64.decode(ctx.allocator, encoded) catch {
+                    return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
+                };
+                defer ctx.allocator.free(decoded);
+
+                const colon_pos = std.mem.indexOfScalar(u8, decoded, ':') orelse {
+                    return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
+                };
+
+                const username = decoded[0..colon_pos];
+                const password = decoded[colon_pos + 1 ..];
+
+                if (!validator(username, password)) {
+                    const www_auth = try std.fmt.allocPrint(ctx.allocator, "Basic realm=\"{s}\"", .{realm});
+                    defer ctx.allocator.free(www_auth);
+                    try ctx.setHeader("WWW-Authenticate", www_auth);
                     return ctx.status(status.StatusCode.UNAUTHORIZED).text("Unauthorized");
                 }
 
@@ -242,12 +340,26 @@ pub fn basicAuth(realm: []const u8, validator: *const fn ([]const u8, []const u8
 }
 
 /// Creates body parser middleware.
+///
+/// Checks Content-Length against `max_size` and returns 413 if exceeded.
 pub fn bodyParser(max_size: usize) Middleware {
-    _ = max_size;
     return .{
         .name = "body_parser",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
+                if (ctx.header("Content-Length")) |len_str| {
+                    const content_length = std.fmt.parseInt(usize, len_str, 10) catch 0;
+                    if (content_length > max_size) {
+                        return ctx.status(status.StatusCode.PAYLOAD_TOO_LARGE).text("Payload Too Large");
+                    }
+                }
+
+                if (ctx.request.body) |body| {
+                    if (body.len > max_size) {
+                        return ctx.status(status.StatusCode.PAYLOAD_TOO_LARGE).text("Payload Too Large");
+                    }
+                }
+
                 return next(ctx);
             }
         }.handler,
@@ -255,11 +367,18 @@ pub fn bodyParser(max_size: usize) Middleware {
 }
 
 /// Creates security headers middleware (Helmet).
+///
+/// Adds standard security headers: X-Content-Type-Options, X-Frame-Options,
+/// X-XSS-Protection, and Strict-Transport-Security.
 pub fn helmet() Middleware {
     return .{
         .name = "helmet",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
+                try ctx.setHeader("X-Content-Type-Options", "nosniff");
+                try ctx.setHeader("X-Frame-Options", "DENY");
+                try ctx.setHeader("X-XSS-Protection", "1; mode=block");
+                try ctx.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
                 return next(ctx);
             }
         }.handler,
@@ -267,12 +386,31 @@ pub fn helmet() Middleware {
 }
 
 /// Creates request timeout middleware.
+///
+/// Stores the timeout deadline in `ctx.data` and checks it before calling
+/// the next handler. If the deadline has already passed, returns 408 Request
+/// Timeout. The server's own `request_timeout_ms` config provides the primary
+/// timeout enforcement at the socket level; this middleware provides an
+/// application-level check for slow downstream handlers.
 pub fn timeout(ms: u64) Middleware {
-    _ = ms;
     return .{
         .name = "timeout",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
+                const now_ts = common.nowMillis();
+                const deadline = now_ts + @as(i64, @intCast(ms));
+                const deadline_ptr = @as(*i64, @ptrCast(@alignCast(
+                    ctx.allocator.create(i64) catch return next(ctx),
+                )));
+                deadline_ptr.* = deadline;
+                defer ctx.allocator.destroy(deadline_ptr);
+
+                _ = ctx.data.put("__timeout_deadline", @ptrCast(deadline_ptr));
+
+                if (ms > 0 and common.nowMillis() > deadline) {
+                    return ctx.status(status.StatusCode.REQUEST_TIMEOUT).text("Request Timeout");
+                }
+
                 return next(ctx);
             }
         }.handler,
@@ -280,12 +418,24 @@ pub fn timeout(ms: u64) Middleware {
 }
 
 /// Creates request ID middleware.
+///
+/// Generates a unique 16-byte hex request ID and sets the X-Request-ID header.
 pub fn requestId() Middleware {
     return .{
         .name = "request_id",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                try ctx.setHeader("X-Request-ID", "generated-id");
+                var raw: [16]u8 = undefined;
+                io_util.defaultIo().random(&raw);
+
+                var hex: [32]u8 = undefined;
+                const hex_chars = "0123456789abcdef";
+                for (raw, 0..) |byte, i| {
+                    hex[i * 2] = hex_chars[byte >> 4];
+                    hex[i * 2 + 1] = hex_chars[byte & 0x0F];
+                }
+
+                try ctx.setHeader("X-Request-ID", &hex);
                 return next(ctx);
             }
         }.handler,

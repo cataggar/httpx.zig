@@ -58,6 +58,9 @@ pub const Parser = struct {
     max_headers: usize = 100,
     header_bytes: usize = 0,
     header_count: usize = 0,
+    /// When false, the parser will not enter body state for responses.
+    /// Used for HEAD responses which have no body.
+    expect_body: bool = true,
 
     const Self = @This();
 
@@ -309,7 +312,18 @@ pub const Parser = struct {
         return line_end + 2;
     }
 
+    fn noBodyByStatus(self: *const Self) bool {
+        if (self.status_code) |code| {
+            return (code >= 100 and code < 200) or code == 204 or code == 304;
+        }
+        return false;
+    }
+
     fn determineBodyState(self: *Self) void {
+        if (!self.expect_body or self.noBodyByStatus()) {
+            self.state = .complete;
+            return;
+        }
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {

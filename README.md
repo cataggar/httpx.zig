@@ -11,7 +11,6 @@
 <a href="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/ci.yml"><img src="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <img src="https://img.shields.io/badge/platforms-linux%20%7C%20windows%20%7C%20macos-blue" alt="Supported Platforms">
 <a href="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
-<a href="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/release.yml"><img src="https://github.com/muhammad-fiaz/httpx.zig/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 <a href="https://github.com/muhammad-fiaz/httpx.zig/releases/latest"><img src="https://img.shields.io/github/v/release/muhammad-fiaz/httpx.zig?label=Latest%20Release&style=flat-square" alt="Latest Release"></a>
 <a href="https://pay.muhammadfiaz.com"><img src="https://img.shields.io/badge/Sponsor-pay.muhammadfiaz.com-ff69b4?style=flat&logo=heart" alt="Sponsor"></a>
 <a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/Sponsor-GitHub-pink?style=social&logo=github" alt="GitHub Sponsors"></a>
@@ -35,8 +34,9 @@
 > [!NOTE]
 > **Project maturity:** This project aims to be production-ready and is actively maintained. It is still a new project and not yet widely adopted. Feel free to use it in your projects.
 >
-> **Custom HTTP/2 & HTTP/3 implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
+> **Custom HTTP/2, HTTP/3, and TLS implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
+> - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — ECDHE key exchange (X25519, P-256, P-384), AEAD cipher suites (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305), ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback, handshake message encryption (TLS 1.3), X.509 certificate parsing, and custom record-layer encryption/decryption
 > - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
 > - **HTTP/2** ALPN negotiation, CONTINUATION frames, SETTINGS enforcement, GOAWAY/RST_STREAM, trailers, and connection pooling
 > - **HTTP/2** stream multiplexing, flow control, and connection preface timeout (RFC 7540)
@@ -58,6 +58,9 @@
 - For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
 - For **archive/compression** support, check out **[archive.zig](https://github.com/muhammad-fiaz/archive.zig)**.
 - For **compression file format** support, check out **[zigx](https://github.com/muhammad-fiaz/zigx)**.
+- For **CUDA** support, check out **[cuda.zig](https://github.com/muhammad-fiaz/cuda.zig)**.
+- For **Simplified build.zig config** support, check out **[buildx.zig](https://github.com/muhammad-fiaz/buildx.zig)**.
+- For **SQLite** support, check out **[sqlite.zig](https://github.com/muhammad-fiaz/sqlite.zig)**.
 - For **file downloading** support, check out **[downloader.zig](https://github.com/muhammad-fiaz/downloader.zig)**.
 - For **update checker/auto-updater** support, check out **[updater.zig](https://github.com/muhammad-fiaz/updater.zig)**.
 - For **numerical computing** support, check out **[num.zig](https://github.com/muhammad-fiaz/num.zig)**.
@@ -79,7 +82,7 @@
 | **Pool Introspection** | Built-in connection pool stats and per-host connection counts. | https://muhammad-fiaz.github.io/httpx.zig/api/pool |
 | **Pattern-based Routing** | Intuitive server routing with dynamic path parameters and groups. | https://muhammad-fiaz.github.io/httpx.zig/guide/routing |
 | **Port Conflict Handling** | Explicit startup strategy to fail fast or auto-increment to the next free port. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
-| **Middleware Stack** | Built-in middleware for CORS, Logging, Rate Limiting, customized Auth, and more. | https://muhammad-fiaz.github.io/httpx.zig/guide/middleware |
+| **Middleware Stack** | Built-in middleware for CORS (comptime-zero-alloc), Compression (gzip/deflate/brotli/zstd), Timeout enforcement, Rate Limiting (with eviction), Logging, Auth, Helmet, Reverse Proxy, and more. | https://muhammad-fiaz.github.io/httpx.zig/guide/middleware |
 | **Pre-Route and Global Handlers** | `preRoute(...)` hooks and `global(...)` fallback handlers for complete request lifecycle control. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Unified Any-Method Routing** | `any(path, handler)` to register all standard HTTP methods on one endpoint. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Concurrency** | Parallel request patterns (`race`, `all`, `any`) and async task execution. | https://muhammad-fiaz.github.io/httpx.zig/guide/concurrency |
@@ -88,17 +91,18 @@
 | **Interceptors** | Global hooks to modify requests and responses (e.g., Auth injection). | https://muhammad-fiaz.github.io/httpx.zig/guide/interceptors |
 | **Logging Hooks** | Server log callbacks plus logger middleware customization for structured output. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **Smart Retries** | Configurable retry policies with exponential backoff. | https://muhammad-fiaz.github.io/httpx.zig/api/client |
+| **Cross-Platform Sockets** | Robust Windows socket handling with `WSAEWOULDBLOCK` retry via `select()`, plus `MSG_NOSIGNAL` on Linux/macOS to prevent SIGPIPE crashes. | https://muhammad-fiaz.github.io/httpx.zig/api/net |
 | **Config Builder Helpers** | Chainable optional customization helpers for `ClientConfig` and `RequestOptions` (defaults remain implicit). | https://muhammad-fiaz.github.io/httpx.zig/api/client |
 | **JSON and HTML** | Helpers for easy JSON serialization and HTML response generation. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **Core Convenience APIs** | Request query-param helpers and response constructors for redirect/text/json. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
-| **TLS/SSL** | Secure connections via TLS 1.3 with ALPN protocol negotiation for HTTP/2. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
+| **TLS/SSL** | Full TLS 1.2 and 1.3 with ALPN (RFC 7301), ECDHE key exchange (X25519, P-256, P-384), AEAD ciphers (AES-128/256-GCM, ChaCha20-Poly1305), handshake encryption, X.509 certificate parsing, PEM cert/key loading for servers, and custom record-layer encryption/decryption. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
 | **Static Files** | Efficient static file serving capabilities. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Streaming and Realtime** | Chunked transfer responses with optional trailers and SSE response helpers. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **HTTP/3 Flow Control** | MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Stream Cancellation** | RESET_STREAM and STOP_SENDING frames for graceful HTTP/3 stream teardown without connection disruption. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Cookie APIs** | First-class request/response cookie helpers for both client and server contexts. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Security** | Security headers (Helmet) and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
-| **No External Dependencies** | Pure Zig implementation for maximum portability and ease of build. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
+| **No External Dependencies** | Pure Zig implementation for maximum portability and ease of build. Compression uses bundled brotli and zstd packages. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
 | **Shared Common Helpers** | Reusable query/cookie helpers plus MIME resolution with explicit fallback and external mapping support. | https://muhammad-fiaz.github.io/httpx.zig/api/utils |
 | **WebSockets** | RFC 6455 upgrade checks, handshake accept key computations, and frame encoding/decoding. | https://muhammad-fiaz.github.io/httpx.zig/examples/websocket-example |
 | **Multipart Form Data** | RFC 2046 multipart body builder and parser for text fields and file uploads. | https://muhammad-fiaz.github.io/httpx.zig/examples/multipart-example |
@@ -122,8 +126,11 @@ Before using `httpx.zig`, ensure you have the following:
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| **Zig** | 0.16.0+ | Download from [ziglang.org](https://ziglang.org/download/) |
+| **Zig** | **0.16.0** (recommended) | Download from [ziglang.org](https://ziglang.org/download/) |
 | **Operating System** | Windows 10+, Linux, macOS | Cross-platform networking support |
+
+> [!IMPORTANT]
+> **Zig 0.16.0 is required.** This project currently targets Zig 0.16.0 (stable). Zig 0.17.0 is in development (dev branch, not yet a stable release) and introduces several minor breaking changes from 0.16.0. Migration to 0.17.0 will happen once it is officially released as a stable version. Please use Zig 0.16.0 for all builds.
 
 ---
 
@@ -163,20 +170,20 @@ zig build -Dtarget=x86-windows
 
 ### Method 1: Zig Fetch (Recommended)
 
-**Latest Release (v0.1.3)**
+**Latest Release (v0.1.4)**
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.4.tar.gz
+```
+
+**Previous Stable Release (v0.1.3)**
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz
 ```
 
-**Previous Stable Release (v0.1.2)**
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
-```
-
 > [!WARNING]
-> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.3**.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.1.4**.
 
 ### Method 2: Zig Fetch (Main Branch)
 
@@ -193,7 +200,7 @@ Add the dependency to your `build.zig.zon` file.
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.4.tar.gz",
         .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
     },
 },
@@ -416,7 +423,7 @@ try server.listen();
  
 ## Examples
 
-The `examples/` directory contains **35 comprehensive, runnable examples** demonstrating all features of `httpx.zig`:
+The `examples/` directory contains **49 comprehensive, runnable examples** demonstrating all features of `httpx.zig`:
 
 **Client:**
 - [`simple_get`](examples/simple_get.zig) - Basic GET requests
@@ -426,21 +433,34 @@ The `examples/` directory contains **35 comprehensive, runnable examples** demon
 - [`http_auth_helpers`](examples/http_auth_helpers.zig) - Bearer and Basic auth helpers
 - [`connection_pool`](examples/connection_pool.zig) - Connection pooling and stats
 - [`proxy_example`](examples/proxy_example.zig) - HTTP forward proxy and SOCKS5h
+- [`socks5_proxy`](examples/socks5_proxy.zig) - SOCKS5 proxy tunneling
 - [`interceptors`](examples/interceptors.zig) - Request/response interceptors
 - [`cookies_demo`](examples/cookies_demo.zig) - Cookie jar management
 - [`concurrent_requests`](examples/concurrent_requests.zig) - Parallel request patterns
+- [`batch_concurrent`](examples/batch_concurrent.zig) - Batch concurrent requests
 - [`simplified_api_aliases`](examples/simplified_api_aliases.zig) - Top-level API aliases
+- [`http_methods`](examples/http_methods.zig) - HTTP method helpers
+- [`https_client`](examples/https_client.zig) - HTTPS client with TLS
+- [`redirect_example`](examples/redirect_example.zig) - Redirect handling
+- [`retry_example`](examples/retry_example.zig) - Retry with backoff
+- [`dns_example`](examples/dns_example.zig) - DNS resolution
+- [`compression_example`](examples/compression_example.zig) - gzip/deflate/brotli/zstd
 
 **Server:**
 - [`simple_server`](examples/simple_server.zig) - Minimal HTTP server
+- [`tls_server`](examples/tls_server.zig) - TLS-enabled server
+- [`cloud_https_server`](examples/cloud_https_server.zig) - Cloud HTTPS server
 - [`router_example`](examples/router_example.zig) - Pattern-based routing
 - [`middleware_example`](examples/middleware_example.zig) - Middleware stack
 - [`static_files`](examples/static_files.zig) - Static file serving
 - [`multi_page_website`](examples/multi_page_website.zig) - Multi-page web app
 - [`streaming`](examples/streaming.zig) - Chunked transfer and SSE
+- [`sse_example`](examples/sse_example.zig) - Server-Sent Events
 - [`health_check_example`](examples/health_check_example.zig) - Liveness/readiness probes
 - [`request_response_customization`](examples/request_response_customization.zig) - Request/response customization
 - [`async_server_example`](examples/async_server_example.zig) - Thread pool concurrency
+- [`logging_callback`](examples/logging_callback.zig) - Logging callbacks
+- [`reverse_proxy_middleware`](examples/reverse_proxy_middleware.zig) - Reverse proxy middleware
 
 **Protocol:**
 - [`http2_example`](examples/http2_example.zig) - HTTP/2 protocol primitives
@@ -453,7 +473,8 @@ The `examples/` directory contains **35 comprehensive, runnable examples** demon
 - [`http3_advanced`](examples/http3_advanced.zig) - QPACK stream instructions, QUIC cancellation, transport parameters
 
 **Advanced Capabilities:**
-- [`websocket_example`](examples/websocket_example.zig) - RFC 6455 WebSockets
+- [`websocket_example`](examples/websocket_example.zig) - RFC 6455 WebSocket client
+- [`websocket_server`](examples/websocket_server.zig) - WebSocket server
 - [`multipart_example`](examples/multipart_example.zig) - RFC 2046 multipart form data
 - [`session_example`](examples/session_example.zig) - TTL-based session store
 - [`metrics_example`](examples/metrics_example.zig) - Observability metrics

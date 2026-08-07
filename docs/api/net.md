@@ -4,12 +4,12 @@ Low-level networking primitives for TCP and UDP across Linux, Windows, macOS, an
 
 ## Platform Support
 
-| Platform | TCP | UDP | TLS |
-|----------|-----|-----|-----|
-| Linux | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ |
-| FreeBSD/NetBSD/OpenBSD | ✅ | ✅ | ✅ |
+| Platform | TCP | UDP | TLS | Notes |
+|----------|-----|-----|-----|-------|
+| Linux | ✅ | ✅ | ✅ | `MSG_NOSIGNAL` prevents SIGPIPE on broken connections |
+| Windows | ✅ | ✅ | ✅ | `WSAEWOULDBLOCK` handled via `select()` retry for large sends |
+| macOS | ✅ | ✅ | ✅ | `MSG_NOSIGNAL` prevents SIGPIPE on broken connections |
+| FreeBSD/NetBSD/OpenBSD | ✅ | ✅ | ✅ | |
 
 ## TCP Socket (`httpx.Socket`)
 
@@ -175,10 +175,10 @@ std.debug.print("{s}\n", .{buf[0..result.n]});
 
 `httpx.address` contains host/address helpers. At the root, aliases are also available:
 
-- `httpx.resolveAddress(host, port)`
-- `httpx.resolveAllAddresses(allocator, host, port)`
-- `httpx.parseHostAndPort(input, default_port)`
-- `httpx.parseAndResolveAddress(input, default_port)`
+- `httpx.resolveAddress(allocator, host, port)` — resolve hostname to a single address (takes an allocator for DNS lookup)
+- `httpx.resolveAllAddresses(allocator, host, port)` — resolve hostname to all candidate addresses (caller frees returned slice)
+- `httpx.parseHostAndPort(input, default_port)` — parse `"host:port"` style strings
+- `httpx.parseAndResolveAddress(allocator, input, default_port)` — parse `"host:port"` and resolve to a concrete address
 - `httpx.isIpAddress(input)` / `httpx.isIp4Address(input)` / `httpx.isIp6Address(input)`
 
 Root-level network lifecycle aliases are also available:
@@ -189,7 +189,7 @@ Root-level network lifecycle aliases are also available:
 ```zig
 const httpx = @import("httpx");
 
-const addr = try httpx.resolveAddress("example.com", 443);
+const addr = try httpx.resolveAddress(allocator, "example.com", 443);
 const parsed = try httpx.parseHostAndPort("localhost:8080", 80);
 ```
 

@@ -13,7 +13,11 @@ const io_util = @import("../util/any_io.zig");
 const defaultIo = io_util.defaultIo;
 const is_windows = builtin.os.tag == .windows;
 
-const is_unix_available = true;
+const is_unix_available = switch (builtin.os.tag) {
+    .linux, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    .windows => true, // Windows 10 1803+ supports AF_UNIX
+    else => false,
+};
 
 // Winsock declarations for Windows support
 const winsock = if (is_windows) struct {
@@ -147,7 +151,7 @@ fn sendBytes(fd: posix.socket_t, data: []const u8) !usize {
         if (rc < 0) return error.WriteFailed;
         return @intCast(rc);
     } else {
-        const rc = posix.system.sendto(fd, data.ptr, data.len, 0, null, 0);
+        const rc = posix.system.sendto(fd, data.ptr, data.len, posix.MSG.NOSIGNAL, null, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             else => return error.WriteFailed,

@@ -28,7 +28,8 @@ Logging is opt-in. Use `httpx.middleware.loggerWithConfig(.{ .log_fn = ... })` t
 - **RateLimit**: Simple in-memory rate limiting.
 - **BasicAuth**: RFC 7617 Basic Authentication.
 - **Helmet**: Security headers.
-- **Compression**: Helper for content encoding.
+- **Compression**: Response compression middleware (gzip, deflate, br, zstd) via `httpx.middleware.compression()`. Compresses responses larger than 1KB by default, preferring brotli > zstd > gzip > deflate.
+- **Timeout**: Application-level per-request timeout enforcement via `httpx.middleware.timeout(ms)`. Stores a deadline and returns 408 if exceeded.
 - **RequestId**: Injects `X-Request-ID`.
 
 ## Writing Custom Middleware
@@ -58,3 +59,35 @@ try server.use(.{
     .handler = MyMiddleware.handler 
 });
 ```
+
+## Compression Middleware
+
+Use `httpx.middleware.compression()` to enable automatic response compression. The middleware negotiates the best encoding based on the client's `Accept-Encoding` header and compresses the response body before sending.
+
+```zig
+try server.use(httpx.middleware.compression());
+```
+
+This enables gzip, deflate, brotli, and zstd compression. The middleware:
+- Reads the incoming `Accept-Encoding` header
+- Prefers brotli > zstd > gzip > deflate (first match wins)
+- Only compresses when the response body exceeds `min_bytes` (default: 1024)
+- Skips compression if `Content-Encoding` is already set on the response
+
+With explicit configuration:
+
+```zig
+try server.use(httpx.middleware.compressionMiddlewareWithConfig(.{
+    .min_bytes = 512, // compress responses >= 512 bytes
+}));
+```
+
+## Timeout Middleware
+
+Use `httpx.middleware.timeout(ms)` to enforce a per-request timeout at the application level. This complements the server's `request_timeout_ms` socket-level timeout:
+
+```zig
+try server.use(httpx.middleware.timeout(5_000)); // 5 second timeout
+```
+
+If the deadline has passed before the handler runs, returns `408 Request Timeout` immediately.

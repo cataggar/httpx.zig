@@ -17,9 +17,27 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    const zstd_dep = b.lazyDependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const brotli_dep = b.lazyDependency("brotli", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const httpx_module = b.createModule(.{
         .root_source_file = b.path("src/httpx.zig"),
     });
+
+    if (zstd_dep) |zstd| {
+        httpx_module.addImport("zstd", zstd.module("zstd"));
+    }
+
+    if (brotli_dep) |brotli| {
+        httpx_module.addImport("brotli", brotli.module("brotli"));
+    }
 
     _ = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
@@ -42,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "connection_pool", .path = "examples/connection_pool.zig" },
         .{ .name = "cookies_demo", .path = "examples/cookies_demo.zig" },
         .{ .name = "proxy_example", .path = "examples/proxy_example.zig" },
+        .{ .name = "socks5_proxy", .path = "examples/socks5_proxy.zig" },
         .{ .name = "simplified_api_aliases", .path = "examples/simplified_api_aliases.zig" },
         .{ .name = "static_files", .path = "examples/static_files.zig" },
         .{ .name = "multi_page_website", .path = "examples/multi_page_website.zig" },
@@ -61,6 +80,19 @@ pub fn build(b: *std.Build) void {
         .{ .name = "request_response_customization", .path = "examples/request_response_customization.zig" },
         .{ .name = "unix_socket_example", .path = "examples/unix_socket_example.zig" },
         .{ .name = "async_server_example", .path = "examples/async_server_example.zig" },
+        .{ .name = "cloud_https_server", .path = "examples/cloud_https_server.zig" },
+        .{ .name = "https_client", .path = "examples/https_client.zig" },
+        .{ .name = "sse_example", .path = "examples/sse_example.zig" },
+        .{ .name = "websocket_server", .path = "examples/websocket_server.zig" },
+        .{ .name = "tls_server", .path = "examples/tls_server.zig" },
+        .{ .name = "compression_example", .path = "examples/compression_example.zig" },
+        .{ .name = "http_methods", .path = "examples/http_methods.zig" },
+        .{ .name = "logging_callback", .path = "examples/logging_callback.zig" },
+        .{ .name = "retry_example", .path = "examples/retry_example.zig" },
+        .{ .name = "dns_example", .path = "examples/dns_example.zig" },
+        .{ .name = "redirect_example", .path = "examples/redirect_example.zig" },
+        .{ .name = "batch_concurrent", .path = "examples/batch_concurrent.zig" },
+        .{ .name = "reverse_proxy_middleware", .path = "examples/reverse_proxy_middleware.zig" },
     };
 
     inline for (examples) |example| {
@@ -102,10 +134,6 @@ pub fn build(b: *std.Build) void {
         linkPlatformLibs(exe, target);
 
         const install_exe = b.addInstallArtifact(exe, .{});
-        // Fully serialize: each example's COMPILE step depends on the previous
-        // example's RUN step having completed. This prevents the Zig compiler
-        // from being launched in parallel for multiple examples, which would
-        // exhaust memory and cause exit code 253 crashes.
         if (previous_run_step) |prev| {
             exe.step.dependOn(prev);
             install_exe.step.dependOn(prev);
@@ -127,6 +155,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    if (zstd_dep) |zstd| {
+        tests.root_module.addImport("zstd", zstd.module("zstd"));
+    }
+    if (brotli_dep) |brotli| {
+        tests.root_module.addImport("brotli", brotli.module("brotli"));
+    }
     linkPlatformLibs(tests, target);
 
     const run_tests = b.addRunArtifact(tests);

@@ -289,16 +289,35 @@ fn posixAccept(sock: posix.socket_t, addr_ptr: *posix.sockaddr, addr_len: *posix
     }
 }
 
+fn winsockWaitWritable(sock: posix.socket_t) !void {
+    var write_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+    write_set.fd_array[0] = toWinsockSocket(sock);
+    write_set.fd_count = 1;
+    var tv = posix.timeval{ .sec = 5, .usec = 0 };
+    const rc = winsock.select(0, null, &write_set, null, &tv);
+    if (rc == winsock.SOCKET_ERROR) return error.SendFailed;
+    if (rc == 0) return error.TimedOut;
+}
+
 fn posixSend(sock: posix.socket_t, data: []const u8, flags: u32) !usize {
     if (is_windows) {
-        const send_len: i32 = std.math.cast(i32, data.len) orelse return error.SendFailed;
-        const rc = winsock.send(toWinsockSocket(sock), data.ptr, send_len, @intCast(flags));
-        if (rc == winsock.SOCKET_ERROR) return error.SendFailed;
-        return @intCast(rc);
+        while (true) {
+            const send_len: i32 = std.math.cast(i32, data.len) orelse return error.SendFailed;
+            const rc = winsock.send(toWinsockSocket(sock), data.ptr, send_len, @intCast(flags));
+            if (rc == winsock.SOCKET_ERROR) {
+                const err = winsock.WSAGetLastError();
+                if (err == winsock.WSAEWOULDBLOCK) {
+                    try winsockWaitWritable(sock);
+                    continue;
+                }
+                return error.SendFailed;
+            }
+            return @intCast(rc);
+        }
     }
 
     while (true) {
-        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), null, 0);
+        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags | posix.MSG.NOSIGNAL), null, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
@@ -309,10 +328,25 @@ fn posixSend(sock: posix.socket_t, data: []const u8, flags: u32) !usize {
 
 fn posixRecv(sock: posix.socket_t, buffer: []u8, flags: u32) !usize {
     if (is_windows) {
-        const recv_len: i32 = std.math.cast(i32, buffer.len) orelse return error.RecvFailed;
-        const rc = winsock.recv(toWinsockSocket(sock), buffer.ptr, recv_len, @intCast(flags));
-        if (rc == winsock.SOCKET_ERROR) return error.RecvFailed;
-        return @intCast(rc);
+        while (true) {
+            const recv_len: i32 = std.math.cast(i32, buffer.len) orelse return error.RecvFailed;
+            const rc = winsock.recv(toWinsockSocket(sock), buffer.ptr, recv_len, @intCast(flags));
+            if (rc == winsock.SOCKET_ERROR) {
+                const err = winsock.WSAGetLastError();
+                if (err == winsock.WSAEWOULDBLOCK) {
+                    var read_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+                    read_set.fd_array[0] = toWinsockSocket(sock);
+                    read_set.fd_count = 1;
+                    var tv = posix.timeval{ .sec = 5, .usec = 0 };
+                    const sel_rc = winsock.select(0, &read_set, null, null, &tv);
+                    if (sel_rc == winsock.SOCKET_ERROR) return error.RecvFailed;
+                    if (sel_rc == 0) return error.TimedOut;
+                    continue;
+                }
+                return error.RecvFailed;
+            }
+            return @intCast(rc);
+        }
     }
 
     while (true) {
@@ -327,14 +361,23 @@ fn posixRecv(sock: posix.socket_t, buffer: []u8, flags: u32) !usize {
 
 fn posixSendTo(sock: posix.socket_t, data: []const u8, flags: u32, addr_ptr: *const posix.sockaddr, addr_len: posix.socklen_t) !usize {
     if (is_windows) {
-        const send_len: i32 = std.math.cast(i32, data.len) orelse return error.SendFailed;
-        const rc = winsock.sendto(toWinsockSocket(sock), data.ptr, send_len, @intCast(flags), addr_ptr, @intCast(addr_len));
-        if (rc == winsock.SOCKET_ERROR) return error.SendFailed;
-        return @intCast(rc);
+        while (true) {
+            const send_len: i32 = std.math.cast(i32, data.len) orelse return error.SendFailed;
+            const rc = winsock.sendto(toWinsockSocket(sock), data.ptr, send_len, @intCast(flags), addr_ptr, @intCast(addr_len));
+            if (rc == winsock.SOCKET_ERROR) {
+                const err = winsock.WSAGetLastError();
+                if (err == winsock.WSAEWOULDBLOCK) {
+                    try winsockWaitWritable(sock);
+                    continue;
+                }
+                return error.SendFailed;
+            }
+            return @intCast(rc);
+        }
     }
 
     while (true) {
-        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags), addr_ptr, addr_len);
+        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(flags | posix.MSG.NOSIGNAL), addr_ptr, addr_len);
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
@@ -483,7 +526,7 @@ pub fn deinit() void {
 
 /// Adapter that exposes a `std.Io.Reader` backed by a connected `Socket`.
 ///
-/// This is primarily used to integrate with `std.crypto.tls.Client`.
+/// This is used to integrate with the custom TLS implementation in `tls.zig`.
 pub const SocketIoReader = struct {
     socket: *Socket,
     reader: Io.Reader,
@@ -576,7 +619,7 @@ pub const SocketIoReader = struct {
 
 /// Adapter that exposes a `std.Io.Writer` backed by a connected `Socket`.
 ///
-/// This is primarily used to integrate with `std.crypto.tls.Client`.
+/// This is used to integrate with the custom TLS implementation in `tls.zig`.
 pub const SocketIoWriter = struct {
     socket: *Socket,
     writer: Io.Writer,
@@ -735,7 +778,7 @@ pub const Socket = struct {
 
     /// Resolves and connects to `host:port`.
     pub fn connectHost(self: *Self, host: []const u8, port: u16) !void {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         try self.connect(addr);
     }
 
@@ -841,6 +884,26 @@ pub const Socket = struct {
         try posixSetSockOpt(self.handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&value));
     }
 
+    /// Enables or disables port reuse (SO_REUSEPORT).
+    pub fn setReusePort(self: *Self, enable: bool) !void {
+        const value: u32 = if (enable) 1 else 0;
+        const optname: u32 = if (builtin.os.tag == .linux or builtin.os.tag == .macos) 15 else posix.SO.REUSEADDR;
+        try posixSetSockOpt(self.handle, posix.SOL.SOCKET, optname, std.mem.asBytes(&value));
+    }
+
+    /// Sets SO_LINGER option on socket.
+    pub fn setLinger(self: *Self, onoff: bool, linger_sec: u16) !void {
+        const LingerStruct = extern struct {
+            l_onoff: c_int,
+            l_linger: c_int,
+        };
+        const l = LingerStruct{
+            .l_onoff = if (onoff) 1 else 0,
+            .l_linger = @intCast(linger_sec),
+        };
+        try posixSetSockOpt(self.handle, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&l));
+    }
+
     /// Binds the socket to an address.
     pub fn bind(self: *Self, addr: net.Address) !void {
         try posixBind(self.handle, &addr.any, addr.getOsSockLen());
@@ -848,7 +911,7 @@ pub const Socket = struct {
 
     /// Resolves and binds to `host:port`.
     pub fn bindHost(self: *Self, host: []const u8, port: u16) !void {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         try self.bind(addr);
     }
 
@@ -944,7 +1007,7 @@ pub const TcpListener = struct {
 
     /// Resolves and creates a TCP listener for `host:port`.
     pub fn initHost(host: []const u8, port: u16) !Self {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         return Self.init(addr);
     }
 
@@ -962,7 +1025,7 @@ pub const TcpListener = struct {
 
     /// Resolves and creates a TCP listener for `host:port` with explicit backlog.
     pub fn initHostWithBacklog(host: []const u8, port: u16, backlog: u31) !Self {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         return initWithBacklog(addr, backlog);
     }
 
@@ -1042,7 +1105,7 @@ pub const UdpSocket = struct {
 
     /// Resolves and binds to `host:port`.
     pub fn bindHost(self: *Self, host: []const u8, port: u16) !void {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         try self.bind(addr);
     }
 
@@ -1055,7 +1118,7 @@ pub const UdpSocket = struct {
 
     /// Resolves and connects to `host:port`.
     pub fn connectHost(self: *Self, host: []const u8, port: u16) !void {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         try self.connect(addr);
     }
 
@@ -1082,7 +1145,7 @@ pub const UdpSocket = struct {
 
     /// Resolves destination host and sends a datagram.
     pub fn sendToHost(self: *Self, host: []const u8, port: u16, data: []const u8) !usize {
-        const addr = try address.resolve(host, port);
+        const addr = try address.resolve(std.heap.page_allocator, host, port);
         return self.sendTo(addr, data);
     }
 
