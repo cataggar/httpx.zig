@@ -28,8 +28,7 @@ zig build example-http3_example -Dtarget=aarch64-macos
 - [Interceptors](/examples/interceptors): Apply request and response interceptors.
 - [Cookies Demo](/examples/cookies-demo): Manage cookie jar values in client flows.
 - [Logging Callback](/examples/logging-callback): Set up custom logging functions for both server and client.
-- [Proxy and Reverse Proxy](/examples/proxy-example): Configure client forward proxies, including SOCKS5h tunnels, and register reverse proxy middleware.
-- [SOCKS5h Proxy](/examples/socks5-proxy): Route requests through a SOCKS5h proxy with remote DNS resolution.
+- [Proxy and Reverse Proxy](/examples/proxy-example): Configure client forward proxies, including SOCKS5h tunnels with remote DNS resolution, and register reverse proxy middleware.
 - [Simplified API Aliases](/examples/simplified-api-aliases): Use short top-level helper APIs with local loopback success mode by default.
 - [Simple Server](/examples/simple-server): Start a minimal HTTP server.
 - [Thread Pool / Async Server](/examples/async-server-example): Start a concurrent HTTP server with thread pool connection dispatching.
