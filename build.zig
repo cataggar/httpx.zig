@@ -27,7 +27,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const httpx_module = b.createModule(.{
+    // Create the public module that will be exported as "httpx" to consumers.
+    // Dependencies must be added here so they propagate to downstream packages.
+    const httpx_module = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
     });
 
@@ -38,10 +40,6 @@ pub fn build(b: *std.Build) void {
     if (brotli_dep) |brotli| {
         httpx_module.addImport("brotli", brotli.module("brotli"));
     }
-
-    _ = b.addModule("httpx", .{
-        .root_source_file = b.path("src/httpx.zig"),
-    });
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
@@ -208,14 +206,21 @@ pub fn build(b: *std.Build) void {
 
     for (cross_targets) |t| {
         const target_cross = b.resolveTargetQuery(t);
+        const root_module_cross = b.createModule(.{
+            .root_source_file = b.path("src/httpx.zig"),
+            .target = target_cross,
+            .optimize = optimize,
+        });
+        if (zstd_dep) |zstd| {
+            root_module_cross.addImport("zstd", zstd.module("zstd"));
+        }
+        if (brotli_dep) |brotli| {
+            root_module_cross.addImport("brotli", brotli.module("brotli"));
+        }
         const lib_cross = b.addLibrary(.{
             .name = "httpx",
             .linkage = .static,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/httpx.zig"),
-                .target = target_cross,
-                .optimize = optimize,
-            }),
+            .root_module = root_module_cross,
         });
         linkPlatformLibs(lib_cross, target_cross);
 
@@ -223,14 +228,22 @@ pub fn build(b: *std.Build) void {
         build_all_step.dependOn(&lib_cross.step);
     }
 
+    const lib_root_module = b.createModule(.{
+        .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (zstd_dep) |zstd| {
+        lib_root_module.addImport("zstd", zstd.module("zstd"));
+    }
+    if (brotli_dep) |brotli| {
+        lib_root_module.addImport("brotli", brotli.module("brotli"));
+    }
+
     const lib = b.addLibrary(.{
         .name = "httpx",
         .linkage = .static,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/httpx.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = lib_root_module,
     });
     linkPlatformLibs(lib, target);
 
