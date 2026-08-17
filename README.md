@@ -36,13 +36,12 @@
 >
 > **Custom HTTP/2, HTTP/3, and TLS implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
-> - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — key exchange: X25519 (TLS 1.2/1.3), P-256 and P-384 (TLS 1.3), X25519+ML-KEM768 post-quantum hybrid (TLS 1.3); AEAD cipher suites (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305); ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback; handshake message encryption (TLS 1.3); X.509 certificate parsing and verification; custom record-layer encryption/decryption
+> - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — key exchange: X25519 (TLS 1.2/1.3); AEAD cipher suites: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback; handshake message encryption (TLS 1.3); X.509 certificate parsing and verification (client-side); custom record-layer encryption/decryption
 > - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
-> - **HTTP/2** ALPN negotiation, CONTINUATION frames, SETTINGS enforcement, GOAWAY/RST_STREAM, trailers, and connection pooling
-> - **HTTP/2** stream multiplexing, flow control, and connection preface timeout (RFC 7540)
-> - **QPACK** header compression (RFC 9204) with decoder/encoder stream instructions for HTTP/3
-> - **QUIC** transport framing (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation and transport parameters for HTTP/3
-> - **HTTP/3** flow control (MAX_DATA/MAX_STREAM_DATA), GOAWAY, and CONNECTION_CLOSE handling
+> - **HTTP/2** stream multiplexing, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and connection pooling (RFC 7540)
+> - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
+> - **QUIC** transport frame encoding/decoding (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation, version negotiation, and transport parameters
+> - **HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE handling
 > - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 
 **Related Zig projects:**
@@ -98,7 +97,7 @@
 | **JSON and HTML** | Helpers for easy JSON serialization and HTML response generation. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **Zero-Copy JSON** | Type-safe JSON methods (`getJson`, `postJsonAndParse`, `Response.json`, `ctx.jsonBody`) with zero-copy borrowed parsing — no arena required. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **Core Convenience APIs** | Request query-param helpers and response constructors for redirect/text/json. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
-| **TLS/SSL** | Full TLS 1.2 and 1.3 with ALPN (RFC 7301), ECDHE key exchange (X25519, P-256, P-384), AEAD ciphers (AES-128/256-GCM, ChaCha20-Poly1305), handshake encryption, X.509 certificate parsing, PEM cert/key loading for servers, and custom record-layer encryption/decryption. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
+| **TLS/SSL** | Full TLS 1.2 and 1.3 with ALPN (RFC 7301), X25519 key exchange, AEAD ciphers (ChaCha20-Poly1305, AES-128/256-GCM), handshake encryption, X.509 certificate parsing (client-side), PEM cert/key loading for servers, and custom record-layer encryption/decryption. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
 | **Static Files** | Efficient static file serving capabilities. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Streaming and Realtime** | Chunked transfer responses with optional trailers and SSE response helpers. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **HTTP/3 Flow Control** | MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |

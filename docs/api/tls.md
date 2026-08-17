@@ -7,26 +7,22 @@ The TLS module provides a fully custom TLS 1.2/1.3 implementation built entirely
 | Feature | TLS 1.2 | TLS 1.3 |
 |---------|---------|---------|
 | X25519 key exchange | ✅ | ✅ |
-| P-256 key exchange | -- | ✅ |
-| P-384 key exchange | -- | ✅ |
-| X25519+ML-KEM768 post-quantum hybrid | -- | ✅ |
 | AES-128-GCM | ✅ | ✅ |
 | AES-256-GCM | ✅ | ✅ |
 | ChaCha20-Poly1305 | ✅ | ✅ |
 | ECDSA P-256 certificate signing | -- | ✅ |
 | Certificate loading (PEM) | ✅ | ✅ |
-| Certificate chain verification | ✅ | ✅ |
+| Certificate chain verification (client-side) | ✅ | ✅ |
 | ALPN negotiation | ✅ | ✅ |
 | SNI extension | ✅ | ✅ |
 | Handshake message encryption | -- | ✅ |
 | Cipher suite selection from client list | -- | ✅ |
-| QUIC-TLS bridge | -- | ✅ |
 
 ## Architecture
 
 ```
 tls.zig              -- High-level Connection, TlsConfig, TlsSession, record-layer AEAD encrypt/decrypt
-├── client.zig       -- TLS 1.2/1.3 client handshake, KeyExchange (X25519/P-256/P-384), cipher suite negotiation
+├── client.zig       -- TLS 1.2/1.3 client handshake, X25519 key exchange, cipher suite negotiation
 ├── server.zig       -- TLS 1.2/1.3 server handshake, ServerHello, cipher selection
 ├── alpn.zig         -- ALPN protocol negotiation
 └── errors.zig       -- Unified TLS error set and alert conversion
@@ -217,10 +213,7 @@ Supported elliptic curves for key exchange:
 
 | Group | Notes |
 |-------|-------|
-| `x25519` | Default, fastest |
-| `secp256r1` | NIST P-256 (TLS 1.3 only) |
-| `secp384r1` | NIST P-384 (TLS 1.3 only) |
-| `x25519_ml_kem768` | Post-quantum hybrid (TLS 1.3 only) |
+| `x25519` | Default, only key exchange actually negotiated by both client and server |
 
 ### Error Set
 
