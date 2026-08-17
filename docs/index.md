@@ -44,19 +44,19 @@ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 | Benchmark | Avg (ns/op) | Throughput (ops/sec) |
 |-----------|-------------|----------------------|
-| headers_parse | 17143.40 | 58331 |
-| uri_parse | 30.54 | 32742548 |
-| status_lookup | 0.87 | 1153375931 |
-| method_lookup | 14.33 | 69779969 |
-| base64_encode | 5740.49 | 174201 |
-| base64_decode | 5647.98 | 177054 |
-| json_builder | 5886.02 | 169894 |
-| request_build | 28003.02 | 35710 |
-| response_builders | 27856.15 | 35898 |
-| executor_run_all | 178.57 | 5599956 |
-| proxy_request_build | 46943.72 | 21302 |
-| h2_frame_header | 0.96 | 1041362935 |
-| h3_varint_encode | 0.97 | 1025960914 |
+| headers_parse | 14669.17 | 68170 |
+| uri_parse | 32.03 | 31220048 |
+| status_lookup | 0.95 | 1054585337 |
+| method_lookup | 14.72 | 67941706 |
+| base64_encode | 4707.96 | 212406 |
+| base64_decode | 4766.07 | 209816 |
+| json_builder | 5066.82 | 197362 |
+| request_build | 25681.18 | 38939 |
+| response_builders | 25546.64 | 39144 |
+| executor_run_all | 198.41 | 5039997 |
+| proxy_request_build | 41799.37 | 23923 |
+| h2_frame_header | 1.00 | 1001883541 |
+| h3_varint_encode | 0.91 | 1100589475 |
 
 ## Install
 

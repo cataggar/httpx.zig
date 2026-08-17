@@ -986,9 +986,13 @@ pub const Server = struct {
     }
 
     fn removeFromActive(self: *Self, socket: Socket) void {
-        for (self.active_connections.items, 0..) |*s, i| {
+        const items = self.active_connections.items;
+        for (items, 0..) |*s, i| {
             if (s.handle == socket.handle) {
-                _ = self.active_connections.swapRemove(i);
+                // Guard against concurrent stop() clearing the list.
+                if (i < self.active_connections.items.len) {
+                    _ = self.active_connections.swapRemove(i);
+                }
                 return;
             }
         }

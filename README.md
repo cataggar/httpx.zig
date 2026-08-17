@@ -621,75 +621,24 @@ zig build bench
 > Benchmark results will vary based on hardware and network conditions.
 > The benchmark suite reports multiple rounds with min/avg/max and throughput to improve result quality.
 
-Benchmark target: `x86_64-windows`, `ReleaseFast`.
+ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 | Benchmark | Avg (ns/op) | Throughput (ops/sec) |
 |-----------|-------------|----------------------|
-| headers_parse | 12575.61 | 79519 |
-| uri_parse | 34.35 | 29114200 |
-| status_lookup | 1.42 | 703135986 |
-| method_lookup | 16.68 | 59947509 |
-| base64_encode | 4258.48 | 234825 |
-| base64_decode | 4137.80 | 241674 |
-| json_builder | 4169.33 | 239846 |
-| request_build | 35594.77 | 28094 |
-| response_builders | 43972.07 | 22741 |
-| executor_run_all | 347.83 | 2874951 |
-| proxy_request_build | 60041.22 | 16655 |
-| h2_frame_header | 1.58 | 632095269 |
-| h3_varint_encode | 1.88 | 531229946 |
+| headers_parse | 14669.17 | 68170 |
+| uri_parse | 32.03 | 31220048 |
+| status_lookup | 0.95 | 1054585337 |
+| method_lookup | 14.72 | 67941706 |
+| base64_encode | 4707.96 | 212406 |
+| base64_decode | 4766.07 | 209816 |
+| json_builder | 5066.82 | 197362 |
+| request_build | 25681.18 | 38939 |
+| response_builders | 25546.64 | 39144 |
+| executor_run_all | 198.41 | 5039997 |
+| proxy_request_build | 41799.37 | 23923 |
+| h2_frame_header | 1.00 | 1001883541 |
+| h3_varint_encode | 0.91 | 1100589475 |
  
-## Bug Fixes
-
-### v0.1.6 — TLS 1.3 fixes, ECDSA certs, connection pool, cookie domain awareness
-
-**TLS 1.3 Fixes:**
-- Fixed TLS 1.3 key extraction: `TlsSession` now correctly copies handshake keys to application keys after `ServerHello`/`Finished`
-- Fixed TLS 1.3 inner plaintext: `TlsSession.write()` now appends `0x17` (application_data) content type byte per RFC 8446 Section 5.1
-- Added ECDSA P-256 certificate signing for TLS 1.3 `CertificateVerify` and TLS 1.2 `ServerKeyExchange`
-- DER parser for ECDSA keys (`scanDerForEcKey`)
-- `loadPrivateKey` updated for SEC1 EC key format
-- `user_canceled` alert handled gracefully (treated as clean close)
-- Sequence number overflow guard for TLS 1.3 key updates
-
-**Connection Pool:**
-- Thread-safe pool access using atomic spinlock
-- Proxy-aware connection matching (`proxy_host`/`proxy_port` fields)
-- `closeConnection()` method for stale connection removal
-- Client removes stale connections from pool on error
-
-**Cookie Handling:**
-- Domain-aware cookie storage per RFC 6265
-- Cookies with `Domain` attribute only sent to matching hosts
-- `parseSetCookie()` extracts Domain, Path, Secure, HttpOnly from Set-Cookie headers
-- Protocol-relative URL redirect support (`//example.com/path`)
-
-**Other:**
-- All TLS debug prints removed
-- All 343 tests pass; all examples build and run
-- Documentation fully updated for v0.1.6
-
-### v0.1.5 — Multipart upload hang on Windows (issue [#26](https://github.com/muhammad-fiaz/httpx.zig/issues/26))
-
-Sending multipart file data larger than ~13 KB caused the upload to hang after a
-few parts on Windows. Root cause: `posixSend` passed the entire remaining buffer
-to a single `winsock.send()` call, which exceeded the kernel send buffer (~8–64 KB)
-and triggered `WSAEWOULDBLOCK` under a 5-second select timeout.
-
-**Fix:**
-- `src/net/socket.zig`: Each individual `winsock.send()` call is now capped to
-  **64 KB** (`MAX_WINSOCK_SEND_CHUNK`). The `sendAll` loop correctly retries until
-  all bytes are sent.
-- `src/net/socket.zig`: `winsockWaitWritable` timeout raised from 5 s → **30 s**
-  (matches the default client `write_ms`).
-- `src/util/multipart.zig`: New `MultipartBuilder.addFileChunked` method and
-  `MAX_RECOMMENDED_CHUNK` constant exported as `httpx.MultipartMaxChunk`.
-
-No application changes are required. Existing code using `withMultipartFiles`
-or `MultipartBuilder.addFile` now works correctly for arbitrarily large payloads.
-
----
-
 ## Contributing
  
 Contributions are welcome! Please:
