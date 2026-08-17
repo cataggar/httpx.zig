@@ -7,11 +7,8 @@ supported with security updates.
 
 | Version  | Supported |
 | -------- | --------- |
-| 0.1.5    | :white_check_mark: |
-| 0.1.3    | :white_check_mark: |
-| 0.1.2    | :white_check_mark: |
-| 0.1.1    | :white_check_mark: |
-| < 0.1.1  | :x: |
+| 0.1.6    | :white_check_mark: |
+| < 0.1.5  | :x: |
 
 Versions below 0.1.1 are considered end-of-life and will not receive
 security fixes or updates.

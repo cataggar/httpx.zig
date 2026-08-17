@@ -45,7 +45,7 @@ pub fn main() !void {
     // paths before any route handler or other middleware runs.
     try server.use(httpx.healthCheck(.{
         .path = "/health",
-        .body = "{\"status\":\"ok\",\"version\":\"0.1.5\"}",
+        .body = "{\"status\":\"ok\",\"version\":\"0.1.6\"}",
         .status = 200,
     }));
     try server.use(httpx.readinessProbe(.{
@@ -63,8 +63,6 @@ pub fn main() !void {
     }.h);
 
     const t = try server.listenInBackground();
-    defer t.join();
-    defer server.stop();
     sleepMs(100);
 
     var client = httpx.Client.initWithConfig(allocator, httpx.ClientConfig.defaults()
@@ -104,4 +102,7 @@ pub fn main() !void {
     std.debug.print("readinessProbe: {s}\n", .{httpx.readinessProbe(.{}).name});
 
     std.debug.print("\n=== Health Check Example Complete ===\n", .{});
+
+    server.stop();
+    t.join();
 }

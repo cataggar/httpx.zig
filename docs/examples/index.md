@@ -12,14 +12,15 @@ This section contains practical `httpx.zig` demo programs for client, server, mi
 For non-host targets, compile (without running) by adding `-Dtarget=...`:
 
 ```bash
-zig build example-tcp_local -Dtarget=x86_64-linux
-zig build example-http3_example -Dtarget=aarch64-macos
+zig build run-all-tcp_local -Dtarget=x86_64-linux
+zig build run-all-http3_example -Dtarget=aarch64-macos
 ```
 
 ## Available Examples
 
 - [Simple Get](/examples/simple-get): Basic GET request and response handling.
 - [Simple Get Deserialize](/examples/simple-get-deserialize): Parse JSON into typed structs.
+- [`json_api_example`](examples/json_api_example.zig): JSON API: getJson, postJsonAndParse, Response.json, server ctx.jsonBody + ctx.json
 - [HTTP Auth Helpers](/examples/http-auth-helpers): Use built-in Bearer and Basic auth request helpers against a local loopback server.
 - [Post JSON](/examples/post-json): Send JSON payloads with POST.
 - [Custom Headers](/examples/custom-headers): Attach auth and custom metadata headers.
@@ -56,9 +57,16 @@ zig build example-http3_example -Dtarget=aarch64-macos
 - [Metrics and Observability](/examples/metrics-example): Aggregate total requests, status codes, latency times, and success rates.
 - [Unix Domain Sockets](/examples/unix-socket-example): Bind servers and connect clients over AF_UNIX sockets.
 - [Health Check Probes](/examples/health-check-example): Configure liveness and readiness probe middlewares.
+- [Readiness Probe](/examples/readiness-probe-example): Readiness probe and health check middleware integration.
+- [Pre-Route Hooks](/examples/pre-route-example): Pre-route hooks and global handler patterns.
 - [Cloud HTTPS Server](/examples/cloud-https-server): Production cloud deployment with TLS, middleware, and health checks.
 - [TLS Server](/examples/tls-server): Custom TLS server with ALPN negotiation.
 - [HTTPS Client](/examples/https-client): HTTPS client with custom TLS configuration.
+- [TLS HTTPS GET](/examples/tls-https-get): Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3).
+- [TLS Configuration Options](/examples/tls-config-options): TLS configuration constructors and ALPN negotiation.
+- [TLS Handshake Details](/examples/tls-handshake-details): TLS handshake info and cipher suites.
+- [TLS Custom CA](/examples/tls-custom-ca): Custom CA certificate verification with self-signed certs.
+- [TLS mTLS](/examples/tls-mtls): Mutual TLS client certificate authentication.
 - [Request Response Customization](/examples/request-response-customization): Customize request properties and response headers.
 - [Compression](/examples/compression-example): Gzip, deflate, brotli, and zstd compression/decompression.
 - [HTTP Methods](/examples/http-methods): GET, POST, PUT, DELETE, HEAD, OPTIONS.

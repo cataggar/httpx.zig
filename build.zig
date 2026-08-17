@@ -27,6 +27,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const tint_dep = b.dependency("tint", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Create the public module that will be exported as "httpx" to consumers.
     // Dependencies must be added here so they propagate to downstream packages.
     const httpx_module = b.addModule("httpx", .{
@@ -35,10 +40,12 @@ pub fn build(b: *std.Build) void {
 
     httpx_module.addImport("zstd", zstd_dep.module("zstd"));
     httpx_module.addImport("brotli", brotli_dep.module("brotli"));
+    httpx_module.addImport("tint", tint_dep.module("tint"));
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
         .{ .name = "simple_get_deserialize", .path = "examples/simple_get_deserialize.zig" },
+        .{ .name = "json_api_example", .path = "examples/json_api_example.zig" },
         .{ .name = "http_auth_helpers", .path = "examples/http_auth_helpers.zig" },
         .{ .name = "post_json", .path = "examples/post_json.zig" },
         .{ .name = "concurrent_requests", .path = "examples/concurrent_requests.zig" },
@@ -85,7 +92,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dns_example", .path = "examples/dns_example.zig" },
         .{ .name = "redirect_example", .path = "examples/redirect_example.zig" },
         .{ .name = "batch_concurrent", .path = "examples/batch_concurrent.zig" },
+        .{ .name = "pre_route_example", .path = "examples/pre_route_example.zig" },
+        .{ .name = "readiness_probe_example", .path = "examples/readiness_probe_example.zig" },
         .{ .name = "reverse_proxy_middleware", .path = "examples/reverse_proxy_middleware.zig" },
+        .{ .name = "tls_https_get", .path = "examples/tls_https_get.zig" },
+        .{ .name = "tls_config_options", .path = "examples/tls_config_options.zig" },
+        .{ .name = "tls_handshake_details", .path = "examples/tls_handshake_details.zig" },
+        .{ .name = "tls_custom_ca", .path = "examples/tls_custom_ca.zig" },
+        .{ .name = "tls_mtls", .path = "examples/tls_mtls.zig" },
     };
 
     inline for (examples) |example| {
@@ -150,6 +164,7 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addImport("zstd", zstd_dep.module("zstd"));
     tests.root_module.addImport("brotli", brotli_dep.module("brotli"));
+    tests.root_module.addImport("tint", tint_dep.module("tint"));
     linkPlatformLibs(tests, target);
 
     const run_tests = b.addRunArtifact(tests);
@@ -204,6 +219,7 @@ pub fn build(b: *std.Build) void {
         });
         root_module_cross.addImport("zstd", zstd_dep.module("zstd"));
         root_module_cross.addImport("brotli", brotli_dep.module("brotli"));
+        root_module_cross.addImport("tint", tint_dep.module("tint"));
         const lib_cross = b.addLibrary(.{
             .name = "httpx",
             .linkage = .static,
@@ -222,6 +238,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_root_module.addImport("zstd", zstd_dep.module("zstd"));
     lib_root_module.addImport("brotli", brotli_dep.module("brotli"));
+    lib_root_module.addImport("tint", tint_dep.module("tint"));
 
     const lib = b.addLibrary(.{
         .name = "httpx",

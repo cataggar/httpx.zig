@@ -60,9 +60,9 @@ Benchmark target: `x86_64-windows`, `ReleaseFast`.
 
 ## Install
 
-::: warning v0.1.5 release and Zig 0.15 deprecation
-`v0.1.5` is the current release and targets Zig `0.16.0+`.
-`v0.1.2` is the previous stable release for the immediate prior `0.1.x` line.
+::: warning v0.1.6 release and Zig 0.15 deprecation
+`v0.1.6` is the current release and targets Zig `0.16.0+`.
+`v0.1.5` is the previous stable release for the immediate prior `0.1.x` line.
 Zig `0.15` support is legacy and remains available only through `0.0.7`.
 The HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads is included in this release.
 If you are upgrading from `0.0.7`, review the GitHub Releases page for migration notes.
@@ -70,16 +70,16 @@ If you are upgrading from `0.0.7`, review the GitHub Releases page for migration
 
 Choose one of these installation methods:
 
-1. Latest release (0.1.5)
+1. Latest release (0.1.6)
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.6.tar.gz
+```
+
+2. Previous stable release (0.1.5)
 
 ```bash
 zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.5.tar.gz
-```
-
-2. Previous stable release (0.1.2)
-
-```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.2.tar.gz
 ```
 
 3. Legacy Zig 0.15 support (0.0.7)
@@ -103,7 +103,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.5.tar.gz",
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.6.tar.gz",
     .hash = "...",
   },
 },
@@ -166,13 +166,14 @@ httpx.zig is validated across Linux, Windows, and macOS:
 All examples are runnable from the repo root:
 
 ```bash
-zig build run-simple_get
+zig build run-all-simple_get
 ```
 
 Available examples (see the `/examples` folder):
 
 - `simple_get.zig`: minimal GET
 - `simple_get_deserialize.zig`: GET request with typed JSON deserialization
+- `json_api_example.zig`: JSON API: getJson, postJsonAndParse, Response.json, server ctx.jsonBody + ctx.json
 - `post_json.zig`: JSON POST
 - `custom_headers.zig`: request headers
 - `interceptors.zig`: request/response interception hooks
@@ -194,6 +195,11 @@ Available examples (see the `/examples` folder):
 - `http3_server_runtime.zig`: local end-to-end high-level HTTP/3 server runtime demo
 - `http2_advanced.zig`: HTTP/2 production features (SETTINGS enforcement, GOAWAY/RST_STREAM, HPACK security, trailers)
 - `http3_advanced.zig`: HTTP/3 production features (QPACK stream instructions, QUIC stream cancellation, transport parameters)
+- `tls_https_get.zig`: Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3)
+- `tls_config_options.zig`: TLS configuration constructors and ALPN negotiation
+- `tls_handshake_details.zig`: TLS handshake info and cipher suites
+- `tls_custom_ca.zig`: Custom CA certificate verification with self-signed certs
+- `tls_mtls.zig`: Mutual TLS client certificate authentication
 - `tcp_local.zig`: local TCP listener/client round trip
 - `udp_local.zig`: UDP local networking utility (prints human-readable `ip:port` for source address)
 - `unix_socket_example.zig`: Unix domain socket IPC client/server (Linux, macOS; Windows 10 build 17061+ only)
@@ -204,6 +210,7 @@ Available examples (see the `/examples` folder):
 - `health_check_example.zig`: liveness and readiness probe middleware
 - `proxy_example.zig`: HTTP proxy and SOCKS5h tunneling
 - `async_server_example.zig`: server thread pool concurrency and request handling on background workers
+- `logging_callback.zig`: custom logging, silent mode, and log_level filtering
 - `request_response_customization.zig`: request and response builder patterns
 - `http_auth_helpers.zig`: Bearer and Basic auth helpers
 
@@ -230,7 +237,7 @@ To validate Linux runtime behavior (not just compile checks), build Linux artifa
 
 ```bash
 zig build test -Dtarget=x86_64-linux
-zig build example-tcp_local -Dtarget=x86_64-linux
+zig build run-all-tcp_local -Dtarget=x86_64-linux
 
 ./zig-out/bin/test
 ./zig-out/bin/tcp_local
