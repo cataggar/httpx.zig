@@ -16,9 +16,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== Mutual TLS (mTLS) Example ===\n\n", .{});
-
-    // Load client certificate and key (using the same dummy certs for demo)
     const client_cert = @embedFile("certs/server_ec.crt");
     const client_key = @embedFile("certs/server_ec.key");
     const ca_cert = @embedFile("certs/server_ec.crt");
@@ -27,7 +24,6 @@ pub fn main() !void {
     std.debug.print("Client key:         {d} bytes\n", .{client_key.len});
     std.debug.print("CA certificate:     {d} bytes\n\n", .{ca_cert.len});
 
-    // 1. Start local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3)
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -47,11 +43,8 @@ pub fn main() !void {
     sleepMs(200);
 
     const port = server.config.port;
-    std.debug.print("mTLS server on 127.0.0.1:{d}\n\n", .{port});
 
-    // 2. Connect with client certificate
     {
-        std.debug.print("--- mTLS Handshake ---\n", .{});
         const config = tls.TlsConfig.insecureWithH2(allocator);
         var sock = try httpx.Socket.create();
         defer sock.close();
@@ -67,7 +60,6 @@ pub fn main() !void {
         std.debug.print("  Handshake: OK\n", .{});
         std.debug.print("  Protocol:  {s}\n", .{session.negotiatedProtocol() orelse "none"});
 
-        // Send HTTP request
         const req = "GET /mtls HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         try session.writeAll(req);
 
@@ -75,21 +67,6 @@ pub fn main() !void {
         const n = try session.read(&buf);
         std.debug.print("  Response:  {d} bytes\n\n", .{n});
     }
-
-    // 3. mTLS flow explanation
-    std.debug.print("--- mTLS Flow ---\n", .{});
-    std.debug.print("  1. Server requests client certificate (CertificateRequest)\n", .{});
-    std.debug.print("  2. Client sends certificate + CertificateVerify\n", .{});
-    std.debug.print("  3. Server verifies client cert against its trust store\n", .{});
-    std.debug.print("  4. Both parties have authenticated\n\n", .{});
-
-    std.debug.print("--- Common mTLS Use Cases ---\n", .{});
-    std.debug.print("  - Service mesh (Istio, Linkerd)\n", .{});
-    std.debug.print("  - Kubernetes API server auth\n", .{});
-    std.debug.print("  - Database connections (PostgreSQL, MySQL)\n", .{});
-    std.debug.print("  - gRPC service-to-service\n", .{});
-
-    std.debug.print("\n=== Example complete ===\n", .{});
 
     server.stop();
     server_thread.join();

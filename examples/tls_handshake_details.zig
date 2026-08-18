@@ -16,9 +16,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== TLS Handshake Details ===\n\n", .{});
-
-    // 1. Start local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3)
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -38,11 +35,8 @@ pub fn main() !void {
     sleepMs(200);
 
     const port = server.config.port;
-    std.debug.print("TLS server on 127.0.0.1:{d}\n\n", .{port});
 
-    // 2. TLS handshake with details
     {
-        std.debug.print("--- TLS Handshake ---\n", .{});
         const config = tls.TlsConfig.insecureWithH2(allocator);
         var sock = try httpx.Socket.create();
         defer sock.close();
@@ -58,9 +52,8 @@ pub fn main() !void {
 
         std.debug.print("  Handshake:    OK\n", .{});
         std.debug.print("  Protocol:     {s}\n", .{session.negotiatedProtocol() orelse "none"});
-        std.debug.print("  HTTP/2:       {}\n", .{session.isHttp2()});
+        std.debug.print("  HTTP/2:       {}\n", .{session.isHTTP2()});
 
-        // Send HTTP request
         const req = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         try session.writeAll(req);
 
@@ -68,17 +61,6 @@ pub fn main() !void {
         const n = try session.read(&buf);
         std.debug.print("  Response:     {d} bytes\n", .{n});
     }
-
-    // 3. Cipher suite info
-    std.debug.print("\n--- Supported Cipher Suites ---\n", .{});
-    std.debug.print("  TLS 1.3: AES_128_GCM_SHA256, AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256\n", .{});
-    std.debug.print("  TLS 1.2: ECDHE_RSA_WITH_AES_128_GCM_SHA256, ECDHE_RSA_WITH_AES_256_GCM_SHA384\n", .{});
-
-    // 4. Key exchange groups
-    std.debug.print("\n--- Key Exchange Groups ---\n", .{});
-    std.debug.print("  x25519, secp256r1 (P-256), secp384r1 (P-384)\n", .{});
-
-    std.debug.print("\n=== Example complete ===\n", .{});
 
     server.stop();
     server_thread.join();

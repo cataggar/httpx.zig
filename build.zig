@@ -90,6 +90,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "logging_callback", .path = "examples/logging_callback.zig" },
         .{ .name = "retry_example", .path = "examples/retry_example.zig" },
         .{ .name = "dns_example", .path = "examples/dns_example.zig" },
+        .{ .name = "dns_cache", .path = "examples/dns_cache.zig" },
+        .{ .name = "dns_resolve_all", .path = "examples/dns_resolve_all.zig" },
+        .{ .name = "dns_configuration", .path = "examples/dns_configuration.zig" },
         .{ .name = "redirect_example", .path = "examples/redirect_example.zig" },
         .{ .name = "batch_concurrent", .path = "examples/batch_concurrent.zig" },
         .{ .name = "pre_route_example", .path = "examples/pre_route_example.zig" },
@@ -100,6 +103,13 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tls_handshake_details", .path = "examples/tls_handshake_details.zig" },
         .{ .name = "tls_custom_ca", .path = "examples/tls_custom_ca.zig" },
         .{ .name = "tls_mtls", .path = "examples/tls_mtls.zig" },
+        .{ .name = "streaming_compression_example", .path = "examples/streaming_compression_example.zig" },
+        .{ .name = "http_cache_example", .path = "examples/http_cache_example.zig" },
+        .{ .name = "buffer_pool_example", .path = "examples/buffer_pool_example.zig" },
+        .{ .name = "http_download", .path = "examples/http_download.zig" },
+        .{ .name = "checksum_example", .path = "examples/checksum_example.zig" },
+        .{ .name = "progress_example", .path = "examples/progress_example.zig" },
+        .{ .name = "ftp_example", .path = "examples/ftp_example.zig" },
     };
 
     inline for (examples) |example| {

@@ -11,14 +11,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
-const io_util = @import("../util/any_io.zig");
+const io_util = @import("../io/any_io.zig");
 const threadIo = io_util.threadIo;
-const dbg = @import("../util/debug.zig");
-
-fn sleepNs(ns: i96) void {
-    const io = threadIo();
-    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(ns), .real) catch {};
-}
 
 pub const ExecutorError = error{
     TaskQueueFull,
@@ -46,6 +40,7 @@ pub const Executor = struct {
     allocator: Allocator,
     config: ExecutorConfig,
     tasks: std.ArrayList(Task) = .empty,
+    task_head: usize = 0,
     running: bool = false,
     threads: []Thread = &.{},
     mutex: std.Io.Mutex = .init,
@@ -55,15 +50,11 @@ pub const Executor = struct {
 
     /// Creates an executor with default configuration.
     pub fn init(allocator: Allocator) Self {
-        dbg.entry("EXEC", "init");
-        defer dbg.exit("EXEC", "init");
         return initWithConfig(allocator, .{});
     }
 
     /// Creates an executor with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ExecutorConfig) Self {
-        dbg.entry("EXEC", "initWithConfig");
-        defer dbg.exit("EXEC", "initWithConfig");
         var cfg = config;
         if (cfg.num_threads == 0) {
             const cpu_count = std.Thread.getCpuCount() catch 4;
@@ -77,8 +68,6 @@ pub const Executor = struct {
 
     /// Releases executor resources.
     pub fn deinit(self: *Self) void {
-        dbg.entry("EXEC", "deinit");
-        defer dbg.exit("EXEC", "deinit");
         self.stop();
         self.tasks.deinit(self.allocator);
         if (self.threads.len > 0) {
@@ -88,12 +77,11 @@ pub const Executor = struct {
 
     /// Submits a task for execution.
     pub fn submit(self: *Self, task: Task) !void {
-        dbg.entry("EXEC", "submit");
         const io = threadIo();
         self.mutex.lock(io) catch unreachable;
         defer self.mutex.unlock(io);
 
-        if (self.tasks.items.len >= self.config.task_queue_size) {
+        if (self.tasks.items.len - self.task_head >= self.config.task_queue_size) {
             return ExecutorError.TaskQueueFull;
         }
 
@@ -110,7 +98,7 @@ pub const Executor = struct {
         }
         defer self.mutex.unlock(threadIo());
 
-        if (self.tasks.items.len >= self.config.task_queue_size) {
+        if (self.tasks.items.len - self.task_head >= self.config.task_queue_size) {
             return ExecutorError.TaskQueueFull;
         }
 
@@ -193,10 +181,13 @@ pub const Executor = struct {
         for (self.threads) |thread| thread.join();
     }
 
-    /// Returns the number of pending tasks.
-    pub fn pendingCount(self: *const Self) usize {
-        // best-effort snapshot
-        return self.tasks.items.len;
+    /// Returns the number of pending tasks (thread-safe snapshot).
+    pub fn pendingCount(self: *Self) usize {
+        const io = threadIo();
+        self.mutex.lock(io) catch unreachable;
+        const count = self.tasks.items.len - self.task_head;
+        self.mutex.unlock(io);
+        return count;
     }
 
     /// Returns true when worker threads are running.
@@ -209,18 +200,34 @@ pub const Executor = struct {
         return self.config.task_queue_size;
     }
 
+    fn dequeueTask(self: *Self) ?Task {
+        if (self.task_head >= self.tasks.items.len) return null;
+        const task = self.tasks.items[self.task_head];
+        self.task_head += 1;
+        self.compactQueue();
+        return task;
+    }
+
+    fn compactQueue(self: *Self) void {
+        if (self.task_head > 0 and self.task_head >= self.tasks.items.len / 2) {
+            const remaining = self.tasks.items.len - self.task_head;
+            if (remaining > 0) {
+                @memmove(self.tasks.items[0..remaining], self.tasks.items[self.task_head..self.tasks.items.len]);
+            }
+            self.tasks.items.len = remaining;
+            self.task_head = 0;
+        }
+    }
+
     /// Runs all tasks synchronously.
     pub fn runAll(self: *Self) void {
         while (true) {
             const io = threadIo();
             self.mutex.lock(io) catch unreachable;
-            if (self.tasks.items.len == 0) {
+            const task = self.dequeueTask() orelse {
                 self.mutex.unlock(io);
                 break;
-            }
-            const idx = self.tasks.items.len - 1;
-            const task = self.tasks.items[idx];
-            self.tasks.items.len = idx;
+            };
             self.mutex.unlock(io);
 
             task.func(task.context);
@@ -231,7 +238,7 @@ pub const Executor = struct {
         while (true) {
             const io = threadIo();
             self.mutex.lock(io) catch unreachable;
-            while (self.running and self.tasks.items.len == 0) {
+            while (self.running and self.task_head >= self.tasks.items.len) {
                 self.cond.wait(io, &self.mutex) catch unreachable;
             }
             if (!self.running) {
@@ -239,9 +246,7 @@ pub const Executor = struct {
                 break;
             }
 
-            const idx = self.tasks.items.len - 1;
-            const task = self.tasks.items[idx];
-            self.tasks.items.len = idx;
+            const task = self.dequeueTask().?;
             self.mutex.unlock(io);
 
             task.func(task.context);
@@ -254,14 +259,19 @@ pub fn Future(comptime T: type) type {
     return struct {
         result: ?T = null,
         error_val: ?anyerror = null,
-        completed: bool = false,
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
 
         const Self = @This();
 
-        /// Waits for the future to complete.
+        /// Waits for the future to complete using a condition variable.
         pub fn wait(self: *Self) !T {
-            while (!self.completed) {
-                sleepNs(1_000_000);
+            const io = threadIo();
+            self.mutex.lock(io) catch unreachable;
+            defer self.mutex.unlock(io);
+            while (!self.completed.load(.acquire)) {
+                self.cond.wait(io, &self.mutex) catch unreachable;
             }
             if (self.error_val) |err| {
                 return err;
@@ -271,7 +281,7 @@ pub fn Future(comptime T: type) type {
 
         /// Returns the result if available.
         pub fn get(self: *const Self) ?T {
-            if (self.completed and self.error_val == null) {
+            if (self.completed.load(.acquire) and self.error_val == null) {
                 return self.result;
             }
             return null;
@@ -279,7 +289,21 @@ pub fn Future(comptime T: type) type {
 
         /// Returns true if the future is completed.
         pub fn isDone(self: *const Self) bool {
-            return self.completed;
+            return self.completed.load(.acquire);
+        }
+
+        /// Marks the future as complete (called by the producer thread).
+        pub fn complete(self: *Self, result: T) void {
+            self.result = result;
+            self.completed.store(true, .release);
+            self.cond.signal(threadIo());
+        }
+
+        /// Marks the future as failed with an error.
+        pub fn fail(self: *Self, err: anyerror) void {
+            self.error_val = err;
+            self.completed.store(true, .release);
+            self.cond.signal(threadIo());
         }
     };
 }
@@ -327,8 +351,7 @@ test "Future" {
     try std.testing.expect(!future.isDone());
     try std.testing.expect(future.get() == null);
 
-    future.result = 42;
-    future.completed = true;
+    future.complete(42);
 
     try std.testing.expect(future.isDone());
     try std.testing.expectEqual(@as(i32, 42), future.get().?);

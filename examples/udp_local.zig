@@ -1,14 +1,7 @@
-//! UDP Local Send/Recv Example
-//!
-//! Demonstrates using `httpx.UdpSocket` to send a datagram to a socket bound
-//! on loopback. This is self-contained and does not require internet access.
-
 const std = @import("std");
 const httpx = @import("httpx");
 
 pub fn main() !void {
-    std.debug.print("=== UDP Local Send/Recv Example ===\n\n", .{});
-
     var recv_sock = try httpx.UdpSocket.create();
     defer recv_sock.close();
 
@@ -31,7 +24,6 @@ pub fn main() !void {
     std.debug.print("Sent: {s}\n", .{msg});
     std.debug.print("Recv: {s}\n", .{buf[0..got.n]});
 
-    // Format the source address as human-readable "ip:port"
     var addr_buf: [64]u8 = undefined;
     var addr_writer = std.Io.Writer.fixed(&addr_buf);
     got.addr.format(&addr_writer) catch {};

@@ -32,7 +32,7 @@
 
 
 > [!NOTE]
-> **Project maturity:** This project aims to be production-ready and is actively maintained. It is still a new project and not yet widely adopted. Feel free to use it in your projects.
+> **Project maturity:** This project is production-ready and actively maintained. It provides a comprehensive HTTP client and server implementation with modern protocol, networking, security, and performance features. The project is actively evolving and welcomes production use and contributions.
 >
 > **Custom HTTP/2, HTTP/3, and TLS implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
@@ -58,7 +58,7 @@
 - For **compression file format** support, check out **[zigx](https://github.com/muhammad-fiaz/zigx)**.
 - For **CUDA** support, check out **[cuda.zig](https://github.com/muhammad-fiaz/cuda.zig)**.
 - For **Simplified build.zig config** support, check out **[buildx.zig](https://github.com/muhammad-fiaz/buildx.zig)**.
-- For **SQLite** support, check out **[sqlite.zig](https://github.com/muhammad-fiaz/sqlite.zig)**.
+- For **SQLite (zig-native implementation)** support, check out **[sqlite.zig](https://github.com/muhammad-fiaz/sqlite.zig)**.
 - For **file downloading** support, check out **[downloader.zig](https://github.com/muhammad-fiaz/downloader.zig)**.
 - For **update checker/auto-updater** support, check out **[updater.zig](https://github.com/muhammad-fiaz/updater.zig)**.
 - For **numerical computing** support, check out **[num.zig](https://github.com/muhammad-fiaz/num.zig)**.
@@ -83,14 +83,18 @@
 | **Pool Introspection** | Built-in connection pool stats and per-host connection counts. | https://muhammad-fiaz.github.io/httpx.zig/api/pool |
 | **Pattern-based Routing** | Intuitive server routing with dynamic path parameters and groups. | https://muhammad-fiaz.github.io/httpx.zig/guide/routing |
 | **Port Conflict Handling** | Explicit startup strategy to fail fast or auto-increment to the next free port. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
-| **Middleware Stack** | Built-in middleware for CORS (comptime-zero-alloc), Compression (gzip/deflate/brotli/zstd), Timeout enforcement, Rate Limiting (with eviction), Logging, Auth, Helmet, Reverse Proxy, and more. | https://muhammad-fiaz.github.io/httpx.zig/guide/middleware |
+| **Middleware Stack** | Built-in middleware for CORS (comptime-zero-alloc), Compression (gzip/deflate/brotli/zstd), Timeout enforcement, Rate Limiting (with eviction and thread safety), Logging, Auth, Helmet, CSRF Protection, Reverse Proxy (with SSRF protection), Body Parsing, Request ID, and Health/Readiness probes. | https://muhammad-fiaz.github.io/httpx.zig/guide/middleware |
+| **CSRF Protection** | Double-submit cookie pattern middleware for state-changing requests (POST/PUT/PATCH/DELETE). Generates random tokens, validates via header or form field. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
+| **SSRF Protection** | Built into reverse proxy middleware. Blocks requests to private/internal IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, link-local, localhost). Returns 403 Forbidden. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
+| **Server Connection Limiting** | Atomic connection counter with configurable `max_connections`. Rejects new connections at capacity with clean socket close. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
+| **Client Request Size Limiting** | Configurable `max_request_size` on `ClientConfig` (default 10 MB). Raises `RequestTooLarge` error, excluded from retry logic. | https://muhammad-fiaz.github.io/httpx.zig/api/client |
 | **Pre-Route and Global Handlers** | `preRoute(...)` hooks and `global(...)` fallback handlers for complete request lifecycle control. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Unified Any-Method Routing** | `any(path, handler)` to register all standard HTTP methods on one endpoint. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
-| **Concurrency** | Parallel request patterns (`race`, `all`, `any`) and async task execution. | https://muhammad-fiaz.github.io/httpx.zig/guide/concurrency |
+| **Concurrency** | Parallel request patterns (`race`, `all`, `any`, `allSettled`, `first`, `fastest`, `settled`) and async task execution with `BatchBuilder`. | https://muhammad-fiaz.github.io/httpx.zig/guide/concurrency |
 | **Socket APIs** | Cross-platform TCP/UDP socket helpers, listener wrappers, and TLS stream adapters. | https://muhammad-fiaz.github.io/httpx.zig/api/net |
-| **Proxy Support** | Client-side HTTP forward proxy routing, SOCKS5h tunneling, and server-side reverse proxy middleware. | https://muhammad-fiaz.github.io/httpx.zig/examples/proxy-example |
+| **Proxy Support** | Client-side HTTP forward proxy routing, SOCKS5h tunneling, and server-side reverse proxy middleware with SSRF protection. | https://muhammad-fiaz.github.io/httpx.zig/examples/proxy-example |
 | **Interceptors** | Global hooks to modify requests and responses (e.g., Auth injection). | https://muhammad-fiaz.github.io/httpx.zig/guide/interceptors |
-| **Logging Hooks** | Server log callbacks plus logger middleware customization for structured output. Internal logging uses tint.zig for colored output; configurable via `log_level` and `log_fn`. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
+| **Logging Hooks** | Server log callbacks plus logger middleware customization for structured output. Internal logging uses tint.zig for colored output; configurable via `log_level` and `log_fn`. Client is silent by default — no internal printing. Custom loggers receive pre-formatted strings without ANSI. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **Smart Retries** | Configurable retry policies with exponential backoff. | https://muhammad-fiaz.github.io/httpx.zig/api/client |
 | **Cross-Platform Sockets** | Robust Windows socket handling with `WSAEWOULDBLOCK` retry via `select()`, plus `MSG_NOSIGNAL` on Linux/macOS to prevent SIGPIPE crashes. | https://muhammad-fiaz.github.io/httpx.zig/api/net |
 | **Config Builder Helpers** | Chainable optional customization helpers for `ClientConfig` and `RequestOptions` (defaults remain implicit). | https://muhammad-fiaz.github.io/httpx.zig/api/client |
@@ -98,14 +102,21 @@
 | **Zero-Copy JSON** | Type-safe JSON methods (`getJson`, `postJsonAndParse`, `Response.json`, `ctx.jsonBody`) with zero-copy borrowed parsing — no arena required. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **Core Convenience APIs** | Request query-param helpers and response constructors for redirect/text/json. | https://muhammad-fiaz.github.io/httpx.zig/api/core |
 | **TLS/SSL** | Full TLS 1.2 and 1.3 with ALPN (RFC 7301), X25519 key exchange, AEAD ciphers (ChaCha20-Poly1305, AES-128/256-GCM), handshake encryption, X.509 certificate parsing (client-side), PEM cert/key loading for servers, and custom record-layer encryption/decryption. | https://muhammad-fiaz.github.io/httpx.zig/api/tls |
-| **Static Files** | Efficient static file serving capabilities. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
+| **Static Files** | Efficient static file serving with ETag, cache control, conditional GET, and MIME type detection. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Streaming and Realtime** | Chunked transfer responses with optional trailers and SSE response helpers. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
+| **Streaming Compression** | `StreamingCompressor` and `StreamingDecompressor` for chunked gzip/deflate/brotli/zstd without buffering entire payloads. | https://muhammad-fiaz.github.io/httpx.zig/api/compress |
+| **HTTP Caching** | `CacheControl` header parsing, `HttpCache` (LRU in-memory with TTL), `ConditionalGet` (ETag/If-None-Match), and thread-safe cache operations. | https://muhammad-fiaz.github.io/httpx.zig/api/cache |
+| **Buffer Pool** | `BufferPool` with slot-based ownership tracking, acquire/release semantics, and detection of foreign/double-release buffers. | https://muhammad-fiaz.github.io/httpx.zig/api/io |
+| **Transfer** | HTTP download/upload with progress tracking, checksums (SHA-256/512, MD5), resume support, atomic downloads. | https://muhammad-fiaz.github.io/httpx.zig/api/transfer |
+| **FTP** | Full FTP/FTPS client with PASV/EPSV, directory listing, upload/download, resume. | https://muhammad-fiaz.github.io/httpx.zig/api/ftp |
+| **DNS Resolution** | `resolveAddress`, `resolveAllAddresses`, `parseHostAndPort`, `parseAndResolveAddress`, `isIpAddress`, `isIp4Address`, `isIp6Address` helpers with RFC 1035 wire protocol, UDP/TCP/DoH transports, and SSRF policy checks. | https://muhammad-fiaz.github.io/httpx.zig/api/dns |
+| **Server-Sent Events** | `SseEvent` type and `parseSSEStream` helper for SSE client parsing. | https://muhammad-fiaz.github.io/httpx.zig/api/sse |
 | **HTTP/3 Flow Control** | MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Stream Cancellation** | RESET_STREAM and STOP_SENDING frames for graceful HTTP/3 stream teardown without connection disruption. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Cookie APIs** | First-class request/response cookie helpers for both client and server contexts. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
-| **Security** | Security headers (Helmet) and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
+| **Security** | Security headers (Helmet: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, HSTS), CSRF protection, SSRF protection in reverse proxy, and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **Minimal Dependencies** | Pure Zig core implementation for maximum portability. Compression uses bundled brotli and zstd packages. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
-| **Shared Common Helpers** | Reusable query/cookie helpers plus MIME resolution with explicit fallback and external mapping support. | https://muhammad-fiaz.github.io/httpx.zig/api/utils |
+| **Shared Common Helpers** | Reusable query/cookie helpers plus MIME resolution with explicit fallback and external mapping support. | https://muhammad-fiaz.github.io/httpx.zig/api/data |
 | **WebSockets** | RFC 6455 upgrade checks, handshake accept key computations, and frame encoding/decoding. | https://muhammad-fiaz.github.io/httpx.zig/examples/websocket-example |
 | **Multipart Form Data** | RFC 2046 multipart body builder (`addFile`, `addFileChunked`) and parser for text fields and large file uploads. Windows-safe: each `winsock.send()` is capped at 64 KB to prevent upload hangs (fix for issue [#26](https://github.com/muhammad-fiaz/httpx.zig/issues/26)). | https://muhammad-fiaz.github.io/httpx.zig/examples/multipart-example |
 | **Session Management** | TTL-based secure in-memory session store and cookie integration. | https://muhammad-fiaz.github.io/httpx.zig/examples/session-example |
@@ -242,252 +253,273 @@ exe.root_module.addImport("httpx", httpx_dep.module("httpx"));
 
 ## Quick Start
 
+### One-Liner Requests
+
+```zig
+const httpx = @import("httpx");
+
+// GET — simplest possible request
+var resp = try httpx.get("https://httpbun.com/get", .{});
+defer resp.deinit();
+
+// POST JSON
+var post = try httpx.post("https://httpbun.com/post", .{ .json = "{\"name\":\"Alice\"}" });
+defer post.deinit();
+
+// Other methods
+var del = try httpx.delete("https://httpbun.com/delete", .{});
+defer del.deinit();
+var patch = try httpx.patch("https://httpbun.com/patch", .{ .json = "{\"x\":1}" });
+defer patch.deinit();
+var head = try httpx.head("https://httpbun.com/get", .{});
+defer head.deinit();
+```
+
 ### Client Usage
- 
+
 ```zig
 const std = @import("std");
 const httpx = @import("httpx");
- 
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
- 
-    // Create client with implicit defaults.
-    // Use explicit ClientConfig overrides only when you need to change defaults.
-    var client = httpx.Client.initForBaseUrl(allocator, "https://httpbun.com");
+
+    // Create client
+    var client = httpx.createClientWithConfig(allocator, .{
+        .base_url = "https://httpbun.com",
+    });
     defer client.deinit();
- 
-    // Simple GET request (request defaults are implicit)
+
+    // GET
     var response = try client.get("/get", .{});
     defer response.deinit();
- 
-    if (response.ok()) {
-        std.debug.print("Response: {s}\n", .{response.text() orelse ""});
 
-        // Parse response as JSON (safely managed via std.json.Parsed)
-        const User = struct { id: u32, name: []const u8 };
-        if (response.json(User, .{})) |parsed| {
-            defer parsed.deinit();
-            std.debug.print("User: {s}\n", .{parsed.value.name});
-        } else |_| {}
-    }
- 
-    // POST with JSON
-    var post_response = try client.post(
-        "/post",
-        .{ .json = "{\"name\": \"John\"}" },
-    );
-    defer post_response.deinit();
+    // POST JSON
+    var post = try client.post("/post", .{ .json = "{\"name\":\"John\"}" });
+    defer post.deinit();
 
-    // Cookie jar helpers
-    try client.setCookie("session", "abc123");
-    _ = client.getCookie("session");
-
-    // Pool stats/maintenance helpers (optional)
-    client.cleanupIdleConnections();
-    const pool_stats = client.poolStats();
-    _ = pool_stats;
+    // Parse JSON response
+    const User = struct { id: u32, name: []const u8 };
+    if (response.json(User, .{})) |parsed| {
+        defer parsed.deinit();
+        std.debug.print("User: {s}\n", .{parsed.value.name});
+    } else |_| {}
 }
 ```
 
 ### Simplified API Aliases
 
-```zig
-// Top-level aliases for concise client code.
-// Allocator is implicit by default.
-var response = try httpx.fetch("https://httpbun.com/get", .{});
-defer response.deinit();
-
-// Defaults are implicit; pass .{} for default request options.
-var by_method = try httpx.send(.GET, "https://httpbun.com/headers", .{});
-defer by_method.deinit();
-
-// Additional aliases
-var del_res = try httpx.delete("https://httpbun.com/delete", .{});
-defer del_res.deinit();
-
-var opts_res = try httpx.opts("https://httpbun.com/get", .{});
-defer opts_res.deinit();
-
-// Optional explicit override (only when needed)
-var timed = try httpx.sendWithAllocator(allocator, .GET, "https://httpbun.com/headers", .{ .timeout_ms = 10_000 });
-defer timed.deinit();
-```
-
-### Explicit Network Helpers
+Every alias has a `*WithAllocator` variant for explicit allocator control.
 
 ```zig
-// Network lifecycle (optional explicit init/deinit)
+// ── HTTP Methods ──
+var r = try httpx.get(url, .{});                  // GET
+var r = try httpx.post(url, .{ .json = "{}" });   // POST
+var r = try httpx.put(url, .{});                   // PUT
+var r = try httpx.del(url, .{});                   // DELETE (short)
+var r = try httpx.delete(url, .{});                // DELETE (full name)
+var r = try httpx.patch(url, .{ .json = "{}" });  // PATCH
+var r = try httpx.head(url, .{});                  // HEAD
+var r = try httpx.opts(url, .{});                  // OPTIONS (short)
+var r = try httpx.options(url, .{});               // OPTIONS (full name)
+var r = try httpx.trace(url, .{});                 // TRACE
+var r = try httpx.connect(url, .{});               // CONNECT
+var r = try httpx.fetch(url, .{});                 // alias for GET
+var r = try httpx.send(.GET, url, .{});            // explicit method
+
+// ── JSON Methods ──
+const T = struct { id: u32 };
+const r = try httpx.getJson(T, url, .{});                         // GET + parse
+const r = try httpx.postJson(url, "{\"x\":1}");                    // POST raw JSON
+const r = try httpx.postJsonAndParse(T, url, body, .{});           // POST + parse
+const r = try httpx.putJson(T, url, body, .{});                    // PUT + parse
+const r = try httpx.patchJson(T, url, body, .{});                  // PATCH + parse
+const r = try httpx.deleteJson(T, url, .{});                       // DELETE + parse
+const r = try httpx.getJsonBorrowed(T, url);                       // zero-copy GET
+const r = try httpx.postJsonBorrowed(T, url, body);                // zero-copy POST
+
+// ── Client Shorthand ──
+var client = httpx.createClient();                                  // page_allocator
+var client = httpx.createClientWithConfig(alloc, .{ .base_url = "..." });
+
+// ── Server Shorthand ──
+var server = httpx.createServer();                                  // page_allocator
+var server = httpx.createServerWithConfig(alloc, .{ .port = 3000 });
+try httpx.serve("/hello", handler);                                 // one-shot
+try httpx.serveWithConfig(alloc, config, "/hello", handler);        // one-shot + config
+
+// ── Concurrency ──
+var results = try httpx.all(alloc, &client, &specs, .{});          // all parallel
+var ok = try httpx.first(alloc, &client, &specs, .{});             // first 2xx
+var fast = try httpx.fastest(alloc, &client, &specs, .{});         // first done
+var settled = try httpx.settled(alloc, &client, &specs, .{});      // all settled
+
+// ── Network ──
+const addr = try httpx.resolveAddress("host", 443);
+const addr = try httpx.parseAndResolveAddress("127.0.0.1:9000", 80);
+const ok = httpx.isIpAddress("::1");
+const mime = httpx.mimeTypeFromPath("file.html");
+
+// ── Lifecycle ──
 try httpx.netInit();
 defer httpx.netDeinit();
 
-// Address helpers
-const one = try httpx.resolveAddress("example.com", 443);
-_ = one;
+// ── Short Aliases ──
+const hpack = httpx.HpackContext;     // HTTP/2 header compression
+const qpack = httpx.QpackContext;     // HTTP/3 header compression
+const h2 = httpx.Http2Connection;     // HTTP/2 connection
+const h2s = httpx.Http2Connection.Settings; // HTTP/2 settings
+const tls_cfg = httpx.TlsConfig;      // TLS configuration
+const tls_s = httpx.TlsSession;       // TLS session
+const sse = httpx.SseEvent;           // Server-Sent Events
+const h3s = httpx.Http3Settings;      // HTTP/3 settings
 
-const parsed = try httpx.parseHostAndPort("localhost:8080", 80);
-_ = parsed;
-
-const final_addr = try httpx.parseAndResolveAddress("127.0.0.1:9000", 80);
-_ = final_addr;
-
-const is_ip = httpx.isIpAddress("::1");
-_ = is_ip;
+// ── Transfer & FTP ──
+const progress = httpx.Progress;      // Transfer progress tracking
+const checksum = httpx.Checksum;      // Checksum result
+const cs_stream = httpx.ChecksumStream; // Streaming checksum
+const dl_cfg = httpx.DownloadConfig;  // Download configuration
+const ul_cfg = httpx.UploadConfig;    // Upload configuration
+const cancel = httpx.CancelToken;     // Cancellation token
+const ftp_c = httpx.FtpClient;        // FTP client
+const ftp_cfg = httpx.FtpConfig;      // FTP configuration
 ```
 
-### Explicit Concurrency Helpers
+### Concurrency
 
 ```zig
+// Parallel requests — run all, first, or fastest
+var client = httpx.createClient();
+defer client.deinit();
+
 const specs = [_]httpx.RequestSpec{
-    .{ .method = .GET, .url = "https://httpbun.com/get", .timeout_ms = 5_000 },
-    .{ .method = .GET, .url = "https://httpbun.com/headers", .version = .HTTP_2 },
+    .{ .method = .GET, .url = "https://httpbun.com/get" },
+    .{ .method = .GET, .url = "https://httpbun.com/headers" },
 };
 
-var client_for_concurrency = httpx.Client.init(allocator);
-defer client_for_concurrency.deinit();
+// all: wait for every request
+var results = try httpx.all(allocator, &client, &specs, .{});
+defer { for (results) |*r| r.deinit(); allocator.free(results); }
 
-var all_results = try httpx.all(allocator, &client_for_concurrency, &specs, .{});
-defer {
-    for (all_results) |*r| r.deinit();
-    allocator.free(all_results);
-}
+// first: return first 2xx response
+var ok = try httpx.first(allocator, &client, &specs, .{});
+if (ok) |*resp| resp.deinit();
 
-const ok_count = httpx.successfulCount(all_results);
-const err_count = httpx.errorCount(all_results);
-_ = ok_count;
-_ = err_count;
-
-var first_ok = try httpx.first(allocator, &client_for_concurrency, &specs, .{});
-if (first_ok) |*resp| resp.deinit();
+// fastest: return first to complete (success or error)
+var fast = try httpx.fastest(allocator, &client, &specs, .{});
+fast.deinit();
 ```
- 
-### Server Usage
- 
+
+### Server
+
 ```zig
 const std = @import("std");
 const httpx = @import("httpx");
- 
-fn helloHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    return ctx.json(.{ .message = "Hello, World!" });
+
+fn hello(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.json(.{ .message = "Hello!" });
 }
- 
-fn htmlHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    return ctx.html("<h1>Hello from httpx.zig!</h1>");
+
+fn page(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.html("<h1>Welcome</h1>");
 }
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+
+    // One-shot server — one line
+    try httpx.serve("/hello", hello);
+    // OR full control:
+    var server = httpx.createServer();
+    defer server.deinit();
+    try server.use(httpx.logger());
+    try server.use(httpx.cors(.{}));
+    try server.use(httpx.helmet());
+    try server.use(httpx.rateLimit(.{ .max_requests = 100 }));
+    try server.get("/hello", hello);
+    try server.get("/page", page);
+    try server.listen();
+}
+```
+
+### Middleware
+
+```zig
+try server.use(httpx.cors(.{ .allow_origins = &.{"*"} }));
+try server.use(httpx.logger());
+try server.use(httpx.helmet());
+try server.use(httpx.rateLimit(.{ .max_requests = 100 }));
+try server.use(httpx.basicAuth("admin", myValidator));
+try server.use(httpx.csrf(.{}));
+try server.use(httpx.bodyParser(1024 * 1024));
+try server.use(httpx.requestTimeout(30_000));
+try server.use(httpx.requestId());
+```
+
+### Network Helpers
+
+```zig
+const addr = try httpx.resolveAddress("example.com", 443);
+const parsed = try httpx.parseHostAndPort("localhost:8080", 80);
+const resolved = try httpx.parseAndResolveAddress("127.0.0.1:9000", 80);
+const is_ip = httpx.isIpAddress("::1"); // true
+```
  
+### Transfer & FTP
+
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
- 
-    var server = httpx.Server.initWithConfig(allocator, .{
+
+    // Progress tracking
+    const p = httpx.Progress{
+        .bytes_transferred = 500,
+        .total_bytes = 1000,
+        .elapsed_ns = std.time.ns_per_s,
+    };
+    if (p.percentage()) |pct| {
+        std.debug.print("Progress: {d:.1}%\n", .{pct});
+    }
+
+    // Cancel token
+    var token = httpx.CancelToken{};
+    std.debug.print("Cancelled: {}\n", .{token.isCancelled()});
+
+    // Checksum computation
+    const data = "Hello, httpx.zig!";
+    const sha256 = httpx.computeChecksum(.sha256, data);
+    var hex_buf: [128]u8 = undefined;
+    std.debug.print("SHA-256: {s}\n", .{sha256.hex(&hex_buf)});
+
+    // Streaming checksum
+    var stream = httpx.ChecksumStream.init(.sha256);
+    stream.update(data);
+    const result = stream.final();
+    std.debug.print("Match: {}\n", .{result.eql(sha256)});
+
+    // FTP client
+    const config = httpx.FtpConfig{
+        .allocator = allocator,
         .host = "127.0.0.1",
-        .port = 8080,
-        .port_conflict = .increment,
-        .max_port_tries = 32,
-    });
-    defer server.deinit();
- 
-    // Add middleware
-    try server.use(httpx.logger());
-    try server.use(httpx.cors(.{}));
- 
-    // Register routes
-    try server.get("/", helloHandler);
-    try server.get("/page", htmlHandler);
- 
-    // Start server
-    try server.listen();
-
-    // Effective port after startup (useful when port_conflict = .increment)
-    std.debug.print("Listening on {d}\n", .{server.listeningPort()});
+        .port = 21,
+        .connection_mode = .passive,
+        .transfer_mode = .binary,
+    };
+    std.debug.print("FTP: {s}:{d}\n", .{ config.host, config.port });
 }
 ```
 
-### Server Port Conflict Handling
-
-```zig
-var server = httpx.Server.initWithConfig(allocator, .{
-    .host = "127.0.0.1",
-    .port = 8080,
-    .port_conflict = .increment, // try 8081, 8082, ... when 8080 is occupied
-    .max_port_tries = 32,
-});
-defer server.deinit();
-
-try server.listen();
-```
-
-- `port_conflict = .fail`: fail immediately if the configured port cannot be bound.
-- `port_conflict = .increment`: retry subsequent ports until success or `max_port_tries` is exhausted.
-- `server.listeningPort()`: returns the effective bound port.
-
-### Server Logging
-
-HTTPX uses [tint.zig](https://github.com/muhammad-fiaz/hint.zig) for colored console output internally. Server logs appear as `HTTPX [INFO] Server listening on ...` with cyan+green coloring.
-
-```zig
-var server = httpx.Server.initWithConfig(allocator, .{
-    .host = "127.0.0.1",
-    .port = 8080,
-    .log_level = .info, // Filter: .debug, .info, .warn, .err
-});
-```
-
-To disable all server logs:
-```zig
-var server = httpx.Server.initWithConfig(allocator, .{
-    .log_level = .err, // Only show errors (or use custom .log_fn)
-});
-```
-
-To provide a custom logger (e.g., for structured logging or silencing):
-```zig
-var server = httpx.Server.initWithConfig(allocator, .{
-    .log_fn = &struct {
-        fn log_fn(level: httpx.LogLevel, message: []const u8) void {
-            // Custom handling: write to file, JSON structured, etc.
-            std.debug.print("[{s}] {s}\n", .{ @tagName(level), message });
-        }
-    }.log_fn,
-});
-```
-
-### JSON API
-
-HTTPX provides type-safe JSON request/response methods with zero-copy borrowed parsing:
-
-```zig
-// Fetch and parse typed response (zero-copy, arena-free)
-const Repo = struct { name: []const u8, stars: u32 };
-const result = try httpx.getJson(allocator, "https://api.github.com/repos/ziglang/zig", .{}, Repo, .{});
-defer result.response.deinit();
-std.debug.print("Repo: {s}\n", .{result.value.name});
-
-// Reusable client with JSON methods
-var client = httpx.Client.init(allocator);
-defer client.deinit();
-
-const user = try client.getJson("https://api.example.com/user/1", .{}, User, .{});
-defer user.response.deinit();
-defer user.value.deinit();
-
-// POST JSON and parse response
-const result2 = try httpx.postJsonAndParse(allocator, "https://api.example.com/users", .{}, .{ .name = "Alice" }, User, .{});
-defer result2.response.deinit();
-
-// Response.json for manual fetch-then-parse
-var resp = try httpx.get(allocator, "https://httpbun.com/get", .{});
-defer resp.deinit();
-if (resp.json(MyStruct, .{ .ignore_unknown_fields = true })) |parsed| {
-    defer parsed.deinit();
-}
-```
- 
 ## Examples
 
-The `examples/` directory contains **57 comprehensive, runnable examples** demonstrating all features of `httpx.zig`:
+The `examples/` directory contains **67 comprehensive, runnable examples** demonstrating all features of `httpx.zig`:
 
 **Client:**
 - [`simple_get`](examples/simple_get.zig) - Basic GET requests
@@ -509,7 +541,12 @@ The `examples/` directory contains **57 comprehensive, runnable examples** demon
 - [`redirect_example`](examples/redirect_example.zig) - Redirect handling
 - [`retry_example`](examples/retry_example.zig) - Retry with backoff
 - [`dns_example`](examples/dns_example.zig) - DNS resolution
+- [`dns_cache`](examples/dns_cache.zig) - DNS cache operations
+- [`dns_configuration`](examples/dns_configuration.zig) - DNS resolver configuration
+- [`dns_resolve_all`](examples/dns_resolve_all.zig) - Resolve all address candidates
 - [`compression_example`](examples/compression_example.zig) - gzip/deflate/brotli/zstd
+- [`streaming_compression_example`](examples/streaming_compression_example.zig) - Streaming chunked compression/decompression
+- [`http_cache_example`](examples/http_cache_example.zig) - HTTP caching: CacheControl, HttpCache, ConditionalGet (ETag)
 
 **Server:**
 - [`simple_server`](examples/simple_server.zig) - Minimal HTTP server
@@ -527,6 +564,7 @@ The `examples/` directory contains **57 comprehensive, runnable examples** demon
 - [`request_response_customization`](examples/request_response_customization.zig) - Request/response customization
 - [`async_server_example`](examples/async_server_example.zig) - Thread pool concurrency
 - [`logging_callback`](examples/logging_callback.zig) - Custom logging, silent mode, and log_level filtering
+- [`logging_callback_server`](examples/logging_callback_server.zig) - Server logging with tint.zig colors and custom logger
 - [`reverse_proxy_middleware`](examples/reverse_proxy_middleware.zig) - Reverse proxy middleware
 
 **Protocol:**
@@ -546,12 +584,19 @@ The `examples/` directory contains **57 comprehensive, runnable examples** demon
 - [`tls_custom_ca`](examples/tls_custom_ca.zig) - Custom CA certificate verification with self-signed certs
 - [`tls_mtls`](examples/tls_mtls.zig) - Mutual TLS (mTLS) client certificate authentication
 
+**Transfer & FTP:**
+- [`http_download`](examples/http_download.zig) - HTTP download with progress and checksums
+- [`checksum_example`](examples/checksum_example.zig) - SHA-256/MD5 checksum computation
+- [`progress_example`](examples/progress_example.zig) - Progress tracking and cancel tokens
+- [`ftp_example`](examples/ftp_example.zig) - FTP client with PASV and directory ops
+
 **Advanced Capabilities:**
 - [`websocket_example`](examples/websocket_example.zig) - RFC 6455 WebSocket client
 - [`websocket_server`](examples/websocket_server.zig) - WebSocket server
 - [`multipart_example`](examples/multipart_example.zig) - RFC 2046 multipart form data
 - [`session_example`](examples/session_example.zig) - TTL-based session store
 - [`metrics_example`](examples/metrics_example.zig) - Observability metrics
+- [`buffer_pool_example`](examples/buffer_pool_example.zig) - Pre-allocated buffer pool with ownership tracking
 - [`unix_socket_example`](examples/unix_socket_example.zig) - AF_UNIX domain sockets
 - [`tcp_local`](examples/tcp_local.zig) - TCP socket helpers
 - [`udp_local`](examples/udp_local.zig) - UDP socket helpers

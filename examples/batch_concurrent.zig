@@ -1,9 +1,3 @@
-//! Batch / Race / AllSettled Concurrent Request Example
-//!
-//! Demonstrates httpx.any(), httpx.race(), and httpx.allSettled() beyond
-//! the basic httpx.all() shown in concurrent_requests.zig.
-//! Shows different concurrency patterns for batch HTTP requests.
-
 const std = @import("std");
 const httpx = @import("httpx");
 
@@ -28,8 +22,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== Batch / Race / AllSettled Example ===\n\n", .{});
-
     const port = try pickFreeTcpPort();
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
@@ -51,8 +43,6 @@ pub fn main() !void {
         .withKeepAlive(false));
     defer client.deinit();
 
-    // 1. httpx.all() - wait for all requests
-    std.debug.print("--- httpx.all() ---\n", .{});
     var batch1 = httpx.BatchBuilder.init(allocator);
     defer batch1.deinit();
     _ = try batch1.get(base_url);
@@ -71,8 +61,6 @@ pub fn main() !void {
         all_results.len,
     });
 
-    // 2. httpx.any() - first 2xx wins
-    std.debug.print("\n--- httpx.any() (first 2xx) ---\n", .{});
     var batch2 = httpx.BatchBuilder.init(allocator);
     defer batch2.deinit();
     _ = try batch2.get(base_url);
@@ -90,8 +78,6 @@ pub fn main() !void {
         std.debug.print("  No 2xx response\n", .{});
     }
 
-    // 3. httpx.race() - first completion wins
-    std.debug.print("\n--- httpx.race() (first completion) ---\n", .{});
     var batch3 = httpx.BatchBuilder.init(allocator);
     defer batch3.deinit();
     _ = try batch3.get(base_url);
@@ -108,8 +94,6 @@ pub fn main() !void {
     }
     first_done.deinit();
 
-    // 4. httpx.allSettled() - all complete, no errors thrown
-    std.debug.print("\n--- httpx.allSettled() (all outcomes) ---\n", .{});
     var batch4 = httpx.BatchBuilder.init(allocator);
     defer batch4.deinit();
     _ = try batch4.get(base_url);
@@ -128,14 +112,6 @@ pub fn main() !void {
         httpx.successfulCount(settled_results),
         httpx.errorCount(settled_results),
     });
-
-    // 5. Aliases
-    std.debug.print("\n--- Convenience Aliases ---\n", .{});
-    std.debug.print("  httpx.first()  = httpx.any()       - first 2xx\n", .{});
-    std.debug.print("  httpx.fastest() = httpx.race()     - first completion\n", .{});
-    std.debug.print("  httpx.settled() = httpx.allSettled() - all outcomes\n", .{});
-
-    std.debug.print("\n=== Batch / Race / AllSettled Example Complete ===\n", .{});
 
     server.stop();
     server_thread.join();

@@ -1,7 +1,3 @@
-//! Cookie Jar Demo
-//!
-//! Demonstrates storing, reading, and attaching cookies with the httpx client.
-
 const std = @import("std");
 const httpx = @import("httpx");
 
@@ -9,8 +5,6 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
-    std.debug.print("=== Cookie Jar Demo ===\n\n", .{});
 
     var client = httpx.Client.init(allocator);
     defer client.deinit();
@@ -24,7 +18,6 @@ pub fn main() !void {
     const removed = client.removeCookie("theme");
     std.debug.print("Removed theme cookie: {}\n", .{removed});
 
-    // Build and serialize a request to demonstrate attached cookies.
     var req = try httpx.Request.init(allocator, .GET, "http://httpbun.com/account");
     defer req.deinit();
 

@@ -24,6 +24,23 @@ const httpx = @import("httpx");
 var server = httpx.Server.init(allocator);
 defer server.deinit();
 
+// Shorthand aliases
+var server = httpx.createServer();                           // uses page_allocator
+var server = httpx.createServerWithConfig(allocator, .{     // explicit allocator + config
+    .port = 3000,
+    .host = "0.0.0.0",
+});
+defer server.deinit();
+
+// One-shot: create + register + listen in one call
+try httpx.serve("/hello", helloHandler);
+
+// One-shot with full config
+try httpx.serveWithConfig(allocator, .{
+    .port = 3000,
+    .port_conflict = .increment,
+}, "/hello", helloHandler);
+
 // Initialize with custom config
 var server = httpx.Server.initWithConfig(allocator, .{
     .port = 3000,
@@ -335,8 +352,8 @@ These methods allow fluent response chaining.
 | `html(data)` | Send HTML response |
 | `file(path)` | Serve a file with extension-based content type |
 | `fileAs(path, content_type)` | Serve a file with explicit content-type override |
-| `download(path, filename)` | Serve a file as an attachment download |
-| `fileWithOptions(path, options)` | Serve a file with cache/security/conditional-request controls |
+| `download(path, filename)` | Serve a file as an attachment download. Rejects filenames containing `"`, `\`, `\r`, `\n`, or null bytes to prevent Content-Disposition injection. |
+| `fileWithOptions(path, options)` | Serve a file with cache/security/conditional-request controls. Rejects null bytes, path traversal (`..`), absolute paths, and UNC paths (`\\`). |
 | `chunked(data, trailers)` | Send chunked transfer body with optional trailers |
 | `sse(events)` | Send Server-Sent Events payload |
 | `redirect(url, code)` | Send redirect |

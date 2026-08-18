@@ -1,12 +1,3 @@
-//! HTTP/3 Advanced Features for httpx.zig
-//!
-//! This example demonstrates the new HTTP/3 production features:
-//! - QPACK encoder/decoder stream instruction encode/decode
-//! - QUIC RESET_STREAM and STOP_SENDING frame construction
-//! - QUIC transport parameters
-//!
-//! These features make the HTTP/3 wire format implementation complete.
-
 const std = @import("std");
 const httpx = @import("httpx");
 
@@ -15,21 +6,12 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("\n=== httpx.zig HTTP/3 Advanced Features ===\n\n", .{});
-
     try qpackInstructionExample(allocator);
     try quicFrameExample();
     try transportParamsExample(allocator);
-
-    std.debug.print("\n=== All HTTP/3 advanced examples completed ===\n", .{});
 }
 
-/// Demonstrates QPACK encoder and decoder stream instruction encode/decode.
 fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
-    std.debug.print("--- QPACK Stream Instructions ---\n", .{});
-
-    // Section Acknowledgment: the decoder confirms it has processed a
-    // header block section up to the required insert count.
     var section_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeSectionAck(42, &section_buf, allocator);
     defer section_buf.deinit(allocator);
@@ -37,9 +19,6 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
     std.debug.print("Section Ack (stream_id=42): {d} bytes\n", .{ack_decoded.len});
     std.debug.print("  Decoded stream_id: {d}\n", .{ack_decoded.result.stream_id});
 
-    // Stream Cancellation: the decoder informs the encoder that it
-    // is cancelling a stream and will discard any dynamic table
-    // entries referenced by that stream's header blocks.
     var cancel_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeStreamCancel(7, &cancel_buf, allocator);
     defer cancel_buf.deinit(allocator);
@@ -47,8 +26,6 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
     std.debug.print("\nStream Cancel (stream_id=7): {d} bytes\n", .{cancel_decoded.len});
     std.debug.print("  Decoded stream_id: {d}\n", .{cancel_decoded.result.stream_id});
 
-    // Insert Count Increment: the decoder informs the encoder of how
-    // many dynamic table entries have been processed.
     var inc_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeInsertCountIncrement(10, &inc_buf, allocator);
     defer inc_buf.deinit(allocator);
@@ -56,8 +33,6 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
     std.debug.print("\nInsert Count Increment (10): {d} bytes\n", .{inc_decoded.len});
     std.debug.print("  Decoded increment: {d}\n", .{inc_decoded.result.increment});
 
-    // Set Dynamic Table Capacity: the decoder tells the encoder
-    // the new maximum dynamic table capacity.
     var cap_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeSetCapacity(4096, &cap_buf, allocator);
     defer cap_buf.deinit(allocator);
@@ -65,10 +40,6 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
     std.debug.print("\nSet Capacity (4096): {d} bytes\n", .{cap_decoded.len});
     std.debug.print("  Decoded capacity: {d}\n", .{cap_decoded.result.capacity});
 
-    // Encoder stream instructions
-
-    // Insert with Name Reference: inserts a header using a reference
-    // to an existing entry in the static or dynamic table.
     var ref_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeInsertNameRef(true, 17, "POST", &ref_buf, allocator);
     defer ref_buf.deinit(allocator);
@@ -83,8 +54,6 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
         ref_decoded.result.value,
     });
 
-    // Insert with Literal Name: inserts a header with a new name
-    // that is not in any existing table.
     var lit_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeInsertLiteral("x-request-id", "req-abc-123", &lit_buf, allocator);
     defer lit_buf.deinit(allocator);
@@ -99,26 +68,18 @@ fn qpackInstructionExample(allocator: std.mem.Allocator) !void {
         lit_decoded.result.value,
     });
 
-    // Duplicate: duplicates an existing dynamic table entry.
     var dup_buf: std.ArrayList(u8) = .empty;
     try httpx.qpack.encodeDuplicate(3, &dup_buf, allocator);
     defer dup_buf.deinit(allocator);
     const dup_decoded = try httpx.qpack.decodeDuplicate(dup_buf.items);
     std.debug.print("\nDuplicate (index=3): {d} bytes\n", .{dup_decoded.len});
     std.debug.print("  Decoded index: {d}\n", .{dup_decoded.result.index});
-
-    std.debug.print("\n", .{});
 }
 
-/// Demonstrates QUIC RESET_STREAM and STOP_SENDING frame construction.
 fn quicFrameExample() !void {
-    std.debug.print("--- QUIC Stream Cancellation Frames ---\n", .{});
-
-    // RESET_STREAM: the sender is aborting transmission of data on
-    // this stream. The receiver can discard any data already received.
     const reset = httpx.quic.ResetStreamFrame{
         .stream_id = 4,
-        .error_code = 0x06, // H3_REQUEST_CANCELLED
+        .error_code = 0x06,
         .final_size = 1024,
     };
     var reset_buf: [64]u8 = undefined;
@@ -129,11 +90,9 @@ fn quicFrameExample() !void {
     std.debug.print("  error_code: 0x{x}\n", .{reset_decoded.frame.error_code});
     std.debug.print("  final_size: {d}\n", .{reset_decoded.frame.final_size});
 
-    // STOP_SENDING: the receiver asks the sender to stop sending
-    // data on this stream. The receiver will discard any data received.
     const stop = httpx.quic.StopSendingFrame{
         .stream_id = 8,
-        .error_code = 0x01, // H3_NO_ERROR
+        .error_code = 0x01,
     };
     var stop_buf: [64]u8 = undefined;
     const stop_len = try stop.encode(&stop_buf);
@@ -141,22 +100,14 @@ fn quicFrameExample() !void {
     std.debug.print("\nSTOP_SENDING:\n", .{});
     std.debug.print("  stream_id: {d}\n", .{stop_decoded.frame.stream_id});
     std.debug.print("  error_code: 0x{x}\n", .{stop_decoded.frame.error_code});
-
-    std.debug.print("\nThese frames are used for graceful stream cancellation\n", .{});
-    std.debug.print("without tearing down the entire QUIC connection.\n", .{});
-
-    std.debug.print("\n", .{});
 }
 
-/// Demonstrates QUIC transport parameter encoding/decoding.
 fn transportParamsExample(allocator: std.mem.Allocator) !void {
-    std.debug.print("--- QUIC Transport Parameters ---\n", .{});
-
     const params = httpx.quic.TransportParameters{
-        .max_idle_timeout = 30000, // 30 seconds
+        .max_idle_timeout = 30000,
         .max_udp_payload_size = 1200,
-        .initial_max_data = 10 * 1024 * 1024, // 10 MB
-        .initial_max_stream_data_bidi_local = 1024 * 1024, // 1 MB
+        .initial_max_data = 10 * 1024 * 1024,
+        .initial_max_stream_data_bidi_local = 1024 * 1024,
         .initial_max_stream_data_bidi_remote = 1024 * 1024,
         .initial_max_stream_data_uni = 1024 * 1024,
         .initial_max_streams_bidi = 100,
@@ -167,13 +118,11 @@ fn transportParamsExample(allocator: std.mem.Allocator) !void {
         .active_connection_id_limit = 4,
     };
 
-    // Encode transport parameters
     const encoded = try params.encode(allocator);
     defer allocator.free(encoded);
 
     std.debug.print("Encoded transport parameters: {d} bytes\n", .{encoded.len});
 
-    // Decode them back
     const decoded = try httpx.quic.TransportParameters.decode(encoded);
 
     std.debug.print("\nDecoded values:\n", .{});
@@ -188,9 +137,4 @@ fn transportParamsExample(allocator: std.mem.Allocator) !void {
         if (decoded.disable_active_migration) "true" else "false",
     });
     std.debug.print("  active_connection_id_limit: {d}\n", .{decoded.active_connection_id_limit});
-
-    std.debug.print("\nTransport parameters are exchanged during the QUIC\n", .{});
-    std.debug.print("  handshake and define connection behavior limits.\n", .{});
-
-    std.debug.print("\n", .{});
 }

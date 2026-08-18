@@ -1,8 +1,3 @@
-//! HTTP/3 High-Level Server Runtime Example for httpx.zig
-//!
-//! This example runs the high-level `Server` in HTTP/3 mode over UDP and serves
-//! a route that is consumed by the high-level HTTP/3 client runtime.
-
 const std = @import("std");
 const httpx = @import("httpx");
 
@@ -16,13 +11,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("\n=== HTTP/3 Server Runtime Example ===\n\n", .{});
-
     var port = try pickFreeUdpPort();
     var attempts: u8 = 0;
     while (true) : (attempts += 1) {
         if (attempts >= 3) {
-            std.debug.print("  Could not bind after 3 attempts - skipping.\n", .{});
             return;
         }
         var server = httpx.Server.initWithConfig(allocator, .{
@@ -47,7 +39,6 @@ pub fn main() !void {
         defer server.deinit();
 
         sleepMs(100);
-        std.debug.print("  Server listening on port {d}\n", .{port});
 
         var client = httpx.Client.initWithConfig(allocator, .{
             .http3_enabled = true,

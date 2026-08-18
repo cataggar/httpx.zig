@@ -12,9 +12,8 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
-const io_util = @import("../util/any_io.zig");
+const io_util = @import("../io/any_io.zig");
 const threadIo = io_util.threadIo;
-const dbg = @import("../util/debug.zig");
 
 const Client = @import("../client/client.zig").Client;
 const Response = @import("../core/response.zig").Response;
@@ -134,8 +133,6 @@ pub const ConcurrencyConfig = struct {
 
 /// Executes all requests and waits for all to complete.
 pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec, config: ConcurrencyConfig) ![]RequestResult {
-    dbg.entry("BATCH", "all");
-    dbg.log("BATCH", "request count: {d}", .{specs.len});
     var results = try allocator.alloc(RequestResult, specs.len);
     errdefer allocator.free(results);
 
@@ -257,8 +254,6 @@ pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec, co
 /// Unlike `all`, this never fails due to a request error; request failures are
 /// represented as `RequestResult.err` values.
 pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestSpec, config: ConcurrencyConfig) ![]RequestResult {
-    dbg.entry("BATCH", "allSettled");
-    dbg.log("BATCH", "request count: {d}", .{specs.len});
     return all(allocator, client, specs, config);
 }
 
@@ -278,8 +273,6 @@ pub fn errorCount(results: []const RequestResult) usize {
 
 /// Executes all requests and returns the first successful response.
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec, config: ConcurrencyConfig) !?Response {
-    dbg.entry("BATCH", "any");
-    dbg.log("BATCH", "request count: {d}", .{specs.len});
     if (specs.len == 0) return null;
 
     switch (config.mode) {
@@ -328,20 +321,20 @@ pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec, co
                                 const io = threadIo();
                                 self.mutex.lock(io) catch unreachable;
                                 self.result.* = rr.success;
-                                rr = .{ .err = error.UnusedResult }; // transfer ownership
+                                rr = .{ .err = error.UnusedResult };
                                 self.cond.signal(io);
                                 self.mutex.unlock(io);
                                 break;
                             }
                         }
 
+                        const io = threadIo();
+                        self.mutex.lock(io) catch unreachable;
                         const prev = self.remaining.fetchSub(1, .acq_rel);
                         if (prev == 1) {
-                            const io = threadIo();
-                            self.mutex.lock(io) catch unreachable;
                             self.cond.signal(io);
-                            self.mutex.unlock(io);
                         }
+                        self.mutex.unlock(io);
                     }
                 }
             };
@@ -376,7 +369,7 @@ pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec, co
 
             const any_io = threadIo();
             mutex.lock(any_io) catch unreachable;
-            while (!winner.load(.acquire) and remaining.load(.acquire) > (specs.len - spawned)) {
+            while (!winner.load(.acquire) and remaining.load(.acquire) > 0) {
                 cond.wait(any_io, &mutex) catch unreachable;
             }
             mutex.unlock(any_io);
@@ -466,8 +459,6 @@ pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec, co
 
 /// Executes all requests and returns the first to complete.
 pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec, config: ConcurrencyConfig) !RequestResult {
-    dbg.entry("BATCH", "race");
-    dbg.log("BATCH", "request count: {d}", .{specs.len});
     if (specs.len == 0) return .{ .err = error.NoRequests };
 
     switch (config.mode) {
@@ -513,13 +504,13 @@ pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec, c
 
                         rr.deinit();
 
+                        const io = threadIo();
+                        self.mutex.lock(io) catch unreachable;
                         const prev = self.remaining.fetchSub(1, .acq_rel);
                         if (prev == 1) {
-                            const io = threadIo();
-                            self.mutex.lock(io) catch unreachable;
                             self.cond.signal(io);
-                            self.mutex.unlock(io);
                         }
+                        self.mutex.unlock(io);
                     }
                 }
             };
@@ -554,7 +545,7 @@ pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec, c
 
             const race_io = threadIo();
             mutex.lock(race_io) catch unreachable;
-            while (!winner.load(.acquire) and remaining.load(.acquire) > (specs.len - spawned)) {
+            while (!winner.load(.acquire) and remaining.load(.acquire) > 0) {
                 cond.wait(race_io, &mutex) catch unreachable;
             }
             mutex.unlock(race_io);
@@ -727,8 +718,6 @@ test "RequestResult summary helpers" {
 }
 
 test "ConcurrencyConfig modes execution" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     var client = Client.initWithConfig(allocator, .{
         .timeouts = .uniform(250),

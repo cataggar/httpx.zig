@@ -1,9 +1,3 @@
-//! Simplified JSON API Example
-//!
-//! Demonstrates the simplified JSON client API for fetching and parsing JSON responses.
-//! Shows typed parsing, the convenience wrappers, and a local server that parses
-//! incoming JSON with ctx.jsonBody().
-
 const std = @import("std");
 const httpx = @import("httpx");
 
@@ -33,12 +27,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== Simplified JSON API Example ===\n\n", .{});
-
-    // ---------------------------------------------------------------
-    // 1. Top-level getJson convenience: fetch + parse in one call
-    // ---------------------------------------------------------------
-    std.debug.print("--- 1. getJson: fetch and parse typed response ---\n", .{});
     {
         var result = httpx.getJson(HttpBunGet, "http://httpbun.com/get?name=Alice&email=alice@test.com&age=30", .{ .ignore_unknown_fields = true }) catch |err| {
             std.debug.print("getJson failed: {}\n", .{err});
@@ -49,10 +37,6 @@ pub fn main() !void {
         std.debug.print("  origin={s} url={s}\n\n", .{ result.value.origin, result.value.url });
     }
 
-    // ---------------------------------------------------------------
-    // 2. Client.getJson: reusable client with typed parsing
-    // ---------------------------------------------------------------
-    std.debug.print("--- 2. Client.getJson: reusable client ---\n", .{});
     {
         var client = httpx.Client.init(allocator);
         defer client.deinit();
@@ -66,10 +50,6 @@ pub fn main() !void {
         std.debug.print("  origin={s} url={s}\n\n", .{ result.value.origin, result.value.url });
     }
 
-    // ---------------------------------------------------------------
-    // 3. postJsonAndParse: POST JSON and parse response
-    // ---------------------------------------------------------------
-    std.debug.print("--- 3. postJsonAndParse: POST and parse response ---\n", .{});
     {
         const req_body =
             \\{"name":"Charlie","email":"charlie@test.com","age":35}
@@ -83,10 +63,6 @@ pub fn main() !void {
         std.debug.print("  origin={s} url={s}\n\n", .{ result.value.origin, result.value.url });
     }
 
-    // ---------------------------------------------------------------
-    // 4. Response.json: manual fetch + parse
-    // ---------------------------------------------------------------
-    std.debug.print("--- 4. Response.json: manual fetch then parse ---\n", .{});
     {
         var response = httpx.get("http://httpbun.com/get?name=Dave&email=dave@test.com&age=40", .{
             .headers = &.{.{ "Accept", "application/json" }},
@@ -103,10 +79,6 @@ pub fn main() !void {
         std.debug.print("  origin={s} url={s}\n\n", .{ resp.origin, resp.url });
     }
 
-    // ---------------------------------------------------------------
-    // 5. Server-side JSON: ctx.jsonBody() and ctx.json()
-    // ---------------------------------------------------------------
-    std.debug.print("--- 5. Server: ctx.jsonBody() + ctx.json() ---\n", .{});
     {
         var server = httpx.Server.initWithConfig(allocator, .{
             .port = 0,
@@ -123,13 +95,11 @@ pub fn main() !void {
             server_thread.join();
         }
 
-        // Wait for the server to bind
         sleepMs(50);
         const port = server.listeningPort();
         const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
         defer allocator.free(base_url);
 
-        // POST JSON to our server and parse response
         const post_url = try std.fmt.allocPrint(allocator, "{s}/api/users", .{base_url});
         defer allocator.free(post_url);
 
@@ -143,7 +113,6 @@ pub fn main() !void {
         defer post_result.response.deinit();
         std.debug.print("  POST response: ok={} message={s}\n", .{ post_result.value.ok, post_result.value.message });
 
-        // GET health endpoint
         const health_url = try std.fmt.allocPrint(allocator, "{s}/api/health", .{base_url});
         defer allocator.free(health_url);
 
@@ -154,8 +123,6 @@ pub fn main() !void {
         defer get_result.response.deinit();
         std.debug.print("  GET response: ok={} message={s}\n\n", .{ get_result.value.ok, get_result.value.message });
     }
-
-    std.debug.print("=== All JSON API examples completed ===\n", .{});
 }
 
 fn createUserHandler(ctx: *httpx.Context) anyerror!httpx.Response {

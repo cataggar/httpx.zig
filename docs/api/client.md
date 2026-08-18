@@ -39,6 +39,13 @@ const httpx = @import("httpx");
 var client = httpx.Client.init(allocator);
 defer client.deinit();
 
+// Shorthand aliases
+var client = httpx.createClient();                        // uses page_allocator
+var client = httpx.createClientWithConfig(allocator, .{  // explicit allocator + config
+    .base_url = "https://api.example.com",
+});
+defer client.deinit();
+
 // Initialize with custom configuration
 var client = httpx.Client.initWithConfig(allocator, .{
     .base_url = "https://api.example.com",
@@ -79,6 +86,7 @@ defer client.deinit();
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
 | `user_agent` | `[]const u8` | `"httpx.zig/0.1.6"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
+| `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
 | `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
