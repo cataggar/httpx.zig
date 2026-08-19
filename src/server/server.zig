@@ -1542,6 +1542,19 @@ pub const Server = struct {
                 }
             }
 
+            // Set send/recv timeouts so TLS operations (including closeNotify)
+            // don't block indefinitely on Linux when the peer has disconnected.
+            if (self.config.write_timeout_ms > 0) {
+                sock.setSendTimeout(self.config.write_timeout_ms) catch {};
+            } else {
+                sock.setSendTimeout(5000) catch {};
+            }
+            if (self.config.keep_alive_timeout_ms > 0) {
+                sock.setRecvTimeout(self.config.keep_alive_timeout_ms) catch {};
+            } else {
+                sock.setRecvTimeout(5000) catch {};
+            }
+
             var tls_conn = tls_mod.acceptServer(self.allocator, &sock, alpn_protos, self.server_tls_config) catch |err| {
                 self.log(.err, "TLS accept failed: {}\n", .{err});
                 return;
