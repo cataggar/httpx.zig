@@ -1435,16 +1435,16 @@ pub const Server = struct {
         }
 
         // Phase 2: Wait for active connections to drain (with timeout).
-        const drain_deadline_ms: u64 = if (self.config.shutdown_timeout_ms > 0)
-            @intCast(@max(0, @as(i64, @intCast(common.nowMillis())) + @as(i64, @intCast(self.config.shutdown_timeout_ms))))
+        // Default 5s drain timeout when none configured, so we never spin forever.
+        const effective_timeout_ms: u64 = if (self.config.shutdown_timeout_ms > 0)
+            self.config.shutdown_timeout_ms
         else
-            0;
+            5000;
+        const drain_deadline_ms: u64 = @intCast(@max(0, @as(i64, @intCast(common.nowMillis())) + @as(i64, @intCast(effective_timeout_ms))));
 
         while (self.active_conn_count.load(.acquire) > 0) {
-            if (drain_deadline_ms > 0) {
-                const now_ms: u64 = @intCast(@max(0, common.nowMillis()));
-                if (now_ms >= drain_deadline_ms) break;
-            }
+            const now_ms: u64 = @intCast(@max(0, common.nowMillis()));
+            if (now_ms >= drain_deadline_ms) break;
             const io = defaultIo();
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
         }
