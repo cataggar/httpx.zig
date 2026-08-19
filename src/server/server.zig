@@ -1623,7 +1623,12 @@ pub const Server = struct {
             }
 
             while (!parser.isComplete()) {
-                const n = try sock.recv(&buffer);
+                const n = sock.recv(&buffer) catch |err| {
+                    // Recv timeout during keep-alive idle wait is normal —
+                    // the client simply didn't send another request in time.
+                    if (err == error.TimedOut) return;
+                    return err;
+                };
                 if (n == 0) {
                     return;
                 }
