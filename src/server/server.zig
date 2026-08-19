@@ -1280,7 +1280,7 @@ pub const Server = struct {
                     const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
                     ctx.server.handleConnection(ctx.socket) catch |err| {
                         switch (err) {
-                            error.TlsConnectionTruncated, error.EndOfStream, error.ConnectionReset, error.RecvFailed, error.SendFailed => {},
+                            error.TlsConnectionTruncated, error.EndOfStream, error.ConnectionReset, error.RecvFailed, error.SendFailed, error.ReadFailed => {},
                             else => ctx.server.log(.err, "Handler error: {}\n", .{err}),
                         }
                     };
@@ -1342,10 +1342,10 @@ pub const Server = struct {
                 self.active_conn_mutex.unlock(io);
             }
             self.handleConnection(socket) catch |err| {
-                // TlsConnectionTruncated and EndOfStream are normal client disconnections,
-                // not errors — don't pollute stderr with them.
+                // TlsConnectionTruncated, EndOfStream, and ReadFailed are normal client
+                // disconnections — not errors — don't pollute stderr with them.
                 switch (err) {
-                    error.TlsConnectionTruncated, error.EndOfStream, error.ConnectionReset, error.RecvFailed, error.SendFailed => {},
+                    error.TlsConnectionTruncated, error.EndOfStream, error.ConnectionReset, error.RecvFailed, error.SendFailed, error.ReadFailed => {},
                     else => self.log(.err, "Handler error: {}\n", .{err}),
                 }
             };
@@ -1624,9 +1624,9 @@ pub const Server = struct {
 
             while (!parser.isComplete()) {
                 const n = sock.recv(&buffer) catch |err| {
-                    // Recv timeout during keep-alive idle wait is normal —
-                    // the client simply didn't send another request in time.
-                    if (err == error.TimedOut) return;
+                    // Recv timeout or read failure during keep-alive idle wait is normal —
+                    // the client simply disconnected or didn't send another request in time.
+                    if (err == error.TimedOut or err == error.ReadFailed) return;
                     return err;
                 };
                 if (n == 0) {
