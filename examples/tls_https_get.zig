@@ -25,7 +25,7 @@ pub fn main() !void {
         .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
         .http2_enabled = true,
         .http3_enabled = true,
-        .keep_alive = true,
+        .keep_alive = false,
     });
     defer server.deinit();
 
