@@ -32,7 +32,7 @@ pub fn main() !void {
 
     try server.use(httpx.healthCheck(.{
         .path = "/health",
-        .body = "{\"status\":\"ok\",\"version\":\"0.1.6\"}",
+        .body = "{\"status\":\"ok\",\"version\":\"0.1.7\"}",
         .status = 200,
     }));
     try server.use(httpx.readinessProbe(.{

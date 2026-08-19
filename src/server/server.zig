@@ -1498,6 +1498,8 @@ pub const Server = struct {
         if (self.config.on_started) |hook| hook(self);
 
         while (self.running.load(.acquire)) {
+            // Re-check before accept — stop() may have nulled the listener.
+            if (self.unix_listener == null) break;
             const conn = self.unix_listener.?.accept() catch |err| {
                 if (!self.running.load(.acquire)) break;
                 self.log(.err, "Unix Accept error: {}\n", .{err});

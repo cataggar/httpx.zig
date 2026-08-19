@@ -389,7 +389,7 @@ fn posixRecv(sock: posix.socket_t, buffer: []u8, flags: u32) !usize {
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            .AGAIN => continue,
+            .AGAIN => return error.TimedOut,
             .CONNRESET => return error.ConnectionResetByPeer,
             else => return error.RecvFailed,
         }
