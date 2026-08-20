@@ -214,7 +214,7 @@ gtag('config', '${GA_ID}');`,
           "priceCurrency": "USD"
         },
         "downloadUrl": "https://github.com/muhammad-fiaz/httpx.zig",
-        "softwareVersion": "0.1.7",
+        "softwareVersion": "0.1.8",
         "license": "https://opensource.org/licenses/MIT"
       });
     } else {

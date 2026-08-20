@@ -22,7 +22,7 @@ pub const qpack = @import("protocol/qpack.zig");
 pub const quic = @import("protocol/quic.zig");
 pub const websocket = @import("protocol/websocket.zig");
 pub const ftp = @import("protocol/ftp.zig");
-pub const transfer = @import("transfer/transfer.zig");
+pub const transfer = @import("io/transfer.zig");
 pub const socket = @import("net/socket.zig");
 
 pub const address = @import("net/address.zig");
@@ -45,8 +45,8 @@ pub const json = @import("data/json.zig");
 pub const mime = @import("data/mime.zig");
 pub const common = @import("data/common.zig");
 pub const multipart = @import("data/multipart.zig");
-pub const metrics = @import("metrics/metrics.zig");
-pub const session = @import("session/session.zig");
+pub const metrics = @import("io/metrics.zig");
+pub const session = @import("server/session.zig");
 pub const list_writer = @import("io/list_writer.zig");
 pub const ContentEncoding = @import("compress/compression.zig").ContentEncoding;
 pub const decompress = @import("compress/compression.zig").decompress;
@@ -60,7 +60,7 @@ pub const TransferCoding = @import("compress/compression.zig").TransferCoding;
 pub const CompressOptions = @import("compress/compression.zig").CompressOptions;
 pub const compression_limits = @import("compress/compression.zig").Limits;
 pub const isCompressible = @import("compress/compression.zig").isCompressible;
-pub const cache = @import("cache/cache.zig");
+pub const cache = @import("data/cache.zig");
 pub const CacheControl = cache.CacheControl;
 pub const HttpCache = cache.HttpCache;
 pub const CacheEntry = cache.CacheEntry;
@@ -75,7 +75,7 @@ pub const DNSConfig = dns.DNSConfig;
 pub const DNSStats = dns.DNSStats;
 pub const AddressFamily = dns.AddressFamily;
 pub const AddressOrder = dns.AddressOrder;
-pub const sse = @import("util/sse.zig");
+pub const sse = @import("protocol/sse.zig");
 pub const parseSSEStream = sse.parseSSEStream;
 
 pub const executor = @import("concurrency/executor.zig");
@@ -307,7 +307,7 @@ pub const RetryInterceptor = client_mod.RetryInterceptor;
 pub const RedirectInterceptor = client_mod.RedirectInterceptor;
 
 // SSE streaming parser export
-pub const StreamingSSEParser = @import("util/sse.zig").StreamingSSEParser;
+pub const StreamingSSEParser = @import("protocol/sse.zig").StreamingSSEParser;
 
 // Session exports
 pub const SessionStore = session.SessionStore;

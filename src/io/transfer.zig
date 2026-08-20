@@ -248,7 +248,7 @@ pub const TransferStats = struct {
 
     pub fn elapsedNs(self: TransferStats) u64 {
         if (self.end_time > 0) return self.end_time - self.start_time;
-        return time.timestamp() - @as(i64, @intCast(self.start_time));
+        return time.timestamp() - @as(i64, @intCast(@min(self.start_time, @as(u64, std.math.maxInt(i64)))));
     }
 
     pub fn averageBps(self: TransferStats) u64 {

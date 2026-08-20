@@ -41,7 +41,7 @@ const list_writer = @import("../io/list_writer.zig");
 const io_util = @import("../io/any_io.zig");
 const Executor = @import("../concurrency/executor.zig").Executor;
 
-const Metrics = @import("../metrics/metrics.zig").Metrics;
+const Metrics = @import("../io/metrics.zig").Metrics;
 
 const defaultIo = io_util.defaultIo;
 const sleepMs = io_util.sleepMsI;
@@ -57,7 +57,7 @@ pub const PortConflictStrategy = enum {
     increment,
 };
 
-pub const SSEEvent = @import("../util/sse.zig").Event;
+pub const SSEEvent = @import("../protocol/sse.zig").Event;
 
 /// Pre-route hook called after parsing the request and before route matching.
 pub const PreRouteHook = *const fn (*Context) anyerror!void;
@@ -1440,7 +1440,7 @@ pub const Server = struct {
             self.config.shutdown_timeout_ms
         else
             5000;
-        const drain_deadline_ms: u64 = @intCast(@max(0, @as(i64, @intCast(common.nowMillis())) + @as(i64, @intCast(effective_timeout_ms))));
+        const drain_deadline_ms: u64 = @intCast(@max(0, common.nowMillis() +| @as(i64, @intCast(@min(effective_timeout_ms, @as(u64, std.math.maxInt(i64)))))));
 
         while (self.active_conn_count.load(.acquire) > 0) {
             const now_ms: u64 = @intCast(@max(0, common.nowMillis()));
@@ -1867,7 +1867,7 @@ pub const Server = struct {
     /// moving to the next. Sends GOAWAY only after all streams complete.
     fn handleHTTP2Frames(self: *Self, conn: *http.HTTP2Connection) !void {
         const header_deadline_ms: u64 = if (self.config.request_timeout_ms > 0)
-            @intCast(@max(0, @as(i64, @intCast(common.nowMillis())) + @as(i64, @intCast(self.config.request_timeout_ms))))
+            @intCast(@max(0, common.nowMillis() +| @as(i64, @intCast(@min(self.config.request_timeout_ms, @as(u64, std.math.maxInt(i64)))))))
         else
             0;
 

@@ -39,7 +39,7 @@ const common = @import("../data/common.zig");
 const list_writer = @import("../io/list_writer.zig");
 const compression_util = @import("../compress/compression.zig");
 const io_util = @import("../io/any_io.zig");
-const Metrics = @import("../metrics/metrics.zig").Metrics;
+const Metrics = @import("../io/metrics.zig").Metrics;
 const dns_mod = @import("../net/dns.zig");
 const server_mod = @import("../server/server.zig");
 const LogFn = server_mod.LogFn;
@@ -1843,8 +1843,8 @@ pub const Client = struct {
                 const window_conn = @as(i64, stream_manager.connection_send_window);
                 if (window_stream <= 0 or window_conn <= 0) return error.FlowControlError;
                 const max_chunk = @min(
-                    @as(usize, @intCast(window_stream)),
-                    @as(usize, @intCast(window_conn)),
+                    std.math.cast(usize, @as(u64, @intCast(window_stream))) orelse std.math.maxInt(usize),
+                    std.math.cast(usize, @as(u64, @intCast(window_conn))) orelse std.math.maxInt(usize),
                 );
                 const chunk_len = @min(body.len - offset, max_chunk, @as(usize, @intCast(peer_max_frame_size)));
                 const is_last = offset + chunk_len == body.len;
