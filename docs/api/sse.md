@@ -2,7 +2,7 @@
 
 Server-Sent Events client parsing and streaming.
 
-Located in `src/util/sse.zig`.
+Located in `src/protocol/sse.zig`.
 
 ## SseEvent
 

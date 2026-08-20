@@ -360,7 +360,7 @@ pub fn rateLimit(comptime config: RateLimitConfig) Middleware {
                 if (st.evict_counter % 512 == 0) {
                     var it = st.store.iterator();
                     while (it.next()) |kv| {
-                        if (now - kv.value_ptr.window_start > @as(i64, @intCast(config.window_ms * 2))) {
+                        if (now - kv.value_ptr.window_start > @as(i64, @intCast(config.window_ms *| 2))) {
                             _ = st.store.remove(kv.key_ptr.*);
                         }
                     }

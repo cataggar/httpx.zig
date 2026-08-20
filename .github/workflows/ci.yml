@@ -95,14 +95,50 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # Linux 64-bit
+          - x86_64-linux
+          - aarch64-linux
+          - riscv64-linux
+          - sparc64-linux
+          - powerpc64-linux
+          - mips64-linux
+          - mips64el-linux
+          - s390x-linux
+
+          # Linux 32-bit
+          - x86-linux
+          - arm-linux-gnueabihf
+          - arm-linux-musleabihf
+          - mips-linux
+          - mipsel-linux
+          - powerpc-linux
+          - thumb-linux
+
+          # Linux 64-bit (musl)
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+
+          # macOS
           - x86_64-macos
           - aarch64-macos
+
+          # Windows 64-bit
           - x86_64-windows
+          - aarch64-windows
+
+          # Windows 32-bit
           - x86-windows
-          - aarch64-linux
-          - x86-linux
-          - riscv64-linux
-          - arm-linux-gnueabihf
+
+          # FreeBSD
+          - x86_64-freebsd
+          - aarch64-freebsd
+
+          # NetBSD
+          - x86_64-netbsd
+
+          # WebAssembly
+          - wasm32-wasi
+          - wasm32-wasip1
 
     steps:
       - name: Checkout
@@ -133,6 +169,27 @@ jobs:
               ;;
             riscv64-linux*)
               sudo apt-get install -y qemu-user-static gcc-riscv64-linux-gnu
+              ;;
+            sparc64-linux*)
+              sudo apt-get install -y qemu-user-static
+              ;;
+            powerpc64-linux*)
+              sudo apt-get install -y qemu-user-static gcc-powerpc64-linux-gnu
+              ;;
+            powerpc-linux*)
+              sudo apt-get install -y qemu-user-static gcc-powerpc-linux-gnu
+              ;;
+            mips64-linux*|mips64el-linux*)
+              sudo apt-get install -y qemu-user-static gcc-mips64-linux-gnuabi64
+              ;;
+            mips-linux*|mipsel-linux*)
+              sudo apt-get install -y qemu-user-static gcc-mips-linux-gnu
+              ;;
+            s390x-linux*)
+              sudo apt-get install -y qemu-user-static gcc-s390x-linux-gnu
+              ;;
+            thumb-linux*)
+              sudo apt-get install -y qemu-user-static gcc-arm-linux-gnueabihf
               ;;
           esac
 

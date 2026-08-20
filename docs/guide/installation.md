@@ -7,9 +7,9 @@ This guide covers all supported installation methods for `httpx.zig`.
 - **Zig Version**: 0.16.0 or later
 - **Operating System**: Windows, Linux, or macOS
 
-::: warning v0.1.7 release and Zig 0.15 deprecation
-`v0.1.7` is the current release and targets Zig `0.16.0+`.
-`v0.1.5` is the previous stable release for the immediate prior `0.1.x` line.
+::: warning v0.1.8 release and Zig 0.15 deprecation
+`v0.1.8` is the current release and targets Zig `0.16.0+`.
+`v0.1.7` is the previous stable release for the immediate prior `0.1.x` line.
 Zig `0.15` support is legacy and remains available only through `0.0.7`.
 The HTTPS/TLS reader fix for Zig `0.16` empty-buffer reads is included in this release.
 If you are upgrading from `0.0.7`, review the GitHub Releases page for migration notes.
@@ -49,20 +49,20 @@ zig build -Dtarget=aarch64-macos
 ```
 :::
 
-## Method 1: Zig Fetch (Latest Release 0.1.7)
+## Method 1: Zig Fetch (Latest Release 0.1.8)
 
 Use the latest tagged release for reproducible builds:
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.7.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.8.tar.gz
 ```
 
-## Method 2: Zig Fetch (Previous Stable 0.1.6)
+## Method 2: Zig Fetch (Previous Stable 0.1.7)
 
-Use the previous stable `0.1.6` release if you want the last `0.1.x` tag before `0.1.7`:
+Use the previous stable `0.1.7` release if you want the last `0.1.x` tag before `0.1.8`:
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.6.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.7.tar.gz
 ```
 
 ## Method 3: Zig Fetch (Legacy Zig 0.15 Support - 0.0.7)
@@ -92,10 +92,10 @@ You can also add the dependency manually:
 ```zig
 .{
     .name = "my-project",
-    .version = "0.1.7",
+    .version = "0.1.8",
     .dependencies = .{
         .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.7.tar.gz",
+            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.8.tar.gz",
             .hash = "...", // Run zig fetch --save <url> to auto-fill this.
         },
     },

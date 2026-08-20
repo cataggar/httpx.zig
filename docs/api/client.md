@@ -84,7 +84,7 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.1.7"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.1.8"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
@@ -410,7 +410,7 @@ defer resp.deinit();
 > On Windows the Winsock kernel send buffer is typically 8–64 KB. When sending
 > large multipart data as a single body, `winsock.send()` may stall.
 >
-> httpx.zig 0.1.7+ automatically caps each send call to 64 KB, so most uploads
+> httpx.zig 0.1.8+ automatically caps each send call to 64 KB, so most uploads
 > now work without application changes. For extra safety—especially for payloads
 > larger than a few hundred KB—keep each `MultipartFile.data` slice under
 > `httpx.MultipartMaxChunk` (64 KB) and issue one request per slice.

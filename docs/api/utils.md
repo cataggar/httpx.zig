@@ -12,7 +12,7 @@ Centralized API documentation for all utility modules.
 | [Data](/api/data) | `src/data/` | MIME types, multipart, JSON builder, shared helpers |
 | [Metrics](/api/metrics) | `src/metrics/` | Thread-safe request/response metrics |
 | [Session](/api/session) | `src/session/` | TTL-based in-memory session store |
-| [SSE](/api/sse) | `src/util/sse.zig` | Server-Sent Events parsing and streaming |
+| [SSE](/api/sse) | `src/protocol/sse.zig` | Server-Sent Events parsing and streaming |
 
 ## Quick Reference
 
