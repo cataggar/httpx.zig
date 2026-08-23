@@ -28,7 +28,17 @@ body:
     id: zig-version
     attributes:
       label: Zig Version
+      description: What version of Zig are you using? (zig version)
       placeholder: 0.16.0
+    validations:
+      required: true
+
+  - type: input
+    id: httpx-version
+    attributes:
+      label: httpx.zig Version
+      description: What version of httpx.zig are you using? (e.g. 0.1.8, main branch commit)
+      placeholder: 0.1.8
     validations:
       required: true
 
