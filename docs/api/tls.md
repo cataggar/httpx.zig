@@ -36,8 +36,99 @@ tls.zig              -- High-level Connection, TlsConfig, TlsSession, record-lay
 ├── client.zig       -- TLS 1.2/1.3 client handshake, X25519 key exchange, cipher suite negotiation
 ├── server.zig       -- TLS 1.2/1.3 server handshake, ServerHello, cipher selection
 ├── alpn.zig         -- ALPN protocol negotiation
+├── trust.zig        -- Provider-neutral trust policy, sources, limits, and peer-verification contract
+├── cert_signature.zig -- Narrow certificate-signature verifier bridge
 └── errors.zig       -- Unified TLS error set and alert conversion
 ```
+
+## Trust Provider Contract
+
+The public trust-provider contract is the first foundation for secure,
+provider-neutral X.509 validation. It is available as `httpx.TrustProvider`
+and `httpx.tls.TrustProvider`.
+
+::: warning Foundation API
+The contract is not connected to the TLS handshakes yet. Existing
+`TLSConfig.verify_server` and `ca_bundle_path` runtime behavior is unchanged
+in this foundation change. Declaring a `TrustSource` does not activate it
+until the later trust-context and handshake integration lands.
+:::
+
+### Ownership and concurrency
+
+`TrustProvider` and `CertificateSignatureVerifier` are borrowed, type-erased
+handles. Their context owners must outlive all TLS contexts and sessions using
+them. Copying a handle does not transfer ownership, neither handle has a
+`deinit` method, and callbacks must not retain request slices.
+
+Provider state is immutable after initialization and verification must be safe
+for concurrent calls. Peer DER, expected identities, signature inputs, and the
+scratch allocator are borrowed only for one synchronous call. A future
+standard provider will own copied/indexed trust anchors separately; it is
+intentionally not represented by a non-functional stub in this foundation.
+
+### Verification request
+
+```zig
+pub const VerifyPeerRequest = struct {
+    role: PeerRole,                         // .server or .client
+    chain_der: []const []const u8,          // leaf first; unordered intermediates
+    expected_identity: ?PeerIdentity,       // .dns_name or parsed .ip_address
+    now_seconds: i64,
+    signature_verifier: CertificateSignatureVerifier,
+    scratch_allocator: std.mem.Allocator,
+    limits: TrustLimits = .{},
+};
+```
+
+The type-erased `TrustProvider.verifyPeer` performs common certificate
+count/size limit checks and then dispatches to the provider. `TrustLimits`
+bounds peer certificate count, individual and aggregate DER bytes, path depth,
+and path-construction candidate attempts.
+
+`CertificateSignatureVerifier` receives borrowed signature
+`AlgorithmIdentifier` components, issuer SubjectPublicKeyInfo DER, exact TBS
+certificate DER, and signature bytes. This seam lets a later `CryptoProvider`
+adapter perform certificate-edge cryptography without moving hostname, time,
+chain, or root policy into the crypto provider.
+
+### Declarative sources and policy
+
+```zig
+const secure_default: httpx.ServerAuthentication = .{
+    .verify = .system,
+};
+
+const private_pki: httpx.ServerAuthentication = .{
+    .verify = .{
+        .custom_only = .{ .pem_file_path = "private-roots.pem" },
+    },
+};
+```
+
+`TrustSource` supports:
+
+- `.system`: platform roots only.
+- `.system_plus_custom`: platform roots merged with a PEM file, in-memory PEM,
+  or an in-memory DER certificate list.
+- `.custom_only`: only the supplied CA material.
+- `.provider`: a caller-owned borrowed `TrustProvider`.
+
+CA source slices are borrowed until runtime trust-context initialization
+finishes; retained material must be copied by that owner. The only policy tag
+for bypassing certificate chain, identity, and time checks is
+`.dangerously_insecure_skip_certificate_verification`. TLS handshake
+proof-of-possession remains a separate responsibility and is never part of
+`TrustProvider`.
+
+### Trust errors
+
+Specific categories include malformed certificates/chains, unknown CA,
+hostname mismatch, expired/not-yet-valid certificates, invalid usage or path
+constraints, invalid/unsupported certificate signatures, trust-store load or
+empty-anchor failures, bounded-input/path-search failures, invalid trust
+configuration, and allocation failure. Local trust errors map to the closest
+TLS alert without erasing the original local error.
 
 ## TlsConfig (Client)
 
@@ -179,19 +270,14 @@ try std.testing.expect(alpn.isHttp1x("http/1.1"));
 
 ## Certificate Verification
 
-Certificate verification uses `std.crypto.Certificate.Chain` for chain validation and hostname verification. During the TLS handshake, the client:
+The current handshake certificate path predates the provider contract and
+uses `std.crypto.Certificate` directly. It parses certificates, verifies
+adjacent signatures, checks time/hostname data, and supports the internal CA
+bundle path when supplied directly to the low-level client.
 
-1. Parses each DER certificate in the chain
-2. Verifies signatures using the issuer's public key
-3. Checks certificate validity periods
-4. Verifies the hostname matches the certificate's Subject Alternative Names
-5. Downloads root certificates from the configured CA bundle when needed
-
-```zig
-// During handshake, certificate chain is verified automatically
-const connection = try tls.connectClient(allocator, socket, &config, "example.com");
-// If verification fails, returns error.TlsCertificateNotVerified or related errors
-```
+The new `TrustProvider` sources are deliberately not advertised as active
+verification behavior yet. Full X.509 parsing/path construction, platform and
+custom root loading, and TLS 1.2/1.3 handshake integration are deferred.
 
 ### Certificate-Related Errors
 
@@ -199,9 +285,19 @@ const connection = try tls.connectClient(allocator, socket, &config, "example.co
 |-------|-------------|
 | `TlsCertificateExpired` | Certificate validity period has expired |
 | `TlsCertificateNotYetValid` | Certificate validity period has not yet started |
-| `TlsCertificateNotVerified` | Certificate chain was not verified (no trusted root found) |
-| `TlsHostnameMismatch` | Hostname doesn't match certificate |
-| `TlsBadCertificate` | Certificate is malformed or invalid |
+| `TlsUnknownCa` | No path reaches a configured trust anchor |
+| `TlsHostnameMismatch` | DNS/IP identity doesn't match the certificate |
+| `TlsMalformedCertificate` / `TlsMalformedCertificateChain` | Certificate DER or chain structure is invalid |
+| `TlsCertificateUsageInvalid` | Leaf usage/EKU is invalid for the peer role |
+| `TlsCertificateConstraintViolation` | A path constraint rejects the chain |
+| `TlsCertificateSignatureInvalid` | A certificate-edge signature is invalid |
+| `TlsUnsupportedCertificateSignatureAlgorithm` | No configured verifier supports the signature algorithm |
+| `TlsTrustStoreLoadFailed` / `TlsNoTrustAnchors` | Trust material could not provide a usable store |
+| `TlsCertificateTooLarge` / `TlsCertificateChainTooLarge` | Input exceeds configured byte/count limits |
+| `TlsCertificatePathTooDeep` / `TlsCertificatePathSearchLimitExceeded` | Path work exceeds configured limits |
+
+`TlsCertificateNotVerified` remains in the legacy handshake path until trust
+integration replaces that ambiguous result with the specific categories above.
 
 ## Types
 

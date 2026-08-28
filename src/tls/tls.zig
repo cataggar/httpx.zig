@@ -13,6 +13,23 @@ const errors = @import("errors.zig");
 const TlsClient = @import("client.zig");
 const any_io = @import("../io/any_io.zig");
 
+pub const trust = @import("trust.zig");
+pub const cert_signature = @import("cert_signature.zig");
+pub const TrustProvider = trust.TrustProvider;
+pub const VerifyPeerRequest = trust.VerifyPeerRequest;
+pub const PeerRole = trust.PeerRole;
+pub const PeerIdentity = trust.PeerIdentity;
+pub const IpAddress = trust.IpAddress;
+pub const TrustLimits = trust.TrustLimits;
+pub const CaBundleSource = trust.CaBundleSource;
+pub const TrustSource = trust.TrustSource;
+pub const ServerAuthentication = trust.ServerAuthentication;
+pub const CertificateSignatureAlgorithmIdentifier = cert_signature.AlgorithmIdentifier;
+pub const CertificateSignatureVerifier = cert_signature.CertificateSignatureVerifier;
+pub const VerifyCertificateSignatureRequest = cert_signature.VerifyCertificateSignatureRequest;
+pub const CertificateSignatureError = cert_signature.CertificateSignatureError;
+pub const TrustError = errors.TrustError;
+
 pub const server = @import("server.zig");
 pub const acceptServer = server.acceptServer;
 

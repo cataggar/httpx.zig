@@ -7,6 +7,29 @@
 
 const std = @import("std");
 
+/// Stable failures produced while loading trust material or authenticating a
+/// peer certificate chain.
+pub const TrustError = error{
+    TlsMalformedCertificate,
+    TlsMalformedCertificateChain,
+    TlsUnknownCa,
+    TlsHostnameMismatch,
+    TlsCertificateExpired,
+    TlsCertificateNotYetValid,
+    TlsCertificateUsageInvalid,
+    TlsCertificateConstraintViolation,
+    TlsCertificateSignatureInvalid,
+    TlsUnsupportedCertificateSignatureAlgorithm,
+    TlsTrustStoreLoadFailed,
+    TlsNoTrustAnchors,
+    TlsCertificateTooLarge,
+    TlsCertificateChainTooLarge,
+    TlsCertificatePathTooDeep,
+    TlsCertificatePathSearchLimitExceeded,
+    TlsInvalidTrustConfiguration,
+    OutOfMemory,
+};
+
 /// All errors that can be produced by the TLS stack.
 pub const TlsError = error{
     // Alert-mapped errors (sent by peer or generated locally)
@@ -114,7 +137,10 @@ pub const TlsError = error{
     /// A certificate could not be parsed or has a malformed structure.
     TlsMalformedCertificate,
 
-    /// The hostname in the certificate does not match the expected SNI.
+    /// The peer certificate list or a selected path is structurally invalid.
+    TlsMalformedCertificateChain,
+
+    /// The certificate does not match the expected DNS or IP peer identity.
     TlsHostnameMismatch,
 
     /// Certificate validity period has not yet started.
@@ -122,6 +148,39 @@ pub const TlsError = error{
 
     /// Certificate chain was not verified (no trusted root found).
     TlsCertificateNotVerified,
+
+    /// The leaf certificate is not valid for the requested peer role.
+    TlsCertificateUsageInvalid,
+
+    /// Certificate path constraints reject the selected chain.
+    TlsCertificateConstraintViolation,
+
+    /// A certificate signature is cryptographically invalid.
+    TlsCertificateSignatureInvalid,
+
+    /// The certificate uses a signature algorithm unavailable to the verifier.
+    TlsUnsupportedCertificateSignatureAlgorithm,
+
+    /// Configured system or custom trust material could not be loaded.
+    TlsTrustStoreLoadFailed,
+
+    /// Trust material loaded successfully but contained no usable anchors.
+    TlsNoTrustAnchors,
+
+    /// One certificate exceeds the configured DER byte limit.
+    TlsCertificateTooLarge,
+
+    /// The certificate list exceeds configured count or aggregate byte limits.
+    TlsCertificateChainTooLarge,
+
+    /// A candidate path exceeds the configured maximum depth.
+    TlsCertificatePathTooDeep,
+
+    /// Path construction exceeded its configured candidate-attempt bound.
+    TlsCertificatePathSearchLimitExceeded,
+
+    /// Trust limits or declarative trust configuration are inconsistent.
+    TlsInvalidTrustConfiguration,
 
     /// The TLS sequence number overflowed (connection must be rekeyed
     /// or closed  --  applications should close and reconnect).
@@ -151,6 +210,9 @@ pub const TlsError = error{
 
     /// Generic write failure to the underlying transport.
     WriteFailed,
+
+    /// A trust or TLS operation could not allocate required memory.
+    OutOfMemory,
 };
 
 /// Converts a `std.crypto.tls.Alert.Description` received from the peer
@@ -202,6 +264,7 @@ pub fn toAlertDescription(err: TlsError) std.crypto.tls.Alert.Description {
         error.TlsUnsupportedCertificate => .unsupported_certificate,
         error.TlsCertificateRevoked => .certificate_revoked,
         error.TlsCertificateExpired => .certificate_expired,
+        error.TlsCertificateNotYetValid => .certificate_expired,
         error.TlsCertificateUnknown => .certificate_unknown,
         error.TlsIllegalParameter => .illegal_parameter,
         error.TlsUnknownCa => .unknown_ca,
@@ -219,6 +282,18 @@ pub fn toAlertDescription(err: TlsError) std.crypto.tls.Alert.Description {
         error.TlsUnknownPskIdentity => .unknown_psk_identity,
         error.TlsCertificateRequired => .certificate_required,
         error.TlsNoApplicationProtocol => .no_application_protocol,
+        error.TlsMalformedCertificate,
+        error.TlsMalformedCertificateChain,
+        error.TlsHostnameMismatch,
+        error.TlsCertificateUsageInvalid,
+        error.TlsCertificateConstraintViolation,
+        error.TlsCertificateSignatureInvalid,
+        error.TlsCertificateTooLarge,
+        error.TlsCertificateChainTooLarge,
+        error.TlsCertificatePathTooDeep,
+        error.TlsCertificatePathSearchLimitExceeded,
+        => .bad_certificate,
+        error.TlsUnsupportedCertificateSignatureAlgorithm => .unsupported_certificate,
         else => .internal_error,
     };
 }
@@ -263,6 +338,25 @@ test "toAlertDescription TlsBadRecordMac" {
 
 test "toAlertDescription unknown error maps to internal_error" {
     try std.testing.expectEqual(std.crypto.tls.Alert.Description.internal_error, toAlertDescription(TlsError.ReadFailed));
+}
+
+test "trust errors map to specific TLS alerts" {
+    try std.testing.expectEqual(
+        std.crypto.tls.Alert.Description.unknown_ca,
+        toAlertDescription(TlsError.TlsUnknownCa),
+    );
+    try std.testing.expectEqual(
+        std.crypto.tls.Alert.Description.certificate_expired,
+        toAlertDescription(TlsError.TlsCertificateNotYetValid),
+    );
+    try std.testing.expectEqual(
+        std.crypto.tls.Alert.Description.bad_certificate,
+        toAlertDescription(TlsError.TlsCertificateSignatureInvalid),
+    );
+    try std.testing.expectEqual(
+        std.crypto.tls.Alert.Description.unsupported_certificate,
+        toAlertDescription(TlsError.TlsUnsupportedCertificateSignatureAlgorithm),
+    );
 }
 
 test "fromAlert user_canceled maps to close_notify" {
