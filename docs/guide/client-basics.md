@@ -78,7 +78,7 @@ Optional: the same request using `RequestOptions` builder helpers:
 const opts = httpx.RequestOptions.defaults()
     .withTimeoutMs(10_000)
     .withHttp2()
-    .withFollowRedirects(true);
+    .withPolicy(.{ .redirect = .{ .policy = .{} } });
 
 var response = try client.get("https://httpbun.com/get", opts);
 defer response.deinit();
@@ -183,7 +183,7 @@ pub const RequestOptions = struct {
     bearer_token: ?[]const u8 = null,          // Authorization: Bearer <token>
     basic_auth: ?httpx.BasicAuth = null,       // Authorization: Basic ...
     timeout_ms: ?u64 = null,                   // Request-specific timeout
-    follow_redirects: ?bool = null,            // Override redirect policy
+    policy: httpx.RequestPolicyOverrides = .{}, // Nullable automatic-policy overrides
     version: ?httpx.Version = null,            // Optional per-request protocol override
     proxy: ?httpx.Proxy = null,                // Per-request forward proxy override
     verify_ssl: ?bool = null,                  // Per-request SSL verification toggle
@@ -192,7 +192,7 @@ pub const RequestOptions = struct {
 };
 ```
 
-All fields are optional customizations. Per-request overrides allow complete control over proxy routing, security verification, connection persistence, and socket routing on a per-request basis without modifying the shared client config. Passing `.{}` keeps defaults implicit.
+All fields are optional customizations. `policy` can independently override retry, redirect, cookie send/store, synthesized `Accept-Encoding`, and response decompression. `RequestPolicyOverrides.embeddingOwned()` disables all five automatic behaviors without changing the execution path. Per-request overrides also control proxy routing, security verification, connection persistence, and socket routing without modifying the shared client config. Passing `.{}` keeps defaults implicit.
 
 ## Proxy Configuration
 

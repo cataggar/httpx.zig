@@ -24,7 +24,7 @@ pub fn main() !void {
 
     var client = httpx.Client.initWithConfig(allocator, .{
         .user_agent = "httpx.zig-interceptor-demo/1.0",
-        .follow_redirects = true,
+        .policy = httpx.ClientPolicy.managed(),
     });
     defer client.deinit();
 

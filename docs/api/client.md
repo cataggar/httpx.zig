@@ -64,8 +64,7 @@ For optional explicit customization, `ClientConfig` supports chainable helpers:
 const cfg = httpx.ClientConfig.defaults()
     .withBaseUrl("https://api.example.com")
     .withTimeouts(httpx.Timeouts.fast())
-    .withRetryPolicy(httpx.RetryPolicy.noRetry())
-    .withFollowRedirects(false)
+    .withPolicy(httpx.ClientPolicy.embeddingOwned())
     .withHttp2Settings(.{ .max_concurrent_streams = 100 })
     .withHttp3Settings(.{ .enable_datagrams = true })
     .withPoolLimits(64, 16)
@@ -81,13 +80,11 @@ defer client.deinit();
 |-------|------|---------|-------------|
 | `base_url` | `?[]const u8` | `null` | Base URL prepended to all requests. |
 | `timeouts` | `Timeouts` | `{}` | Connection and read/write timeouts. |
-| `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
-| `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
+| `policy` | `ClientPolicy` | managed | Retry, redirect, cookie send/store, automatic `Accept-Encoding`, and response decompression behavior. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
 | `user_agent` | `[]const u8` | `"httpx.zig/0.1.8"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
-| `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
 | `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
 | `http3_enabled` | `bool` | `false` | Enable high-level HTTP/3 execution path over UDP/QUIC stream framing. |
@@ -102,6 +99,49 @@ defer client.deinit();
 | `log_fn` | `?LogFn` | `null` | Optional logging callback. When set, `Client.log()` delegates formatted messages to this function. Leave unset to disable client-side logging. |
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
+
+### Client Policy
+
+`ClientPolicy` is the single source of truth for five independent automatic behaviors:
+
+| Field | Type | Managed default |
+|-------|------|-----------------|
+| `retry` | `RetryBehavior` | `.policy = RetryPolicy{}` |
+| `redirect` | `RedirectBehavior` | `.policy = RedirectPolicy{}` |
+| `cookies` | `CookiePolicy` | `.send_and_store` |
+| `accept_encoding` | `AcceptEncodingPolicy` | `.library_default` |
+| `decompression` | `DecompressionPolicy` | `.enabled` |
+
+Retry and redirect behavior can be `.disabled` or carry their detailed policy. Cookie behavior can be `.disabled`, `.send_only`, `.store_only`, or `.send_and_store`. Automatic encoding can be `.disabled`, `.library_default`, or `.explicit = "..."`.
+
+Use embedding-owned mode when a higher-level transport owns retries, redirects, cookies, encoding negotiation, and decoding:
+
+```zig
+var client = httpx.Client.initWithConfig(allocator, .{
+    .policy = httpx.ClientPolicy.embeddingOwned(),
+});
+defer client.deinit();
+
+var response = try client.get(url, .{
+    .policy = httpx.RequestPolicyOverrides.embeddingOwned(),
+});
+defer response.deinit();
+```
+
+Policy is resolved once per logical request. Disabling a feature never removes a caller-provided `Cookie` or `Accept-Encoding` header. With decompression disabled, the response retains its encoded bytes and `Content-Encoding` header.
+
+Migration: direct `retry_policy`, `redirect_policy`, `follow_redirects`, `accept_encoding`, and `auto_decompress` fields were replaced by `ClientConfig.policy`; per-request `follow_redirects` was replaced by `RequestOptions.policy.redirect`. `RequestSpec.follow_redirects` similarly became `RequestSpec.policy`. The `withRetryPolicy`, `withRedirectPolicy`, and `withFollowRedirects` helpers remain as compatibility adapters and write only the new policy fields.
+
+```zig
+const config = httpx.ClientConfig{
+    .policy = .{
+        .retry = .{ .policy = retry_policy },
+        .redirect = .disabled,
+        .accept_encoding = .{ .explicit = "gzip" },
+        .decompression = .disabled,
+    },
+};
+```
 
 ### Timeouts (`Timeouts`)
 
@@ -143,11 +183,12 @@ defer res.deinit();
 | `ClientConfig.forBaseUrl(url)` | Returns defaults with `base_url` set. |
 | `withBaseUrl(url_or_null)` | Override base URL on a copy. |
 | `withTimeouts(timeouts)` | Override timeout bundle (`Timeouts`). |
-| `withRetryPolicy(policy)` | Override retry behavior (`RetryPolicy`). |
-| `withRedirectPolicy(policy)` | Override redirect behavior (`RedirectPolicy`). |
+| `withPolicy(policy)` | Override all automatic behavior (`ClientPolicy`). |
+| `withRetryPolicy(policy)` | Compatibility helper that enables the supplied `RetryPolicy`. |
+| `withRedirectPolicy(policy)` | Compatibility helper that enables the supplied `RedirectPolicy`. |
 | `withDefaultHeaders(headers_or_null)` | Override default client headers. |
 | `withUserAgent(ua)` | Override `User-Agent` string. |
-| `withFollowRedirects(enabled)` | Override client-level redirect following. |
+| `withFollowRedirects(enabled)` | Compatibility helper that maps to `policy.redirect`. |
 | `withProtocols(http2, http3)` | Override protocol runtime toggles. |
 | `withHttp2Settings(settings)` | Override HTTP/2 SETTINGS values. |
 | `withHttp3Settings(settings)` | Override HTTP/3 SETTINGS values. |
@@ -319,7 +360,7 @@ Per-request overrides for configuration.
 | `read_timeout_ms` | `?u64` | `null` | Request-specific read phase timeout override (ms). |
 | `write_timeout_ms` | `?u64` | `null` | Request-specific write phase timeout override (ms). |
 | `timeouts` | `?Timeouts` | `null` | Explicit request-specific `Timeouts` struct override. |
-| `follow_redirects` | `?bool` | `null` | Override client redirect setting. |
+| `policy` | `RequestPolicyOverrides` | `{}` | Nullable per-feature overrides resolved against `ClientConfig.policy`. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
 | `proxy` | `?Proxy` | `null` | Per-request forward proxy override. |
 | `verify_ssl` | `?bool` | `null` | Per-request SSL verification toggle override. |
@@ -348,7 +389,7 @@ const opts = httpx.RequestOptions.defaults()
     .withQueryParams(&.{ .{ "page", "1" } })
     .withTimeoutMs(10_000)
     .withHttp2()
-    .withFollowRedirects(true)
+    .withPolicy(.{ .redirect = .{ .policy = .{} } })
     .withSslVerification(false)
     .withKeepAlive(false);
 
@@ -371,7 +412,8 @@ Available helpers:
 - `withReadTimeoutMs(ms)`
 - `withWriteTimeoutMs(ms)`
 - `withTimeouts(timeouts)`
-- `withFollowRedirects(bool)`
+- `withPolicy(RequestPolicyOverrides)`
+- `withFollowRedirects(bool)` (compatibility adapter)
 - `withVersion(version)`
 - `withHttp2()`
 - `withHttp3()`

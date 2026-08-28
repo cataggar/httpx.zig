@@ -20,13 +20,12 @@ pub fn main() !void {
 
     const default = httpx.RedirectPolicy{};
     std.debug.print("  max_redirects:    {d}\n", .{default.max_redirects});
-    std.debug.print("  follow_redirects: {}\n", .{default.follow_redirects});
     std.debug.print("  preserve_method:  {}\n", .{default.preserve_method});
     std.debug.print("  preserve_headers: {}\n", .{default.preserve_headers});
     std.debug.print("  allow_cross_origin: {}\n", .{default.allow_cross_origin});
 
-    const no_follow = httpx.RedirectPolicy.noFollow();
-    std.debug.print("  follow_redirects: {}\n", .{no_follow.follow_redirects});
+    const embedding_owned = httpx.ClientPolicy.embeddingOwned();
+    std.debug.print("  embedding-owned redirects disabled: {}\n", .{embedding_owned.redirect == .disabled});
 
     const strict = httpx.RedirectPolicy.strict();
     std.debug.print("  preserve_method: {}\n", .{strict.preserve_method});

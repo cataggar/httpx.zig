@@ -33,6 +33,7 @@ The root module re-exports core types and convenience helpers so most apps can i
 ### Optional Client Builder Helpers
 
 - `httpx.ClientConfig.defaults().withDefaultHeaders(...)`
+- `httpx.ClientConfig.defaults().withPolicy(...)`
 - `httpx.ClientConfig.defaults().withFollowRedirects(...)`
 - `httpx.ClientConfig.defaults().withHttp2Settings(...)`
 - `httpx.ClientConfig.defaults().withHttp3Settings(...)`
@@ -53,6 +54,7 @@ The root module re-exports core types and convenience helpers so most apps can i
 - `httpx.RequestOptions.defaults().withHttp3()`
 - `httpx.RequestOptions.defaults().withJson(...)`
 - `httpx.RequestOptions.defaults().withHeaders(...)`
+- `httpx.RequestOptions.defaults().withPolicy(...)`
 - `httpx.RequestOptions.defaults().withFollowRedirects(...)`
 - `httpx.RequestOptions.defaults().withTimeout(...)`
 - `httpx.RequestOptions.defaults().withMultipartFields(...)`
@@ -61,6 +63,9 @@ The root module re-exports core types and convenience helpers so most apps can i
 - `httpx.BasicAuth`
 - `httpx.Proxy`
 - `httpx.ProxyKind`
+- `httpx.ClientPolicy`
+- `httpx.RequestPolicyOverrides`
+- `httpx.EffectiveClientPolicy`
 
 ### Server Types
 

@@ -27,7 +27,7 @@ pub const RequestSpec = struct {
     json: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     timeout_ms: ?u64 = null,
-    follow_redirects: ?bool = null,
+    policy: types.RequestPolicyOverrides = .{},
     version: ?types.Version = null,
 };
 
@@ -638,7 +638,7 @@ fn executeSpec(client: *Client, spec: RequestSpec) RequestResult {
         .json = spec.json,
         .headers = spec.headers,
         .timeout_ms = spec.timeout_ms,
-        .follow_redirects = spec.follow_redirects,
+        .policy = spec.policy,
         .version = spec.version,
     });
 
@@ -686,14 +686,14 @@ test "RequestSpec" {
         .url = "http://httpbun.com",
         .body = "{\"key\":\"value\"}",
         .timeout_ms = 2_000,
-        .follow_redirects = false,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
         .version = .HTTP_2,
     };
 
     try std.testing.expectEqual(types.Method.POST, spec.method);
     try std.testing.expect(spec.body != null);
     try std.testing.expectEqual(@as(u64, 2_000), spec.timeout_ms.?);
-    try std.testing.expect(!spec.follow_redirects.?);
+    try std.testing.expect(spec.policy.redirect.? == .disabled);
     try std.testing.expectEqual(types.Version.HTTP_2, spec.version.?);
 }
 

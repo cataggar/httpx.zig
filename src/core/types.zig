@@ -422,7 +422,6 @@ pub const RetryPolicy = struct {
 /// Redirect policy configuration for HTTP clients.
 pub const RedirectPolicy = struct {
     max_redirects: u32 = 10,
-    follow_redirects: bool = true,
     preserve_method: bool = false,
     preserve_headers: bool = true,
     allow_cross_origin: bool = true,
@@ -439,14 +438,139 @@ pub const RedirectPolicy = struct {
         };
     }
 
-    /// Creates a policy that doesn't follow redirects.
-    pub fn noFollow() RedirectPolicy {
-        return .{ .follow_redirects = false };
-    }
-
     /// Creates a strict policy that preserves method on redirects.
     pub fn strict() RedirectPolicy {
         return .{ .preserve_method = true };
+    }
+};
+
+/// Automatic retry behavior for a logical client request.
+pub const RetryBehavior = union(enum) {
+    disabled,
+    policy: RetryPolicy,
+};
+
+/// Automatic redirect behavior for a logical client request.
+pub const RedirectBehavior = union(enum) {
+    disabled,
+    policy: RedirectPolicy,
+};
+
+/// Cookie-jar behavior for a logical client request.
+pub const CookiePolicy = enum {
+    disabled,
+    send_only,
+    store_only,
+    send_and_store,
+
+    pub fn sends(self: CookiePolicy) bool {
+        return self == .send_only or self == .send_and_store;
+    }
+
+    pub fn stores(self: CookiePolicy) bool {
+        return self == .store_only or self == .send_and_store;
+    }
+};
+
+/// Automatic `Accept-Encoding` header synthesis.
+pub const AcceptEncodingPolicy = union(enum) {
+    disabled,
+    library_default,
+    explicit: []const u8,
+
+    pub const library_default_value = "gzip, deflate, br, zstd, identity";
+
+    pub fn value(self: AcceptEncodingPolicy) ?[]const u8 {
+        return switch (self) {
+            .disabled => null,
+            .library_default => library_default_value,
+            .explicit => |explicit_value| explicit_value,
+        };
+    }
+};
+
+/// Automatic response-body decompression behavior.
+pub const DecompressionPolicy = enum {
+    disabled,
+    enabled,
+};
+
+/// Nullable per-request overrides for the five automatic client behaviors.
+pub const RequestPolicyOverrides = struct {
+    retry: ?RetryBehavior = null,
+    redirect: ?RedirectBehavior = null,
+    cookies: ?CookiePolicy = null,
+    accept_encoding: ?AcceptEncodingPolicy = null,
+    decompression: ?DecompressionPolicy = null,
+
+    /// Disables every automatic client behavior for one request.
+    pub fn embeddingOwned() RequestPolicyOverrides {
+        return .{
+            .retry = .disabled,
+            .redirect = .disabled,
+            .cookies = .disabled,
+            .accept_encoding = .disabled,
+            .decompression = .disabled,
+        };
+    }
+};
+
+/// Fully resolved policy used unchanged for one logical request.
+pub const EffectiveClientPolicy = struct {
+    retry: RetryBehavior,
+    redirect: RedirectBehavior,
+    cookies: CookiePolicy,
+    accept_encoding: AcceptEncodingPolicy,
+    decompression: DecompressionPolicy,
+
+    pub fn retryPolicy(self: EffectiveClientPolicy) ?RetryPolicy {
+        return switch (self.retry) {
+            .disabled => null,
+            .policy => |policy| policy,
+        };
+    }
+
+    pub fn redirectPolicy(self: EffectiveClientPolicy) ?RedirectPolicy {
+        return switch (self.redirect) {
+            .disabled => null,
+            .policy => |policy| policy,
+        };
+    }
+};
+
+/// Client-wide defaults for the five independently configurable behaviors.
+pub const ClientPolicy = struct {
+    retry: RetryBehavior = .{ .policy = .{} },
+    redirect: RedirectBehavior = .{ .policy = .{} },
+    cookies: CookiePolicy = .send_and_store,
+    accept_encoding: AcceptEncodingPolicy = .library_default,
+    decompression: DecompressionPolicy = .enabled,
+
+    /// Managed behavior compatible with the historical client defaults.
+    pub fn managed() ClientPolicy {
+        return .{};
+    }
+
+    /// Disables every automatic behavior so an embedding transport owns policy.
+    pub fn embeddingOwned() ClientPolicy {
+        return .{
+            .retry = .disabled,
+            .redirect = .disabled,
+            .cookies = .disabled,
+            .accept_encoding = .disabled,
+            .decompression = .disabled,
+        };
+    }
+
+    /// Resolves nullable request overrides into one immutable value.
+    pub fn resolve(self: ClientPolicy, overrides: RequestPolicyOverrides) EffectiveClientPolicy {
+        return .{
+            .retry = overrides.retry orelse self.retry,
+            .redirect = overrides.redirect orelse self.redirect,
+            .cookies = overrides.cookies orelse self.cookies,
+            .accept_encoding = overrides.accept_encoding orelse self.accept_encoding,
+            .decompression = overrides.decompression orelse self.decompression,
+        };
     }
 };
 
@@ -588,6 +712,66 @@ test "RedirectPolicy.getRedirectMethod" {
     try std.testing.expectEqual(Method.POST, strict.getRedirectMethod(308, .POST));
     // Strict: 303 ALWAYS changes to GET per RFC 7231
     try std.testing.expectEqual(Method.GET, strict.getRedirectMethod(303, .POST));
+}
+
+test "ClientPolicy managed and embedding-owned presets" {
+    const managed = ClientPolicy.managed().resolve(.{});
+    try std.testing.expect(managed.retry == .policy);
+    try std.testing.expect(managed.redirect == .policy);
+    try std.testing.expectEqual(CookiePolicy.send_and_store, managed.cookies);
+    try std.testing.expect(managed.accept_encoding == .library_default);
+    try std.testing.expectEqual(DecompressionPolicy.enabled, managed.decompression);
+
+    const embedding_owned = ClientPolicy.embeddingOwned().resolve(.{});
+    try std.testing.expect(embedding_owned.retry == .disabled);
+    try std.testing.expect(embedding_owned.redirect == .disabled);
+    try std.testing.expectEqual(CookiePolicy.disabled, embedding_owned.cookies);
+    try std.testing.expect(embedding_owned.accept_encoding == .disabled);
+    try std.testing.expectEqual(DecompressionPolicy.disabled, embedding_owned.decompression);
+}
+
+test "ClientPolicy resolves each request override independently" {
+    const base = ClientPolicy.embeddingOwned();
+
+    const retry = base.resolve(.{ .retry = .{ .policy = .{ .max_retries = 1 } } });
+    try std.testing.expect(retry.retry == .policy);
+    try std.testing.expect(retry.redirect == .disabled);
+
+    const redirect = base.resolve(.{ .redirect = .{ .policy = .{ .max_redirects = 2 } } });
+    try std.testing.expect(redirect.redirect == .policy);
+    try std.testing.expect(redirect.cookies == .disabled);
+
+    const cookies = base.resolve(.{ .cookies = .send_only });
+    try std.testing.expectEqual(CookiePolicy.send_only, cookies.cookies);
+    try std.testing.expect(cookies.accept_encoding == .disabled);
+
+    const encoding = base.resolve(.{ .accept_encoding = .{ .explicit = "gzip" } });
+    try std.testing.expectEqualStrings("gzip", encoding.accept_encoding.value().?);
+    try std.testing.expectEqual(DecompressionPolicy.disabled, encoding.decompression);
+
+    const decompression = base.resolve(.{ .decompression = .enabled });
+    try std.testing.expectEqual(DecompressionPolicy.enabled, decompression.decompression);
+    try std.testing.expect(decompression.retry == .disabled);
+}
+
+test "RequestPolicyOverrides embedding-owned preset disables all features" {
+    const effective = ClientPolicy.managed().resolve(RequestPolicyOverrides.embeddingOwned());
+    try std.testing.expect(effective.retry == .disabled);
+    try std.testing.expect(effective.redirect == .disabled);
+    try std.testing.expectEqual(CookiePolicy.disabled, effective.cookies);
+    try std.testing.expect(effective.accept_encoding == .disabled);
+    try std.testing.expectEqual(DecompressionPolicy.disabled, effective.decompression);
+}
+
+test "CookiePolicy send and store capabilities are independent" {
+    try std.testing.expect(!CookiePolicy.disabled.sends());
+    try std.testing.expect(!CookiePolicy.disabled.stores());
+    try std.testing.expect(CookiePolicy.send_only.sends());
+    try std.testing.expect(!CookiePolicy.send_only.stores());
+    try std.testing.expect(!CookiePolicy.store_only.sends());
+    try std.testing.expect(CookiePolicy.store_only.stores());
+    try std.testing.expect(CookiePolicy.send_and_store.sends());
+    try std.testing.expect(CookiePolicy.send_and_store.stores());
 }
 
 test "CancellationToken basic" {
