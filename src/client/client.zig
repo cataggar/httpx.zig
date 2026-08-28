@@ -2789,12 +2789,7 @@ const TLSHTTP2Transport = struct {
     session: *TLSSession,
 
     fn writeAll(self: *TLSHTTP2Transport, data: []const u8) !void {
-        var written: usize = 0;
-        while (written < data.len) {
-            const n = try self.session.write(data[written..]);
-            if (n == 0) return error.UnexpectedEof;
-            written += n;
-        }
+        try self.session.writeAll(data);
         try self.session.flush();
     }
 
