@@ -39,13 +39,15 @@ const common = @import("../data/common.zig");
 const list_writer = @import("../io/list_writer.zig");
 const compression_util = @import("../compress/compression.zig");
 const io_util = @import("../io/any_io.zig");
+const io_context = @import("../io/context.zig");
+const IoContext = io_context.IoContext;
+const Deadline = io_context.Deadline;
 const Metrics = @import("../io/metrics.zig").Metrics;
 const dns_mod = @import("../net/dns.zig");
 const server_mod = @import("../server/server.zig");
 const LogFn = server_mod.LogFn;
 
 const defaultIo = io_util.defaultIo;
-const sleepMs = io_util.sleepMs;
 
 const RequestTimeouts = struct {
     connect_ms: u64,
@@ -266,6 +268,9 @@ pub const RequestOptions = struct {
     read_timeout_ms: ?u64 = null,
     write_timeout_ms: ?u64 = null,
     timeouts: ?types.Timeouts = null,
+    /// Optional borrowed cancellation token. It must outlive the request.
+    /// The client only observes this token and never signals it.
+    cancel_token: ?*const types.CancellationToken = null,
     follow_redirects: ?bool = null,
     version: ?types.Version = null,
     multipart_fields: ?[]const MultipartField = null,
@@ -443,6 +448,13 @@ pub const RequestOptions = struct {
         return out;
     }
 
+    /// Returns a copy that observes a borrowed cancellation token.
+    pub fn withCancellation(self: RequestOptions, cancel_token: ?*const types.CancellationToken) RequestOptions {
+        var out = self;
+        out.cancel_token = cancel_token;
+        return out;
+    }
+
     /// Returns a copy with explicit connect phase timeout in milliseconds.
     pub fn withConnectTimeoutMs(self: RequestOptions, connect_timeout_ms: u64) RequestOptions {
         var out = self;
@@ -575,14 +587,24 @@ pub const Client = struct {
 
     /// Resolves a hostname to a single address using the configured DNS resolver
     /// (if any) or falling back to the system resolver.
-    fn resolveAddress(self: *Self, hostname: []const u8, port: u16) !address_mod.Address {
+    fn resolveAddress(
+        self: *Self,
+        hostname: []const u8,
+        port: u16,
+        context: *const IoContext,
+    ) !address_mod.Address {
+        try context.check();
         if (self.config.dns_resolver) |resolver| {
-            var result = try resolver.resolve(hostname, .{ .port = port });
+            var result = try resolver.resolveWithContext(hostname, .{ .port = port }, context);
             defer result.deinit();
             if (result.addresses.len == 0) return error.DNSResolutionFailed;
             return result.addresses[0];
         }
-        return try address_mod.resolve(self.allocator, hostname, port);
+
+        // The platform getaddrinfo path is blocking and cannot be
+        // synchronously cancelled. Check immediately before and after it.
+        const resolved = address_mod.resolve(self.allocator, hostname, port);
+        return context.unwrapAfterBlocking(address_mod.Address, resolved);
     }
 
     /// Logs a formatted message. If config.log_fn is provided, delegates to it.
@@ -635,6 +657,8 @@ pub const Client = struct {
     }
 
     fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
+        if (reqOpts.cancel_token) |token| try token.throwIfCancelled();
+
         const full_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
@@ -825,36 +849,47 @@ pub const Client = struct {
         return response;
     }
 
+    fn normalizeRequestContextError(context: *const IoContext, err: anyerror) anyerror {
+        if (err == error.Timeout and context.expiredDeadline() != null) {
+            return error.RequestTimeout;
+        }
+        return err;
+    }
+
+    fn checkRequestContext(context: *const IoContext) !void {
+        context.check() catch |err| return normalizeRequestContextError(context, err);
+    }
+
+    fn waitForRetry(context: *const IoContext, delay_ms: u64) !void {
+        context.waitForMs(delay_ms) catch |err| return normalizeRequestContextError(context, err);
+    }
+
     /// Executes the actual HTTP request.
     fn executeRequest(self: *Self, req: *Request, reqOpts: RequestOptions) !Response {
         if (self.config.metrics) |m| m.recordRequest();
         const start_time_ms: u64 = @intCast(@max(common.nowMillis(), 0));
         const timeouts = self.resolveRequestTimeouts(reqOpts);
-        const request_deadline_ms: u64 = if (timeouts.request_ms > 0) start_time_ms + timeouts.request_ms else 0;
+        const context = IoContext.init(.{
+            .external_cancel = reqOpts.cancel_token,
+            .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
+        });
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
-            // Check request deadline before each attempt.
-            if (request_deadline_ms > 0) {
-                const now_ms: u64 = @intCast(@max(common.nowMillis(), 0));
-                if (now_ms >= request_deadline_ms) {
-                    if (self.config.metrics) |m| m.recordError();
-                    return error.RequestTimeout;
-                }
-            }
+            checkRequestContext(&context) catch |err| {
+                if (self.config.metrics) |m| m.recordError();
+                return err;
+            };
 
-            var res = self.executeRequestOnce(req, reqOpts) catch |err| {
+            var res = self.executeRequestOnce(req, reqOpts, &context) catch |raw_err| {
+                const err = normalizeRequestContextError(&context, raw_err);
                 if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries and isRetryableRequestError(err)) {
-                    // Check deadline before retry delay.
-                    if (request_deadline_ms > 0) {
-                        const now_ms: u64 = @intCast(@max(common.nowMillis(), 0));
-                        if (now_ms >= request_deadline_ms) {
-                            if (self.config.metrics) |m| m.recordError();
-                            return error.RequestTimeout;
-                        }
-                    }
+                    checkRequestContext(&context) catch |context_err| {
+                        if (self.config.metrics) |m| m.recordError();
+                        return context_err;
+                    };
                     attempt += 1;
                     if (self.config.metrics) |m| {
                         m.recordError();
@@ -867,7 +902,12 @@ pub const Client = struct {
                         }
                     }
                     const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) sleepMs(delay_ms);
+                    if (delay_ms > 0) {
+                        waitForRetry(&context, delay_ms) catch |context_err| {
+                            if (self.config.metrics) |m| m.recordError();
+                            return context_err;
+                        };
+                    }
                     continue;
                 }
                 // Call error interceptors.
@@ -881,15 +921,11 @@ pub const Client = struct {
             };
 
             if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
-                // Check deadline before retry.
-                if (request_deadline_ms > 0) {
-                    const now_ms: u64 = @intCast(@max(common.nowMillis(), 0));
-                    if (now_ms >= request_deadline_ms) {
-                        res.deinit();
-                        if (self.config.metrics) |m| m.recordError();
-                        return error.RequestTimeout;
-                    }
-                }
+                checkRequestContext(&context) catch |err| {
+                    res.deinit();
+                    if (self.config.metrics) |m| m.recordError();
+                    return err;
+                };
                 // Parse Retry-After header if present.
                 const retry_after_ms = if (res.headers.get("Retry-After")) |ra|
                     parseRetryAfter(ra) orelse policy.calculateDelay(attempt)
@@ -904,7 +940,12 @@ pub const Client = struct {
                         fn_ptr(attempt, interceptor.context);
                     }
                 }
-                if (retry_after_ms > 0) sleepMs(retry_after_ms);
+                if (retry_after_ms > 0) {
+                    waitForRetry(&context, retry_after_ms) catch |err| {
+                        if (self.config.metrics) |m| m.recordError();
+                        return err;
+                    };
+                }
                 continue;
             }
 
@@ -937,6 +978,9 @@ pub const Client = struct {
             mem.eql(u8, name, "HTTP3Error") or
             mem.eql(u8, name, "QUICError") or
             mem.eql(u8, name, "CompressionError") or
+            mem.eql(u8, name, "Cancelled") or
+            mem.eql(u8, name, "Timeout") or
+            mem.eql(u8, name, "RequestTimeout") or
             mem.eql(u8, name, "ResponseTooLarge") or
             mem.eql(u8, name, "RequestTooLarge") or
             mem.eql(u8, name, "TooManyRedirects"));
@@ -1043,7 +1087,13 @@ pub const Client = struct {
         };
     }
 
-    fn executeRequestOnce(self: *Self, req: *Request, reqOpts: RequestOptions) !Response {
+    fn executeRequestOnce(
+        self: *Self,
+        req: *Request,
+        reqOpts: RequestOptions,
+        context: *const IoContext,
+    ) !Response {
+        try context.check();
         const timeouts = self.resolveRequestTimeouts(reqOpts);
         const keep_alive = reqOpts.keep_alive orelse self.config.keep_alive;
         const verify_ssl = reqOpts.verify_ssl orelse self.config.verify_ssl;
@@ -1087,15 +1137,15 @@ pub const Client = struct {
             if (effective_proxy != null) {
                 // Fall back to HTTP/2 if also enabled; otherwise return error.
                 if (wants_http2) {
-                    return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts);
+                    return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, context);
                 }
                 return error.ProxyNotSupported;
             }
-            return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts);
+            return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, context);
         }
 
         if (wants_http2) {
-            return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts);
+            return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, context);
         }
 
         var request_data: []u8 = undefined;
@@ -1113,7 +1163,7 @@ pub const Client = struct {
         if (req.uri.isTLS()) {
             const connect_host = if (effective_proxy) |p| p.host else host;
             const connect_port = if (effective_proxy) |p| p.port else port;
-            const addr = try self.resolveAddress(connect_host, connect_port);
+            const addr = try self.resolveAddress(connect_host, connect_port, context);
 
             var socket = try Socket.createForAddress(addr);
             defer socket.close();
@@ -1146,7 +1196,7 @@ pub const Client = struct {
         }
 
         if (keep_alive) {
-            var conn = try self.pool.getConnection(host, port, effective_proxy, timeouts.connect_ms);
+            var conn = try self.pool.getConnectionWithContext(host, port, effective_proxy, timeouts.connect_ms, context);
             errdefer conn.close();
             defer self.pool.releaseConnection(conn);
 
@@ -1169,7 +1219,7 @@ pub const Client = struct {
 
         const connect_host = if (effective_proxy) |p| p.host else host;
         const connect_port = if (effective_proxy) |p| p.port else port;
-        const addr = try self.resolveAddress(connect_host, connect_port);
+        const addr = try self.resolveAddress(connect_host, connect_port, context);
 
         var socket = try Socket.createForAddress(addr);
         defer socket.close();
@@ -1201,6 +1251,7 @@ pub const Client = struct {
         port: u16,
         timeouts: RequestTimeouts,
         reqOpts: RequestOptions,
+        context: *const IoContext,
     ) !Response {
         var effective_proxy = reqOpts.proxy orelse self.config.proxy;
         if (effective_proxy) |p| {
@@ -1210,7 +1261,7 @@ pub const Client = struct {
 
         const connect_host = if (effective_proxy) |p| p.host else host;
         const connect_port = if (effective_proxy) |p| p.port else port;
-        const addr = try self.resolveAddress(connect_host, connect_port);
+        const addr = try self.resolveAddress(connect_host, connect_port, context);
 
         var socket = try Socket.createForAddress(addr);
         defer socket.close();
@@ -1315,9 +1366,10 @@ pub const Client = struct {
         port: u16,
         timeouts: RequestTimeouts,
         reqOpts: RequestOptions,
+        context: *const IoContext,
     ) !Response {
         _ = reqOpts;
-        const addr = try self.resolveAddress(host, port);
+        const addr = try self.resolveAddress(host, port, context);
 
         var socket = try UdpSocket.createForAddress(addr);
         defer socket.close();
@@ -3199,6 +3251,7 @@ test "RequestOptions builder helpers" {
     const form_fields = [_][2][]const u8{
         .{ "email", "user@example.com" },
     };
+    var cancel_token = types.CancellationToken.init();
 
     const opts = RequestOptions.defaults()
         .withHeaders(&headers)
@@ -3207,6 +3260,7 @@ test "RequestOptions builder helpers" {
         .withFormUrlEncoded(&form_fields)
         .withBearerToken("token-123")
         .withTimeoutMs(2_500)
+        .withCancellation(&cancel_token)
         .withFollowRedirects(false)
         .withVersion(.HTTP_2);
 
@@ -3220,6 +3274,7 @@ test "RequestOptions builder helpers" {
     try std.testing.expectEqualStrings("token-123", opts.bearer_token.?);
     try std.testing.expect(opts.basic_auth == null);
     try std.testing.expectEqual(@as(u64, 2_500), opts.timeout_ms.?);
+    try std.testing.expect(opts.cancel_token.? == &cancel_token);
     try std.testing.expect(!opts.follow_redirects.?);
     try std.testing.expectEqual(types.Version.HTTP_2, opts.version.?);
 
@@ -3338,7 +3393,32 @@ test "Client retry classifier avoids TLS/protocol retries" {
     try std.testing.expect(!Client.isRetryableRequestError(error.TLSConnectionTruncated));
     try std.testing.expect(!Client.isRetryableRequestError(error.InvalidResponse));
     try std.testing.expect(!Client.isRetryableRequestError(error.ProtocolError));
+    try std.testing.expect(!Client.isRetryableRequestError(error.Cancelled));
+    try std.testing.expect(!Client.isRetryableRequestError(error.RequestTimeout));
     try std.testing.expect(Client.isRetryableRequestError(error.ConnectionReset));
+}
+
+test "Client retry wait maps cancellation and request deadline" {
+    var token = types.CancellationToken.init();
+    token.cancel();
+    const cancelled = IoContext.init(.{ .external_cancel = &token });
+    try std.testing.expectError(error.Cancelled, Client.waitForRetry(&cancelled, 1_000));
+
+    const expired = IoContext.init(.{ .request_deadline = Deadline.at(0) });
+    try std.testing.expectError(error.RequestTimeout, Client.waitForRetry(&expired, 1_000));
+}
+
+test "Client observes an already-cancelled borrowed token before request setup" {
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    var token = types.CancellationToken.init();
+    token.cancel();
+
+    try std.testing.expectError(
+        error.Cancelled,
+        client.request(.GET, "not-a-valid-url", .{ .cancel_token = &token }),
+    );
 }
 
 test "Client proxy request formatting" {

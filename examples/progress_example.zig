@@ -28,6 +28,6 @@ pub fn main() !void {
         std.debug.print("unknown\n", .{});
     }
 
-    var token = httpx.CancelToken{};
+    var token = httpx.CancelToken.init();
     std.debug.print("Cancelled: {}\n", .{token.isCancelled()});
 }

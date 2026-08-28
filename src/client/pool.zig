@@ -18,6 +18,7 @@ const dns_mod = @import("../net/dns.zig");
 const types = @import("../core/types.zig");
 const proxy_mod = @import("proxy.zig");
 const common = @import("../data/common.zig");
+const IoContext = @import("../io/context.zig").IoContext;
 const Proxy = types.Proxy;
 
 pub const PoolError = error{
@@ -124,6 +125,16 @@ pub const ConnectionPool = struct {
         }
     }
 
+    fn acquireLockWithContext(self: *Self, context: *const IoContext) !void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            try context.waitForMs(1);
+        }
+        context.check() catch |err| {
+            self.releaseLock();
+            return err;
+        };
+    }
+
     fn releaseLock(self: *Self) void {
         self.lock.store(0, .release);
     }
@@ -155,7 +166,21 @@ pub const ConnectionPool = struct {
 
     /// Gets or creates a connection to the specified host.
     pub fn getConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !*Connection {
-        self.acquireLock();
+        const context = IoContext.init(.{});
+        return self.getConnectionWithContext(host, port, proxy, connect_timeout_ms, &context);
+    }
+
+    /// Context-aware connection acquisition. Pool lock contention and custom
+    /// DNS in-flight waits observe cancellation and deadlines.
+    pub fn getConnectionWithContext(
+        self: *Self,
+        host: []const u8,
+        port: u16,
+        proxy: ?Proxy,
+        connect_timeout_ms: u64,
+        context: *const IoContext,
+    ) !*Connection {
+        try self.acquireLockWithContext(context);
         defer self.releaseLock();
 
         for (self.connections.items) |*conn| {
@@ -175,31 +200,49 @@ pub const ConnectionPool = struct {
         }
         if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
 
-        return self.createConnection(host, port, proxy, connect_timeout_ms);
+        return self.createConnection(host, port, proxy, connect_timeout_ms, context);
     }
 
     /// Creates a new connection.
-    fn createConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !*Connection {
+    fn createConnection(
+        self: *Self,
+        host: []const u8,
+        port: u16,
+        proxy: ?Proxy,
+        connect_timeout_ms: u64,
+        context: *const IoContext,
+    ) !*Connection {
+        try context.check();
         const host_owned = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(host_owned);
 
         const connect_host = if (proxy) |p| p.host else host;
         const connect_port = if (proxy) |p| p.port else port;
         const addr = if (self.config.dns_resolver) |resolver| blk: {
-            var result = try resolver.resolve(connect_host, .{ .port = connect_port });
+            var result = try resolver.resolveWithContext(connect_host, .{ .port = connect_port }, context);
             defer result.deinit();
             if (result.addresses.len == 0) return error.DNSResolutionFailed;
             break :blk result.addresses[0];
-        } else try address_mod.resolve(self.allocator, connect_host, connect_port);
+        } else blk: {
+            // The platform getaddrinfo path is blocking and cannot be
+            // synchronously cancelled. Check immediately before and after it.
+            try context.check();
+            const resolved = address_mod.resolve(self.allocator, connect_host, connect_port);
+            break :blk try context.unwrapAfterBlocking(address_mod.Address, resolved);
+        };
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
-        try socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
+        try context.check();
+        const connect_result = socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
+        try context.unwrapAfterBlocking(void, connect_result);
         try socket.setNoDelay(true);
 
         if (proxy) |p| {
             if (p.kind == .socks5h) {
-                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
+                try context.check();
+                const tunnel_result = proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
+                try context.unwrapAfterBlocking(void, tunnel_result);
             }
         }
 
@@ -351,6 +394,22 @@ test "ConnectionPool config" {
 
     try std.testing.expectEqual(@as(u32, 50), pool.config.max_connections);
     try std.testing.expectEqual(@as(u32, 10), pool.config.max_per_host);
+}
+
+test "ConnectionPool contextual acquisition observes cancellation during lock wait" {
+    var pool = ConnectionPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    pool.lock.store(1, .release);
+    defer pool.lock.store(0, .release);
+    var token = types.CancellationToken.init();
+    token.cancel();
+    const context = IoContext.init(.{ .external_cancel = &token });
+
+    try std.testing.expectError(
+        error.Cancelled,
+        pool.getConnectionWithContext("127.0.0.1", 80, null, 1, &context),
+    );
 }
 
 test "Connection health check" {
