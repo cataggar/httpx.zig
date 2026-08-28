@@ -5030,7 +5030,7 @@ test "HTTP2 partial SETTINGS update retained peer settings" {
     try std.testing.expectEqual(@as(usize, 9), capture.bytes.items.len);
 }
 
-test "public Client reuses H2 with retained flow control settings and GOAWAY drain" {
+fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
     const allocator = std.testing.allocator;
     var tls_config = try tls_mod.loadServerTLSConfig(
         allocator,
@@ -5050,6 +5050,7 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
         handshakes: u32 = 0,
         stream_ids: [2]u31 = .{ 0, 0 },
         body_lengths: [2]usize = .{ 0, 0 },
+        goaway_error_code: u32,
         failure: ?anyerror = null,
 
         const Frame = struct {
@@ -5094,7 +5095,7 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
             manager: *h2stream.StreamManager,
             stream_id: u31,
             body: []const u8,
-            goaway: bool,
+            response_goaway_code: ?u32,
         ) !void {
             var len_buf: [32]u8 = undefined;
             const content_length = try std.fmt.bufPrint(&len_buf, "{d}", .{body.len});
@@ -5114,8 +5115,9 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
             defer std.heap.page_allocator.free(header_frames);
             try connection.writeAll(header_frames);
 
-            if (goaway) {
-                const goaway_payload = try h2stream.buildGoawayPayload(stream_id, .no_error, null, std.heap.page_allocator);
+            if (response_goaway_code) |raw_error_code| {
+                const error_code: http.HTTP2ErrorCode = @enumFromInt(raw_error_code);
+                const goaway_payload = try h2stream.buildGoawayPayload(stream_id, error_code, null, std.heap.page_allocator);
                 defer std.heap.page_allocator.free(goaway_payload);
                 try writeHTTP2Frame(connection, .goaway, 0, 0, goaway_payload);
                 const split = body.len / 2;
@@ -5177,7 +5179,7 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
 
             var response_manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
             defer response_manager.deinit();
-            try sendResponse(&connection, &response_manager, self.stream_ids[0], "one", false);
+            try sendResponse(&connection, &response_manager, self.stream_ids[0], "one", null);
 
             var second_done = false;
             var stream_credit_sent = false;
@@ -5200,7 +5202,7 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
                 }
             }
 
-            try sendResponse(&connection, &response_manager, self.stream_ids[1], "complete-body", true);
+            try sendResponse(&connection, &response_manager, self.stream_ids[1], "complete-body", self.goaway_error_code);
             var response_window_updates: usize = 0;
             while (response_window_updates < 4) {
                 const frame = try readFrame(&connection, &payload_buffer);
@@ -5209,7 +5211,11 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
         }
     };
 
-    var server = LoopbackH2Server{ .listener = &listener, .tls_config = &tls_config };
+    var server = LoopbackH2Server{
+        .listener = &listener,
+        .tls_config = &tls_config,
+        .goaway_error_code = goaway_error_code,
+    };
     const server_thread = try std.Thread.spawn(.{}, LoopbackH2Server.run, .{&server});
     var joined = false;
     defer if (!joined) {
@@ -5255,6 +5261,18 @@ test "public Client reuses H2 with retained flow control settings and GOAWAY dra
     try std.testing.expectEqual(@as(usize, first_body.len), server.body_lengths[0]);
     try std.testing.expectEqual(@as(usize, second_body.len), server.body_lengths[1]);
     try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+}
+
+test "public Client completes allowed H2 stream after GOAWAY no_error" {
+    try runPublicClientH2GoAwayTest(@intFromEnum(http.HTTP2ErrorCode.no_error));
+}
+
+test "public Client completes allowed H2 stream after known nonzero GOAWAY" {
+    try runPublicClientH2GoAwayTest(@intFromEnum(http.HTTP2ErrorCode.protocol_error));
+}
+
+test "public Client completes allowed H2 stream after unknown GOAWAY" {
+    try runPublicClientH2GoAwayTest(0xFFFFFFFF);
 }
 
 test "Client stores Set-Cookie headers" {

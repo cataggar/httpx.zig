@@ -13,7 +13,8 @@ multiplexer is not currently exposed.
 Session reuse retains peer SETTINGS, HPACK state, connection flow-control
 credit, and odd stream IDs. Partial SETTINGS update retained values rather than
 resetting omitted fields. GOAWAY drains the session while an allowed active
-stream is read through END_STREAM. Opportunistic ALPN selection of HTTP/1.1
+stream is read through END_STREAM. Known nonzero and unknown GOAWAY error codes
+are preserved without enum traps. Opportunistic ALPN selection of HTTP/1.1
 falls back to the pooled HTTP/1.1 path.
 - **ALPN** negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback
 :::
@@ -67,7 +68,11 @@ std.debug.print("version={s} status={d}\n", .{ res.version.toString(), res.statu
 ```
 
 ::: tip TLS & ALPN Protocol Negotiation
-httpx.zig natively performs ALPN protocol negotiation via a post-handshake HTTP/2 preface probe on TLS connections when `http2_enabled = true` or when using `TlsConfig.withH2()`. If the server supports HTTP/2, the connection uses HTTP/2; otherwise it cleanly falls back to HTTP/1.1 without dropping data.
+httpx.zig performs RFC 7301 ALPN negotiation in the TLS handshake when
+`http2_enabled = true` or when using `TlsConfig.withH2()`. The client advertises
+a u16-length protocol list and accepts the selected protocol from TLS 1.2
+ServerHello or TLS 1.3 EncryptedExtensions. If the server selects HTTP/1.1, the
+connection safely falls back without dropping data.
 :::
 
 ## High-level Server Usage

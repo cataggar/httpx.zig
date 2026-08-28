@@ -864,3 +864,18 @@ test "buildRstStreamFrame produces correct wire format" {
     const error_code = try parseRstStreamPayload(frame[9..13]);
     try std.testing.expectEqual(http.HTTP2ErrorCode.cancel, error_code);
 }
+
+test "parseGoawayPayload preserves known and unknown error codes" {
+    const cases = [_]u32{
+        @intFromEnum(http.HTTP2ErrorCode.no_error),
+        @intFromEnum(http.HTTP2ErrorCode.protocol_error),
+        0xFFFFFFFF,
+    };
+    for (cases) |raw_code| {
+        var payload = [_]u8{0} ** 8;
+        mem.writeInt(u32, payload[4..8], raw_code, .big);
+        const parsed = try parseGoawayPayload(&payload, std.testing.allocator);
+        defer if (parsed.debug_data) |debug_data| std.testing.allocator.free(debug_data);
+        try std.testing.expectEqual(raw_code, @intFromEnum(parsed.error_code));
+    }
+}
