@@ -180,12 +180,28 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
 
+    const provider_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls/crypto/provider_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkPlatformLibs(provider_tests, target);
+    const run_provider_tests = b.addRunArtifact(provider_tests);
+    const provider_test_step = b.step("test-tls-provider", "Run TLS CryptoProvider contract tests");
+
     // Only run tests when target matches host; otherwise build test artifact only.
     if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
         test_step.dependOn(&run_tests.step);
+        test_step.dependOn(&run_provider_tests.step);
+        provider_test_step.dependOn(&run_provider_tests.step);
     } else {
         const install_tests = b.addInstallArtifact(tests, .{});
+        const install_provider_tests = b.addInstallArtifact(provider_tests, .{});
         test_step.dependOn(&install_tests.step);
+        test_step.dependOn(&install_provider_tests.step);
+        provider_test_step.dependOn(&install_provider_tests.step);
     }
 
     const bench_exe = b.addExecutable(.{

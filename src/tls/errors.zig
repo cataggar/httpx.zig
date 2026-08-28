@@ -134,6 +134,18 @@ pub const TlsError = error{
     /// An unsupported cipher suite was selected by the server.
     TlsUnsupportedCipherSuite,
 
+    /// The selected transcript, PRF, or signature hash is unavailable.
+    TlsUnsupportedHash,
+
+    /// The selected authenticated-encryption algorithm is unavailable.
+    TlsUnsupportedAead,
+
+    /// The selected key-exchange group or its KEM component is unavailable.
+    TlsUnsupportedGroup,
+
+    /// The selected or credential-required signature scheme is unavailable.
+    TlsUnsupportedSignatureScheme,
+
     /// A certificate could not be parsed or has a malformed structure.
     TlsMalformedCertificate,
 
@@ -369,5 +381,13 @@ test "error set has expected members" {
         const ErrorSet = @TypeOf(TlsError.TlsCloseNotify);
         _ = ErrorSet;
     }
+    const unsupported_hash: TlsError = error.TlsUnsupportedHash;
+    const unsupported_aead: TlsError = error.TlsUnsupportedAead;
+    const unsupported_group: TlsError = error.TlsUnsupportedGroup;
+    const unsupported_signature: TlsError = error.TlsUnsupportedSignatureScheme;
+    try std.testing.expectEqual(error.TlsUnsupportedHash, unsupported_hash);
+    try std.testing.expectEqual(error.TlsUnsupportedAead, unsupported_aead);
+    try std.testing.expectEqual(error.TlsUnsupportedGroup, unsupported_group);
+    try std.testing.expectEqual(error.TlsUnsupportedSignatureScheme, unsupported_signature);
     try std.testing.expect(true);
 }

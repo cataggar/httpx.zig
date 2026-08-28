@@ -29,6 +29,12 @@ pub const CertificateSignatureVerifier = cert_signature.CertificateSignatureVeri
 pub const VerifyCertificateSignatureRequest = cert_signature.VerifyCertificateSignatureRequest;
 pub const CertificateSignatureError = cert_signature.CertificateSignatureError;
 pub const TrustError = errors.TrustError;
+pub const crypto_provider = @import("crypto/provider.zig");
+pub const CryptoProvider = crypto_provider.CryptoProvider;
+pub const CryptoProviderVTable = crypto_provider.VTable;
+pub const CryptoProviderCapabilities = crypto_provider.Capabilities;
+pub const CryptoCapabilities = crypto_provider.Capabilities;
+pub const CryptoProviderError = crypto_provider.ProviderError;
 
 pub const server = @import("server.zig");
 pub const acceptServer = server.acceptServer;
