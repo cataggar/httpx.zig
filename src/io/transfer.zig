@@ -5,8 +5,7 @@ const fs = std.fs;
 const time = std.time;
 const testing = std.testing;
 const Allocator = mem.Allocator;
-const any_io = @import("../io/any_io.zig");
-const threadIo = any_io.threadIo;
+const types = @import("../core/types.zig");
 
 pub const Progress = struct {
     bytes_transferred: u64,
@@ -215,28 +214,8 @@ pub const TransferError = error{
     FileAlreadyExists,
 };
 
-pub const CancelToken = struct {
-    cancelled: bool = false,
-    mu: std.Io.Mutex = .init,
-
-    pub fn cancel(self: *CancelToken) void {
-        const io = threadIo();
-        self.mu.lock(io) catch unreachable;
-        defer self.mu.unlock(io);
-        self.cancelled = true;
-    }
-
-    pub fn isCancelled(self: *CancelToken) bool {
-        const io = threadIo();
-        self.mu.lock(io) catch unreachable;
-        defer self.mu.unlock(io);
-        return self.cancelled;
-    }
-
-    pub fn check(self: *const CancelToken) TransferError!void {
-        if (self.isCancelled()) return error.Cancelled;
-    }
-};
+/// Backward-compatible name for the canonical atomic cancellation token.
+pub const CancelToken = types.CancellationToken;
 
 pub const TransferStats = struct {
     bytes_transferred: u64 = 0,
@@ -614,7 +593,7 @@ test "UploadConfig defaults" {
 }
 
 test "CancelToken basic operations" {
-    var token = CancelToken{};
+    var token = CancelToken.init();
     try testing.expect(!token.isCancelled());
     token.cancel();
     try testing.expect(token.isCancelled());
@@ -622,7 +601,7 @@ test "CancelToken basic operations" {
 }
 
 test "CancelToken check passes when not cancelled" {
-    var token = CancelToken{};
+    var token = CancelToken.init();
     try token.check();
 }
 

@@ -4,6 +4,8 @@ const net = @import("compat.zig");
 const address_mod = @import("address.zig");
 const common = @import("../data/common.zig");
 const socket_mod = @import("socket.zig");
+const IoContext = @import("../io/context.zig").IoContext;
+const CancellationToken = @import("../core/types.zig").CancellationToken;
 
 const posix = std.posix;
 
@@ -786,10 +788,26 @@ pub const DNSResolver = struct {
     };
 
     pub fn resolve(self: *Self, hostname: []const u8, options: ResolveOptions) !DNSResolution {
+        const context = IoContext.init(.{});
+        return self.resolveWithContext(hostname, options, &context);
+    }
+
+    /// Resolves a hostname while observing cancellation and monotonic
+    /// deadlines. The in-flight deduplication wait is interruptible. Individual
+    /// UDP/TCP DNS socket operations remain bounded by their existing timeouts
+    /// until context-aware socket I/O is implemented.
+    pub fn resolveWithContext(
+        self: *Self,
+        hostname: []const u8,
+        options: ResolveOptions,
+        context: *const IoContext,
+    ) !DNSResolution {
+        try context.check();
         const family = options.address_family orelse self.cache.config.address_family;
         const order = options.address_order orelse self.cache.config.address_order;
 
         if (address_mod.isIp4Address(hostname)) {
+            try context.check();
             self.cache.stats.literal_hits += 1;
             const parsed = try net.Address.parseIp(hostname, options.port);
             const addrs = try self.allocator.alloc(net.Address, 1);
@@ -801,6 +819,7 @@ pub const DNSResolver = struct {
             };
         }
         if (address_mod.isIp6Address(hostname)) {
+            try context.check();
             self.cache.stats.literal_hits += 1;
             const parsed = try net.Address.parseIp(hostname, options.port);
             const addrs = try self.allocator.alloc(net.Address, 1);
@@ -817,6 +836,7 @@ pub const DNSResolver = struct {
             const cached = self.cache.cacheLookup(hostname);
             self.cache.lock.unlock(common.threadIo());
 
+            try context.check();
             if (cached) |entry| {
                 self.cache.stats.hits += 1;
                 const filtered = self.filterAddresses(entry.addresses, family, order);
@@ -837,13 +857,14 @@ pub const DNSResolver = struct {
                 inf.*.incRef();
                 self.cache.stats.dedup_hits += 1;
                 self.cache.lock.unlock(common.threadIo());
+                defer inf.*.decRef();
 
                 while (!inf.*.ready.load(.acquire)) {
-                    std.Thread.yield() catch {};
+                    try context.waitForMs(1);
                 }
+                try context.check();
                 const failed = inf.*.failed;
                 const addrs = inf.*.addresses;
-                inf.*.decRef();
 
                 if (failed) {
                     return error.DNSLookupFailed;
@@ -859,21 +880,33 @@ pub const DNSResolver = struct {
                 };
             }
 
-            const inf = try self.cache.allocator.create(InFlight);
+            const inf = self.cache.allocator.create(InFlight) catch |err| {
+                self.cache.lock.unlock(common.threadIo());
+                return err;
+            };
             inf.* = .{ .allocator = self.cache.allocator };
-            inf.incRef();
-            inf.incRef();
-            self.cache.in_flight.put(self.cache.allocator, try self.cache.allocator.dupe(u8, hostname), inf) catch {
+            inf.incRef(); // Resolver owner.
+            inf.incRef(); // In-flight map.
+            const in_flight_key = self.cache.allocator.dupe(u8, hostname) catch {
+                inf.decRef();
+                inf.decRef();
+                self.cache.lock.unlock(common.threadIo());
+                return error.OutOfMemory;
+            };
+            self.cache.in_flight.put(self.cache.allocator, in_flight_key, inf) catch {
+                self.cache.allocator.free(in_flight_key);
+                inf.decRef();
                 inf.decRef();
                 self.cache.lock.unlock(common.threadIo());
                 return error.OutOfMemory;
             };
             self.cache.lock.unlock(common.threadIo());
+            defer inf.decRef();
 
             const result = self.performResolution(hostname, family);
+            var publish_error: ?anyerror = null;
 
             self.cache.lock.lock(common.threadIo()) catch {};
-            inf.ready.store(true, .release);
             switch (result) {
                 .ok => |addrs| {
                     inf.addresses = addrs;
@@ -887,41 +920,39 @@ pub const DNSResolver = struct {
                         self.cache.allocator.free(kv.key);
                         self.cache.allocator.free(kv.value.addresses);
                     }
-                    const neg_key = self.cache.allocator.dupe(u8, hostname) catch return error.OutOfMemory;
-                    self.cache.negative.put(self.cache.allocator, neg_key, .{
-                        .created_at_ms = common.nowMillis(),
-                        .ttl_ms = self.cache.config.negative_ttl_ms,
-                    }) catch {
-                        self.cache.allocator.free(neg_key);
-                    };
+                    if (self.cache.allocator.dupe(u8, hostname)) |neg_key| {
+                        self.cache.negative.put(self.cache.allocator, neg_key, .{
+                            .created_at_ms = common.nowMillis(),
+                            .ttl_ms = self.cache.config.negative_ttl_ms,
+                        }) catch |err| {
+                            self.cache.allocator.free(neg_key);
+                            publish_error = err;
+                        };
+                    } else |err| {
+                        publish_error = err;
+                    }
                 },
             }
+            inf.ready.store(true, .release);
             if (self.cache.in_flight.fetchRemove(hostname)) |kv| {
                 self.cache.allocator.free(kv.key);
                 kv.value.decRef();
             }
             self.cache.lock.unlock(common.threadIo());
 
+            try context.check();
+            if (publish_error) |err| return err;
             const inf_failed = inf.failed;
-            const inf_addrs_len = inf.addresses.len;
-            const inf_addrs: []net.Address = if (!inf_failed and inf_addrs_len > 0)
-                try self.allocator.dupe(net.Address, inf.addresses)
-            else
-                &.{};
-            inf.decRef();
-
             if (!inf_failed) {
-                self.cache.cacheStore(hostname, inf_addrs, self.cache.config.positive_ttl_ms);
+                self.cache.cacheStore(hostname, inf.addresses, self.cache.config.positive_ttl_ms);
             }
 
             if (inf_failed) {
-                self.allocator.free(inf_addrs);
                 return error.DNSLookupFailed;
             }
 
-            const filtered = self.filterAddresses(inf_addrs, family, order);
+            const filtered = self.filterAddresses(inf.addresses, family, order);
             const addrs = try self.allocator.dupe(net.Address, filtered);
-            self.allocator.free(inf_addrs);
             for (addrs) |*a| a.setPort(options.port);
             return .{
                 .hostname = hostname,
@@ -930,10 +961,13 @@ pub const DNSResolver = struct {
             };
         }
 
+        try context.check();
         const result = self.performResolution(hostname, family);
 
         switch (result) {
             .ok => |addrs| {
+                defer self.allocator.free(addrs);
+                try context.check();
                 if (self.cache.config.cache_enabled) {
                     self.cache.cacheStore(hostname, addrs, self.cache.config.positive_ttl_ms);
                 }
@@ -948,16 +982,30 @@ pub const DNSResolver = struct {
             },
             .err => {
                 self.cache.cacheNegative(hostname);
+                try context.check();
                 return error.DNSLookupFailed;
             },
         }
     }
 
     pub fn resolveAll(self: *Self, hostname: []const u8, options: ResolveOptions) !DNSResolution {
+        const context = IoContext.init(.{});
+        return self.resolveAllWithContext(hostname, options, &context);
+    }
+
+    /// Context-aware counterpart to `resolve`.
+    pub fn resolveAllWithContext(
+        self: *Self,
+        hostname: []const u8,
+        options: ResolveOptions,
+        context: *const IoContext,
+    ) !DNSResolution {
+        try context.check();
         const family = options.address_family orelse self.cache.config.address_family;
         const order = options.address_order orelse self.cache.config.address_order;
 
         if (address_mod.isIp4Address(hostname)) {
+            try context.check();
             self.cache.stats.literal_hits += 1;
             const parsed = try net.Address.parseIp(hostname, options.port);
             const addrs = try self.allocator.alloc(net.Address, 1);
@@ -969,6 +1017,7 @@ pub const DNSResolver = struct {
             };
         }
         if (address_mod.isIp6Address(hostname)) {
+            try context.check();
             self.cache.stats.literal_hits += 1;
             const parsed = try net.Address.parseIp(hostname, options.port);
             const addrs = try self.allocator.alloc(net.Address, 1);
@@ -985,6 +1034,7 @@ pub const DNSResolver = struct {
             const cached = self.cache.cacheLookup(hostname);
             self.cache.lock.unlock(common.threadIo());
 
+            try context.check();
             if (cached) |entry| {
                 self.cache.stats.hits += 1;
                 const filtered = self.filterAddresses(entry.addresses, family, order);
@@ -999,10 +1049,13 @@ pub const DNSResolver = struct {
             self.cache.stats.misses += 1;
         }
 
+        try context.check();
         const result = self.performResolution(hostname, family);
 
         switch (result) {
             .ok => |addrs| {
+                defer self.allocator.free(addrs);
+                try context.check();
                 if (self.cache.config.cache_enabled) {
                     self.cache.cacheStore(hostname, addrs, self.cache.config.positive_ttl_ms);
                 }
@@ -1017,6 +1070,7 @@ pub const DNSResolver = struct {
             },
             .err => {
                 self.cache.cacheNegative(hostname);
+                try context.check();
                 return error.DNSLookupFailed;
             },
         }
@@ -1149,9 +1203,20 @@ fn dnsTestWorker(resolver: *DNSResolver, thread_id: u32) void {
         ) catch continue;
         defer std.heap.page_allocator.free(name);
 
-        _ = resolver.resolve(name, .{}) catch {};
+        var addresses = [_]net.Address{
+            net.Address.initIp4(.{ 127, 0, 0, @intCast(i + 1) }, 80),
+        };
+        resolver.cache.cacheStore(name, &addresses, resolver.cache.config.positive_ttl_ms);
+        _ = resolver.cache.count();
         resolver.invalidate(name);
     }
+}
+
+fn cancelWhenDedupWaitStarts(in_flight: *InFlight, token: *CancellationToken) void {
+    while (in_flight.ref_count.load(.acquire) < 2) {
+        std.Thread.yield() catch {};
+    }
+    token.cancel();
 }
 
 test "DNSConfig defaults" {
@@ -1343,6 +1408,47 @@ test "DNSResolver resolve IP literal" {
     defer res6.deinit();
     try std.testing.expect(res6.ok());
     try std.testing.expectEqual(@as(usize, 1), res6.addresses.len);
+}
+
+test "DNSResolver context checks cancellation before cache or lookup" {
+    var resolver = DNSResolver.init(std.testing.allocator, .{});
+    defer resolver.deinit();
+
+    var token = CancellationToken.init();
+    token.cancel();
+    const context = IoContext.init(.{ .external_cancel = &token });
+
+    try std.testing.expectError(
+        error.Cancelled,
+        resolver.resolveWithContext("127.0.0.1", .{ .port = 80 }, &context),
+    );
+    try std.testing.expectEqual(@as(u64, 0), resolver.cache.stats.literal_hits);
+}
+
+test "DNSResolver context interrupts in-flight dedup wait" {
+    const allocator = std.testing.allocator;
+    var resolver = DNSResolver.init(allocator, .{
+        .cache_enabled = false,
+        .dedup_enabled = true,
+    });
+    defer resolver.deinit();
+
+    const in_flight = try allocator.create(InFlight);
+    in_flight.* = .{ .allocator = allocator };
+    in_flight.incRef();
+    const key = try allocator.dupe(u8, "dedup.test");
+    try resolver.cache.in_flight.put(allocator, key, in_flight);
+
+    var token = CancellationToken.init();
+    const context = IoContext.init(.{ .external_cancel = &token });
+    const thread = try std.Thread.spawn(.{}, cancelWhenDedupWaitStarts, .{ in_flight, &token });
+
+    const result = resolver.resolveWithContext("dedup.test", .{}, &context);
+    thread.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(token.isCancelled());
+    try std.testing.expectEqual(@as(u32, 1), in_flight.ref_count.load(.acquire));
 }
 
 test "DNSResolver resolveAll IP literal" {

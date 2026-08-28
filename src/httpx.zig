@@ -24,6 +24,7 @@ pub const websocket = @import("protocol/websocket.zig");
 pub const ftp = @import("protocol/ftp.zig");
 pub const transfer = @import("io/transfer.zig");
 pub const socket = @import("net/socket.zig");
+const io_context = @import("io/context.zig");
 
 pub const address = @import("net/address.zig");
 
@@ -368,6 +369,7 @@ pub const ResumeInfo = transfer.ResumeInfo;
 pub const DownloadConfig = transfer.DownloadConfig;
 pub const UploadConfig = transfer.UploadConfig;
 pub const TransferError = transfer.TransferError;
+/// Backward-compatible alias of the canonical atomic `CancellationToken`.
 pub const CancelToken = transfer.CancelToken;
 pub const computeChecksum = transfer.computeChecksum;
 
@@ -958,6 +960,10 @@ test "common" {
 
 test "socket" {
     _ = socket;
+}
+
+test "I/O context" {
+    _ = io_context;
 }
 
 test "address" {

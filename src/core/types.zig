@@ -357,6 +357,11 @@ pub const CancellationToken = struct {
     pub fn throwIfCancelled(self: *const @This()) error{Cancelled}!void {
         if (self.isCancelled()) return error.Cancelled;
     }
+
+    /// Backward-compatible shorthand for `throwIfCancelled`.
+    pub fn check(self: *const @This()) error{Cancelled}!void {
+        return self.throwIfCancelled();
+    }
 };
 
 /// Retry policy configuration with exponential backoff support.
