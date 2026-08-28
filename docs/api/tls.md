@@ -237,7 +237,8 @@ pub const Connection = struct {
 | `reader()` | Get an `AnyReader` for reading decrypted data |
 | `writer()` | Get an `AnyWriter` for writing encrypted data |
 | `read(buffer)` | Read decrypted data from the connection |
-| `write(data)` | Write encrypted data to the connection |
+| `write(data)` | Seal and send at most one 16,384-byte plaintext record; returns plaintext bytes consumed |
+| `writeAll(data)` | Send the complete plaintext buffer as independently framed records |
 
 ## Client Handshake
 

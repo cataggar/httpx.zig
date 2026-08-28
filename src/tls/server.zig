@@ -847,8 +847,12 @@ fn acceptServerTLS13Comptime(
 
     conn.app_write_key = skey;
     conn.app_write_iv = server_app_keys.iv;
+    conn.app_write_secret = .{0} ** 48;
+    @memcpy(conn.app_write_secret.?[0..server_app_traffic_secret.len], server_app_traffic_secret[0..]);
     conn.app_read_key = ckey;
     conn.app_read_iv = client_app_keys.iv;
+    conn.app_read_secret = .{0} ** 48;
+    @memcpy(conn.app_read_secret.?[0..client_app_traffic_secret.len], client_app_traffic_secret[0..]);
     conn.tls_version = .tls_1_3;
     conn.cipher_suite = negotiated_cs;
     conn.sni_hostname = parsed.sni_hostname;
