@@ -20,6 +20,7 @@ const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
 const Socket = @import("../net/socket.zig").Socket;
+const TcpListener = @import("../net/socket.zig").TcpListener;
 const UdpSocket = @import("../net/socket.zig").UdpSocket;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
@@ -60,13 +61,11 @@ const RequestTimeouts = struct {
 pub const ClientConfig = struct {
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
-    retry_policy: types.RetryPolicy = .{},
-    redirect_policy: types.RedirectPolicy = .{},
+    policy: types.ClientPolicy = .{},
     default_headers: ?[]const [2][]const u8 = null,
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = 100 * 1024 * 1024,
     max_request_size: usize = 10 * 1024 * 1024,
-    follow_redirects: bool = true,
     verify_ssl: bool = true,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
@@ -88,13 +87,8 @@ pub const ClientConfig = struct {
     /// Optional DNS resolver for hostname resolution. When set, the client uses
     /// this resolver (with its cache and deduplication) instead of the system resolver.
     dns_resolver: ?*dns_mod.DNSResolver = null,
-    /// Whether to automatically decompress response bodies based on Content-Encoding.
-    auto_decompress: bool = true,
     /// Compression options for request body compression. Null disables compression.
     request_compression: ?compression_util.CompressOptions = null,
-    /// Encodings to advertise in Accept-Encoding, in priority order.
-    /// If null, sends "gzip, deflate, br, zstd, identity".
-    accept_encoding: ?[]const u8 = null,
 
     /// Returns default client configuration.
     pub fn defaults() ClientConfig {
@@ -127,17 +121,24 @@ pub const ClientConfig = struct {
         return out;
     }
 
-    /// Returns a copy with a new retry policy.
-    pub fn withRetryPolicy(self: ClientConfig, retry_policy: types.RetryPolicy) ClientConfig {
+    /// Returns a copy with all automatic client behavior configured.
+    pub fn withPolicy(self: ClientConfig, policy: types.ClientPolicy) ClientConfig {
         var out = self;
-        out.retry_policy = retry_policy;
+        out.policy = policy;
         return out;
     }
 
-    /// Returns a copy with a new redirect policy.
+    /// Compatibility helper that enables retries with the supplied policy.
+    pub fn withRetryPolicy(self: ClientConfig, retry_policy: types.RetryPolicy) ClientConfig {
+        var out = self;
+        out.policy.retry = .{ .policy = retry_policy };
+        return out;
+    }
+
+    /// Compatibility helper that enables redirects with the supplied policy.
     pub fn withRedirectPolicy(self: ClientConfig, redirect_policy: types.RedirectPolicy) ClientConfig {
         var out = self;
-        out.redirect_policy = redirect_policy;
+        out.policy.redirect = .{ .policy = redirect_policy };
         return out;
     }
 
@@ -155,10 +156,19 @@ pub const ClientConfig = struct {
         return out;
     }
 
-    /// Returns a copy with client-level redirect-follow behavior.
+    /// Compatibility helper for the former client-level redirect flag.
+    /// Enabling redirects preserves the configured redirect policy when present,
+    /// or installs the managed default after a previously disabled policy.
     pub fn withFollowRedirects(self: ClientConfig, follow_redirects: bool) ClientConfig {
         var out = self;
-        out.follow_redirects = follow_redirects;
+        if (follow_redirects) {
+            out.policy.redirect = switch (out.policy.redirect) {
+                .disabled => .{ .policy = .{} },
+                .policy => |policy| .{ .policy = policy },
+            };
+        } else {
+            out.policy.redirect = .disabled;
+        }
         return out;
     }
 
@@ -271,7 +281,7 @@ pub const RequestOptions = struct {
     /// Optional borrowed cancellation token. It must outlive the request.
     /// The client only observes this token and never signals it.
     cancel_token: ?*const types.CancellationToken = null,
-    follow_redirects: ?bool = null,
+    policy: types.RequestPolicyOverrides = .{},
     version: ?types.Version = null,
     multipart_fields: ?[]const MultipartField = null,
     multipart_files: ?[]const MultipartFile = null,
@@ -476,10 +486,19 @@ pub const RequestOptions = struct {
         return out;
     }
 
-    /// Returns a copy with an explicit redirect-follow policy.
+    /// Returns a copy with per-feature automatic-policy overrides.
+    pub fn withPolicy(self: RequestOptions, policy: types.RequestPolicyOverrides) RequestOptions {
+        var out = self;
+        out.policy = policy;
+        return out;
+    }
+
+    /// Compatibility helper for the former per-request redirect flag.
+    /// Enabling uses the managed redirect defaults; use `withPolicy` to supply
+    /// a custom `RedirectPolicy`.
     pub fn withFollowRedirects(self: RequestOptions, follow_redirects: bool) RequestOptions {
         var out = self;
-        out.follow_redirects = follow_redirects;
+        out.policy.redirect = if (follow_redirects) .{ .policy = .{} } else .disabled;
         return out;
     }
 
@@ -643,7 +662,7 @@ pub const Client = struct {
 
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.requestInternal(method, url, reqOpts, 0);
+        return self.requestInternal(method, url, reqOpts);
     }
 
     /// Alias for request() with a shorter name for application code.
@@ -656,8 +675,26 @@ pub const Client = struct {
         return self.get(url, reqOpts);
     }
 
-    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
-        if (reqOpts.cancel_token) |token| try token.throwIfCancelled();
+    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
+        const effective_policy = self.config.policy.resolve(reqOpts.policy);
+        const timeouts = self.resolveRequestTimeouts(reqOpts);
+        const context = IoContext.init(.{
+            .external_cancel = reqOpts.cancel_token,
+            .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
+        });
+        return self.requestWithPolicy(method, url, reqOpts, &effective_policy, &context, 0);
+    }
+
+    fn requestWithPolicy(
+        self: *Self,
+        method: types.Method,
+        url: []const u8,
+        reqOpts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
+        context: *const IoContext,
+        depth: u32,
+    ) !Response {
+        try checkRequestContext(context);
 
         const full_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
@@ -673,14 +710,16 @@ pub const Client = struct {
         }
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
-        if (!req.headers.contains("Accept-Encoding")) {
-            const ae = self.config.accept_encoding orelse "gzip, deflate, br, zstd, identity";
-            try req.headers.set("Accept-Encoding", ae);
-        }
 
         if (self.config.default_headers) |hdrs| {
             for (hdrs) |h| {
                 try req.headers.set(h[0], h[1]);
+            }
+        }
+
+        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
+            if (effective_policy.accept_encoding.value()) |value| {
+                try req.headers.set(HeaderName.ACCEPT_ENCODING, value);
             }
         }
 
@@ -778,7 +817,9 @@ pub const Client = struct {
             try req.setBearerAuth(token);
         }
 
-        try self.attachCookies(&req);
+        if (effective_policy.cookies.sends()) {
+            try self.attachCookies(&req);
+        }
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -786,8 +827,10 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts);
-        try self.storeCookies(&response, req.uri.host orelse "");
+        var response = try self.executeRequest(&req, reqOpts, effective_policy, context);
+        if (effective_policy.cookies.stores()) {
+            try self.storeCookies(&response, req.uri.host orelse "");
+        }
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -795,9 +838,9 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.follow_redirects orelse self.config.follow_redirects;
-        if (should_follow and response.isRedirect()) {
-            if (depth >= self.config.redirect_policy.max_redirects) {
+        if (response.isRedirect()) {
+            const redirect_policy = effective_policy.redirectPolicy() orelse return response;
+            if (depth >= redirect_policy.max_redirects) {
                 if (self.config.metrics) |m| m.redirectFailed();
                 response.deinit();
                 return error.TooManyRedirects;
@@ -818,7 +861,7 @@ pub const Client = struct {
                 }
             }
 
-            const next_method = self.config.redirect_policy.getRedirectMethod(response.status.code, req.method);
+            const next_method = redirect_policy.getRedirectMethod(response.status.code, req.method);
 
             // Security: strip credentials on cross-origin redirects (RFC 6454).
             var next_opts = reqOpts;
@@ -843,7 +886,7 @@ pub const Client = struct {
             response.deinit();
             defer safe_headers.deinit(self.allocator);
             if (self.config.metrics) |m| m.redirect();
-            return self.requestInternal(next_method, next_url, next_opts, depth + 1);
+            return self.requestWithPolicy(next_method, next_url, next_opts, effective_policy, context, depth + 1);
         }
 
         return response;
@@ -865,50 +908,56 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, reqOpts: RequestOptions) !Response {
+    fn executeRequest(
+        self: *Self,
+        req: *Request,
+        reqOpts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
+        context: *const IoContext,
+    ) !Response {
         if (self.config.metrics) |m| m.recordRequest();
         const start_time_ms: u64 = @intCast(@max(common.nowMillis(), 0));
-        const timeouts = self.resolveRequestTimeouts(reqOpts);
-        const context = IoContext.init(.{
-            .external_cancel = reqOpts.cancel_token,
-            .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
-        });
-        const policy = self.config.retry_policy;
-        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
+        const retry_policy = effective_policy.retryPolicy();
+        const can_retry_method = if (retry_policy) |policy|
+            (!policy.retry_only_idempotent) or req.method.isIdempotent()
+        else
+            false;
 
         var attempt: u32 = 0;
         while (true) {
-            checkRequestContext(&context) catch |err| {
+            checkRequestContext(context) catch |err| {
                 if (self.config.metrics) |m| m.recordError();
                 return err;
             };
 
-            var res = self.executeRequestOnce(req, reqOpts, &context) catch |raw_err| {
-                const err = normalizeRequestContextError(&context, raw_err);
-                if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries and isRetryableRequestError(err)) {
-                    checkRequestContext(&context) catch |context_err| {
-                        if (self.config.metrics) |m| m.recordError();
-                        return context_err;
-                    };
-                    attempt += 1;
-                    if (self.config.metrics) |m| {
-                        m.recordError();
-                        m.retryAttempt();
-                    }
-                    // Call retry interceptors.
-                    for (self.interceptors.items) |interceptor| {
-                        if (interceptor.retry_fn) |fn_ptr| {
-                            fn_ptr(attempt, interceptor.context);
-                        }
-                    }
-                    const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) {
-                        waitForRetry(&context, delay_ms) catch |context_err| {
+            var res = self.executeRequestOnce(req, reqOpts, effective_policy, context) catch |raw_err| {
+                const err = normalizeRequestContextError(context, raw_err);
+                if (retry_policy) |policy| {
+                    if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries and isRetryableRequestError(err)) {
+                        checkRequestContext(context) catch |context_err| {
                             if (self.config.metrics) |m| m.recordError();
                             return context_err;
                         };
+                        attempt += 1;
+                        if (self.config.metrics) |m| {
+                            m.recordError();
+                            m.retryAttempt();
+                        }
+                        // Call retry interceptors.
+                        for (self.interceptors.items) |interceptor| {
+                            if (interceptor.retry_fn) |fn_ptr| {
+                                fn_ptr(attempt, interceptor.context);
+                            }
+                        }
+                        const delay_ms = policy.calculateDelay(attempt);
+                        if (delay_ms > 0) {
+                            waitForRetry(context, delay_ms) catch |context_err| {
+                                if (self.config.metrics) |m| m.recordError();
+                                return context_err;
+                            };
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 // Call error interceptors.
                 for (self.interceptors.items) |interceptor| {
@@ -920,33 +969,35 @@ pub const Client = struct {
                 return err;
             };
 
-            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
-                checkRequestContext(&context) catch |err| {
-                    res.deinit();
-                    if (self.config.metrics) |m| m.recordError();
-                    return err;
-                };
-                // Parse Retry-After header if present.
-                const retry_after_ms = if (res.headers.get("Retry-After")) |ra|
-                    parseRetryAfter(ra) orelse policy.calculateDelay(attempt)
-                else
-                    policy.calculateDelay(attempt);
-                res.deinit();
-                attempt += 1;
-                if (self.config.metrics) |m| m.retryAttempt();
-                // Call retry interceptors.
-                for (self.interceptors.items) |interceptor| {
-                    if (interceptor.retry_fn) |fn_ptr| {
-                        fn_ptr(attempt, interceptor.context);
-                    }
-                }
-                if (retry_after_ms > 0) {
-                    waitForRetry(&context, retry_after_ms) catch |err| {
+            if (retry_policy) |policy| {
+                if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
+                    checkRequestContext(context) catch |err| {
+                        res.deinit();
                         if (self.config.metrics) |m| m.recordError();
                         return err;
                     };
+                    // Parse Retry-After header if present.
+                    const retry_after_ms = if (res.headers.get("Retry-After")) |ra|
+                        parseRetryAfter(ra) orelse policy.calculateDelay(attempt)
+                    else
+                        policy.calculateDelay(attempt);
+                    res.deinit();
+                    attempt += 1;
+                    if (self.config.metrics) |m| m.retryAttempt();
+                    // Call retry interceptors.
+                    for (self.interceptors.items) |interceptor| {
+                        if (interceptor.retry_fn) |fn_ptr| {
+                            fn_ptr(attempt, interceptor.context);
+                        }
+                    }
+                    if (retry_after_ms > 0) {
+                        waitForRetry(context, retry_after_ms) catch |err| {
+                            if (self.config.metrics) |m| m.recordError();
+                            return err;
+                        };
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // Record metrics.
@@ -1048,7 +1099,7 @@ pub const Client = struct {
 
         try socket.sendAll(connect_req);
 
-        var response = try self.readResponseFromTcp(socket, true);
+        var response = try self.readResponseFromTcp(socket, true, .disabled);
         defer response.deinit();
 
         if (response.status.code < 200 or response.status.code >= 300) {
@@ -1091,6 +1142,7 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         reqOpts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
     ) !Response {
         try context.check();
@@ -1117,7 +1169,7 @@ pub const Client = struct {
 
             try socket.sendAll(request_data);
             if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-            return self.readResponseFromTcp(&socket, req.method.hasResponseBody());
+            return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
         }
 
         const host = req.uri.host orelse return error.InvalidUri;
@@ -1137,15 +1189,15 @@ pub const Client = struct {
             if (effective_proxy != null) {
                 // Fall back to HTTP/2 if also enabled; otherwise return error.
                 if (wants_http2) {
-                    return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, context);
+                    return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, effective_policy, context);
                 }
                 return error.ProxyNotSupported;
             }
-            return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, context);
+            return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, effective_policy, context);
         }
 
         if (wants_http2) {
-            return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, context);
+            return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, effective_policy, context);
         }
 
         var request_data: []u8 = undefined;
@@ -1192,7 +1244,7 @@ pub const Client = struct {
                 try socket.setRecvTimeout(timeouts.connect_ms);
             }
 
-            return self.executeTLSHttp(&socket, host, port, request_data, verify_ssl);
+            return self.executeTLSHttp(&socket, host, port, request_data, verify_ssl, effective_policy.decompression);
         }
 
         if (keep_alive) {
@@ -1210,7 +1262,7 @@ pub const Client = struct {
 
             try conn.socket.sendAll(request_data);
             if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-            var res = try self.readResponseFromTcp(&conn.socket, req.method.hasResponseBody());
+            var res = try self.readResponseFromTcp(&conn.socket, req.method.hasResponseBody(), effective_policy.decompression);
             if (!res.headers.isKeepAlive(res.version)) {
                 self.pool.closeConnection(conn);
             }
@@ -1241,7 +1293,7 @@ pub const Client = struct {
 
         try socket.sendAll(request_data);
         if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-        return self.readResponseFromTcp(&socket, req.method.hasResponseBody());
+        return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
     }
 
     fn executeRequestHTTP2(
@@ -1251,6 +1303,7 @@ pub const Client = struct {
         port: u16,
         timeouts: RequestTimeouts,
         reqOpts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
     ) !Response {
         var effective_proxy = reqOpts.proxy orelse self.config.proxy;
@@ -1320,7 +1373,7 @@ pub const Client = struct {
             switch (negotiated) {
                 .http_2 => {
                     var transport = TLSHTTP2Transport{ .session = &session };
-                    return self.executeHTTP2WithTransport(req, &transport);
+                    return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
                 },
                 .http_3 => {
                     // Server selected h3 via ALPN.  For TLS-based connections
@@ -1329,7 +1382,7 @@ pub const Client = struct {
                     // Alt-Svc or fall back to HTTP/2 if available.
                     if (self.config.http2_enabled) {
                         var transport = TLSHTTP2Transport{ .session = &session };
-                        return self.executeHTTP2WithTransport(req, &transport);
+                        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
                     }
                     return error.UnsupportedHttpVersion;
                 },
@@ -1343,7 +1396,7 @@ pub const Client = struct {
                     try session.writeAll(request_data);
                     try session.flush();
 
-                    return self.readResponseFromTLS(&session, req.method.hasResponseBody());
+                    return self.readResponseFromTLS(&session, req.method.hasResponseBody(), effective_policy.decompression);
                 },
             }
         }
@@ -1356,7 +1409,7 @@ pub const Client = struct {
             try socket.setRecvTimeout(timeouts.read_ms);
         }
 
-        return self.executeHTTP2WithTransport(req, &transport);
+        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
     }
 
     fn executeRequestHTTP3(
@@ -1366,6 +1419,7 @@ pub const Client = struct {
         port: u16,
         timeouts: RequestTimeouts,
         reqOpts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
     ) !Response {
         _ = reqOpts;
@@ -1384,10 +1438,15 @@ pub const Client = struct {
         try socket.connect(addr);
 
         var transport = UDPHTTP3Transport{ .socket = &socket };
-        return self.executeHTTP3WithTransport(req, &transport);
+        return self.executeHTTP3WithTransport(req, &transport, effective_policy.decompression);
     }
 
-    fn executeHTTP3WithTransport(self: *Self, req: *Request, transport: anytype) !Response {
+    fn executeHTTP3WithTransport(
+        self: *Self,
+        req: *Request,
+        transport: anytype,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
         var qpack_encoder = qpack.QPACKContext.initWithCapacity(
             self.allocator,
             common.clampU64ToUsize(self.config.http3_settings.qpack_max_table_capacity),
@@ -1541,7 +1600,7 @@ pub const Client = struct {
 
         if (response_body.items.len > 0) {
             // Decompress body based on Content-Encoding header (HTTP/3).
-            if (self.config.auto_decompress) {
+            if (decompression == .enabled) {
                 if (response.headers.get(HeaderName.CONTENT_ENCODING)) |encoding_str| {
                     if (compression_util.ContentEncoding.fromString(encoding_str)) |enc| {
                         if (enc != .identity) {
@@ -1817,7 +1876,12 @@ pub const Client = struct {
         }
     }
 
-    fn executeHTTP2WithTransport(self: *Self, req: *Request, transport: anytype) !Response {
+    fn executeHTTP2WithTransport(
+        self: *Self,
+        req: *Request,
+        transport: anytype,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
         var stream_manager = h2stream.StreamManager.init(self.allocator, true);
         defer stream_manager.deinit();
 
@@ -2197,8 +2261,8 @@ pub const Client = struct {
 
         if (body.items.len > 0) {
             // Decompress body based on Content-Encoding header (HTTP/2).
-            if (self.config.auto_decompress) {
-                if (response_headers.get(HeaderName.CONTENT_ENCODING)) |encoding_str| {
+            if (decompression == .enabled) {
+                if (response.headers.get(HeaderName.CONTENT_ENCODING)) |encoding_str| {
                     if (compression_util.ContentEncoding.fromString(encoding_str)) |enc| {
                         if (enc != .identity) {
                             if (compression_util.decompress(self.allocator, enc, body.items)) |decompressed| {
@@ -2264,7 +2328,15 @@ pub const Client = struct {
         return socket;
     }
 
-    fn executeTLSHttp(self: *Self, socket: *Socket, host: []const u8, port: u16, request_data: []const u8, verify_ssl: bool) !Response {
+    fn executeTLSHttp(
+        self: *Self,
+        socket: *Socket,
+        host: []const u8,
+        port: u16,
+        request_data: []const u8,
+        verify_ssl: bool,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
         const tls_cfg = if (verify_ssl) TLSConfig.init(self.allocator) else TLSConfig.insecure(self.allocator);
 
         // Set up reconnect context for TLS version fallback.
@@ -2318,10 +2390,16 @@ pub const Client = struct {
             self.allocator.destroy(s);
         }
 
-        return self.responseFromParser(&parser);
+        return responseFromParser(&parser, decompression);
     }
 
-    fn readResponseFromReadFn(self: *Self, reader: anytype, readFn: *const fn (@TypeOf(reader), []u8) anyerror!usize, expect_body: bool) !Response {
+    fn readResponseFromReadFn(
+        self: *Self,
+        reader: anytype,
+        readFn: *const fn (@TypeOf(reader), []u8) anyerror!usize,
+        expect_body: bool,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.expect_body = expect_body;
@@ -2339,18 +2417,28 @@ pub const Client = struct {
         parser.finishEof();
 
         if (!parser.isComplete()) return error.InvalidResponse;
-        return self.responseFromParser(&parser);
+        return responseFromParser(&parser, decompression);
     }
 
-    fn readResponseFromTcp(self: *Self, socket: *Socket, expect_body: bool) !Response {
-        return self.readResponseFromReadFn(socket, Socket.recv, expect_body);
+    fn readResponseFromTcp(
+        self: *Self,
+        socket: *Socket,
+        expect_body: bool,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
+        return self.readResponseFromReadFn(socket, Socket.recv, expect_body, decompression);
     }
 
-    fn readResponseFromTLS(self: *Self, session: *TLSSession, expect_body: bool) !Response {
-        return self.readResponseFromReadFn(session, TLSSession.read, expect_body);
+    fn readResponseFromTLS(
+        self: *Self,
+        session: *TLSSession,
+        expect_body: bool,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
+        return self.readResponseFromReadFn(session, TLSSession.read, expect_body, decompression);
     }
 
-    fn readResponseFromIo(self: *Self, r: *std.Io.Reader) !Response {
+    fn readResponseFromIo(self: *Self, r: *std.Io.Reader, decompression: types.DecompressionPolicy) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
 
@@ -2373,10 +2461,10 @@ pub const Client = struct {
         parser.finishEof();
 
         if (!parser.isComplete()) return error.InvalidResponse;
-        return self.responseFromParser(&parser);
+        return responseFromParser(&parser, decompression);
     }
 
-    fn responseFromParser(self: *Self, parser: *Parser) !Response {
+    fn responseFromParser(parser: *Parser, decompression: types.DecompressionPolicy) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -2388,7 +2476,7 @@ pub const Client = struct {
 
         if (parser.getBody().len > 0) {
             const raw_body = parser.getBody();
-            if (self.config.auto_decompress) {
+            if (decompression == .enabled) {
                 if (res.headers.get(HeaderName.CONTENT_ENCODING)) |encoding_str| {
                     if (compression_util.ContentEncoding.fromString(encoding_str)) |enc| {
                         if (enc != .identity) {
@@ -2457,6 +2545,8 @@ pub const Client = struct {
     }
 
     fn attachCookies(self: *Self, req: *Request) !void {
+        // A caller-provided Cookie header is authoritative.
+        if (req.headers.contains(HeaderName.COOKIE)) return;
         if (self.cookies.count() == 0) return;
 
         const req_host = req.uri.host orelse return;
@@ -3155,6 +3245,99 @@ fn applyResponseHeaderBlock(
     }
 }
 
+const PolicyTestServer = struct {
+    listener: *TcpListener,
+    responses: []const []const u8,
+    requests: [8][8192]u8 = undefined,
+    request_lengths: [8]usize = [_]usize{0} ** 8,
+    request_count: usize = 0,
+    failure: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn runFallible(self: *@This()) !void {
+        if (self.responses.len > self.requests.len) return error.TooManyTestResponses;
+
+        for (self.responses, 0..) |response, index| {
+            var accepted = try self.listener.accept();
+            {
+                defer accepted.socket.close();
+
+                var length: usize = 0;
+                while (length < self.requests[index].len) {
+                    const n = try accepted.socket.recv(self.requests[index][length..]);
+                    if (n == 0) return error.UnexpectedEndOfStream;
+                    length += n;
+                    if (mem.indexOf(u8, self.requests[index][0..length], "\r\n\r\n") != null) break;
+                }
+                self.request_lengths[index] = length;
+                self.request_count += 1;
+                try accepted.socket.sendAll(response);
+            }
+        }
+    }
+
+    fn request(self: *const @This(), index: usize) []const u8 {
+        return self.requests[index][0..self.request_lengths[index]];
+    }
+};
+
+const PolicyInterceptorCounts = struct {
+    retries: u32 = 0,
+    redirects: u32 = 0,
+
+    fn onRetry(_: u32, context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.retries += 1;
+    }
+
+    fn onRedirect(_: []const u8, context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.redirects += 1;
+    }
+};
+
+fn makePolicyTestResponse(
+    allocator: Allocator,
+    status: []const u8,
+    headers: []const [2][]const u8,
+    body: []const u8,
+) ![]u8 {
+    var bytes = std.ArrayList(u8).empty;
+    errdefer bytes.deinit(allocator);
+    const writer = list_writer.init(allocator, &bytes);
+
+    try writer.print("HTTP/1.1 {s}\r\n", .{status});
+    for (headers) |header| {
+        try writer.print("{s}: {s}\r\n", .{ header[0], header[1] });
+    }
+    try writer.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+    try writer.writeAll(body);
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn policyTestUrl(allocator: Allocator, listener: *TcpListener, path: []const u8) ![]u8 {
+    const address = try listener.getLocalAddress();
+    return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ address.getPort(), path });
+}
+
+fn requestHeaderValue(request_bytes: []const u8, name: []const u8) ?[]const u8 {
+    var lines = mem.splitSequence(u8, request_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) {
+            return mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
 test "Client initialization" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator);
@@ -3189,7 +3372,7 @@ test "Client initialization defaults" {
 
     try std.testing.expect(client.config.base_url == null);
     try std.testing.expect(client.config.keep_alive);
-    try std.testing.expect(client.config.follow_redirects);
+    try std.testing.expect(client.config.policy.redirect == .policy);
     try std.testing.expect(client.config.verify_ssl);
     try std.testing.expectEqual(@as(u32, 20), client.config.pool_max_connections);
     try std.testing.expectEqual(@as(u32, 5), client.config.pool_max_per_host);
@@ -3219,12 +3402,14 @@ test "ClientConfig builder helpers" {
 
     try std.testing.expectEqualStrings("http://httpbun.com", cfg.base_url.?);
     try std.testing.expectEqual(@as(u64, 5_000), cfg.timeouts.connect_ms);
-    try std.testing.expectEqual(@as(u32, 0), cfg.retry_policy.max_retries);
-    try std.testing.expect(cfg.redirect_policy.preserve_method);
+    switch (cfg.policy.retry) {
+        .policy => |policy| try std.testing.expectEqual(@as(u32, 0), policy.max_retries),
+        .disabled => return error.TestUnexpectedResult,
+    }
     try std.testing.expect(cfg.default_headers != null);
     try std.testing.expectEqual(@as(usize, 1), cfg.default_headers.?.len);
     try std.testing.expectEqualStrings("MyClient/1.0", cfg.user_agent);
-    try std.testing.expect(!cfg.follow_redirects);
+    try std.testing.expect(cfg.policy.redirect == .disabled);
     try std.testing.expect(cfg.http2_enabled);
     try std.testing.expect(!cfg.http3_enabled);
     try std.testing.expectEqual(@as(u32, 42), cfg.http2_settings.max_concurrent_streams);
@@ -3237,6 +3422,16 @@ test "ClientConfig builder helpers" {
     try std.testing.expect(cfg.proxy != null);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.proxy.?.host);
     try std.testing.expectEqual(@as(u16, 8080), cfg.proxy.?.port);
+
+    const strict_redirects = ClientConfig.defaults().withRedirectPolicy(types.RedirectPolicy.strict());
+    switch (strict_redirects.policy.redirect) {
+        .policy => |policy| try std.testing.expect(policy.preserve_method),
+        .disabled => return error.TestUnexpectedResult,
+    }
+
+    const embedding_owned = ClientConfig.defaults().withPolicy(types.ClientPolicy.embeddingOwned());
+    try std.testing.expect(embedding_owned.policy.retry == .disabled);
+    try std.testing.expect(embedding_owned.policy.redirect == .disabled);
 }
 
 test "RequestOptions builder helpers" {
@@ -3275,7 +3470,7 @@ test "RequestOptions builder helpers" {
     try std.testing.expect(opts.basic_auth == null);
     try std.testing.expectEqual(@as(u64, 2_500), opts.timeout_ms.?);
     try std.testing.expect(opts.cancel_token.? == &cancel_token);
-    try std.testing.expect(!opts.follow_redirects.?);
+    try std.testing.expect(opts.policy.redirect.? == .disabled);
     try std.testing.expectEqual(types.Version.HTTP_2, opts.version.?);
 
     const basic = RequestOptions.defaults().withBasicAuth("demo", "pass");
@@ -3286,6 +3481,392 @@ test "RequestOptions builder helpers" {
 
     const h3 = RequestOptions.defaults().withHTTP3();
     try std.testing.expectEqual(types.Version.HTTP_3, h3.version.?);
+
+    const embedding_owned = RequestOptions.defaults().withPolicy(types.RequestPolicyOverrides.embeddingOwned());
+    try std.testing.expect(embedding_owned.policy.retry.? == .disabled);
+    try std.testing.expect(embedding_owned.policy.redirect.? == .disabled);
+}
+
+test "embedding-owned request disables redirect cookies encoding and decompression" {
+    const allocator = std.testing.allocator;
+    const plaintext = "encoded redirect body";
+    const encoded = try compression_util.compress(allocator, .gzip, plaintext);
+    defer allocator.free(encoded);
+
+    const response_headers = [_][2][]const u8{
+        .{ "Location", "/next" },
+        .{ "Set-Cookie", "server_cookie=new; Path=/" },
+        .{ "Content-Encoding", "gzip" },
+    };
+    const response_bytes = try makePolicyTestResponse(allocator, "302 Found", &response_headers, encoded);
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/redirect");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+    try client.setCookie("session", "jar-value");
+
+    var counts = PolicyInterceptorCounts{};
+    try client.addInterceptor(.{
+        .retry_fn = PolicyInterceptorCounts.onRetry,
+        .redirect_fn = PolicyInterceptorCounts.onRedirect,
+        .context = &counts,
+    });
+
+    var response = try client.get(url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+    try std.testing.expectEqual(@as(u16, 302), response.status.code);
+    try std.testing.expectEqualSlices(u8, encoded, response.body.?);
+    try std.testing.expectEqualStrings("gzip", response.headers.get(HeaderName.CONTENT_ENCODING).?);
+    try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.COOKIE) == null);
+    try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
+    try std.testing.expectEqual(@as(usize, 1), client.cookieCount());
+    try std.testing.expectEqual(@as(u32, 0), counts.retries);
+    try std.testing.expectEqual(@as(u32, 0), counts.redirects);
+}
+
+test "embedding-owned request returns first retryable response" {
+    const allocator = std.testing.allocator;
+    const response_bytes = try makePolicyTestResponse(allocator, "503 Service Unavailable", &.{}, "unavailable");
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/retry");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    var counts = PolicyInterceptorCounts{};
+    try client.addInterceptor(.{
+        .retry_fn = PolicyInterceptorCounts.onRetry,
+        .context = &counts,
+    });
+
+    var response = try client.get(url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqual(@as(u32, 0), counts.retries);
+}
+
+test "request retry override enables only retry behavior" {
+    const allocator = std.testing.allocator;
+    const unavailable = try makePolicyTestResponse(allocator, "503 Service Unavailable", &.{}, "retry");
+    defer allocator.free(unavailable);
+    const success = try makePolicyTestResponse(allocator, "200 OK", &.{}, "ok");
+    defer allocator.free(success);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ unavailable, success };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/retry");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    var counts = PolicyInterceptorCounts{};
+    try client.addInterceptor(.{
+        .retry_fn = PolicyInterceptorCounts.onRetry,
+        .context = &counts,
+    });
+
+    var response = try client.get(url, .{
+        .policy = .{
+            .retry = .{ .policy = .{
+                .max_retries = 1,
+                .initial_delay_ms = 0,
+                .max_delay_ms = 0,
+                .jitter = 0,
+            } },
+        },
+    });
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(u32, 1), counts.retries);
+    try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
+}
+
+test "request redirect override enables only redirect behavior" {
+    const allocator = std.testing.allocator;
+    const redirect_headers = [_][2][]const u8{.{ "Location", "/final" }};
+    const redirect = try makePolicyTestResponse(allocator, "302 Found", &redirect_headers, "");
+    defer allocator.free(redirect);
+    const success = try makePolicyTestResponse(allocator, "200 OK", &.{}, "final");
+    defer allocator.free(success);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ redirect, success };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/redirect");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    var counts = PolicyInterceptorCounts{};
+    try client.addInterceptor(.{
+        .redirect_fn = PolicyInterceptorCounts.onRedirect,
+        .context = &counts,
+    });
+
+    var response = try client.get(url, .{
+        .policy = .{ .redirect = .{ .policy = .{ .max_redirects = 1 } } },
+    });
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(u32, 1), counts.redirects);
+    try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
+}
+
+test "cookie policy overrides send and store independently and preserve caller header" {
+    const allocator = std.testing.allocator;
+    const ignored_headers = [_][2][]const u8{.{ "Set-Cookie", "ignored=value; Path=/" }};
+    const ignored = try makePolicyTestResponse(allocator, "200 OK", &ignored_headers, "send");
+    defer allocator.free(ignored);
+    const stored_headers = [_][2][]const u8{.{ "Set-Cookie", "stored=value; Path=/" }};
+    const stored = try makePolicyTestResponse(allocator, "200 OK", &stored_headers, "store");
+    defer allocator.free(stored);
+    const caller = try makePolicyTestResponse(allocator, "200 OK", &.{}, "caller");
+    defer allocator.free(caller);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ ignored, stored, caller };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/cookies");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+    try client.setCookie("session", "jar-value");
+
+    var send_response = try client.get(url, .{
+        .policy = .{ .cookies = .send_only },
+    });
+    send_response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), client.cookieCount());
+
+    var store_response = try client.get(url, .{
+        .policy = .{ .cookies = .store_only },
+    });
+    store_response.deinit();
+    try std.testing.expectEqual(@as(usize, 2), client.cookieCount());
+
+    const caller_headers = [_][2][]const u8{.{ HeaderName.COOKIE, "caller=value" }};
+    var caller_response = try client.get(url, .{
+        .headers = &caller_headers,
+        .policy = .{ .cookies = .send_and_store },
+    });
+    caller_response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 3), server.request_count);
+    try std.testing.expect(mem.indexOf(u8, requestHeaderValue(server.request(0), HeaderName.COOKIE).?, "session=jar-value") != null);
+    try std.testing.expect(requestHeaderValue(server.request(1), HeaderName.COOKIE) == null);
+    try std.testing.expectEqualStrings("caller=value", requestHeaderValue(server.request(2), HeaderName.COOKIE).?);
+}
+
+test "encoding and decompression overrides are independent and preserve caller header" {
+    const allocator = std.testing.allocator;
+    const plaintext = "decompressed response";
+    const encoded = try compression_util.compress(allocator, .gzip, plaintext);
+    defer allocator.free(encoded);
+
+    const first = try makePolicyTestResponse(allocator, "200 OK", &.{}, "first");
+    defer allocator.free(first);
+    const encoded_headers = [_][2][]const u8{.{ "Content-Encoding", "gzip" }};
+    const second = try makePolicyTestResponse(allocator, "200 OK", &encoded_headers, encoded);
+    defer allocator.free(second);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ first, second };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/encoding");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    var first_response = try client.get(url, .{
+        .policy = .{ .accept_encoding = .{ .explicit = "gzip" } },
+    });
+    defer first_response.deinit();
+    try std.testing.expectEqualStrings("first", first_response.body.?);
+
+    const caller_headers = [_][2][]const u8{.{ HeaderName.ACCEPT_ENCODING, "caller-coding" }};
+    var second_response = try client.get(url, .{
+        .headers = &caller_headers,
+        .policy = .{
+            .accept_encoding = .{ .explicit = "br" },
+            .decompression = .enabled,
+        },
+    });
+    defer second_response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqualStrings("gzip", requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING).?);
+    try std.testing.expectEqualStrings("caller-coding", requestHeaderValue(server.request(1), HeaderName.ACCEPT_ENCODING).?);
+    try std.testing.expectEqualStrings(plaintext, second_response.body.?);
+    try std.testing.expectEqualStrings("gzip", second_response.headers.get(HeaderName.CONTENT_ENCODING).?);
+}
+
+test "managed policy keeps automatic cookies encoding storage and decompression" {
+    const allocator = std.testing.allocator;
+    const plaintext = "managed response";
+    const encoded = try compression_util.compress(allocator, .gzip, plaintext);
+    defer allocator.free(encoded);
+
+    const response_headers = [_][2][]const u8{
+        .{ "Set-Cookie", "managed=value; Path=/" },
+        .{ "Content-Encoding", "gzip" },
+    };
+    const response_bytes = try makePolicyTestResponse(allocator, "200 OK", &response_headers, encoded);
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/managed");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+    try client.setCookie("session", "jar-value");
+
+    var response = try client.get(url, .{});
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqualStrings(plaintext, response.body.?);
+    try std.testing.expectEqualStrings("gzip", response.headers.get(HeaderName.CONTENT_ENCODING).?);
+    try std.testing.expect(mem.indexOf(u8, requestHeaderValue(server.request(0), HeaderName.COOKIE).?, "session=jar-value") != null);
+    try std.testing.expectEqualStrings(types.AcceptEncodingPolicy.library_default_value, requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING).?);
+    try std.testing.expectEqual(@as(usize, 2), client.cookieCount());
 }
 
 test "Client stores Set-Cookie headers" {

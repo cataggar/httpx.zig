@@ -221,7 +221,7 @@ pub const RequestSpec = struct {
     json: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     timeout_ms: ?u64 = null,
-    follow_redirects: ?bool = null,
+    policy: RequestPolicyOverrides = .{},
     version: ?Version = null,
 };
 ```
