@@ -43,6 +43,8 @@ pub const record_header_len = 5;
 const max_plaintext_len = 1 << 14;
 const max_ciphertext_len = max_plaintext_len + 256;
 const max_record_len = record_header_len + max_ciphertext_len;
+// Bound work per read when a peer floods valid zero-length application records.
+const max_consecutive_empty_records = 32;
 
 const ContentType = tls.ContentType;
 
@@ -274,6 +276,31 @@ fn decryptTLS12ForSuite(
     };
 }
 
+fn decryptTLS13ForSuite(
+    ciphertext: []u8,
+    hdr: *const [record_header_len]u8,
+    seq: u64,
+    iv: *const [12]u8,
+    key: *const [32]u8,
+    cipher_suite: tls.CipherSuite,
+) ![]u8 {
+    const nonce = nonceTLS13(iv, seq);
+    return switch (cipher_suite) {
+        .AES_128_GCM_SHA256 => blk: {
+            var k: [16]u8 = undefined;
+            @memcpy(&k, key[0..16]);
+            break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, ciphertext, hdr, &nonce, &k);
+        },
+        .AES_256_GCM_SHA384 => {
+            return decryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, ciphertext, hdr, &nonce, key);
+        },
+        .CHACHA20_POLY1305_SHA256 => {
+            return decryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, ciphertext, hdr, &nonce, key);
+        },
+        else => error.TlsUnsupportedCipherSuite,
+    };
+}
+
 fn writeBoundedEncryptedRecord(
     sender: anytype,
     version: tls.ProtocolVersion,
@@ -390,6 +417,137 @@ fn returnApplicationPlaintext(
         read_buf_pos.* = 0;
     }
     return to_copy;
+}
+
+const ApplicationRecord = struct {
+    content_type: u8,
+    content: []u8,
+};
+
+fn parseTLS13InnerPlaintext(plaintext: []u8) !ApplicationRecord {
+    var content_type_pos = plaintext.len;
+    while (content_type_pos > 0) {
+        content_type_pos -= 1;
+        if (plaintext[content_type_pos] != 0) {
+            return .{
+                .content_type = plaintext[content_type_pos],
+                .content = plaintext[0..content_type_pos],
+            };
+        }
+    }
+    return error.TlsUnexpectedMessage;
+}
+
+fn dispatchApplicationRecord(record: ApplicationRecord) ![]u8 {
+    return switch (record.content_type) {
+        @intFromEnum(ContentType.application_data) => record.content,
+        @intFromEnum(ContentType.alert) => {
+            if (record.content.len != 2) return error.TlsDecodeError;
+            const description: tls.Alert.Description = @enumFromInt(record.content[1]);
+            return errors.fromAlert(description);
+        },
+        else => error.TlsUnexpectedMessage,
+    };
+}
+
+fn readApplicationData(
+    socket: *Socket,
+    version: tls.ProtocolVersion,
+    key: [32]u8,
+    iv: [12]u8,
+    cipher_suite: tls.CipherSuite,
+    read_seq: *u64,
+    read_buf: *[max_record_len]u8,
+    read_buf_len: *usize,
+    read_buf_pos: *usize,
+    output: []u8,
+) !usize {
+    if (output.len == 0) return 0;
+
+    if (read_buf_pos.* < read_buf_len.*) {
+        const available = read_buf_len.* - read_buf_pos.*;
+        const to_copy = @min(available, output.len);
+        @memcpy(output[0..to_copy], read_buf[read_buf_pos.*..][0..to_copy]);
+        read_buf_pos.* += to_copy;
+        return to_copy;
+    }
+
+    var empty_records: usize = 0;
+    while (true) {
+        var total: usize = 0;
+        while (total < record_header_len) {
+            const n = socket.recv(read_buf[total..record_header_len]) catch |err| switch (err) {
+                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) return error.TlsConnectionTruncated;
+            total += n;
+        }
+
+        const length = mem.readInt(u16, read_buf[3..5], .big);
+        if (length > max_ciphertext_len) return error.TlsRecordOverflow;
+        while (total < record_header_len + length) {
+            const n = socket.recv(read_buf[total..][0 .. record_header_len + length - total]) catch |err| switch (err) {
+                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) return error.TlsConnectionTruncated;
+            total += n;
+        }
+
+        const header = read_buf[0..record_header_len];
+        const record_body = read_buf[record_header_len..][0..length];
+        const record = switch (version) {
+            .tls_1_3 => blk: {
+                if (header[0] != @intFromEnum(ContentType.application_data)) {
+                    return error.TlsUnexpectedMessage;
+                }
+                const plaintext = try decryptTLS13ForSuite(
+                    record_body,
+                    header,
+                    read_seq.*,
+                    &iv,
+                    &key,
+                    cipher_suite,
+                );
+                read_seq.* += 1;
+                break :blk try parseTLS13InnerPlaintext(plaintext);
+            },
+            .tls_1_2 => blk: {
+                const plaintext = try decryptTLS12ForSuite(
+                    record_body,
+                    header,
+                    read_seq.*,
+                    &iv,
+                    &key,
+                    cipher_suite,
+                );
+                read_seq.* += 1;
+                break :blk ApplicationRecord{
+                    .content_type = header[0],
+                    .content = plaintext,
+                };
+            },
+            else => return error.TlsUnsupportedCipherSuite,
+        };
+
+        const application_data = try dispatchApplicationRecord(record);
+        if (application_data.len == 0) {
+            empty_records += 1;
+            if (empty_records > max_consecutive_empty_records) {
+                return error.TlsUnexpectedMessage;
+            }
+            continue;
+        }
+
+        return returnApplicationPlaintext(
+            read_buf,
+            read_buf_len,
+            read_buf_pos,
+            output,
+            application_data,
+        );
+    }
 }
 
 pub fn hmacSha256Expand(secret: []const u8, label: []const u8, seed: []const u8, out: []u8) void {
@@ -1184,93 +1342,22 @@ pub const Connection = struct {
     pub fn flush(_: *Connection) !void {}
 
     pub fn read(self: *Connection, buf: []u8) !usize {
-        const socket = self.socket;
         const version = self.tls_version;
         const key = self.app_read_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_read_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-
-        if (self.read_buf_pos < self.read_buf_len) {
-            const available = self.read_buf_len - self.read_buf_pos;
-            const to_copy = @min(available, buf.len);
-            @memcpy(buf[0..to_copy], self.read_buf[self.read_buf_pos..][0..to_copy]);
-            self.read_buf_pos += to_copy;
-            return to_copy;
-        }
-
-        var total: usize = 0;
-        while (total < 5) {
-            const n = socket.recv(self.read_buf[total..5]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-                else => return error.ReadFailed,
-            };
-            if (n == 0) return error.TlsConnectionTruncated;
-            total += n;
-        }
-        const length = mem.readInt(u16, self.read_buf[3..5], .big);
-        if (length > max_ciphertext_len) return error.TlsRecordOverflow;
-        while (total < 5 + length) {
-            const n = socket.recv(self.read_buf[total..][0 .. 5 + length - total]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-                else => return error.ReadFailed,
-            };
-            if (n == 0) return error.TlsConnectionTruncated;
-            total += n;
-        }
-        const record_body = self.read_buf[5..][0..length];
-
-        switch (version) {
-            .tls_1_3 => {
-                const nonce_val = nonceTLS13(&iv, self.read_seq);
-                const plaintext = switch (cs) {
-                    .AES_128_GCM_SHA256 => blk: {
-                        var k: [16]u8 = undefined;
-                        @memcpy(&k, key[0..16]);
-                        break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    .AES_256_GCM_SHA384 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    .CHACHA20_POLY1305_SHA256 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    else => return error.TlsUnsupportedCipherSuite,
-                };
-                self.read_seq += 1;
-                if (plaintext.len == 0) return 0;
-                const data_len = plaintext.len - 1;
-                return returnApplicationPlaintext(
-                    &self.read_buf,
-                    &self.read_buf_len,
-                    &self.read_buf_pos,
-                    buf,
-                    plaintext[0..data_len],
-                );
-            },
-            .tls_1_2 => {
-                const plaintext = try decryptTLS12ForSuite(
-                    record_body,
-                    self.read_buf[0..5],
-                    self.read_seq,
-                    &iv,
-                    &key,
-                    cs,
-                );
-                self.read_seq += 1;
-                return returnApplicationPlaintext(
-                    &self.read_buf,
-                    &self.read_buf_len,
-                    &self.read_buf_pos,
-                    buf,
-                    plaintext,
-                );
-            },
-            else => return error.TlsUnsupportedCipherSuite,
-        }
+        return readApplicationData(
+            self.socket,
+            version,
+            key,
+            iv,
+            cs,
+            &self.read_seq,
+            &self.read_buf,
+            &self.read_buf_len,
+            &self.read_buf_pos,
+            buf,
+        );
     }
 };
 
@@ -1508,88 +1595,18 @@ pub const TLSSession = struct {
         const key = self.app_read_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_read_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-
-        if (self.read_buf_pos < self.read_buf_len) {
-            const available = self.read_buf_len - self.read_buf_pos;
-            const to_copy = @min(available, buf.len);
-            @memcpy(buf[0..to_copy], self.read_buf[self.read_buf_pos..][0..to_copy]);
-            self.read_buf_pos += to_copy;
-            return to_copy;
-        }
-
-        var total: usize = 0;
-        while (total < 5) {
-            const n = socket.recv(self.read_buf[total..5]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-                else => return error.ReadFailed,
-            };
-            if (n == 0) return error.TlsConnectionTruncated;
-            total += n;
-        }
-        const length = mem.readInt(u16, self.read_buf[3..5], .big);
-        if (length > max_ciphertext_len) return error.TlsRecordOverflow;
-        while (total < 5 + length) {
-            const n = socket.recv(self.read_buf[total..][0 .. 5 + length - total]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-                else => return error.ReadFailed,
-            };
-            if (n == 0) return error.TlsConnectionTruncated;
-            total += n;
-        }
-        const record_body = self.read_buf[5..][0..length];
-
-        switch (version) {
-            .tls_1_3 => {
-                const nonce_val = nonceTLS13(&iv, self.read_seq);
-                const plaintext = switch (cs) {
-                    .AES_128_GCM_SHA256 => blk: {
-                        var k: [16]u8 = undefined;
-                        @memcpy(&k, key[0..16]);
-                        break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    .AES_256_GCM_SHA384 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    .CHACHA20_POLY1305_SHA256 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, record_body, self.read_buf[0..5], &nonce_val, &k);
-                    },
-                    else => return error.TlsUnsupportedCipherSuite,
-                };
-                self.read_seq += 1;
-                if (plaintext.len == 0) return 0;
-                const data_len = plaintext.len - 1;
-                return returnApplicationPlaintext(
-                    &self.read_buf,
-                    &self.read_buf_len,
-                    &self.read_buf_pos,
-                    buf,
-                    plaintext[0..data_len],
-                );
-            },
-            .tls_1_2 => {
-                const plaintext = try decryptTLS12ForSuite(
-                    record_body,
-                    self.read_buf[0..5],
-                    self.read_seq,
-                    &iv,
-                    &key,
-                    cs,
-                );
-                self.read_seq += 1;
-                return returnApplicationPlaintext(
-                    &self.read_buf,
-                    &self.read_buf_len,
-                    &self.read_buf_pos,
-                    buf,
-                    plaintext,
-                );
-            },
-            else => return error.TlsUnsupportedCipherSuite,
-        }
+        return readApplicationData(
+            socket,
+            version,
+            key,
+            iv,
+            cs,
+            &self.read_seq,
+            &self.read_buf,
+            &self.read_buf_len,
+            &self.read_buf_pos,
+            buf,
+        );
     }
 };
 pub const TlsSession = TLSSession;
@@ -1944,6 +1961,194 @@ fn testSocketPair() ![2]Socket {
             Socket.fromHandle(handles[1]),
         };
     }
+}
+
+const TestApplicationReader = union(TestWritePath) {
+    connection: Connection,
+    session: TLSSession,
+
+    fn init(
+        path: TestWritePath,
+        socket: *Socket,
+        version: tls.ProtocolVersion,
+        cipher_suite: tls.CipherSuite,
+    ) TestApplicationReader {
+        return switch (path) {
+            .connection => .{ .connection = .{
+                .allocator = std.testing.allocator,
+                .socket = socket,
+                .tls_version = version,
+                .connected = true,
+                .app_read_key = test_write_key,
+                .app_read_iv = test_write_iv,
+                .cipher_suite = cipher_suite,
+            } },
+            .session => blk: {
+                var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+                session.socket = socket;
+                session.tls_version = version;
+                session.app_read_key = test_write_key;
+                session.app_read_iv = test_write_iv;
+                session.cipher_suite = cipher_suite;
+                break :blk .{ .session = session };
+            },
+        };
+    }
+
+    fn read(self: *TestApplicationReader, output: []u8) !usize {
+        return switch (self.*) {
+            .connection => |*connection| connection.read(output),
+            .session => |*session| session.read(output),
+        };
+    }
+
+    fn sequence(self: *const TestApplicationReader) u64 {
+        return switch (self.*) {
+            .connection => |connection| connection.read_seq,
+            .session => |session| session.read_seq,
+        };
+    }
+};
+
+fn testReadCipherSuite(path: TestWritePath, version: tls.ProtocolVersion) tls.CipherSuite {
+    return switch (version) {
+        .tls_1_3 => switch (path) {
+            .connection => .AES_128_GCM_SHA256,
+            .session => .CHACHA20_POLY1305_SHA256,
+        },
+        .tls_1_2 => testCipherSuite(path, version),
+        else => unreachable,
+    };
+}
+
+fn appendTestProtectedRecord(
+    wire: *std.ArrayList(u8),
+    version: tls.ProtocolVersion,
+    cipher_suite: tls.CipherSuite,
+    sequence: u64,
+    content: []const u8,
+    content_type: u8,
+    tls13_padding_len: usize,
+    include_tls13_content_type: bool,
+) !void {
+    var header: [record_header_len]u8 = undefined;
+    header[1] = 0x03;
+    header[2] = 0x03;
+    var encrypted_buf: [max_ciphertext_len]u8 = undefined;
+
+    const encrypted = switch (version) {
+        .tls_1_3 => blk: {
+            var inner: [max_ciphertext_len]u8 = undefined;
+            const type_len: usize = if (include_tls13_content_type) 1 else 0;
+            const inner_len = content.len + type_len + tls13_padding_len;
+            if (inner_len > inner.len - crypto.aead.aes_gcm.Aes128Gcm.tag_length) {
+                return error.TestRecordTooLarge;
+            }
+            @memcpy(inner[0..content.len], content);
+            var inner_pos = content.len;
+            if (include_tls13_content_type) {
+                inner[inner_pos] = content_type;
+                inner_pos += 1;
+            }
+            @memset(inner[inner_pos..inner_len], 0);
+
+            header[0] = @intFromEnum(ContentType.application_data);
+            mem.writeInt(u16, header[3..5], @intCast(inner_len + crypto.aead.aes_gcm.Aes128Gcm.tag_length), .big);
+            const nonce = nonceTLS13(&test_write_iv, sequence);
+            break :blk switch (cipher_suite) {
+                .AES_128_GCM_SHA256 => aes128: {
+                    var key: [16]u8 = undefined;
+                    @memcpy(&key, test_write_key[0..key.len]);
+                    break :aes128 try encryptTLS13(
+                        crypto.aead.aes_gcm.Aes128Gcm,
+                        &encrypted_buf,
+                        inner[0..inner_len],
+                        &header,
+                        &nonce,
+                        &key,
+                    );
+                },
+                .AES_256_GCM_SHA384 => try encryptTLS13(
+                    crypto.aead.aes_gcm.Aes256Gcm,
+                    &encrypted_buf,
+                    inner[0..inner_len],
+                    &header,
+                    &nonce,
+                    &test_write_key,
+                ),
+                .CHACHA20_POLY1305_SHA256 => try encryptTLS13(
+                    crypto.aead.chacha_poly.ChaCha20Poly1305,
+                    &encrypted_buf,
+                    inner[0..inner_len],
+                    &header,
+                    &nonce,
+                    &test_write_key,
+                ),
+                else => return error.TlsUnsupportedCipherSuite,
+            };
+        },
+        .tls_1_2 => blk: {
+            if (tls13_padding_len != 0 or !include_tls13_content_type) {
+                return error.InvalidTestRecord;
+            }
+            header[0] = content_type;
+            mem.writeInt(
+                u16,
+                header[3..5],
+                @intCast(try tls12CiphertextLen(cipher_suite, content.len)),
+                .big,
+            );
+            break :blk try encryptTLS12ForSuite(
+                &encrypted_buf,
+                content,
+                &header,
+                sequence,
+                &test_write_iv,
+                &test_write_key,
+                cipher_suite,
+            );
+        },
+        else => return error.TlsUnsupportedCipherSuite,
+    };
+
+    try wire.appendSlice(std.testing.allocator, &header);
+    try wire.appendSlice(std.testing.allocator, encrypted);
+}
+
+fn expectProtectedRecordError(
+    path: TestWritePath,
+    version: tls.ProtocolVersion,
+    content: []const u8,
+    content_type: u8,
+    tls13_padding_len: usize,
+    include_tls13_content_type: bool,
+    expected_error: anyerror,
+) !void {
+    const cipher_suite = testReadCipherSuite(path, version);
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestProtectedRecord(
+        &wire,
+        version,
+        cipher_suite,
+        0,
+        content,
+        content_type,
+        tls13_padding_len,
+        include_tls13_content_type,
+    );
+
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+    try sender.sendAll(wire.items);
+
+    var reader = TestApplicationReader.init(path, &receiver, version, cipher_suite);
+    var output: [64]u8 = undefined;
+    try std.testing.expectError(expected_error, reader.read(&output));
+    try std.testing.expectEqual(@as(u64, 1), reader.sequence());
 }
 
 const SocketReadContext = struct {
@@ -2377,6 +2582,216 @@ test "TLS 1.3 small reads preserve complete multi-record plaintext" {
         plaintext,
         8192,
     );
+}
+
+test "TLS 1.3 application reads strip padding and preserve buffered plaintext" {
+    const paths = [_]TestWritePath{ .connection, .session };
+    const messages = [_][]const u8{ "padded ", "application data" };
+    const expected = "padded application data";
+
+    for (paths) |path| {
+        const cipher_suite = testReadCipherSuite(path, .tls_1_3);
+        var wire = std.ArrayList(u8).empty;
+        defer wire.deinit(std.testing.allocator);
+        try appendTestProtectedRecord(
+            &wire,
+            .tls_1_3,
+            cipher_suite,
+            0,
+            messages[0],
+            @intFromEnum(ContentType.application_data),
+            7,
+            true,
+        );
+        try appendTestProtectedRecord(
+            &wire,
+            .tls_1_3,
+            cipher_suite,
+            1,
+            messages[1],
+            @intFromEnum(ContentType.application_data),
+            31,
+            true,
+        );
+
+        const sockets = try testSocketPair();
+        var sender = sockets[0];
+        defer sender.close();
+        var receiver = sockets[1];
+        defer receiver.close();
+        try sender.sendAll(wire.items);
+
+        var reader = TestApplicationReader.init(path, &receiver, .tls_1_3, cipher_suite);
+        var reconstructed: [expected.len]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < reconstructed.len) {
+            var small_buf: [3]u8 = undefined;
+            const n = try reader.read(small_buf[0..@min(small_buf.len, reconstructed.len - offset)]);
+            try std.testing.expect(n > 0);
+            @memcpy(reconstructed[offset..][0..n], small_buf[0..n]);
+            offset += n;
+        }
+        try std.testing.expectEqualStrings(expected, &reconstructed);
+        try std.testing.expectEqual(@as(u64, 2), reader.sequence());
+    }
+}
+
+test "TLS application reads dispatch authenticated alerts and unexpected content" {
+    const paths = [_]TestWritePath{ .connection, .session };
+    const alert_close_notify = [_]u8{ 1, @intFromEnum(tls.Alert.Description.close_notify) };
+    const alert_handshake_failure = [_]u8{ 2, @intFromEnum(tls.Alert.Description.handshake_failure) };
+    const handshake = [_]u8{ @intFromEnum(tls.HandshakeType.new_session_ticket), 0, 0, 0 };
+
+    for (paths) |path| {
+        try expectProtectedRecordError(
+            path,
+            .tls_1_3,
+            &alert_close_notify,
+            @intFromEnum(ContentType.alert),
+            5,
+            true,
+            error.TlsCloseNotify,
+        );
+        try expectProtectedRecordError(
+            path,
+            .tls_1_3,
+            &alert_handshake_failure,
+            @intFromEnum(ContentType.alert),
+            0,
+            true,
+            error.TlsHandshakeFailure,
+        );
+        try expectProtectedRecordError(
+            path,
+            .tls_1_3,
+            &handshake,
+            @intFromEnum(ContentType.handshake),
+            3,
+            true,
+            error.TlsUnexpectedMessage,
+        );
+        try expectProtectedRecordError(
+            path,
+            .tls_1_3,
+            "",
+            0,
+            8,
+            false,
+            error.TlsUnexpectedMessage,
+        );
+
+        try expectProtectedRecordError(
+            path,
+            .tls_1_2,
+            &alert_close_notify,
+            @intFromEnum(ContentType.alert),
+            0,
+            true,
+            error.TlsCloseNotify,
+        );
+        try expectProtectedRecordError(
+            path,
+            .tls_1_2,
+            &alert_handshake_failure,
+            @intFromEnum(ContentType.alert),
+            0,
+            true,
+            error.TlsHandshakeFailure,
+        );
+        try expectProtectedRecordError(
+            path,
+            .tls_1_2,
+            &handshake,
+            @intFromEnum(ContentType.handshake),
+            0,
+            true,
+            error.TlsUnexpectedMessage,
+        );
+    }
+}
+
+test "TLS application reads skip empty records before returning data" {
+    const paths = [_]TestWritePath{ .connection, .session };
+    const versions = [_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 };
+    const message = "after empty";
+
+    for (paths) |path| {
+        for (versions) |version| {
+            const cipher_suite = testReadCipherSuite(path, version);
+            var wire = std.ArrayList(u8).empty;
+            defer wire.deinit(std.testing.allocator);
+            try appendTestProtectedRecord(
+                &wire,
+                version,
+                cipher_suite,
+                0,
+                "",
+                @intFromEnum(ContentType.application_data),
+                if (version == .tls_1_3) 4 else 0,
+                true,
+            );
+            try appendTestProtectedRecord(
+                &wire,
+                version,
+                cipher_suite,
+                1,
+                message,
+                @intFromEnum(ContentType.application_data),
+                if (version == .tls_1_3) 9 else 0,
+                true,
+            );
+
+            const sockets = try testSocketPair();
+            var sender = sockets[0];
+            defer sender.close();
+            var receiver = sockets[1];
+            defer receiver.close();
+            try sender.sendAll(wire.items);
+
+            var reader = TestApplicationReader.init(path, &receiver, version, cipher_suite);
+            var output: [message.len]u8 = undefined;
+            const first_len = try reader.read(output[0..4]);
+            try std.testing.expectEqual(@as(usize, 4), first_len);
+            try std.testing.expectEqualStrings(message[0..4], output[0..first_len]);
+            try std.testing.expectEqual(@as(u64, 2), reader.sequence());
+
+            const second_len = try reader.read(output[first_len..]);
+            try std.testing.expectEqual(message.len - first_len, second_len);
+            try std.testing.expectEqualStrings(message[first_len..], output[first_len..][0..second_len]);
+            try std.testing.expectEqual(@as(u64, 2), reader.sequence());
+        }
+    }
+}
+
+test "TLS application reads bound consecutive empty record processing" {
+    const path: TestWritePath = .connection;
+    const cipher_suite = testReadCipherSuite(path, .tls_1_3);
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    for (0..max_consecutive_empty_records + 1) |sequence| {
+        try appendTestProtectedRecord(
+            &wire,
+            .tls_1_3,
+            cipher_suite,
+            sequence,
+            "",
+            @intFromEnum(ContentType.application_data),
+            0,
+            true,
+        );
+    }
+
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+    try sender.sendAll(wire.items);
+
+    var reader = TestApplicationReader.init(path, &receiver, .tls_1_3, cipher_suite);
+    var output: [1]u8 = undefined;
+    try std.testing.expectError(error.TlsUnexpectedMessage, reader.read(&output));
+    try std.testing.expectEqual(@as(u64, max_consecutive_empty_records + 1), reader.sequence());
 }
 
 test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally" {
