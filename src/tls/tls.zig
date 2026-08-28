@@ -105,13 +105,89 @@ pub fn decryptTLS13(
     return ciphertext[0..ct_len];
 }
 
-/// RFC 5246 §6.2.3.3 AEAD record protection.
+fn encryptTLS12Aead(
+    comptime Aead: type,
+    comptime record_iv_length: usize,
+    out: []u8,
+    plaintext: []const u8,
+    hdr: *const [record_header_len]u8,
+    seq: u64,
+    iv: *const [12]u8,
+    key: *const [Aead.key_length]u8,
+) ![]u8 {
+    const fixed_iv_length = Aead.nonce_length - record_iv_length;
+    comptime std.debug.assert(record_iv_length == 0 or record_iv_length == 8);
+
+    var nonce: [12]u8 = undefined;
+    if (record_iv_length == 0) {
+        nonce = iv.*;
+        var seq_bytes: [8]u8 = undefined;
+        mem.writeInt(u64, &seq_bytes, seq, .big);
+        for (seq_bytes, 0..) |byte, i| {
+            nonce[fixed_iv_length - 8 + i] ^= byte;
+        }
+    } else {
+        @memcpy(nonce[0..fixed_iv_length], iv[0..fixed_iv_length]);
+        mem.writeInt(u64, nonce[fixed_iv_length..][0..8], seq, .big);
+        @memcpy(out[0..record_iv_length], nonce[fixed_iv_length..]);
+    }
+
+    var aad: [record_header_len + 8]u8 = undefined;
+    mem.writeInt(u64, aad[0..8], seq, .big);
+    aad[8] = hdr[0];
+    aad[9] = hdr[1];
+    aad[10] = hdr[2];
+    mem.writeInt(u16, aad[11..13], @intCast(plaintext.len), .big);
+
+    var tag: [Aead.tag_length]u8 = undefined;
+    const ciphertext = out[record_iv_length..][0..plaintext.len];
+    Aead.encrypt(ciphertext, &tag, plaintext, &aad, nonce, key.*);
+    @memcpy(out[record_iv_length + plaintext.len ..][0..Aead.tag_length], &tag);
+    return out[0 .. record_iv_length + plaintext.len + Aead.tag_length];
+}
+
+fn decryptTLS12Aead(
+    comptime Aead: type,
+    comptime record_iv_length: usize,
+    ciphertext: []u8,
+    hdr: *const [record_header_len]u8,
+    seq: u64,
+    iv: *const [12]u8,
+    key: *const [Aead.key_length]u8,
+) ![]u8 {
+    const fixed_iv_length = Aead.nonce_length - record_iv_length;
+    comptime std.debug.assert(record_iv_length == 0 or record_iv_length == 8);
+    if (ciphertext.len < record_iv_length + Aead.tag_length) return error.TlsDecryptError;
+
+    var nonce: [12]u8 = undefined;
+    if (record_iv_length == 0) {
+        nonce = iv.*;
+        var seq_bytes: [8]u8 = undefined;
+        mem.writeInt(u64, &seq_bytes, seq, .big);
+        for (seq_bytes, 0..) |byte, i| {
+            nonce[fixed_iv_length - 8 + i] ^= byte;
+        }
+    } else {
+        @memcpy(nonce[0..fixed_iv_length], iv[0..fixed_iv_length]);
+        @memcpy(nonce[fixed_iv_length..], ciphertext[0..record_iv_length]);
+    }
+
+    const plain_len = ciphertext.len - record_iv_length - Aead.tag_length;
+    var aad: [record_header_len + 8]u8 = undefined;
+    mem.writeInt(u64, aad[0..8], seq, .big);
+    aad[8] = hdr[0];
+    aad[9] = hdr[1];
+    aad[10] = hdr[2];
+    mem.writeInt(u16, aad[11..13], @intCast(plain_len), .big);
+    const tag: [Aead.tag_length]u8 = ciphertext[ciphertext.len - Aead.tag_length ..][0..Aead.tag_length].*;
+    const encrypted = ciphertext[record_iv_length..][0..plain_len];
+    Aead.decrypt(encrypted, encrypted, tag, &aad, nonce, key.*) catch return error.TlsDecryptError;
+    return encrypted;
+}
+
+/// RFC 5288 AES-GCM TLS 1.2 record protection.
 ///
-/// nonce = write_salt (first 4 bytes of `iv`) || explicit_nonce (8 bytes = sequence number)
-/// additional_data = seq_num(8) || type || version || **plaintext length**
-/// (the AAD carries TLSCompressed.length, NOT the ciphertext record length!)
-///
-/// Wire layout: explicit_nonce(8) || ciphertext || tag(16)
+/// Wire layout: explicit_nonce(8) || ciphertext || tag(16).
 pub fn encryptTLS12(
     comptime Aead: type,
     out: []u8,
@@ -121,23 +197,7 @@ pub fn encryptTLS12(
     iv: *const [12]u8,
     key: *const [Aead.key_length]u8,
 ) ![]u8 {
-    var explicit_iv: [8]u8 = undefined;
-    mem.writeInt(u64, &explicit_iv, seq, .big);
-    var nonce: [12]u8 = undefined;
-    @memcpy(nonce[0..4], iv[0..4]);
-    @memcpy(nonce[4..12], &explicit_iv);
-    var aad: [record_header_len + 8]u8 = undefined;
-    mem.writeInt(u64, aad[0..8], seq, .big);
-    // Synthesize the AAD header with the PLAINTEXT length.
-    aad[8] = hdr[0];
-    aad[9] = hdr[1];
-    aad[10] = hdr[2];
-    mem.writeInt(u16, aad[11..13], @intCast(plaintext.len), .big);
-    @memcpy(out[0..8], &explicit_iv);
-    var tag: [Aead.tag_length]u8 = undefined;
-    Aead.encrypt(out[8..][0..plaintext.len], &tag, plaintext, &aad, nonce, key.*);
-    @memcpy(out[8 + plaintext.len ..][0..Aead.tag_length], &tag);
-    return out[0 .. 8 + plaintext.len + Aead.tag_length];
+    return encryptTLS12Aead(Aead, 8, out, plaintext, hdr, seq, iv, key);
 }
 
 pub fn decryptTLS12(
@@ -148,22 +208,70 @@ pub fn decryptTLS12(
     iv: *const [12]u8,
     key: *const [Aead.key_length]u8,
 ) ![]u8 {
-    if (ciphertext.len < 8 + Aead.tag_length) return error.TlsDecryptError;
-    const explicit_iv: [8]u8 = ciphertext[0..8].*;
-    var nonce: [12]u8 = undefined;
-    @memcpy(nonce[0..4], iv[0..4]);
-    @memcpy(nonce[4..12], &explicit_iv);
-    const plain_len = ciphertext.len - 8 - Aead.tag_length;
-    var aad: [record_header_len + 8]u8 = undefined;
-    mem.writeInt(u64, aad[0..8], seq, .big);
-    aad[8] = hdr[0];
-    aad[9] = hdr[1];
-    aad[10] = hdr[2];
-    mem.writeInt(u16, aad[11..13], @intCast(plain_len), .big);
-    const tag: [Aead.tag_length]u8 = ciphertext[ciphertext.len - Aead.tag_length ..][0..Aead.tag_length].*;
-    const ct_len = ciphertext.len - 8 - Aead.tag_length;
-    Aead.decrypt(ciphertext[8..][0..ct_len], ciphertext[8..][0..ct_len], tag, &aad, nonce, key.*) catch return error.TlsDecryptError;
-    return ciphertext[8..][0..ct_len];
+    return decryptTLS12Aead(Aead, 8, ciphertext, hdr, seq, iv, key);
+}
+
+fn tls12CiphertextLen(cipher_suite: tls.CipherSuite, plaintext_len: usize) !usize {
+    return plaintext_len + switch (cipher_suite) {
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        => @as(usize, 8 + crypto.aead.aes_gcm.Aes128Gcm.tag_length),
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        => @as(usize, crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length),
+        else => return error.TlsUnsupportedCipherSuite,
+    };
+}
+
+fn encryptTLS12ForSuite(
+    out: []u8,
+    plaintext: []const u8,
+    hdr: *const [record_header_len]u8,
+    seq: u64,
+    iv: *const [12]u8,
+    key: *const [32]u8,
+    cipher_suite: tls.CipherSuite,
+) ![]u8 {
+    return switch (cipher_suite) {
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
+            var k: [16]u8 = undefined;
+            @memcpy(&k, key[0..16]);
+            break :blk try encryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, out, plaintext, hdr, seq, iv, &k);
+        },
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            return encryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, out, plaintext, hdr, seq, iv, key);
+        },
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            return encryptTLS12Aead(crypto.aead.chacha_poly.ChaCha20Poly1305, 0, out, plaintext, hdr, seq, iv, key);
+        },
+        else => error.TlsUnsupportedCipherSuite,
+    };
+}
+
+fn decryptTLS12ForSuite(
+    ciphertext: []u8,
+    hdr: *const [record_header_len]u8,
+    seq: u64,
+    iv: *const [12]u8,
+    key: *const [32]u8,
+    cipher_suite: tls.CipherSuite,
+) ![]u8 {
+    return switch (cipher_suite) {
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
+            var k: [16]u8 = undefined;
+            @memcpy(&k, key[0..16]);
+            break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, ciphertext, hdr, seq, iv, &k);
+        },
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            return decryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, ciphertext, hdr, seq, iv, key);
+        },
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            return decryptTLS12Aead(crypto.aead.chacha_poly.ChaCha20Poly1305, 0, ciphertext, hdr, seq, iv, key);
+        },
+        else => error.TlsUnsupportedCipherSuite,
+    };
 }
 
 fn writeBoundedEncryptedRecord(
@@ -222,37 +330,28 @@ fn writeBoundedEncryptedRecord(
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
         },
         .tls_1_2 => {
+            const ciphertext_len = try tls12CiphertextLen(cipher_suite, plaintext.len);
             var hdr: [record_header_len]u8 = undefined;
             const hdr_val = RecordHeader{
                 .content_type = content_type,
                 .version = .tls_1_2,
-                .length = @intCast(8 + plaintext.len + 16),
+                .length = @intCast(ciphertext_len),
             };
             hdr_val.format(&hdr);
 
             var out_buf: [max_record_len]u8 = undefined;
             @memcpy(out_buf[0..record_header_len], &hdr);
-            const enc_len = switch (cipher_suite) {
-                .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-                    var k: [16]u8 = undefined;
-                    @memcpy(&k, key[0..16]);
-                    const enc = try encryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, out_buf[record_header_len..], plaintext, &hdr, seq.*, &iv, &k);
-                    break :blk enc.len;
-                },
-                .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => blk: {
-                    var k: [32]u8 = undefined;
-                    @memcpy(&k, key[0..32]);
-                    const enc = try encryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, out_buf[record_header_len..], plaintext, &hdr, seq.*, &iv, &k);
-                    break :blk enc.len;
-                },
-                .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => blk: {
-                    var k: [32]u8 = undefined;
-                    @memcpy(&k, key[0..32]);
-                    const enc = try encryptTLS12(crypto.aead.chacha_poly.ChaCha20Poly1305, out_buf[record_header_len..], plaintext, &hdr, seq.*, &iv, &k);
-                    break :blk enc.len;
-                },
-                else => return error.TlsUnsupportedCipherSuite,
-            };
+            const encrypted = try encryptTLS12ForSuite(
+                out_buf[record_header_len..],
+                plaintext,
+                &hdr,
+                seq.*,
+                &iv,
+                &key,
+                cipher_suite,
+            );
+            const enc_len = encrypted.len;
+            std.debug.assert(enc_len == ciphertext_len);
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
         },
         else => return error.TlsUnsupportedCipherSuite,
@@ -269,6 +368,28 @@ fn writeAllBoundedRecords(writer: anytype, data: []const u8) !void {
         if (n == 0 or n > data.len - written) return error.WriteFailed;
         written += n;
     }
+}
+
+fn returnApplicationPlaintext(
+    read_buf: *[max_record_len]u8,
+    read_buf_len: *usize,
+    read_buf_pos: *usize,
+    output: []u8,
+    plaintext: []const u8,
+) usize {
+    const to_copy = @min(plaintext.len, output.len);
+    @memmove(output[0..to_copy], plaintext[0..to_copy]);
+
+    const remaining = plaintext.len - to_copy;
+    if (remaining > 0) {
+        @memmove(read_buf[0..remaining], plaintext[to_copy..]);
+        read_buf_len.* = remaining;
+        read_buf_pos.* = 0;
+    } else {
+        read_buf_len.* = 0;
+        read_buf_pos.* = 0;
+    }
+    return to_copy;
 }
 
 pub fn hmacSha256Expand(secret: []const u8, label: []const u8, seed: []const u8, out: []u8) void {
@@ -582,32 +703,32 @@ pub fn sendTLS12EncryptedHandshake(
     seq: *u64,
     cs: tls.CipherSuite,
 ) !void {
+    const ciphertext_len = try tls12CiphertextLen(cs, msg.len);
     var hdr_buf: [record_header_len]u8 = undefined;
     const hdr_val = RecordHeader{
         .content_type = .handshake,
         .version = .tls_1_2,
-        .length = @intCast(8 + msg.len + 16),
+        .length = @intCast(ciphertext_len),
     };
     hdr_val.format(&hdr_buf);
 
     var out_buf: [record_header_len + max_plaintext_len + 256]u8 = undefined;
     @memcpy(out_buf[0..record_header_len], &hdr_buf);
 
-    const enc_len = switch (cs) {
-        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            const enc = try encryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, out_buf[record_header_len..], msg, &hdr_buf, seq.*, iv, &k);
-            break :blk enc.len;
-        },
-        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            const enc = try encryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, out_buf[record_header_len..], msg, &hdr_buf, seq.*, iv, &k);
-            break :blk enc.len;
-        },
-        else => return error.TlsUnsupportedCipherSuite,
-    };
+    var key_buf: [32]u8 = .{0} ** 32;
+    if (key.len > key_buf.len) return error.TlsUnsupportedCipherSuite;
+    @memcpy(key_buf[0..key.len], key);
+    const encrypted = try encryptTLS12ForSuite(
+        out_buf[record_header_len..],
+        msg,
+        &hdr_buf,
+        seq.*,
+        iv,
+        &key_buf,
+        cs,
+    );
+    const enc_len = encrypted.len;
+    std.debug.assert(enc_len == ciphertext_len);
 
     socket.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
     seq.* += 1;
@@ -655,19 +776,10 @@ pub fn readTLS12EncryptedRecord(
 
     const hdr: *const [record_header_len]u8 = buf[0..5];
     const ct = buf[5..][0..length];
-    const plain = switch (cs) {
-        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, ct, hdr, seq.*, iv, &k);
-        },
-        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, ct, hdr, seq.*, iv, &k);
-        },
-        else => return error.TlsUnsupportedCipherSuite,
-    };
+    var key_buf: [32]u8 = .{0} ** 32;
+    if (key.len > key_buf.len) return error.TlsUnsupportedCipherSuite;
+    @memcpy(key_buf[0..key.len], key);
+    const plain = try decryptTLS12ForSuite(ct, hdr, seq.*, iv, &key_buf, cs);
     seq.* += 1;
     return plain;
 }
@@ -1131,41 +1243,31 @@ pub const Connection = struct {
                 self.read_seq += 1;
                 if (plaintext.len == 0) return 0;
                 const data_len = plaintext.len - 1;
-                const to_copy = @min(data_len, buf.len);
-                @memcpy(buf[0..to_copy], plaintext[0..to_copy]);
-                return to_copy;
+                return returnApplicationPlaintext(
+                    &self.read_buf,
+                    &self.read_buf_len,
+                    &self.read_buf_pos,
+                    buf,
+                    plaintext[0..data_len],
+                );
             },
             .tls_1_2 => {
-                const plaintext = switch (cs) {
-                    .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-                        var k: [16]u8 = undefined;
-                        @memcpy(&k, key[0..16]);
-                        break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS12(crypto.aead.chacha_poly.ChaCha20Poly1305, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    else => return error.TlsUnsupportedCipherSuite,
-                };
+                const plaintext = try decryptTLS12ForSuite(
+                    record_body,
+                    self.read_buf[0..5],
+                    self.read_seq,
+                    &iv,
+                    &key,
+                    cs,
+                );
                 self.read_seq += 1;
-                const to_copy = @min(plaintext.len, buf.len);
-                @memcpy(buf[0..to_copy], plaintext[0..to_copy]);
-                if (plaintext.len > to_copy) {
-                    @memcpy(self.read_buf[0 .. plaintext.len - to_copy], plaintext[to_copy..]);
-                    self.read_buf_len = plaintext.len - to_copy;
-                    self.read_buf_pos = 0;
-                } else {
-                    self.read_buf_len = 0;
-                    self.read_buf_pos = 0;
-                }
-                return to_copy;
+                return returnApplicationPlaintext(
+                    &self.read_buf,
+                    &self.read_buf_len,
+                    &self.read_buf_pos,
+                    buf,
+                    plaintext,
+                );
             },
             else => return error.TlsUnsupportedCipherSuite,
         }
@@ -1460,41 +1562,31 @@ pub const TLSSession = struct {
                 self.read_seq += 1;
                 if (plaintext.len == 0) return 0;
                 const data_len = plaintext.len - 1;
-                const to_copy = @min(data_len, buf.len);
-                @memcpy(buf[0..to_copy], plaintext[0..to_copy]);
-                return to_copy;
+                return returnApplicationPlaintext(
+                    &self.read_buf,
+                    &self.read_buf_len,
+                    &self.read_buf_pos,
+                    buf,
+                    plaintext[0..data_len],
+                );
             },
             .tls_1_2 => {
-                const plaintext = switch (cs) {
-                    .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-                        var k: [16]u8 = undefined;
-                        @memcpy(&k, key[0..16]);
-                        break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => blk: {
-                        var k: [32]u8 = undefined;
-                        @memcpy(&k, key[0..32]);
-                        break :blk try decryptTLS12(crypto.aead.chacha_poly.ChaCha20Poly1305, record_body, self.read_buf[0..5], self.read_seq, &iv, &k);
-                    },
-                    else => return error.TlsUnsupportedCipherSuite,
-                };
+                const plaintext = try decryptTLS12ForSuite(
+                    record_body,
+                    self.read_buf[0..5],
+                    self.read_seq,
+                    &iv,
+                    &key,
+                    cs,
+                );
                 self.read_seq += 1;
-                const to_copy = @min(plaintext.len, buf.len);
-                @memcpy(buf[0..to_copy], plaintext[0..to_copy]);
-                if (plaintext.len > to_copy) {
-                    @memcpy(self.read_buf[0 .. plaintext.len - to_copy], plaintext[to_copy..]);
-                    self.read_buf_len = plaintext.len - to_copy;
-                    self.read_buf_pos = 0;
-                } else {
-                    self.read_buf_len = 0;
-                    self.read_buf_pos = 0;
-                }
-                return to_copy;
+                return returnApplicationPlaintext(
+                    &self.read_buf,
+                    &self.read_buf_len,
+                    &self.read_buf_pos,
+                    buf,
+                    plaintext,
+                );
             },
             else => return error.TlsUnsupportedCipherSuite,
         }
@@ -2046,6 +2138,7 @@ const ScriptedSender = struct {
 const ScriptedRecordWriter = struct {
     sender: *ScriptedSender,
     version: tls.ProtocolVersion,
+    cipher_suite: ?tls.CipherSuite = null,
     sequence: u64 = 0,
 
     fn write(self: *@This(), data: []const u8) !usize {
@@ -2054,7 +2147,7 @@ const ScriptedRecordWriter = struct {
             self.version,
             test_write_key,
             test_write_iv,
-            testCipherSuite(.session, self.version),
+            self.cipher_suite orelse testCipherSuite(.session, self.version),
             &self.sequence,
             data,
             .application_data,
@@ -2140,4 +2233,309 @@ test "TLS writeAll rejects zero progress and preserves errors" {
 
     var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
     try std.testing.expectError(error.WriteFailed, session.writeAll("data"));
+}
+
+const ApplicationWriteThreadContext = struct {
+    socket: *Socket,
+    path: TestWritePath,
+    version: tls.ProtocolVersion,
+    cipher_suite: tls.CipherSuite,
+    plaintext: []const u8,
+    sequence: u64 = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        defer self.socket.shutdownWrite() catch {};
+        switch (self.path) {
+            .connection => {
+                var conn = Connection{
+                    .allocator = std.testing.allocator,
+                    .socket = self.socket,
+                    .tls_version = self.version,
+                    .connected = true,
+                    .app_write_key = test_write_key,
+                    .app_write_iv = test_write_iv,
+                    .cipher_suite = self.cipher_suite,
+                };
+                conn.writeAll(self.plaintext) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                self.sequence = conn.write_seq;
+            },
+            .session => {
+                var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+                session.socket = self.socket;
+                session.tls_version = self.version;
+                session.app_write_key = test_write_key;
+                session.app_write_iv = test_write_iv;
+                session.cipher_suite = self.cipher_suite;
+                session.writeAll(self.plaintext) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                self.sequence = session.write_seq;
+            },
+        }
+    }
+};
+
+fn expectApplicationRoundTrip(
+    writer_path: TestWritePath,
+    reader_path: TestWritePath,
+    version: tls.ProtocolVersion,
+    cipher_suite: tls.CipherSuite,
+    plaintext: []const u8,
+    read_chunk_len: usize,
+) !void {
+    try std.testing.expect(read_chunk_len > 0 and read_chunk_len <= 8192);
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+
+    var write_context = ApplicationWriteThreadContext{
+        .socket = &sender,
+        .path = writer_path,
+        .version = version,
+        .cipher_suite = cipher_suite,
+        .plaintext = plaintext,
+    };
+    var write_thread: ?std.Thread = try std.Thread.spawn(
+        .{},
+        ApplicationWriteThreadContext.run,
+        .{&write_context},
+    );
+    errdefer {
+        receiver.close();
+        if (write_thread) |thread| thread.join();
+    }
+
+    var connection_reader = Connection{
+        .allocator = std.testing.allocator,
+        .socket = &receiver,
+        .tls_version = version,
+        .connected = true,
+        .app_read_key = test_write_key,
+        .app_read_iv = test_write_iv,
+        .cipher_suite = cipher_suite,
+    };
+    var session_reader = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+    session_reader.socket = &receiver;
+    session_reader.tls_version = version;
+    session_reader.app_read_key = test_write_key;
+    session_reader.app_read_iv = test_write_iv;
+    session_reader.cipher_suite = cipher_suite;
+
+    var reconstructed = std.ArrayList(u8).empty;
+    defer reconstructed.deinit(std.testing.allocator);
+    var read_buf: [8192]u8 = undefined;
+    while (reconstructed.items.len < plaintext.len) {
+        const n = switch (reader_path) {
+            .connection => try connection_reader.read(read_buf[0..read_chunk_len]),
+            .session => try session_reader.read(read_buf[0..read_chunk_len]),
+        };
+        if (n == 0) return error.UnexpectedEof;
+        try reconstructed.appendSlice(std.testing.allocator, read_buf[0..n]);
+    }
+
+    if (write_thread) |thread| {
+        thread.join();
+        write_thread = null;
+    }
+    if (write_context.err) |err| return err;
+
+    const expected_records = if (plaintext.len == 0) 0 else (plaintext.len + max_plaintext_len - 1) / max_plaintext_len;
+    const read_sequence = switch (reader_path) {
+        .connection => connection_reader.read_seq,
+        .session => session_reader.read_seq,
+    };
+    try std.testing.expectEqual(expected_records, write_context.sequence);
+    try std.testing.expectEqual(expected_records, read_sequence);
+    try std.testing.expectEqualSlices(u8, plaintext, reconstructed.items);
+}
+
+test "TLS 1.3 small reads preserve complete multi-record plaintext" {
+    const plaintext = try std.testing.allocator.alloc(u8, 2 * max_plaintext_len + 123);
+    defer std.testing.allocator.free(plaintext);
+    fillTestPlaintext(plaintext);
+
+    try expectApplicationRoundTrip(
+        .session,
+        .connection,
+        .tls_1_3,
+        .AES_128_GCM_SHA256,
+        plaintext,
+        8192,
+    );
+    try expectApplicationRoundTrip(
+        .connection,
+        .session,
+        .tls_1_3,
+        .AES_128_GCM_SHA256,
+        plaintext,
+        8192,
+    );
+}
+
+test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally" {
+    const message = "forced TLS 1.2 ChaCha20-Poly1305 record";
+    const initial_seq: u64 = 0x0102030405060708;
+    var scripted_sender = ScriptedSender{
+        .allocator = std.testing.allocator,
+        .max_chunk = 9,
+    };
+    defer scripted_sender.deinit();
+    var scripted_writer = ScriptedRecordWriter{
+        .sender = &scripted_sender,
+        .version = .tls_1_2,
+        .cipher_suite = .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        .sequence = initial_seq,
+    };
+    try std.testing.expectEqual(message.len, try scripted_writer.write(message));
+    try std.testing.expectEqual(initial_seq + 1, scripted_writer.sequence);
+    try std.testing.expectEqual(
+        record_header_len + message.len + crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length,
+        scripted_sender.bytes.items.len,
+    );
+    try std.testing.expectEqual(
+        message.len + crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length,
+        mem.readInt(u16, scripted_sender.bytes.items[3..5], .big),
+    );
+
+    var aad: [record_header_len + 8]u8 = undefined;
+    mem.writeInt(u64, aad[0..8], initial_seq, .big);
+    @memcpy(aad[8..11], scripted_sender.bytes.items[0..3]);
+    mem.writeInt(u16, aad[11..13], message.len, .big);
+    const expected_nonce = nonceTLS13(&test_write_iv, initial_seq);
+    var expected_ciphertext: [message.len]u8 = undefined;
+    var expected_tag: [crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length]u8 = undefined;
+    crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
+        &expected_ciphertext,
+        &expected_tag,
+        message,
+        &aad,
+        expected_nonce,
+        test_write_key,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &expected_ciphertext,
+        scripted_sender.bytes.items[record_header_len..][0..message.len],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &expected_tag,
+        scripted_sender.bytes.items[record_header_len + message.len ..],
+    );
+
+    const round_trip = try std.testing.allocator.dupe(u8, scripted_sender.bytes.items);
+    defer std.testing.allocator.free(round_trip);
+    const decrypted = try decryptTLS12ForSuite(
+        round_trip[record_header_len..],
+        round_trip[0..record_header_len],
+        initial_seq,
+        &test_write_iv,
+        &test_write_key,
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    );
+    try std.testing.expectEqualStrings(message, decrypted);
+
+    const tampered = try std.testing.allocator.dupe(u8, scripted_sender.bytes.items);
+    defer std.testing.allocator.free(tampered);
+    tampered[record_header_len] ^= 0x80;
+    try std.testing.expectError(
+        error.TlsDecryptError,
+        decryptTLS12ForSuite(
+            tampered[record_header_len..],
+            tampered[0..record_header_len],
+            initial_seq,
+            &test_write_iv,
+            &test_write_key,
+            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ),
+    );
+
+    const production_tampered = try std.testing.allocator.dupe(u8, scripted_sender.bytes.items);
+    defer std.testing.allocator.free(production_tampered);
+    production_tampered[record_header_len + 1] ^= 0x40;
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+    try sender.sendAll(production_tampered);
+    var conn = Connection{
+        .allocator = std.testing.allocator,
+        .socket = &receiver,
+        .tls_version = .tls_1_2,
+        .connected = true,
+        .app_read_key = test_write_key,
+        .app_read_iv = test_write_iv,
+        .cipher_suite = .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        .read_seq = initial_seq,
+    };
+    var read_buf: [128]u8 = undefined;
+    try std.testing.expectError(error.TlsDecryptError, conn.read(&read_buf));
+    try std.testing.expectEqual(initial_seq, conn.read_seq);
+
+    const plaintext = try std.testing.allocator.alloc(u8, max_plaintext_len + 321);
+    defer std.testing.allocator.free(plaintext);
+    fillTestPlaintext(plaintext);
+    try expectApplicationRoundTrip(
+        .session,
+        .connection,
+        .tls_1_2,
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        plaintext,
+        4093,
+    );
+    try expectApplicationRoundTrip(
+        .connection,
+        .session,
+        .tls_1_2,
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        plaintext,
+        4093,
+    );
+}
+
+test "TLS 1.2 ChaCha handshake record helpers round trip" {
+    const suites = [_]tls.CipherSuite{
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    };
+    const message = "\x14\x00\x00\x0c0123456789ab";
+
+    for (suites) |cipher_suite| {
+        const sockets = try testSocketPair();
+        var sender = sockets[0];
+        defer sender.close();
+        var receiver = sockets[1];
+        defer receiver.close();
+
+        var write_seq: u64 = 7;
+        try sendTLS12EncryptedHandshake(
+            &sender,
+            message,
+            &test_write_key,
+            &test_write_iv,
+            &write_seq,
+            cipher_suite,
+        );
+        var read_seq: u64 = 7;
+        var record_buf: [4096]u8 = undefined;
+        const plaintext = try readTLS12EncryptedRecord(
+            &receiver,
+            &record_buf,
+            &test_write_key,
+            &test_write_iv,
+            &read_seq,
+            cipher_suite,
+        );
+        try std.testing.expectEqualStrings(message, plaintext);
+        try std.testing.expectEqual(@as(u64, 8), write_seq);
+        try std.testing.expectEqual(@as(u64, 8), read_seq);
+    }
 }

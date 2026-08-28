@@ -10,6 +10,7 @@
 //! - Cross-platform (Linux, Windows, macOS)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tint = @import("tint");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -638,29 +639,28 @@ pub const Context = struct {
         const writer = self.getStreamWriter() orelse return error.NoStreamWriter;
 
         // Write status line
-        _ = try writer.write("HTTP/1.1 ");
+        try writer.writeAll("HTTP/1.1 ");
         const status_str = std.fmt.allocPrint(self.allocator, "{d}", .{status_code}) catch unreachable;
         defer self.allocator.free(status_str);
-        _ = try writer.write(status_str);
-        _ = try writer.write("\r\n");
+        try writer.writeAll(status_str);
+        try writer.writeAll("\r\n");
 
         // Write headers
         if (headers) |h| {
-            var it = h.iterator();
-            while (it.next()) |entry| {
-                _ = try writer.write(entry.key_ptr.*);
-                _ = try writer.write(": ");
-                _ = try writer.write(entry.value_ptr.*);
-                _ = try writer.write("\r\n");
+            for (h.iterator()) |entry| {
+                try writer.writeAll(entry.name);
+                try writer.writeAll(": ");
+                try writer.writeAll(entry.value);
+                try writer.writeAll("\r\n");
             }
         }
 
         // Add Transfer-Encoding: chunked
-        _ = try writer.write("Transfer-Encoding: chunked\r\n");
-        _ = try writer.write("\r\n");
+        try writer.writeAll("Transfer-Encoding: chunked\r\n");
+        try writer.writeAll("\r\n");
 
         self.streaming_done = true;
-        return writer;
+        return writer.*;
     }
 
     /// Writes a chunk to the streaming response body.
@@ -673,7 +673,7 @@ pub const Context = struct {
     pub fn finishStreaming(self: *Self) !void {
         const writer = self.getStreamWriter() orelse return error.NoStreamWriter;
         // Write the final empty chunk to signal end of body
-        try writer.write("0\r\n\r\n");
+        try writer.writeAll("0\r\n\r\n");
     }
 
     /// Starts a raw streaming response without Transfer-Encoding.
@@ -682,26 +682,25 @@ pub const Context = struct {
         const writer = self.getStreamWriter() orelse return error.NoStreamWriter;
 
         // Write status line
-        _ = try writer.write("HTTP/1.1 ");
+        try writer.writeAll("HTTP/1.1 ");
         const status_str = std.fmt.allocPrint(self.allocator, "{d}", .{status_code}) catch unreachable;
         defer self.allocator.free(status_str);
-        _ = try writer.write(status_str);
-        _ = try writer.write("\r\n");
+        try writer.writeAll(status_str);
+        try writer.writeAll("\r\n");
 
         // Write headers
         if (headers) |h| {
-            var it = h.iterator();
-            while (it.next()) |entry| {
-                _ = try writer.write(entry.key_ptr.*);
-                _ = try writer.write(": ");
-                _ = try writer.write(entry.value_ptr.*);
-                _ = try writer.write("\r\n");
+            for (h.iterator()) |entry| {
+                try writer.writeAll(entry.name);
+                try writer.writeAll(": ");
+                try writer.writeAll(entry.value);
+                try writer.writeAll("\r\n");
             }
         }
 
-        _ = try writer.write("\r\n");
+        try writer.writeAll("\r\n");
         self.streaming_done = true;
-        return writer;
+        return writer.*;
     }
 
     /// Starts a streaming SSE response by writing headers and returning a writer.
@@ -3965,4 +3964,95 @@ test "HTTP/2 server handles concurrent streams" {
 
     try std.testing.expect(found_stream_1);
     try std.testing.expect(found_stream_3);
+}
+
+fn streamingTestSocketPair() ![2]Socket {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var handles: [2]std.posix.socket_t = undefined;
+        const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &handles);
+        if (std.posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+        return .{
+            Socket.fromHandle(handles[0]),
+            Socket.fromHandle(handles[1]),
+        };
+    }
+}
+
+test "TLS streaming headers preserve values larger than one record" {
+    const modes = [_]enum { chunked, raw }{ .chunked, .raw };
+    const key = [_]u8{0x5a} ** 32;
+    const iv = [_]u8{0xa5} ** 12;
+
+    for (modes) |mode| {
+        const large_value = try std.testing.allocator.alloc(u8, 20 * 1024 + 37);
+        defer std.testing.allocator.free(large_value);
+        @memset(large_value, 'v');
+
+        var headers = Headers.init(std.testing.allocator);
+        defer headers.deinit();
+        try headers.append("X-Large", large_value);
+
+        const sockets = try streamingTestSocketPair();
+        var sender = sockets[0];
+        defer sender.close();
+        var receiver = sockets[1];
+        defer receiver.close();
+
+        var tls_sender = tls_mod.Connection{
+            .allocator = std.testing.allocator,
+            .socket = &sender,
+            .tls_version = .tls_1_3,
+            .connected = true,
+            .app_write_key = key,
+            .app_write_iv = iv,
+            .cipher_suite = .AES_128_GCM_SHA256,
+        };
+        var tls_receiver = tls_mod.Connection{
+            .allocator = std.testing.allocator,
+            .socket = &receiver,
+            .tls_version = .tls_1_3,
+            .connected = true,
+            .app_read_key = key,
+            .app_read_iv = iv,
+            .cipher_suite = .AES_128_GCM_SHA256,
+        };
+        var stream_writer = StreamWriter.fromTLS(std.testing.allocator, &tls_sender);
+
+        var request = try Request.init(std.testing.allocator, .GET, "/");
+        defer request.deinit();
+        var context = Context.init(std.testing.allocator, &request);
+        defer context.deinit();
+        try context.data.put("__stream_writer", @ptrCast(&stream_writer));
+
+        _ = switch (mode) {
+            .chunked => try context.startStreaming(200, &headers),
+            .raw => try context.startRawStreaming(200, &headers),
+        };
+        try sender.shutdownWrite();
+
+        var expected = std.ArrayList(u8).empty;
+        defer expected.deinit(std.testing.allocator);
+        try expected.appendSlice(std.testing.allocator, "HTTP/1.1 200\r\nX-Large: ");
+        try expected.appendSlice(std.testing.allocator, large_value);
+        try expected.appendSlice(std.testing.allocator, "\r\n");
+        if (mode == .chunked) {
+            try expected.appendSlice(std.testing.allocator, "Transfer-Encoding: chunked\r\n");
+        }
+        try expected.appendSlice(std.testing.allocator, "\r\n");
+
+        var actual = std.ArrayList(u8).empty;
+        defer actual.deinit(std.testing.allocator);
+        var read_buf: [1024]u8 = undefined;
+        while (actual.items.len < expected.items.len) {
+            const n = try tls_receiver.read(&read_buf);
+            if (n == 0) return error.UnexpectedEof;
+            try actual.appendSlice(std.testing.allocator, read_buf[0..n]);
+        }
+
+        try std.testing.expect(context.streaming_done);
+        try std.testing.expect(tls_sender.write_seq > 1);
+        try std.testing.expectEqualSlices(u8, expected.items, actual.items);
+    }
 }
