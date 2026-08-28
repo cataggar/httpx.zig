@@ -337,6 +337,20 @@ pub const MultipartFile = client_mod.MultipartFile;
 
 pub const TLSConfig = tls.TLSConfig;
 pub const TlsConfig = tls.TLSConfig;
+pub const TrustProvider = tls.TrustProvider;
+pub const VerifyPeerRequest = tls.VerifyPeerRequest;
+pub const PeerRole = tls.PeerRole;
+pub const PeerIdentity = tls.PeerIdentity;
+pub const TrustIpAddress = tls.IpAddress;
+pub const TrustLimits = tls.TrustLimits;
+pub const CaBundleSource = tls.CaBundleSource;
+pub const TrustSource = tls.TrustSource;
+pub const ServerAuthentication = tls.ServerAuthentication;
+pub const TrustError = tls.TrustError;
+pub const CertificateSignatureAlgorithmIdentifier = tls.CertificateSignatureAlgorithmIdentifier;
+pub const CertificateSignatureVerifier = tls.CertificateSignatureVerifier;
+pub const VerifyCertificateSignatureRequest = tls.VerifyCertificateSignatureRequest;
+pub const CertificateSignatureError = tls.CertificateSignatureError;
 
 // Transfer exports
 pub const Progress = transfer.Progress;
@@ -969,4 +983,21 @@ test "dns" {
     _ = DNSStats;
     _ = AddressFamily;
     _ = AddressOrder;
+}
+
+test "tls trust contract exports" {
+    _ = TrustProvider;
+    _ = VerifyPeerRequest;
+    _ = PeerRole;
+    _ = PeerIdentity;
+    _ = TrustIpAddress;
+    _ = TrustLimits;
+    _ = CaBundleSource;
+    _ = TrustSource;
+    _ = ServerAuthentication;
+    _ = TrustError;
+    _ = CertificateSignatureAlgorithmIdentifier;
+    _ = CertificateSignatureVerifier;
+    _ = VerifyCertificateSignatureRequest;
+    _ = CertificateSignatureError;
 }
