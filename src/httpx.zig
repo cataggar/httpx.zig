@@ -351,6 +351,12 @@ pub const CertificateSignatureAlgorithmIdentifier = tls.CertificateSignatureAlgo
 pub const CertificateSignatureVerifier = tls.CertificateSignatureVerifier;
 pub const VerifyCertificateSignatureRequest = tls.VerifyCertificateSignatureRequest;
 pub const CertificateSignatureError = tls.CertificateSignatureError;
+pub const crypto_provider = tls.crypto_provider;
+pub const CryptoProvider = tls.CryptoProvider;
+pub const CryptoProviderVTable = tls.CryptoProviderVTable;
+pub const CryptoProviderCapabilities = tls.CryptoProviderCapabilities;
+pub const CryptoCapabilities = tls.CryptoCapabilities;
+pub const CryptoProviderError = tls.CryptoProviderError;
 
 // Transfer exports
 pub const Progress = transfer.Progress;
