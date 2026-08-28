@@ -153,6 +153,19 @@ pub const IoContext = struct {
         return self.checkAt(monotonicNowNs());
     }
 
+    /// Checks cancellation/deadlines before unwrapping a completed blocking
+    /// operation. Evaluate and capture `result` before calling this helper so a
+    /// cancellation or deadline that becomes active while the operation blocks
+    /// deterministically takes precedence over the operation's own error.
+    pub fn unwrapAfterBlocking(
+        self: *const Self,
+        comptime T: type,
+        result: anyerror!T,
+    ) anyerror!T {
+        try self.check();
+        return try result;
+    }
+
     /// Sleeps for up to `duration_ms`, waking in bounded slices to observe
     /// cancellation and deadlines. Context deadline expiry returns
     /// `error.Timeout`; completing the requested delay returns success.
@@ -234,6 +247,18 @@ const FakeClock = struct {
     }
 };
 
+const FakeResolverError = error{ResolverFailed};
+
+fn failAfterCancelling(token: *types.CancellationToken) FakeResolverError!u8 {
+    token.cancel();
+    return error.ResolverFailed;
+}
+
+fn failAfterExpiring(context: *IoContext) FakeResolverError!u8 {
+    context.setPhaseDeadline(Deadline.at(0));
+    return error.ResolverFailed;
+}
+
 test "IoContext observes already-cancelled state" {
     var external = types.CancellationToken.init();
     external.cancel();
@@ -280,6 +305,30 @@ test "IoContext timeout boundary and cancellation precedence" {
 
     context.cancel();
     try std.testing.expectError(error.Cancelled, context.checkAt(100));
+}
+
+test "blocking result unwrap gives context state precedence over resolver error" {
+    var token = types.CancellationToken.init();
+    const cancelled = IoContext.init(.{ .external_cancel = &token });
+    const cancelled_result = failAfterCancelling(&token);
+    try std.testing.expectError(
+        error.Cancelled,
+        cancelled.unwrapAfterBlocking(u8, cancelled_result),
+    );
+
+    var expired = IoContext.init(.{});
+    const expired_result = failAfterExpiring(&expired);
+    try std.testing.expectError(
+        error.Timeout,
+        expired.unwrapAfterBlocking(u8, expired_result),
+    );
+
+    const active = IoContext.init(.{});
+    const resolver_result: FakeResolverError!u8 = error.ResolverFailed;
+    try std.testing.expectError(
+        error.ResolverFailed,
+        active.unwrapAfterBlocking(u8, resolver_result),
+    );
 }
 
 test "deadline construction saturates on overflow" {

@@ -227,23 +227,22 @@ pub const ConnectionPool = struct {
             // The platform getaddrinfo path is blocking and cannot be
             // synchronously cancelled. Check immediately before and after it.
             try context.check();
-            const resolved = try address_mod.resolve(self.allocator, connect_host, connect_port);
-            try context.check();
-            break :blk resolved;
+            const resolved = address_mod.resolve(self.allocator, connect_host, connect_port);
+            break :blk try context.unwrapAfterBlocking(address_mod.Address, resolved);
         };
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
         try context.check();
-        try socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
-        try context.check();
+        const connect_result = socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
+        try context.unwrapAfterBlocking(void, connect_result);
         try socket.setNoDelay(true);
 
         if (proxy) |p| {
             if (p.kind == .socks5h) {
                 try context.check();
-                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
-                try context.check();
+                const tunnel_result = proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
+                try context.unwrapAfterBlocking(void, tunnel_result);
             }
         }
 

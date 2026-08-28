@@ -603,9 +603,8 @@ pub const Client = struct {
 
         // The platform getaddrinfo path is blocking and cannot be
         // synchronously cancelled. Check immediately before and after it.
-        const resolved = try address_mod.resolve(self.allocator, hostname, port);
-        try context.check();
-        return resolved;
+        const resolved = address_mod.resolve(self.allocator, hostname, port);
+        return context.unwrapAfterBlocking(address_mod.Address, resolved);
     }
 
     /// Logs a formatted message. If config.log_fn is provided, delegates to it.
