@@ -406,6 +406,36 @@ test "Headers multiple values" {
     try std.testing.expectEqual(@as(usize, 2), headers.count());
 }
 
+test "Headers preserve interleaved duplicate wire order" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("X-A", "1");
+    try headers.append("X-B", "x");
+    try headers.append("X-A", "2");
+    try headers.append("Set-Cookie", "a=1");
+    try headers.append("Set-Cookie", "b=2");
+
+    const entries = headers.iterator();
+    try std.testing.expectEqual(@as(usize, 5), entries.len);
+    try std.testing.expectEqualStrings("X-A", entries[0].name);
+    try std.testing.expectEqualStrings("1", entries[0].value);
+    try std.testing.expectEqualStrings("X-B", entries[1].name);
+    try std.testing.expectEqualStrings("X-A", entries[2].name);
+    try std.testing.expectEqualStrings("2", entries[2].value);
+
+    const x_a = try headers.getAll("X-A", allocator);
+    defer allocator.free(x_a);
+    try std.testing.expectEqual(@as(usize, 2), x_a.len);
+    try std.testing.expectEqualStrings("1", x_a[0]);
+    try std.testing.expectEqualStrings("2", x_a[1]);
+
+    const set_cookie = try headers.getAll("Set-Cookie", allocator);
+    defer allocator.free(set_cookie);
+    try std.testing.expectEqual(@as(usize, 2), set_cookie.len);
+}
+
 test "Headers Content-Length parsing" {
     const allocator = std.testing.allocator;
     var headers = Headers.init(allocator);

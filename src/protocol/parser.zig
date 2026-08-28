@@ -665,6 +665,35 @@ test "Parser headers" {
     try std.testing.expectEqualStrings("test", parser.headers.get("User-Agent").?);
 }
 
+test "Parser preserves interleaved duplicate response headers" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "X-A: 1\r\n" ++
+            "X-B: x\r\n" ++
+            "X-A: 2\r\n" ++
+            "Set-Cookie: a=1\r\n" ++
+            "Set-Cookie: b=2\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+    );
+
+    const entries = parser.headers.iterator();
+    try std.testing.expectEqualStrings("X-A", entries[0].name);
+    try std.testing.expectEqualStrings("X-B", entries[1].name);
+    try std.testing.expectEqualStrings("X-A", entries[2].name);
+    const x_a = try parser.headers.getAll("X-A", allocator);
+    defer allocator.free(x_a);
+    try std.testing.expectEqual(@as(usize, 2), x_a.len);
+    try std.testing.expectEqualStrings("1", x_a[0]);
+    try std.testing.expectEqualStrings("2", x_a[1]);
+    const cookies = try parser.headers.getAll("Set-Cookie", allocator);
+    defer allocator.free(cookies);
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
+}
+
 test "Parser reset" {
     const allocator = std.testing.allocator;
     var parser = Parser.init(allocator);

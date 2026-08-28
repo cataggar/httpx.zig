@@ -495,13 +495,20 @@ pub const DecompressionPolicy = enum {
     enabled,
 };
 
-/// Nullable per-request overrides for the five automatic client behaviors.
+/// Automatic synthesis of the client configured `User-Agent`.
+pub const UserAgentPolicy = enum {
+    disabled,
+    enabled,
+};
+
+/// Nullable per-request overrides for automatic client behaviors.
 pub const RequestPolicyOverrides = struct {
     retry: ?RetryBehavior = null,
     redirect: ?RedirectBehavior = null,
     cookies: ?CookiePolicy = null,
     accept_encoding: ?AcceptEncodingPolicy = null,
     decompression: ?DecompressionPolicy = null,
+    user_agent: ?UserAgentPolicy = null,
 
     /// Disables every automatic client behavior for one request.
     pub fn embeddingOwned() RequestPolicyOverrides {
@@ -511,6 +518,7 @@ pub const RequestPolicyOverrides = struct {
             .cookies = .disabled,
             .accept_encoding = .disabled,
             .decompression = .disabled,
+            .user_agent = .disabled,
         };
     }
 };
@@ -522,6 +530,7 @@ pub const EffectiveClientPolicy = struct {
     cookies: CookiePolicy,
     accept_encoding: AcceptEncodingPolicy,
     decompression: DecompressionPolicy,
+    user_agent: UserAgentPolicy,
 
     pub fn retryPolicy(self: EffectiveClientPolicy) ?RetryPolicy {
         return switch (self.retry) {
@@ -538,13 +547,14 @@ pub const EffectiveClientPolicy = struct {
     }
 };
 
-/// Client-wide defaults for the five independently configurable behaviors.
+/// Client-wide defaults for independently configurable automatic behaviors.
 pub const ClientPolicy = struct {
     retry: RetryBehavior = .{ .policy = .{} },
     redirect: RedirectBehavior = .{ .policy = .{} },
     cookies: CookiePolicy = .send_and_store,
     accept_encoding: AcceptEncodingPolicy = .library_default,
     decompression: DecompressionPolicy = .enabled,
+    user_agent: UserAgentPolicy = .enabled,
 
     /// Managed behavior compatible with the historical client defaults.
     pub fn managed() ClientPolicy {
@@ -559,6 +569,7 @@ pub const ClientPolicy = struct {
             .cookies = .disabled,
             .accept_encoding = .disabled,
             .decompression = .disabled,
+            .user_agent = .disabled,
         };
     }
 
@@ -570,6 +581,7 @@ pub const ClientPolicy = struct {
             .cookies = overrides.cookies orelse self.cookies,
             .accept_encoding = overrides.accept_encoding orelse self.accept_encoding,
             .decompression = overrides.decompression orelse self.decompression,
+            .user_agent = overrides.user_agent orelse self.user_agent,
         };
     }
 };
@@ -721,6 +733,7 @@ test "ClientPolicy managed and embedding-owned presets" {
     try std.testing.expectEqual(CookiePolicy.send_and_store, managed.cookies);
     try std.testing.expect(managed.accept_encoding == .library_default);
     try std.testing.expectEqual(DecompressionPolicy.enabled, managed.decompression);
+    try std.testing.expectEqual(UserAgentPolicy.enabled, managed.user_agent);
 
     const embedding_owned = ClientPolicy.embeddingOwned().resolve(.{});
     try std.testing.expect(embedding_owned.retry == .disabled);
@@ -728,6 +741,7 @@ test "ClientPolicy managed and embedding-owned presets" {
     try std.testing.expectEqual(CookiePolicy.disabled, embedding_owned.cookies);
     try std.testing.expect(embedding_owned.accept_encoding == .disabled);
     try std.testing.expectEqual(DecompressionPolicy.disabled, embedding_owned.decompression);
+    try std.testing.expectEqual(UserAgentPolicy.disabled, embedding_owned.user_agent);
 }
 
 test "ClientPolicy resolves each request override independently" {
@@ -752,6 +766,10 @@ test "ClientPolicy resolves each request override independently" {
     const decompression = base.resolve(.{ .decompression = .enabled });
     try std.testing.expectEqual(DecompressionPolicy.enabled, decompression.decompression);
     try std.testing.expect(decompression.retry == .disabled);
+
+    const user_agent = base.resolve(.{ .user_agent = .enabled });
+    try std.testing.expectEqual(UserAgentPolicy.enabled, user_agent.user_agent);
+    try std.testing.expect(user_agent.redirect == .disabled);
 }
 
 test "RequestPolicyOverrides embedding-owned preset disables all features" {
@@ -761,6 +779,7 @@ test "RequestPolicyOverrides embedding-owned preset disables all features" {
     try std.testing.expectEqual(CookiePolicy.disabled, effective.cookies);
     try std.testing.expect(effective.accept_encoding == .disabled);
     try std.testing.expectEqual(DecompressionPolicy.disabled, effective.decompression);
+    try std.testing.expectEqual(UserAgentPolicy.disabled, effective.user_agent);
 }
 
 test "CookiePolicy send and store capabilities are independent" {

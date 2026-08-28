@@ -1,17 +1,21 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-fn logRequest(request: *httpx.Request, context: ?*anyopaque) anyerror!void {
+fn logRequest(request: *httpx.Request, attempt: *const httpx.AttemptContext, context: ?*anyopaque) anyerror!void {
     _ = context;
-    std.debug.print("[Interceptor] Request: {s} {s}\n", .{
+    std.debug.print("[Interceptor] Request #{d}.{d}: {s} {s}\n", .{
+        attempt.logical_request_id,
+        attempt.attempt,
         request.method.toString(),
         request.uri.path,
     });
 }
 
-fn logResponse(response: *httpx.Response, context: ?*anyopaque) anyerror!void {
+fn logResponse(response: *httpx.Response, attempt: *const httpx.AttemptContext, context: ?*anyopaque) anyerror!void {
     _ = context;
-    std.debug.print("[Interceptor] Response: {d} {s}\n", .{
+    std.debug.print("[Interceptor] Response #{d}.{d}: {d} {s}\n", .{
+        attempt.logical_request_id,
+        attempt.attempt,
         response.status.code,
         response.status.phrase,
     });
@@ -34,5 +38,5 @@ pub fn main() !void {
         .context = null,
     });
 
-    std.debug.print("Interceptors registered: {d}\n", .{client.interceptors.items.len});
+    std.debug.print("Interceptor registered\n", .{});
 }

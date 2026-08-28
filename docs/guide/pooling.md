@@ -6,7 +6,18 @@
 
 ## Connection Pooling
 
-The `Client` automatically manages a pool of TCP connections. When a request is made, it checks for an idle, healthy connection to the target host. If one exists, it is reused; otherwise, a new connection is created.
+The `Client` automatically manages a pool of TCP and TLS connections. Each
+entry is heap-stable and checked out through an exclusive lease, so growing or
+cleaning the pool cannot invalidate an in-use handle. HTTPS keeps its
+`TLSSession` attached to the stable socket entry across requests.
+
+HTTP/2 keeps HPACK, SETTINGS, flow-control, and stream-id state with the pooled
+session. Reuse is deliberately sequential (stream IDs 1, 3, 5, ...), not
+concurrent multiplexing. GOAWAY marks a session draining and later requests
+open another connection. A GOAWAY that arrives after a completed response may
+be observed by the next lease; that request returns an error in embedding-owned
+mode, while an enabled retry policy may replay its buffered body on a new
+session.
 
 ### Configuration
 
@@ -23,4 +34,3 @@ const config = httpx.ClientConfig{
 This acts mostly transparently to the user.
 
 For parallel request execution (all, race, any) and task execution, see the [Concurrency](/guide/concurrency) guide.
-

@@ -1,24 +1,22 @@
-//! HTTP Connection Pool for httpx.zig
+//! HTTP connection pool for httpx.zig.
 //!
-//! Provides connection pooling for HTTP clients:
-//!
-//! - Reusable TCP connections with keep-alive
-//! - Per-host connection limits
-//! - Automatic connection health checking
-//! - Idle connection timeout and cleanup
-//! - Thread-safe access via mutex
+//! Pool entries are individually heap allocated. A checked-out lease therefore
+//! remains stable even when the pointer array grows or idle entries are removed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 
 const Socket = @import("../net/socket.zig").Socket;
+const TcpListener = @import("../net/socket.zig").TcpListener;
 const address_mod = @import("../net/address.zig");
 const dns_mod = @import("../net/dns.zig");
 const types = @import("../core/types.zig");
 const proxy_mod = @import("proxy.zig");
 const common = @import("../data/common.zig");
 const IoContext = @import("../io/context.zig").IoContext;
+const TLSSession = @import("../tls/tls.zig").TLSSession;
+const TLSConfig = @import("../tls/tls.zig").TLSConfig;
+const h2stream = @import("../protocol/stream.zig");
 const Proxy = types.Proxy;
 
 pub const PoolError = error{
@@ -26,69 +24,225 @@ pub const PoolError = error{
     PoolExhaustedForHost,
 };
 
-/// Pooled connection representing a reusable socket.
-pub const Connection = struct {
-    socket: Socket,
+pub const PoolScheme = enum {
+    plain,
+    tls,
+};
+
+pub const PoolProtocol = enum {
+    http1,
+    http2,
+};
+
+/// Complete reuse identity for one transport route.
+pub const PoolKey = struct {
+    scheme: PoolScheme = .plain,
     host: []const u8,
     port: u16,
-    proxy_host: ?[]const u8 = null,
+    proxy: ?Proxy = null,
+    verify_tls: bool = true,
+    protocol: PoolProtocol = .http1,
+};
+
+const OwnedPoolKey = struct {
+    scheme: PoolScheme,
+    host: []u8,
+    port: u16,
+    proxy_kind: ?types.ProxyKind = null,
+    proxy_host: ?[]u8 = null,
     proxy_port: ?u16 = null,
-    in_use: bool = false,
+    proxy_username: ?[]u8 = null,
+    proxy_password: ?[]u8 = null,
+    verify_tls: bool,
+    protocol: PoolProtocol,
+
+    fn init(allocator: Allocator, key: PoolKey) !OwnedPoolKey {
+        const host = try allocator.dupe(u8, key.host);
+        errdefer allocator.free(host);
+        const proxy_host = if (key.proxy) |proxy|
+            try allocator.dupe(u8, proxy.host)
+        else
+            null;
+        errdefer if (proxy_host) |value| allocator.free(value);
+        const proxy_username = if (key.proxy) |proxy|
+            if (proxy.username) |value| try allocator.dupe(u8, value) else null
+        else
+            null;
+        errdefer if (proxy_username) |value| allocator.free(value);
+        const proxy_password = if (key.proxy) |proxy|
+            if (proxy.password) |value| try allocator.dupe(u8, value) else null
+        else
+            null;
+        return .{
+            .scheme = key.scheme,
+            .host = host,
+            .port = key.port,
+            .proxy_kind = if (key.proxy) |proxy| proxy.kind else null,
+            .proxy_host = proxy_host,
+            .proxy_port = if (key.proxy) |proxy| proxy.port else null,
+            .proxy_username = proxy_username,
+            .proxy_password = proxy_password,
+            .verify_tls = key.verify_tls,
+            .protocol = key.protocol,
+        };
+    }
+
+    fn deinit(self: *OwnedPoolKey, allocator: Allocator) void {
+        allocator.free(self.host);
+        if (self.proxy_host) |host| allocator.free(host);
+        if (self.proxy_username) |username| allocator.free(username);
+        if (self.proxy_password) |password| allocator.free(password);
+    }
+
+    fn matches(self: *const OwnedPoolKey, key: PoolKey) bool {
+        if (self.scheme != key.scheme or
+            self.port != key.port or
+            self.verify_tls != key.verify_tls or
+            self.protocol != key.protocol or
+            !std.mem.eql(u8, self.host, key.host))
+        {
+            return false;
+        }
+        if (key.proxy) |proxy| {
+            const proxy_host = self.proxy_host orelse return false;
+            return self.proxy_kind == proxy.kind and
+                self.proxy_port == proxy.port and
+                std.mem.eql(u8, proxy_host, proxy.host) and
+                optionalEql(self.proxy_username, proxy.username) and
+                optionalEql(self.proxy_password, proxy.password);
+        }
+        return self.proxy_host == null;
+    }
+};
+
+fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+pub const EntryState = enum {
+    connecting,
+    idle,
+    leased,
+    draining,
+    closed,
+};
+
+/// Persistent state for sequential HTTP/2 session reuse.
+///
+/// A pool lease gives one caller exclusive ownership of this state. HTTP/2
+/// multiplexing is intentionally not attempted by the client.
+pub const H2SessionState = struct {
+    stream_manager: h2stream.StreamManager,
+    initialized: bool = false,
+    peer_max_frame_size: u32 = 16_384,
+    draining: bool = false,
+
+    pub fn init(allocator: Allocator) H2SessionState {
+        return .{ .stream_manager = h2stream.StreamManager.init(allocator, true) };
+    }
+
+    pub fn deinit(self: *H2SessionState) void {
+        self.stream_manager.deinit();
+    }
+};
+
+const Entry = struct {
+    key: OwnedPoolKey,
+    socket: ?Socket = null,
+    tls_session: ?TLSSession = null,
+    h2_session: ?H2SessionState = null,
+    state: EntryState = .connecting,
+    generation: u64 = 0,
+    lease_count: u32 = 0,
     created_at: i64,
     last_used: i64,
     requests_made: u32 = 0,
 
-    const Self = @This();
-
-    /// Marks the connection as in use.
-    pub fn acquire(self: *Self) void {
-        self.in_use = true;
-        self.last_used = common.nowMillis();
+    fn isHealthy(self: *const Entry, max_idle_ms: i64, max_requests: u32) bool {
+        if (self.state != .idle) return false;
+        const socket = self.socket orelse return false;
+        if (!socket.isValid() or self.requests_made >= max_requests) return false;
+        return common.nowMillis() - self.last_used < max_idle_ms;
     }
 
-    /// Releases the connection back to the pool.
-    pub fn release(self: *Self) void {
-        self.in_use = false;
-        self.last_used = common.nowMillis();
-        self.requests_made += 1;
+    fn shouldEvict(self: *const Entry, idle_timeout_ms: i64, max_requests: u32) bool {
+        if (self.lease_count != 0 or self.state == .connecting or self.state == .leased) return false;
+        const socket = self.socket orelse return true;
+        if (!socket.isValid() or self.requests_made >= max_requests) return true;
+        return self.state == .draining or common.nowMillis() - self.last_used >= idle_timeout_ms;
+    }
+};
+
+pub const LeaseDisposition = enum {
+    reusable,
+    broken,
+    draining,
+};
+
+/// Exclusive ownership of one heap-stable pool entry.
+pub const ConnectionLease = struct {
+    pool: *ConnectionPool,
+    entry: *Entry,
+    generation: u64,
+    released: bool = false,
+
+    pub fn socket(self: *ConnectionLease) *Socket {
+        std.debug.assert(!self.released);
+        return &self.entry.socket.?;
     }
 
-    /// Returns true if the connection is healthy and reusable.
-    pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
-        if (self.in_use) return false;
-        if (!self.socket.isValid()) return false;
-        const idle_time = common.nowMillis() - self.last_used;
-        return idle_time < max_idle_ms;
+    pub fn tlsSession(self: *ConnectionLease) ?*TLSSession {
+        std.debug.assert(!self.released);
+        if (self.entry.tls_session) |*session| return session;
+        return null;
     }
 
-    /// Returns true if this connection should be evicted from the pool.
-    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
-        if (self.in_use) return false;
-        if (!self.socket.isValid()) return true;
-        if (self.requests_made >= max_requests_per_connection) return true;
-        const idle_time = common.nowMillis() - self.last_used;
-        return idle_time >= idle_timeout_ms;
+    /// Initializes TLS in stable entry storage and returns the attached session.
+    pub fn initializeTls(self: *ConnectionLease, config: TLSConfig) *TLSSession {
+        std.debug.assert(!self.released);
+        std.debug.assert(self.entry.tls_session == null);
+        self.entry.tls_session = TLSSession.init(config);
+        self.entry.tls_session.?.attachSocket(&self.entry.socket.?);
+        return &self.entry.tls_session.?;
     }
 
-    /// Returns true if this connection matches the given host/port/proxy.
-    pub fn matches(self: *const Self, host: []const u8, port: u16, proxy: ?Proxy) bool {
-        if (!std.mem.eql(u8, self.host, host) or self.port != port) return false;
-        if (proxy) |p| {
-            if (self.proxy_host) |ph| {
-                if (!std.mem.eql(u8, ph, p.host)) return false;
-                if (self.proxy_port != p.port) return false;
-            } else {
-                return false;
-            }
-        } else if (self.proxy_host != null) {
-            return false;
+    pub fn replaceSocket(self: *ConnectionLease, replacement: Socket) void {
+        std.debug.assert(!self.released);
+        if (self.entry.socket) |*old_socket| old_socket.close();
+        self.entry.socket = replacement;
+        if (self.entry.tls_session) |*session| {
+            session.attachSocket(&self.entry.socket.?);
         }
-        return true;
     }
 
-    /// Closes the underlying socket.
-    pub fn close(self: *Self) void {
-        self.socket.close();
+    pub fn h2Session(self: *ConnectionLease) *H2SessionState {
+        std.debug.assert(!self.released);
+        if (self.entry.h2_session == null) {
+            self.entry.h2_session = H2SessionState.init(self.pool.allocator);
+        }
+        return &self.entry.h2_session.?;
+    }
+
+    pub fn isFresh(self: *const ConnectionLease) bool {
+        return self.entry.requests_made == 0 and
+            self.entry.tls_session == null and
+            self.entry.h2_session == null;
+    }
+
+    pub fn requestCount(self: *const ConnectionLease) u32 {
+        return self.entry.requests_made;
+    }
+
+    /// Stable identity useful for diagnostics and regression tests.
+    pub fn entryAddress(self: *const ConnectionLease) usize {
+        return @intFromPtr(self.entry);
+    }
+
+    pub fn release(self: *ConnectionLease, disposition: LeaseDisposition) !void {
+        if (self.released) return error.LeaseAlreadyReleased;
+        self.released = true;
+        try self.pool.releaseLease(self.entry, self.generation, disposition);
     }
 };
 
@@ -110,11 +264,11 @@ pub const PoolStats = struct {
     idle: usize,
 };
 
-/// HTTP connection pool with thread-safe access.
+/// Thread-safe pool of stable entries.
 pub const ConnectionPool = struct {
     allocator: Allocator,
     config: PoolConfig,
-    connections: std.ArrayList(Connection) = .empty,
+    entries: std.ArrayList(*Entry) = .empty,
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     const Self = @This();
@@ -139,39 +293,36 @@ pub const ConnectionPool = struct {
         self.lock.store(0, .release);
     }
 
-    /// Creates a new connection pool.
     pub fn init(allocator: Allocator) Self {
         return initWithConfig(allocator, .{});
     }
 
-    /// Creates a connection pool with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: PoolConfig) Self {
-        return .{
-            .allocator = allocator,
-            .config = config,
-        };
+        return .{ .allocator = allocator, .config = config };
     }
 
-    /// Releases all pool resources.
+    /// Exclusive shutdown. No leases may remain outstanding.
     pub fn deinit(self: *Self) void {
         self.acquireLock();
-        defer self.releaseLock();
-        for (self.connections.items) |*conn| {
-            conn.close();
-            self.allocator.free(conn.host);
-            if (conn.proxy_host) |ph| self.allocator.free(ph);
+        const entries = self.entries;
+        self.entries = .empty;
+        self.releaseLock();
+
+        for (entries.items) |entry| {
+            std.debug.assert(entry.lease_count == 0);
+            self.destroyEntry(entry);
         }
-        self.connections.deinit(self.allocator);
+        var owned_entries = entries;
+        owned_entries.deinit(self.allocator);
     }
 
-    /// Gets or creates a connection to the specified host.
-    pub fn getConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !*Connection {
+    /// Compatibility helper for a plain HTTP/1.1 route.
+    pub fn getConnection(self: *Self, host: []const u8, port: u16, proxy: ?Proxy, connect_timeout_ms: u64) !ConnectionLease {
         const context = IoContext.init(.{});
         return self.getConnectionWithContext(host, port, proxy, connect_timeout_ms, &context);
     }
 
-    /// Context-aware connection acquisition. Pool lock contention and custom
-    /// DNS in-flight waits observe cancellation and deadlines.
+    /// Compatibility helper for a plain HTTP/1.1 route.
     pub fn getConnectionWithContext(
         self: *Self,
         host: []const u8,
@@ -179,53 +330,110 @@ pub const ConnectionPool = struct {
         proxy: ?Proxy,
         connect_timeout_ms: u64,
         context: *const IoContext,
-    ) !*Connection {
-        try self.acquireLockWithContext(context);
-        defer self.releaseLock();
+    ) !ConnectionLease {
+        return self.getLeaseWithContext(.{
+            .host = host,
+            .port = port,
+            .proxy = proxy,
+        }, connect_timeout_ms, context);
+    }
 
-        for (self.connections.items) |*conn| {
-            if (conn.matches(host, port, proxy)) {
-                if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
-                    conn.acquire();
-                    return conn;
-                }
+    pub fn getLeaseWithContext(
+        self: *Self,
+        key: PoolKey,
+        connect_timeout_ms: u64,
+        context: *const IoContext,
+    ) !ConnectionLease {
+        try self.acquireLockWithContext(context);
+
+        for (self.entries.items) |entry| {
+            if (entry.key.matches(key) and entry.isHealthy(
+                self.config.idle_timeout_ms,
+                self.config.max_requests_per_connection,
+            )) {
+                entry.state = .leased;
+                entry.lease_count = 1;
+                entry.generation +%= 1;
+                entry.last_used = common.nowMillis();
+                const generation = entry.generation;
+                self.releaseLock();
+                return .{ .pool = self, .entry = entry, .generation = generation };
             }
         }
 
-        if (self.totalCountLocked() >= self.config.max_connections) return PoolError.PoolExhausted;
+        if (self.entries.items.len >= self.config.max_connections) {
+            self.releaseLock();
+            return PoolError.PoolExhausted;
+        }
 
         var host_count: u32 = 0;
-        for (self.connections.items) |conn| {
-            if (conn.matches(host, port, proxy)) host_count += 1;
+        for (self.entries.items) |entry| {
+            if (entry.key.port == key.port and std.mem.eql(u8, entry.key.host, key.host)) {
+                host_count += 1;
+            }
         }
-        if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+        if (host_count >= self.config.max_per_host) {
+            self.releaseLock();
+            return PoolError.PoolExhaustedForHost;
+        }
 
-        return self.createConnection(host, port, proxy, connect_timeout_ms, context);
+        const owned_key = OwnedPoolKey.init(self.allocator, key) catch |err| {
+            self.releaseLock();
+            return err;
+        };
+        const entry = self.allocator.create(Entry) catch |err| {
+            var mutable_key = owned_key;
+            mutable_key.deinit(self.allocator);
+            self.releaseLock();
+            return err;
+        };
+        const now = common.nowMillis();
+        entry.* = .{
+            .key = owned_key,
+            .state = .connecting,
+            .lease_count = 1,
+            .generation = 1,
+            .created_at = now,
+            .last_used = now,
+        };
+        self.entries.append(self.allocator, entry) catch |err| {
+            self.destroyEntry(entry);
+            self.releaseLock();
+            return err;
+        };
+        self.releaseLock();
+
+        self.connectEntry(entry, key, connect_timeout_ms, context) catch |err| {
+            self.acquireLock();
+            _ = self.unlinkEntryLocked(entry);
+            self.releaseLock();
+            entry.lease_count = 0;
+            self.destroyEntry(entry);
+            return err;
+        };
+
+        self.acquireLock();
+        entry.state = .leased;
+        self.releaseLock();
+        return .{ .pool = self, .entry = entry, .generation = entry.generation };
     }
 
-    /// Creates a new connection.
-    fn createConnection(
+    fn connectEntry(
         self: *Self,
-        host: []const u8,
-        port: u16,
-        proxy: ?Proxy,
+        entry: *Entry,
+        key: PoolKey,
         connect_timeout_ms: u64,
         context: *const IoContext,
-    ) !*Connection {
+    ) !void {
         try context.check();
-        const host_owned = try self.allocator.dupe(u8, host);
-        errdefer self.allocator.free(host_owned);
-
-        const connect_host = if (proxy) |p| p.host else host;
-        const connect_port = if (proxy) |p| p.port else port;
+        const connect_host = if (key.proxy) |proxy| proxy.host else key.host;
+        const connect_port = if (key.proxy) |proxy| proxy.port else key.port;
         const addr = if (self.config.dns_resolver) |resolver| blk: {
             var result = try resolver.resolveWithContext(connect_host, .{ .port = connect_port }, context);
             defer result.deinit();
             if (result.addresses.len == 0) return error.DNSResolutionFailed;
             break :blk result.addresses[0];
         } else blk: {
-            // The platform getaddrinfo path is blocking and cannot be
-            // synchronously cancelled. Check immediately before and after it.
             try context.check();
             const resolved = address_mod.resolve(self.allocator, connect_host, connect_port);
             break :blk try context.unwrapAfterBlocking(address_mod.Address, resolved);
@@ -233,140 +441,141 @@ pub const ConnectionPool = struct {
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
-        try context.check();
-        const connect_result = socket.connectWithTimeout(addr, if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms);
-        try context.unwrapAfterBlocking(void, connect_result);
+        const timeout = if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms;
+        try context.unwrapAfterBlocking(void, socket.connectWithTimeout(addr, timeout));
         try socket.setNoDelay(true);
 
-        if (proxy) |p| {
-            if (p.kind == .socks5h) {
+        if (key.proxy) |proxy| {
+            if (proxy.kind == .socks5h) {
                 try context.check();
-                const tunnel_result = proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
-                try context.unwrapAfterBlocking(void, tunnel_result);
+                try context.unwrapAfterBlocking(
+                    void,
+                    proxy_mod.establishSocks5hTunnel(&socket, key.host, key.port, proxy),
+                );
             }
         }
 
-        const now = common.nowMillis();
-
-        const proxy_host_owned: ?[]const u8 = if (proxy) |p| try self.allocator.dupe(u8, p.host) else null;
-
-        self.connections.append(self.allocator, .{
-            .socket = socket,
-            .host = host_owned,
-            .port = port,
-            .proxy_host = proxy_host_owned,
-            .proxy_port = if (proxy) |p| p.port else null,
-            .in_use = true,
-            .created_at = now,
-            .last_used = now,
-        }) catch {
-            if (proxy_host_owned) |ph| self.allocator.free(ph);
-            return error.OutOfMemory;
-        };
-
-        return &self.connections.items[self.connections.items.len - 1];
+        entry.socket = socket;
     }
 
-    /// Releases a connection back to the pool.
-    pub fn releaseConnection(self: *Self, conn: *Connection) void {
+    fn releaseLease(
+        self: *Self,
+        entry: *Entry,
+        generation: u64,
+        disposition: LeaseDisposition,
+    ) !void {
         self.acquireLock();
-        defer self.releaseLock();
-        conn.release();
+        if (entry.generation != generation or entry.state != .leased or entry.lease_count != 1) {
+            self.releaseLock();
+            return error.StaleLease;
+        }
+
+        entry.lease_count = 0;
+        entry.requests_made +%= 1;
+        entry.last_used = common.nowMillis();
+
+        const can_reuse = disposition == .reusable and
+            entry.socket != null and
+            entry.socket.?.isValid() and
+            entry.requests_made < self.config.max_requests_per_connection and
+            !(if (entry.h2_session) |h2| h2.draining else false);
+
+        if (can_reuse) {
+            entry.state = .idle;
+            self.releaseLock();
+            return;
+        }
+
+        entry.state = if (disposition == .draining) .draining else .closed;
+        _ = self.unlinkEntryLocked(entry);
+        self.releaseLock();
+        self.destroyEntry(entry);
     }
 
-    /// Marks a connection as closed and removes it from the pool.
-    pub fn closeConnection(self: *Self, conn: *Connection) void {
-        self.acquireLock();
-        defer self.releaseLock();
-        conn.close();
-        self.allocator.free(conn.host);
-        if (conn.proxy_host) |ph| self.allocator.free(ph);
-        // Find and remove the connection
-        for (self.connections.items, 0..) |*c, i| {
-            if (std.meta.eql(c.socket, conn.socket)) {
-                _ = self.connections.orderedRemove(i);
-                return;
+    fn unlinkEntryLocked(self: *Self, target: *Entry) bool {
+        for (self.entries.items, 0..) |entry, index| {
+            if (entry == target) {
+                _ = self.entries.orderedRemove(index);
+                return true;
             }
         }
+        return false;
     }
 
-    /// Removes idle connections that have exceeded the timeout.
+    fn destroyEntry(self: *Self, entry: *Entry) void {
+        if (entry.h2_session) |*h2| h2.deinit();
+        if (entry.tls_session) |*session| session.deinit();
+        if (entry.socket) |*socket| socket.close();
+        entry.key.deinit(self.allocator);
+        self.allocator.destroy(entry);
+    }
+
+    /// Removes only zero-lease entries. Checked-out entries remain stable.
     pub fn cleanup(self: *Self) void {
-        self.acquireLock();
-        defer self.releaseLock();
-        var i: usize = 0;
-        while (i < self.connections.items.len) {
-            const conn = &self.connections.items[i];
-            if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
-                conn.close();
-                self.allocator.free(conn.host);
-                if (conn.proxy_host) |ph| self.allocator.free(ph);
-                _ = self.connections.orderedRemove(i);
-            } else {
-                i += 1;
+        while (true) {
+            self.acquireLock();
+            var victim: ?*Entry = null;
+            for (self.entries.items) |entry| {
+                if (entry.shouldEvict(
+                    self.config.idle_timeout_ms,
+                    self.config.max_requests_per_connection,
+                )) {
+                    victim = entry;
+                    _ = self.unlinkEntryLocked(entry);
+                    break;
+                }
             }
+            self.releaseLock();
+            const entry = victim orelse return;
+            self.destroyEntry(entry);
         }
-    }
-
-    /// Returns the number of active connections.
-    pub fn activeCount(self: *Self) usize {
-        self.acquireLock();
-        defer self.releaseLock();
-        var count: usize = 0;
-        for (self.connections.items) |conn| {
-            if (conn.in_use) count += 1;
-        }
-        return count;
-    }
-
-    /// Returns the total number of connections.
-    fn totalCountLocked(self: *Self) usize {
-        return self.connections.items.len;
-    }
-
-    fn idleCountLocked(self: *Self) usize {
-        var active: usize = 0;
-        for (self.connections.items) |conn| {
-            if (conn.in_use) active += 1;
-        }
-        return self.connections.items.len - active;
-    }
-
-    fn hostConnectionCountLocked(self: *Self, host: []const u8, port: u16) usize {
-        var count: usize = 0;
-        for (self.connections.items) |conn| {
-            if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
-                count += 1;
-            }
-        }
-        return count;
     }
 
     fn statsLocked(self: *Self) PoolStats {
         var active: usize = 0;
-        for (self.connections.items) |conn| {
-            if (conn.in_use) active += 1;
+        var idle: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.lease_count > 0 or entry.state == .connecting) active += 1;
+            if (entry.state == .idle) idle += 1;
         }
-        const total = self.connections.items.len;
-        return .{ .total = total, .active = active, .idle = total - active };
+        return .{ .total = self.entries.items.len, .active = active, .idle = idle };
     }
 
     pub fn totalCount(self: *Self) usize {
         self.acquireLock();
         defer self.releaseLock();
-        return self.totalCountLocked();
+        return self.entries.items.len;
+    }
+
+    pub fn activeCount(self: *Self) usize {
+        return self.stats().active;
     }
 
     pub fn idleCount(self: *Self) usize {
-        self.acquireLock();
-        defer self.releaseLock();
-        return self.idleCountLocked();
+        return self.stats().idle;
     }
 
     pub fn hostConnectionCount(self: *Self, host: []const u8, port: u16) usize {
         self.acquireLock();
         defer self.releaseLock();
-        return self.hostConnectionCountLocked(host, port);
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.key.port == port and std.mem.eql(u8, entry.key.host, host)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn h2NextClientStreamId(self: *Self, host: []const u8, port: u16) ?u31 {
+        self.acquireLock();
+        defer self.releaseLock();
+        for (self.entries.items) |entry| {
+            if (entry.key.port == port and std.mem.eql(u8, entry.key.host, host)) {
+                if (entry.h2_session) |*session| {
+                    return session.stream_manager.next_client_stream_id;
+                }
+            }
+        }
+        return null;
     }
 
     pub fn stats(self: *Self) PoolStats {
@@ -377,21 +586,17 @@ pub const ConnectionPool = struct {
 };
 
 test "ConnectionPool initialization" {
-    const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator);
+    var pool = ConnectionPool.init(std.testing.allocator);
     defer pool.deinit();
-
     try std.testing.expectEqual(@as(usize, 0), pool.totalCount());
 }
 
 test "ConnectionPool config" {
-    const allocator = std.testing.allocator;
-    var pool = ConnectionPool.initWithConfig(allocator, .{
+    var pool = ConnectionPool.initWithConfig(std.testing.allocator, .{
         .max_connections = 50,
         .max_per_host = 10,
     });
     defer pool.deinit();
-
     try std.testing.expectEqual(@as(u32, 50), pool.config.max_connections);
     try std.testing.expectEqual(@as(u32, 10), pool.config.max_per_host);
 }
@@ -412,30 +617,80 @@ test "ConnectionPool contextual acquisition observes cancellation during lock wa
     );
 }
 
-test "Connection health check" {
-    var conn = Connection{
-        .socket = try Socket.create(),
-        .host = "localhost",
-        .port = 8080,
-        .created_at = common.nowMillis(),
-        .last_used = common.nowMillis(),
-    };
-    defer conn.socket.close();
-
-    try std.testing.expect(conn.isHealthy(60_000));
-
-    conn.in_use = true;
-    try std.testing.expect(!conn.isHealthy(60_000));
+test "ConnectionPool stats helpers" {
+    var pool = ConnectionPool.init(std.testing.allocator);
+    defer pool.deinit();
+    const stats = pool.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.total);
+    try std.testing.expectEqual(@as(usize, 0), stats.active);
+    try std.testing.expectEqual(@as(usize, 0), stats.idle);
 }
 
-test "ConnectionPool stats helpers" {
-    const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator);
+test "ConnectionPool growth keeps checked-out lease addresses stable" {
+    const connection_count = 24;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+
+    const AcceptServer = struct {
+        listener: *TcpListener,
+        release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var sockets: [connection_count]Socket = undefined;
+            var accepted_count: usize = 0;
+            defer {
+                for (sockets[0..accepted_count]) |*socket| socket.close();
+            }
+            while (accepted_count < connection_count) : (accepted_count += 1) {
+                const accepted = self.listener.accept() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                sockets[accepted_count] = accepted.socket;
+            }
+            while (!self.release.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    var server = AcceptServer{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, AcceptServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.release.store(true, .release);
+        thread.join();
+    };
+
+    var pool = ConnectionPool.initWithConfig(std.testing.allocator, .{
+        .max_connections = connection_count,
+        .max_per_host = connection_count,
+    });
     defer pool.deinit();
 
-    const s = pool.stats();
-    try std.testing.expectEqual(@as(usize, 0), s.total);
-    try std.testing.expectEqual(@as(usize, 0), s.active);
-    try std.testing.expectEqual(@as(usize, 0), s.idle);
-    try std.testing.expectEqual(@as(usize, 0), pool.hostConnectionCount("httpbun.com", 443));
+    var leases: [connection_count]ConnectionLease = undefined;
+    const context = IoContext.init(.{});
+    for (&leases) |*lease| {
+        lease.* = try pool.getLeaseWithContext(.{
+            .host = "127.0.0.1",
+            .port = address.getPort(),
+        }, 5_000, &context);
+    }
+
+    const first_address = leases[0].entryAddress();
+    try std.testing.expectEqual(first_address, leases[0].entryAddress());
+    pool.cleanup();
+    try std.testing.expectEqual(@as(usize, connection_count), pool.stats().active);
+    try std.testing.expectEqual(first_address, leases[0].entryAddress());
+
+    for (&leases) |*lease| try lease.release(.reusable);
+    try std.testing.expectEqual(@as(usize, connection_count), pool.stats().idle);
+    try std.testing.expectError(error.LeaseAlreadyReleased, leases[0].release(.reusable));
+
+    server.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
 }

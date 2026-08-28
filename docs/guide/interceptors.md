@@ -16,16 +16,26 @@ Interceptors are defined using the `Interceptor` struct and added to the client.
 pub const Interceptor = struct {
     request_fn: ?RequestInterceptor = null,
     response_fn: ?ResponseInterceptor = null,
+    error_fn: ?ErrorInterceptor = null,
+    retry_fn: ?RetryInterceptor = null,
+    redirect_fn: ?RedirectInterceptor = null,
     context: ?*anyopaque = null,
 };
 ```
+
+Each callback receives an `AttemptContext` with a logical request ID,
+one-based attempt number, redirect count, effective policy, and URL. Request
+and response/error callbacks run for every actual transport attempt. Retry and
+redirect callbacks run only when the client performs that action.
 
 ## Example: Auth Token Injector
 
 This interceptor adds a Bearer token to every outgoing request.
 
 ```zig
-fn addAuthToken(req: *httpx.Request, ctx: ?*anyopaque) !void {
+fn addAuthToken(req: *httpx.Request, attempt: *const httpx.AttemptContext, ctx: ?*anyopaque) !void {
+    _ = attempt;
+    _ = ctx;
     // In a real app, you might cast ctx to a Config struct
     try req.headers.set("Authorization", "Bearer my-secret-token");
 }
@@ -41,8 +51,9 @@ try client.addInterceptor(.{
 ## Example: Response Logger
 
 ```zig
-fn logResponse(res: *httpx.Response, ctx: ?*anyopaque) !void {
-    std.debug.print("Status: {d}\n", .{res.status.code});
+fn logResponse(res: *httpx.Response, attempt: *const httpx.AttemptContext, ctx: ?*anyopaque) !void {
+    _ = ctx;
+    std.debug.print("Attempt {d}, status: {d}\n", .{ attempt.attempt, res.status.code });
 }
 
 try client.addInterceptor(.{
@@ -50,4 +61,6 @@ try client.addInterceptor(.{
 });
 ```
 
-You can chain multiple interceptors. They will be executed in the order they were added.
+You can chain multiple interceptors. They are snapshotted and executed in
+registration order without a client lock held. Callbacks may run concurrently
+and reentrantly, so their borrowed context must outlive all in-flight requests.

@@ -106,6 +106,7 @@ pub const RedirectBehavior = types.RedirectBehavior;
 pub const CookiePolicy = types.CookiePolicy;
 pub const AcceptEncodingPolicy = types.AcceptEncodingPolicy;
 pub const DecompressionPolicy = types.DecompressionPolicy;
+pub const UserAgentPolicy = types.UserAgentPolicy;
 pub const ClientPolicy = types.ClientPolicy;
 pub const RequestPolicyOverrides = types.RequestPolicyOverrides;
 pub const EffectiveClientPolicy = types.EffectiveClientPolicy;
@@ -203,13 +204,18 @@ pub const RequestOptions = client_mod.RequestOptions;
 pub const BasicAuth = client_mod.BasicAuth;
 pub const CookieEntry = client_mod.CookieEntry;
 pub const Interceptor = client_mod.Interceptor;
+pub const AttemptContext = client_mod.AttemptContext;
 pub const RequestInterceptor = client_mod.RequestInterceptor;
 pub const ResponseInterceptor = client_mod.ResponseInterceptor;
 pub const JsonBorrowedResult = client_mod.JsonBorrowedResult;
 
 pub const ConnectionPool = pool.ConnectionPool;
 pub const PoolConfig = pool.PoolConfig;
-pub const Connection = pool.Connection;
+pub const PoolKey = pool.PoolKey;
+pub const PoolScheme = pool.PoolScheme;
+pub const PoolProtocol = pool.PoolProtocol;
+pub const ConnectionLease = pool.ConnectionLease;
+pub const LeaseDisposition = pool.LeaseDisposition;
 pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;

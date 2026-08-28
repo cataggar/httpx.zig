@@ -128,7 +128,8 @@ The client automatically stores `Set-Cookie` values and sends a `Cookie` header 
 
 ```zig
 try client.setCookie("session", "abc123");
-if (client.getCookie("session")) |session| {
+if (try client.getCookie("session")) |session| {
+    defer client.freeCookieValue(session);
     std.debug.print("session={s}\n", .{session});
 }
 _ = client.removeCookie("session");
@@ -192,7 +193,14 @@ pub const RequestOptions = struct {
 };
 ```
 
-All fields are optional customizations. `policy` can independently override retry, redirect, cookie send/store, synthesized `Accept-Encoding`, and response decompression. `RequestPolicyOverrides.embeddingOwned()` disables all five automatic behaviors without changing the execution path. Per-request overrides also control proxy routing, security verification, connection persistence, and socket routing without modifying the shared client config. Passing `.{}` keeps defaults implicit.
+All fields are optional customizations. `policy` can independently override
+retry, redirect, cookie send/store, synthesized `Accept-Encoding`, response
+decompression, and synthesized `User-Agent`.
+`RequestPolicyOverrides.embeddingOwned()` disables all automatic behaviors
+without changing the execution path. Per-request overrides also control proxy
+routing, security verification, connection persistence, and socket routing
+without modifying the shared client config. Passing `.{}` keeps defaults
+implicit.
 
 ## Proxy Configuration
 

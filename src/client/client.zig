@@ -33,7 +33,10 @@ const quic = @import("../protocol/quic.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
 const TLSConfig = @import("../tls/tls.zig").TLSConfig;
 const TLSSession = @import("../tls/tls.zig").TLSSession;
-const ConnectionPool = @import("pool.zig").ConnectionPool;
+const TLSConnection = @import("../tls/tls.zig").Connection;
+const pool_mod = @import("pool.zig");
+const ConnectionPool = pool_mod.ConnectionPool;
+const ConnectionLease = pool_mod.ConnectionLease;
 const proxy_mod = @import("proxy.zig");
 const PoolStats = @import("pool.zig").PoolStats;
 const common = @import("../data/common.zig");
@@ -520,20 +523,26 @@ pub const RequestOptions = struct {
     }
 };
 
-/// Request interceptor function type.
-pub const RequestInterceptor = *const fn (*Request, ?*anyopaque) anyerror!void;
+/// Immutable metadata for one transport attempt.
+///
+/// `attempt` is one-based and resets after each followed redirect.
+/// `redirect_count` is zero for the original URL. Slices are borrowed for the
+/// duration of the callback. Callbacks may run concurrently and reentrantly.
+pub const AttemptContext = struct {
+    logical_request_id: u64,
+    attempt: u32,
+    redirect_count: u32,
+    policy: types.EffectiveClientPolicy,
+    url: []const u8,
+};
 
-/// Response interceptor function type.
-pub const ResponseInterceptor = *const fn (*Response, ?*anyopaque) anyerror!void;
-
-/// Error interceptor function type. Called when a request fails.
-pub const ErrorInterceptor = *const fn (anyerror, ?*anyopaque) void;
-
-/// Retry interceptor function type. Called when a request is about to be retried.
-pub const RetryInterceptor = *const fn (u32, ?*anyopaque) void;
-
-/// Redirect interceptor function type. Called when a redirect is followed.
-pub const RedirectInterceptor = *const fn ([]const u8, ?*anyopaque) void;
+pub const RequestInterceptor = *const fn (*Request, *const AttemptContext, ?*anyopaque) anyerror!void;
+pub const ResponseInterceptor = *const fn (*Response, *const AttemptContext, ?*anyopaque) anyerror!void;
+pub const ErrorInterceptor = *const fn (anyerror, *const AttemptContext, ?*anyopaque) void;
+/// Called after an attempt result has been observed and a retry will occur.
+pub const RetryInterceptor = *const fn (*const AttemptContext, ?*anyopaque) void;
+/// Called after a redirect response has been observed and will be followed.
+pub const RedirectInterceptor = *const fn ([]const u8, *const AttemptContext, ?*anyopaque) void;
 
 /// Interceptor with context.
 pub const Interceptor = struct {
@@ -557,13 +566,78 @@ pub const CookieEntry = struct {
     stored_at: i64 = 0,
 };
 
-/// HTTP Client.
-pub const Client = struct {
-    allocator: Allocator,
+fn freeCookieEntry(allocator: Allocator, entry: CookieEntry) void {
+    allocator.free(entry.value);
+    allocator.free(entry.path);
+    allocator.free(entry.domain);
+}
+
+const ClientState = struct {
+    backing_allocator: Allocator,
+    allocator_lock: std.atomic.Mutex = .unlocked,
+    interceptor_lock: std.atomic.Mutex = .unlocked,
+    cookie_lock: std.atomic.Mutex = .unlocked,
     config: ClientConfig,
     interceptors: std.ArrayList(Interceptor) = .empty,
     cookies: std.StringHashMapUnmanaged(CookieEntry) = .{},
     pool: ConnectionPool,
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    next_request_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+
+    fn lock(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn allocator(self: *ClientState) Allocator {
+        return .{ .ptr = self, .vtable = &allocator_vtable };
+    }
+
+    fn allocatorAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ClientState = @ptrCast(@alignCast(ctx));
+        lock(&self.allocator_lock);
+        defer self.allocator_lock.unlock();
+        return self.backing_allocator.vtable.alloc(self.backing_allocator.ptr, len, alignment, ret_addr);
+    }
+
+    fn allocatorResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ClientState = @ptrCast(@alignCast(ctx));
+        lock(&self.allocator_lock);
+        defer self.allocator_lock.unlock();
+        return self.backing_allocator.vtable.resize(self.backing_allocator.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn allocatorRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ClientState = @ptrCast(@alignCast(ctx));
+        lock(&self.allocator_lock);
+        defer self.allocator_lock.unlock();
+        return self.backing_allocator.vtable.remap(self.backing_allocator.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn allocatorFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ClientState = @ptrCast(@alignCast(ctx));
+        lock(&self.allocator_lock);
+        defer self.allocator_lock.unlock();
+        self.backing_allocator.vtable.free(self.backing_allocator.ptr, memory, alignment, ret_addr);
+    }
+
+    const allocator_vtable = Allocator.VTable{
+        .alloc = allocatorAlloc,
+        .resize = allocatorResize,
+        .remap = allocatorRemap,
+        .free = allocatorFree,
+    };
+};
+
+/// Thread-safe HTTP client handle.
+///
+/// Request methods, cookie operations, interceptor registration, and pool
+/// inspection may be called concurrently. Interceptors and log callbacks may
+/// also run concurrently and reentrantly. `deinit` is exclusive and is valid
+/// only after all requests have completed and all responses are no longer used.
+pub const Client = struct {
+    allocator: Allocator,
+    shared: *ClientState,
 
     const Self = @This();
 
@@ -574,16 +648,23 @@ pub const Client = struct {
 
     /// Creates a new HTTP client with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ClientConfig) Self {
-        return .{
-            .allocator = allocator,
+        const shared = allocator.create(ClientState) catch @panic("httpx.Client state allocation failed");
+        shared.* = .{
+            .backing_allocator = allocator,
             .config = config,
-            .pool = ConnectionPool.initWithConfig(allocator, .{
-                .max_connections = config.pool_max_connections,
-                .max_per_host = config.pool_max_per_host,
-                .connect_timeout_ms = config.timeouts.connect_ms,
-                .idle_timeout_ms = if (config.timeouts.idle_ms > 0) @intCast(config.timeouts.idle_ms) else 60_000,
-                .dns_resolver = config.dns_resolver,
-            }),
+            .pool = undefined,
+        };
+        const synchronized_allocator = shared.allocator();
+        shared.pool = ConnectionPool.initWithConfig(synchronized_allocator, .{
+            .max_connections = config.pool_max_connections,
+            .max_per_host = config.pool_max_per_host,
+            .connect_timeout_ms = config.timeouts.connect_ms,
+            .idle_timeout_ms = if (config.timeouts.idle_ms > 0) @intCast(config.timeouts.idle_ms) else 60_000,
+            .dns_resolver = config.dns_resolver,
+        });
+        return .{
+            .allocator = synchronized_allocator,
+            .shared = shared,
         };
     }
 
@@ -594,14 +675,44 @@ pub const Client = struct {
 
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
-        self.interceptors.deinit(self.allocator);
-        var it = self.cookies.iterator();
+        self.shared.closing.store(true, .release);
+        std.debug.assert(self.shared.in_flight.load(.acquire) == 0);
+
+        self.shared.pool.deinit();
+        self.shared.interceptors.deinit(self.allocator);
+        var it = self.shared.cookies.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*.value);
+            freeCookieEntry(self.allocator, entry.value_ptr.*);
         }
-        self.cookies.deinit(self.allocator);
-        self.pool.deinit();
+        self.shared.cookies.deinit(self.allocator);
+        const backing_allocator = self.shared.backing_allocator;
+        backing_allocator.destroy(self.shared);
+    }
+
+    /// Returns the immutable configuration snapshot captured at initialization.
+    pub fn configuration(self: *const Self) *const ClientConfig {
+        return &self.shared.config;
+    }
+
+    fn beginRequest(self: *Self) !u64 {
+        if (self.shared.closing.load(.acquire)) return error.ClientClosed;
+        _ = self.shared.in_flight.fetchAdd(1, .acq_rel);
+        if (self.shared.closing.load(.acquire)) {
+            _ = self.shared.in_flight.fetchSub(1, .acq_rel);
+            return error.ClientClosed;
+        }
+        return self.shared.next_request_id.fetchAdd(1, .monotonic);
+    }
+
+    fn endRequest(self: *Self) void {
+        _ = self.shared.in_flight.fetchSub(1, .acq_rel);
+    }
+
+    fn snapshotInterceptors(self: *Self) ![]Interceptor {
+        ClientState.lock(&self.shared.interceptor_lock);
+        defer self.shared.interceptor_lock.unlock();
+        return self.allocator.dupe(Interceptor, self.shared.interceptors.items);
     }
 
     /// Resolves a hostname to a single address using the configured DNS resolver
@@ -613,7 +724,7 @@ pub const Client = struct {
         context: *const IoContext,
     ) !address_mod.Address {
         try context.check();
-        if (self.config.dns_resolver) |resolver| {
+        if (self.shared.config.dns_resolver) |resolver| {
             var result = try resolver.resolveWithContext(hostname, .{ .port = port }, context);
             defer result.deinit();
             if (result.addresses.len == 0) return error.DNSResolutionFailed;
@@ -629,8 +740,8 @@ pub const Client = struct {
     /// Logs a formatted message. If config.log_fn is provided, delegates to it.
     /// Otherwise, silently drops the message. Client does not print internally.
     pub fn log(self: *const Self, level: server_mod.LogLevel, comptime format: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.config.log_level)) return;
-        if (self.config.log_fn) |log_fn| {
+        if (@intFromEnum(level) < @intFromEnum(self.shared.config.log_level)) return;
+        if (self.shared.config.log_fn) |log_fn| {
             var buf: [1024]u8 = undefined;
             if (std.fmt.bufPrint(&buf, format, args)) |msg| {
                 log_fn(level, msg);
@@ -642,22 +753,24 @@ pub const Client = struct {
 
     /// Adds an interceptor to the client.
     pub fn addInterceptor(self: *Self, interceptor: Interceptor) !void {
-        try self.interceptors.append(self.allocator, interceptor);
+        ClientState.lock(&self.shared.interceptor_lock);
+        defer self.shared.interceptor_lock.unlock();
+        try self.shared.interceptors.append(self.allocator, interceptor);
     }
 
     /// Removes idle or exhausted pooled connections based on pool policy.
     pub fn cleanupIdleConnections(self: *Self) void {
-        self.pool.cleanup();
+        self.shared.pool.cleanup();
     }
 
     /// Returns a snapshot of total/active/idle pooled connection counts.
     pub fn poolStats(self: *Self) PoolStats {
-        return self.pool.stats();
+        return self.shared.pool.stats();
     }
 
     /// Returns how many pooled connections are tracked for a host/port.
     pub fn hostPoolConnectionCount(self: *Self, host: []const u8, port: u16) usize {
-        return self.pool.hostConnectionCount(host, port);
+        return self.shared.pool.hostConnectionCount(host, port);
     }
 
     /// Makes an HTTP request.
@@ -676,13 +789,15 @@ pub const Client = struct {
     }
 
     fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
-        const effective_policy = self.config.policy.resolve(reqOpts.policy);
+        const logical_request_id = try self.beginRequest();
+        defer self.endRequest();
+        const effective_policy = self.shared.config.policy.resolve(reqOpts.policy);
         const timeouts = self.resolveRequestTimeouts(reqOpts);
         const context = IoContext.init(.{
             .external_cancel = reqOpts.cancel_token,
             .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
         });
-        return self.requestWithPolicy(method, url, reqOpts, &effective_policy, &context, 0);
+        return self.requestWithPolicy(method, url, reqOpts, &effective_policy, &context, logical_request_id, 0);
     }
 
     fn requestWithPolicy(
@@ -692,14 +807,15 @@ pub const Client = struct {
         reqOpts: RequestOptions,
         effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
+        logical_request_id: u64,
         depth: u32,
     ) !Response {
         try checkRequestContext(context);
 
-        const full_url = if (self.config.base_url) |base|
-            try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
-        else
-            try self.allocator.dupe(u8, url);
+        const full_url = if (self.shared.config.base_url) |base| blk: {
+            if (mem.indexOf(u8, url, "://") != null) break :blk try self.allocator.dupe(u8, url);
+            break :blk try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url });
+        } else try self.allocator.dupe(u8, url);
         defer self.allocator.free(full_url);
 
         var req = try Request.init(self.allocator, method, full_url);
@@ -709,23 +825,28 @@ pub const Client = struct {
             req.version = version;
         }
 
-        try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
-
-        if (self.config.default_headers) |hdrs| {
+        if (self.shared.config.default_headers) |hdrs| {
             for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
-            }
-        }
-
-        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
-            if (effective_policy.accept_encoding.value()) |value| {
-                try req.headers.set(HeaderName.ACCEPT_ENCODING, value);
+                try req.headers.append(h[0], h[1]);
             }
         }
 
         if (reqOpts.headers) |hdrs| {
             for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
+                try req.headers.append(h[0], h[1]);
+            }
+        }
+
+        if (effective_policy.user_agent == .enabled and
+            !req.headers.contains(HeaderName.USER_AGENT) and
+            self.shared.config.user_agent.len > 0)
+        {
+            try req.headers.append(HeaderName.USER_AGENT, self.shared.config.user_agent);
+        }
+
+        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
+            if (effective_policy.accept_encoding.value()) |value| {
+                try req.headers.append(HeaderName.ACCEPT_ENCODING, value);
             }
         }
 
@@ -783,14 +904,14 @@ pub const Client = struct {
 
         // Enforce request size limit.
         if (req.body) |body| {
-            if (body.len > self.config.max_request_size) {
+            if (body.len > self.shared.config.max_request_size) {
                 return error.RequestTooLarge;
             }
         }
 
         // Compress request body if configured.
         if (req.body) |body| {
-            if (body.len > 0 and self.config.request_compression != null) {
+            if (body.len > 0 and self.shared.config.request_compression != null) {
                 if (req.headers.get("Content-Encoding") == null) {
                     const ct = req.headers.get("Content-Type") orelse "";
                     if (compression_util.isCompressible(ct)) {
@@ -798,7 +919,7 @@ pub const Client = struct {
                             self.allocator,
                             .gzip,
                             body,
-                            self.config.request_compression.?,
+                            self.shared.config.request_compression.?,
                         )) |compressed| {
                             req.body = compressed;
                             req.body_owned = true;
@@ -821,27 +942,21 @@ pub const Client = struct {
             try self.attachCookies(&req);
         }
 
-        for (self.interceptors.items) |interceptor| {
-            if (interceptor.request_fn) |f| {
-                try f(&req, interceptor.context);
-            }
-        }
-
-        var response = try self.executeRequest(&req, reqOpts, effective_policy, context);
-        if (effective_policy.cookies.stores()) {
-            try self.storeCookies(&response, req.uri.host orelse "");
-        }
-
-        for (self.interceptors.items) |interceptor| {
-            if (interceptor.response_fn) |f| {
-                try f(&response, interceptor.context);
-            }
-        }
+        const execution = try self.executeRequest(
+            &req,
+            reqOpts,
+            effective_policy,
+            context,
+            logical_request_id,
+            depth,
+            full_url,
+        );
+        var response = execution.response;
 
         if (response.isRedirect()) {
             const redirect_policy = effective_policy.redirectPolicy() orelse return response;
             if (depth >= redirect_policy.max_redirects) {
-                if (self.config.metrics) |m| m.redirectFailed();
+                if (self.shared.config.metrics) |m| m.redirectFailed();
                 response.deinit();
                 return error.TooManyRedirects;
             }
@@ -854,10 +969,18 @@ pub const Client = struct {
             const next_url = try self.resolveRedirectUrl(req.uri, location);
             defer self.allocator.free(next_url);
 
-            // Call redirect interceptors.
-            for (self.interceptors.items) |interceptor| {
+            const attempt_context = AttemptContext{
+                .logical_request_id = logical_request_id,
+                .attempt = execution.attempt,
+                .redirect_count = depth,
+                .policy = effective_policy.*,
+                .url = full_url,
+            };
+            const interceptors = try self.snapshotInterceptors();
+            defer self.allocator.free(interceptors);
+            for (interceptors) |interceptor| {
                 if (interceptor.redirect_fn) |fn_ptr| {
-                    fn_ptr(next_url, interceptor.context);
+                    fn_ptr(next_url, &attempt_context, interceptor.context);
                 }
             }
 
@@ -885,8 +1008,16 @@ pub const Client = struct {
 
             response.deinit();
             defer safe_headers.deinit(self.allocator);
-            if (self.config.metrics) |m| m.redirect();
-            return self.requestWithPolicy(next_method, next_url, next_opts, effective_policy, context, depth + 1);
+            if (self.shared.config.metrics) |m| m.redirect();
+            return self.requestWithPolicy(
+                next_method,
+                next_url,
+                next_opts,
+                effective_policy,
+                context,
+                logical_request_id,
+                depth + 1,
+            );
         }
 
         return response;
@@ -907,15 +1038,23 @@ pub const Client = struct {
         context.waitForMs(delay_ms) catch |err| return normalizeRequestContextError(context, err);
     }
 
-    /// Executes the actual HTTP request.
+    const RequestExecution = struct {
+        response: Response,
+        attempt: u32,
+    };
+
+    /// Executes all transport attempts for one URL in a logical request.
     fn executeRequest(
         self: *Self,
         req: *Request,
         reqOpts: RequestOptions,
         effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
-    ) !Response {
-        if (self.config.metrics) |m| m.recordRequest();
+        logical_request_id: u64,
+        redirect_count: u32,
+        url: []const u8,
+    ) !RequestExecution {
+        if (self.shared.config.metrics) |m| m.recordRequest();
         const start_time_ms: u64 = @intCast(@max(common.nowMillis(), 0));
         const retry_policy = effective_policy.retryPolicy();
         const can_retry_method = if (retry_policy) |policy|
@@ -923,57 +1062,87 @@ pub const Client = struct {
         else
             false;
 
-        var attempt: u32 = 0;
+        var attempt: u32 = 1;
         while (true) {
             checkRequestContext(context) catch |err| {
-                if (self.config.metrics) |m| m.recordError();
+                if (self.shared.config.metrics) |m| m.recordError();
                 return err;
             };
 
+            const attempt_context = AttemptContext{
+                .logical_request_id = logical_request_id,
+                .attempt = attempt,
+                .redirect_count = redirect_count,
+                .policy = effective_policy.*,
+                .url = url,
+            };
+            const interceptors = try self.snapshotInterceptors();
+            defer self.allocator.free(interceptors);
+
+            for (interceptors) |interceptor| {
+                if (interceptor.request_fn) |callback| {
+                    try callback(req, &attempt_context, interceptor.context);
+                }
+            }
+
             var res = self.executeRequestOnce(req, reqOpts, effective_policy, context) catch |raw_err| {
                 const err = normalizeRequestContextError(context, raw_err);
+                for (interceptors) |interceptor| {
+                    if (interceptor.error_fn) |callback| {
+                        callback(err, &attempt_context, interceptor.context);
+                    }
+                }
                 if (retry_policy) |policy| {
-                    if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries and isRetryableRequestError(err)) {
+                    if (policy.retry_on_connection_error and can_retry_method and attempt <= policy.max_retries and isRetryableRequestError(err)) {
                         checkRequestContext(context) catch |context_err| {
-                            if (self.config.metrics) |m| m.recordError();
+                            if (self.shared.config.metrics) |m| m.recordError();
                             return context_err;
                         };
-                        attempt += 1;
-                        if (self.config.metrics) |m| {
+                        if (self.shared.config.metrics) |m| {
                             m.recordError();
                             m.retryAttempt();
                         }
-                        // Call retry interceptors.
-                        for (self.interceptors.items) |interceptor| {
+                        for (interceptors) |interceptor| {
                             if (interceptor.retry_fn) |fn_ptr| {
-                                fn_ptr(attempt, interceptor.context);
+                                fn_ptr(&attempt_context, interceptor.context);
                             }
                         }
                         const delay_ms = policy.calculateDelay(attempt);
                         if (delay_ms > 0) {
                             waitForRetry(context, delay_ms) catch |context_err| {
-                                if (self.config.metrics) |m| m.recordError();
+                                if (self.shared.config.metrics) |m| m.recordError();
                                 return context_err;
                             };
                         }
+                        attempt += 1;
                         continue;
                     }
                 }
-                // Call error interceptors.
-                for (self.interceptors.items) |interceptor| {
-                    if (interceptor.error_fn) |fn_ptr| {
-                        fn_ptr(err, interceptor.context);
-                    }
-                }
-                if (self.config.metrics) |m| m.recordError();
+                if (self.shared.config.metrics) |m| m.recordError();
                 return err;
             };
 
+            if (effective_policy.cookies.stores()) {
+                self.storeCookies(&res, req.uri.host orelse "") catch |err| {
+                    res.deinit();
+                    return err;
+                };
+            }
+
+            for (interceptors) |interceptor| {
+                if (interceptor.response_fn) |callback| {
+                    callback(&res, &attempt_context, interceptor.context) catch |err| {
+                        res.deinit();
+                        return err;
+                    };
+                }
+            }
+
             if (retry_policy) |policy| {
-                if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
+                if (can_retry_method and attempt <= policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
                     checkRequestContext(context) catch |err| {
                         res.deinit();
-                        if (self.config.metrics) |m| m.recordError();
+                        if (self.shared.config.metrics) |m| m.recordError();
                         return err;
                     };
                     // Parse Retry-After header if present.
@@ -982,26 +1151,25 @@ pub const Client = struct {
                     else
                         policy.calculateDelay(attempt);
                     res.deinit();
-                    attempt += 1;
-                    if (self.config.metrics) |m| m.retryAttempt();
-                    // Call retry interceptors.
-                    for (self.interceptors.items) |interceptor| {
+                    if (self.shared.config.metrics) |m| m.retryAttempt();
+                    for (interceptors) |interceptor| {
                         if (interceptor.retry_fn) |fn_ptr| {
-                            fn_ptr(attempt, interceptor.context);
+                            fn_ptr(&attempt_context, interceptor.context);
                         }
                     }
                     if (retry_after_ms > 0) {
                         waitForRetry(context, retry_after_ms) catch |err| {
-                            if (self.config.metrics) |m| m.recordError();
+                            if (self.shared.config.metrics) |m| m.recordError();
                             return err;
                         };
                     }
+                    attempt += 1;
                     continue;
                 }
             }
 
             // Record metrics.
-            if (self.config.metrics) |m| {
+            if (self.shared.config.metrics) |m| {
                 const now_ms: u64 = @intCast(@max(common.nowMillis(), 0));
                 const elapsed_ms: u64 = now_ms -| start_time_ms;
                 const latency_ns = elapsed_ms * 1_000_000;
@@ -1009,7 +1177,7 @@ pub const Client = struct {
                 m.recordResponse(res.status.code, body_len, latency_ns);
             }
 
-            return res;
+            return .{ .response = res, .attempt = attempt };
         }
     }
 
@@ -1108,10 +1276,10 @@ pub const Client = struct {
     }
 
     fn resolveRequestTimeouts(self: *const Self, req_opts: RequestOptions) RequestTimeouts {
-        var connect_ms = self.config.timeouts.connect_ms;
-        var read_ms = self.config.timeouts.read_ms;
-        var write_ms = self.config.timeouts.write_ms;
-        var request_ms = self.config.timeouts.request_ms;
+        var connect_ms = self.shared.config.timeouts.connect_ms;
+        var read_ms = self.shared.config.timeouts.read_ms;
+        var write_ms = self.shared.config.timeouts.write_ms;
+        var request_ms = self.shared.config.timeouts.request_ms;
 
         if (req_opts.timeouts) |t| {
             connect_ms = t.connect_ms;
@@ -1147,9 +1315,9 @@ pub const Client = struct {
     ) !Response {
         try context.check();
         const timeouts = self.resolveRequestTimeouts(reqOpts);
-        const keep_alive = reqOpts.keep_alive orelse self.config.keep_alive;
-        const verify_ssl = reqOpts.verify_ssl orelse self.config.verify_ssl;
-        const unix_socket_path = reqOpts.unix_socket_path orelse self.config.unix_socket_path;
+        const keep_alive = reqOpts.keep_alive orelse self.shared.config.keep_alive;
+        const verify_ssl = reqOpts.verify_ssl orelse self.shared.config.verify_ssl;
+        const unix_socket_path = reqOpts.unix_socket_path orelse self.shared.config.unix_socket_path;
 
         if (unix_socket_path) |path| {
             const unix_mod = @import("../net/unix.zig");
@@ -1168,20 +1336,20 @@ pub const Client = struct {
             defer self.allocator.free(request_data);
 
             try socket.sendAll(request_data);
-            if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
+            if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
             return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
         }
 
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
 
-        var effective_proxy = reqOpts.proxy orelse self.config.proxy;
+        var effective_proxy = reqOpts.proxy orelse self.shared.config.proxy;
         if (effective_proxy) |p| {
             if (p.shouldBypassProxy(host)) effective_proxy = null;
         }
 
-        const wants_http2 = self.config.http2_enabled or req.version == .HTTP_2;
-        const wants_http3 = self.config.http3_enabled or req.version == .HTTP_3;
+        const wants_http2 = self.shared.config.http2_enabled or req.version == .HTTP_2;
+        const wants_http3 = self.shared.config.http3_enabled or req.version == .HTTP_3;
 
         // HTTP/3 takes priority, but falls back to HTTP/2 when a proxy is
         // configured (QUIC does not support standard HTTP proxies).
@@ -1213,6 +1381,63 @@ pub const Client = struct {
         defer self.allocator.free(request_data);
 
         if (req.uri.isTLS()) {
+            if (keep_alive) {
+                var lease = try self.shared.pool.getLeaseWithContext(.{
+                    .scheme = .tls,
+                    .host = host,
+                    .port = port,
+                    .proxy = effective_proxy,
+                    .verify_tls = verify_ssl,
+                    .protocol = .http1,
+                }, timeouts.connect_ms, context);
+                var disposition: pool_mod.LeaseDisposition = .broken;
+                defer lease.release(disposition) catch {};
+
+                const fresh = lease.isFresh();
+                const socket = lease.socket();
+                if (fresh) {
+                    if (effective_proxy) |proxy| {
+                        if (proxy.kind == .http) {
+                            try self.establishProxyTLSTunnel(socket, host, port, proxy);
+                        }
+                    }
+                }
+
+                const session = lease.tlsSession() orelse blk: {
+                    const tls_config = if (verify_ssl)
+                        TLSConfig.init(self.allocator)
+                    else
+                        TLSConfig.insecure(self.allocator);
+                    const new_session = lease.initializeTls(tls_config);
+                    if (timeouts.connect_ms > 0) try socket.setRecvTimeout(timeouts.connect_ms);
+                    try self.handshakePooledTls(
+                        &lease,
+                        new_session,
+                        host,
+                        port,
+                        effective_proxy == null,
+                    );
+                    break :blk new_session;
+                };
+
+                try socket.setRecvTimeout(timeouts.read_ms);
+                try socket.setSendTimeout(timeouts.write_ms);
+                try session.writeAll(request_data);
+                try session.flush();
+                if (self.shared.config.metrics) |metrics| metrics.recordBytesSent(@intCast(request_data.len));
+
+                const response = try self.readResponseFromTLS(
+                    session,
+                    req.method.hasResponseBody(),
+                    effective_policy.decompression,
+                );
+                disposition = if (responseIsReusable(&response, req.method.hasResponseBody()))
+                    .reusable
+                else
+                    .draining;
+                return response;
+            }
+
             const connect_host = if (effective_proxy) |p| p.host else host;
             const connect_port = if (effective_proxy) |p| p.port else port;
             const addr = try self.resolveAddress(connect_host, connect_port, context);
@@ -1248,24 +1473,29 @@ pub const Client = struct {
         }
 
         if (keep_alive) {
-            var conn = try self.pool.getConnectionWithContext(host, port, effective_proxy, timeouts.connect_ms, context);
-            errdefer conn.close();
-            defer self.pool.releaseConnection(conn);
+            var lease = try self.shared.pool.getLeaseWithContext(.{
+                .scheme = .plain,
+                .host = host,
+                .port = port,
+                .proxy = effective_proxy,
+                .verify_tls = false,
+                .protocol = .http1,
+            }, timeouts.connect_ms, context);
+            var disposition: pool_mod.LeaseDisposition = .broken;
+            defer lease.release(disposition) catch {};
+            const socket = lease.socket();
 
-            if (timeouts.read_ms > 0) {
-                try conn.socket.setRecvTimeout(timeouts.read_ms);
-            }
-            if (timeouts.write_ms > 0) {
-                try conn.socket.setSendTimeout(timeouts.write_ms);
-            }
-            try conn.socket.setKeepAlive(true);
+            try socket.setRecvTimeout(timeouts.read_ms);
+            try socket.setSendTimeout(timeouts.write_ms);
+            try socket.setKeepAlive(true);
 
-            try conn.socket.sendAll(request_data);
-            if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-            var res = try self.readResponseFromTcp(&conn.socket, req.method.hasResponseBody(), effective_policy.decompression);
-            if (!res.headers.isKeepAlive(res.version)) {
-                self.pool.closeConnection(conn);
-            }
+            try socket.sendAll(request_data);
+            if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
+            const res = try self.readResponseFromTcp(socket, req.method.hasResponseBody(), effective_policy.decompression);
+            disposition = if (responseIsReusable(&res, req.method.hasResponseBody()))
+                .reusable
+            else
+                .draining;
             return res;
         }
 
@@ -1292,7 +1522,7 @@ pub const Client = struct {
         }
 
         try socket.sendAll(request_data);
-        if (self.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
+        if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
         return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
     }
 
@@ -1306,11 +1536,80 @@ pub const Client = struct {
         effective_policy: *const types.EffectiveClientPolicy,
         context: *const IoContext,
     ) !Response {
-        var effective_proxy = reqOpts.proxy orelse self.config.proxy;
+        var effective_proxy = reqOpts.proxy orelse self.shared.config.proxy;
         if (effective_proxy) |p| {
             if (p.shouldBypassProxy(host)) effective_proxy = null;
         }
-        const verify_ssl = reqOpts.verify_ssl orelse self.config.verify_ssl;
+        const verify_ssl = reqOpts.verify_ssl orelse self.shared.config.verify_ssl;
+        const keep_alive = reqOpts.keep_alive orelse self.shared.config.keep_alive;
+
+        if (keep_alive) {
+            var lease = try self.shared.pool.getLeaseWithContext(.{
+                .scheme = if (req.uri.isTLS()) .tls else .plain,
+                .host = host,
+                .port = port,
+                .proxy = effective_proxy,
+                .verify_tls = verify_ssl,
+                .protocol = .http2,
+            }, timeouts.connect_ms, context);
+            var disposition: pool_mod.LeaseDisposition = .broken;
+            defer lease.release(disposition) catch {};
+
+            const fresh = lease.isFresh();
+            const socket = lease.socket();
+            if (fresh) {
+                if (effective_proxy) |proxy| {
+                    if (proxy.kind == .http and req.uri.isTLS()) {
+                        try self.establishProxyTLSTunnel(socket, host, port, proxy);
+                    }
+                }
+            }
+
+            const h2_session = lease.h2Session();
+            const response = if (req.uri.isTLS()) blk: {
+                const tls_session = lease.tlsSession() orelse tls_blk: {
+                    const tls_config = if (verify_ssl)
+                        TLSConfig.withH2(self.allocator)
+                    else
+                        TLSConfig.insecureWithH2(self.allocator);
+                    const new_session = lease.initializeTls(tls_config);
+                    if (timeouts.connect_ms > 0) try socket.setRecvTimeout(timeouts.connect_ms);
+                    try self.handshakePooledTls(
+                        &lease,
+                        new_session,
+                        host,
+                        port,
+                        effective_proxy == null,
+                    );
+                    if (http.negotiateVersion(new_session.negotiatedProtocol()) != .http_2) {
+                        return error.UnsupportedHttpVersion;
+                    }
+                    break :tls_blk new_session;
+                };
+                try socket.setRecvTimeout(timeouts.read_ms);
+                try socket.setSendTimeout(timeouts.write_ms);
+                var transport = TLSHTTP2Transport{ .session = tls_session };
+                break :blk try self.executeHTTP2WithTransport(
+                    req,
+                    &transport,
+                    effective_policy.decompression,
+                    h2_session,
+                );
+            } else blk: {
+                try socket.setRecvTimeout(timeouts.read_ms);
+                try socket.setSendTimeout(timeouts.write_ms);
+                var transport = SocketHTTP2Transport{ .socket = socket };
+                break :blk try self.executeHTTP2WithTransport(
+                    req,
+                    &transport,
+                    effective_policy.decompression,
+                    h2_session,
+                );
+            };
+
+            disposition = if (h2_session.draining) .draining else .reusable;
+            return response;
+        }
 
         const connect_host = if (effective_proxy) |p| p.host else host;
         const connect_port = if (effective_proxy) |p| p.port else port;
@@ -1338,7 +1637,7 @@ pub const Client = struct {
             // Build ALPN list based on enabled protocols.
             // When both HTTP/2 and HTTP/3 are enabled, advertise all three.
             const tls_session_cfg = blk: {
-                if (self.config.http3_enabled and self.config.http2_enabled) {
+                if (self.shared.config.http3_enabled and self.shared.config.http2_enabled) {
                     break :blk if (verify_ssl)
                         TLSConfig.withH3(self.allocator)
                     else
@@ -1372,17 +1671,21 @@ pub const Client = struct {
             const negotiated = http.negotiateVersion(session.negotiatedProtocol());
             switch (negotiated) {
                 .http_2 => {
+                    var h2_session = pool_mod.H2SessionState.init(self.allocator);
+                    defer h2_session.deinit();
                     var transport = TLSHTTP2Transport{ .session = &session };
-                    return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
+                    return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression, &h2_session);
                 },
                 .http_3 => {
                     // Server selected h3 via ALPN.  For TLS-based connections
                     // (TCP), HTTP/3 negotiation means the server prefers QUIC
                     // but we are on a TCP socket.  Attempt to upgrade via
                     // Alt-Svc or fall back to HTTP/2 if available.
-                    if (self.config.http2_enabled) {
+                    if (self.shared.config.http2_enabled) {
+                        var h2_session = pool_mod.H2SessionState.init(self.allocator);
+                        defer h2_session.deinit();
                         var transport = TLSHTTP2Transport{ .session = &session };
-                        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
+                        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression, &h2_session);
                     }
                     return error.UnsupportedHttpVersion;
                 },
@@ -1409,7 +1712,9 @@ pub const Client = struct {
             try socket.setRecvTimeout(timeouts.read_ms);
         }
 
-        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression);
+        var h2_session = pool_mod.H2SessionState.init(self.allocator);
+        defer h2_session.deinit();
+        return self.executeHTTP2WithTransport(req, &transport, effective_policy.decompression, &h2_session);
     }
 
     fn executeRequestHTTP3(
@@ -1449,17 +1754,17 @@ pub const Client = struct {
     ) !Response {
         var qpack_encoder = qpack.QPACKContext.initWithCapacity(
             self.allocator,
-            common.clampU64ToUsize(self.config.http3_settings.qpack_max_table_capacity),
+            common.clampU64ToUsize(self.shared.config.http3_settings.qpack_max_table_capacity),
         );
         defer qpack_encoder.deinit();
-        qpack_encoder.max_blocked_streams = self.config.http3_settings.qpack_blocked_streams;
+        qpack_encoder.max_blocked_streams = self.shared.config.http3_settings.qpack_blocked_streams;
 
         var qpack_decoder = qpack.QPACKContext.initWithCapacity(
             self.allocator,
-            common.clampU64ToUsize(self.config.http3_settings.qpack_max_table_capacity),
+            common.clampU64ToUsize(self.shared.config.http3_settings.qpack_max_table_capacity),
         );
         defer qpack_decoder.deinit();
-        qpack_decoder.max_blocked_streams = self.config.http3_settings.qpack_blocked_streams;
+        qpack_decoder.max_blocked_streams = self.shared.config.http3_settings.qpack_blocked_streams;
 
         // HTTP/3 flow control state
         var conn_max_data: u64 = 10 * 1024 * 1024; // 10 MB default
@@ -1503,7 +1808,7 @@ pub const Client = struct {
 
         var settings_payload = std.ArrayList(u8).empty;
         defer settings_payload.deinit(self.allocator);
-        try http.encodeHTTP3SettingsPayload(self.config.http3_settings, self.allocator, &settings_payload);
+        try http.encodeHTTP3SettingsPayload(self.shared.config.http3_settings, self.allocator, &settings_payload);
 
         var control_stream_payload = std.ArrayList(u8).empty;
         defer control_stream_payload.deinit(self.allocator);
@@ -1551,7 +1856,7 @@ pub const Client = struct {
             const incoming = try decodeHTTP3StreamDatagram(read_buf[0..n], &session);
 
             if (incoming.stream_id == 0) {
-                if (response_stream_payload.items.len + incoming.data.len > self.config.max_response_size) {
+                if (response_stream_payload.items.len + incoming.data.len > self.shared.config.max_response_size) {
                     return error.ResponseTooLarge;
                 }
                 try response_stream_payload.appendSlice(self.allocator, incoming.data);
@@ -1559,7 +1864,7 @@ pub const Client = struct {
                     got_response_fin = true;
                 }
             } else if (incoming.stream_id == 3) {
-                if (peer_control_payload.items.len + incoming.data.len > self.config.max_response_size) {
+                if (peer_control_payload.items.len + incoming.data.len > self.shared.config.max_response_size) {
                     return error.ResponseTooLarge;
                 }
                 try peer_control_payload.appendSlice(self.allocator, incoming.data);
@@ -1717,7 +2022,7 @@ pub const Client = struct {
                     }
                 },
                 @intFromEnum(http.HTTP3FrameType.data) => {
-                    if (response_body.items.len + frame_payload.len > self.config.max_response_size) {
+                    if (response_body.items.len + frame_payload.len > self.shared.config.max_response_size) {
                         return error.ResponseTooLarge;
                     }
                     try response_body.appendSlice(self.allocator, frame_payload);
@@ -1801,7 +2106,7 @@ pub const Client = struct {
             const fhdr = http.HTTP2FrameHeader.parse(hdr_bytes);
 
             const payload_len: usize = @intCast(fhdr.length);
-            if (payload_len > self.config.max_response_size) return error.FrameTooLarge;
+            if (payload_len > self.shared.config.max_response_size) return error.FrameTooLarge;
 
             const payload = try self.allocator.alloc(u8, payload_len);
             errdefer self.allocator.free(payload);
@@ -1881,20 +2186,23 @@ pub const Client = struct {
         req: *Request,
         transport: anytype,
         decompression: types.DecompressionPolicy,
+        session_state: *pool_mod.H2SessionState,
     ) !Response {
-        var stream_manager = h2stream.StreamManager.init(self.allocator, true);
-        defer stream_manager.deinit();
+        const local_settings = toConnectionSettings(self.shared.config.http2_settings, self.shared.config.allow_push);
+        if (!session_state.initialized) {
+            try transport.writeAll(http.HTTP2_PREFACE);
 
-        try transport.writeAll(http.HTTP2_PREFACE);
+            var settings_payload = std.ArrayList(u8).empty;
+            defer settings_payload.deinit(self.allocator);
+            try http.encodeSettingsPayload(local_settings, self.allocator, &settings_payload);
+            try writeHTTP2Frame(transport, .settings, 0, 0, settings_payload.items);
+            session_state.initialized = true;
+        }
 
-        var settings_payload = std.ArrayList(u8).empty;
-        defer settings_payload.deinit(self.allocator);
-
-        const local_settings = toConnectionSettings(self.config.http2_settings, self.config.allow_push);
-        try http.encodeSettingsPayload(local_settings, self.allocator, &settings_payload);
-        try writeHTTP2Frame(transport, .settings, 0, 0, settings_payload.items);
-
+        const stream_manager = &session_state.stream_manager;
         const request_stream = try stream_manager.createStream();
+        defer stream_manager.removeStream(request_stream.id);
+        request_stream.send_window = @intCast(stream_manager.peer_settings.initial_window_size);
         try request_stream.open();
 
         var path_buf: ?[]u8 = null;
@@ -1915,7 +2223,7 @@ pub const Client = struct {
 
         const has_body = req.body != null and req.body.?.len > 0;
         const headers_frames = try h2stream.buildHeadersAndContinuations(
-            &stream_manager,
+            stream_manager,
             request_stream.id,
             header_entries.items,
             null,
@@ -1927,7 +2235,7 @@ pub const Client = struct {
 
         try transport.writeAll(headers_frames);
 
-        var peer_max_frame_size: u32 = local_settings.max_frame_size;
+        var peer_max_frame_size: u32 = session_state.peer_max_frame_size;
 
         // Buffered early-response frames received during the body upload phase
         // (when we pump for WINDOW_UPDATE). These are replayed at the start of
@@ -1949,7 +2257,7 @@ pub const Client = struct {
                     try pumpUntilSendWindow(
                         self,
                         transport,
-                        &stream_manager,
+                        stream_manager,
                         request_stream,
                         &peer_max_frame_size,
                         &early_frames,
@@ -2049,6 +2357,7 @@ pub const Client = struct {
                         try http.applySettingsPayload(&peer_settings, frame.payload);
                         try stream_manager.applyPeerSettings(peer_settings);
                         peer_max_frame_size = peer_settings.max_frame_size;
+                        session_state.peer_max_frame_size = peer_max_frame_size;
                         try writeHTTP2Frame(transport, .settings, 0x01, 0, &.{});
                     }
                 },
@@ -2061,13 +2370,14 @@ pub const Client = struct {
                     }
                 },
                 .goaway => {
+                    session_state.draining = true;
                     if (status_code == null) return error.ProtocolError;
                     response_done = true;
                 },
                 .window_update, .priority => {},
                 .push_promise => {
                     if (frame.header.stream_id == 0) return error.ProtocolError;
-                    if (!self.config.allow_push) {
+                    if (!self.shared.config.allow_push) {
                         const promised_stream_id = (@as(u31, frame.payload[0] & 0x7F) << 24) |
                             (@as(u31, frame.payload[1]) << 16) |
                             (@as(u31, frame.payload[2]) << 8) |
@@ -2094,7 +2404,7 @@ pub const Client = struct {
 
                         if ((frame.header.flags & 0x04) != 0) {
                             const parsed = try h2stream.parseHeadersFramePayload(
-                                &stream_manager,
+                                stream_manager,
                                 frame.payload,
                                 frame.header.flags,
                                 self.allocator,
@@ -2127,7 +2437,7 @@ pub const Client = struct {
                         const expect_initial_headers = status_code == null;
                         try applyResponseHeaderBlock(
                             self,
-                            &stream_manager,
+                            stream_manager,
                             frame.payload,
                             frame.header.flags,
                             expect_initial_headers,
@@ -2158,7 +2468,7 @@ pub const Client = struct {
                     if ((frame.header.flags & 0x04) != 0) {
                         if (got_end_stream) {
                             const parsed = try h2stream.parseHeadersFramePayload(
-                                &stream_manager,
+                                stream_manager,
                                 pending_headers_block.items,
                                 pending_headers_flags,
                                 self.allocator,
@@ -2183,7 +2493,7 @@ pub const Client = struct {
                             const expect_initial_headers = status_code == null;
                             try applyResponseHeaderBlock(
                                 self,
-                                &stream_manager,
+                                stream_manager,
                                 pending_headers_block.items,
                                 pending_headers_flags,
                                 expect_initial_headers,
@@ -2217,7 +2527,7 @@ pub const Client = struct {
                         data_slice = frame.payload[1 .. frame.payload.len - pad_len];
                     }
 
-                    if (body.items.len + data_slice.len > self.config.max_response_size) return error.ResponseTooLarge;
+                    if (body.items.len + data_slice.len > self.shared.config.max_response_size) return error.ResponseTooLarge;
                     try body.appendSlice(self.allocator, data_slice);
 
                     if (data_slice.len > 0) {
@@ -2287,7 +2597,7 @@ pub const Client = struct {
         const header = http.HTTP2FrameHeader.parse(header_bytes);
 
         const payload_len: usize = @intCast(header.length);
-        if (payload_len > self.config.max_response_size) return error.FrameTooLarge;
+        if (payload_len > self.shared.config.max_response_size) return error.FrameTooLarge;
 
         const payload = try self.allocator.alloc(u8, payload_len);
         errdefer self.allocator.free(payload);
@@ -2326,6 +2636,42 @@ pub const Client = struct {
         socket.setNoDelay(true) catch {};
         ctx.socket = socket;
         return socket;
+    }
+
+    fn handshakePooledTls(
+        self: *Self,
+        lease: *ConnectionLease,
+        session: *TLSSession,
+        host: []const u8,
+        port: u16,
+        allow_reconnect: bool,
+    ) !void {
+        var reconnect_ctx = ReconnectContext{
+            .allocator = self.allocator,
+            .host = host,
+            .port = port,
+        };
+        errdefer if (reconnect_ctx.socket) |socket| {
+            socket.close();
+            self.allocator.destroy(socket);
+        };
+
+        if (allow_reconnect) {
+            session.reconnect_fn = reconnectCallback;
+            session.reconnect_ctx = &reconnect_ctx;
+        }
+        defer {
+            session.reconnect_fn = null;
+            session.reconnect_ctx = null;
+        }
+
+        try session.handshake(host);
+        if (reconnect_ctx.socket) |socket| {
+            const replacement = socket.*;
+            self.allocator.destroy(socket);
+            reconnect_ctx.socket = null;
+            lease.replaceSocket(replacement);
+        }
     }
 
     fn executeTLSHttp(
@@ -2374,7 +2720,7 @@ pub const Client = struct {
             const n = try session.read(&buf);
             if (n == 0) break;
             total_read += n;
-            if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
             _ = try parser.feed(buf[0..n]);
         }
 
@@ -2410,7 +2756,7 @@ pub const Client = struct {
             const n = try readFn(reader, &buf);
             if (n == 0) break;
             total_read += n;
-            if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
             _ = try parser.feed(buf[0..n]);
         }
 
@@ -2453,7 +2799,7 @@ pub const Client = struct {
                 continue;
             }
             total_read += buffered.len;
-            if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
             const consumed = try parser.feed(buffered);
             r.toss(consumed);
         }
@@ -2468,6 +2814,7 @@ pub const Client = struct {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
+        res.version = parser.version;
 
         // Move headers ownership from parser to response.
         res.headers.deinit();
@@ -2495,6 +2842,18 @@ pub const Client = struct {
         }
 
         return res;
+    }
+
+    fn responseIsReusable(response: *const Response, expect_body: bool) bool {
+        if (!response.headers.isKeepAlive(response.version)) return false;
+        if (!expect_body or
+            (response.status.code >= 100 and response.status.code < 200) or
+            response.status.code == 204 or
+            response.status.code == 304)
+        {
+            return true;
+        }
+        return response.headers.getContentLength() != null or response.headers.isChunked();
     }
 
     fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
@@ -2547,7 +2906,9 @@ pub const Client = struct {
     fn attachCookies(self: *Self, req: *Request) !void {
         // A caller-provided Cookie header is authoritative.
         if (req.headers.contains(HeaderName.COOKIE)) return;
-        if (self.cookies.count() == 0) return;
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        if (self.shared.cookies.count() == 0) return;
 
         const req_host = req.uri.host orelse return;
         const req_path = if (req.uri.path.len > 0) req.uri.path else "/";
@@ -2558,7 +2919,7 @@ pub const Client = struct {
         defer list.deinit(self.allocator);
         const writer = list_writer.init(self.allocator, &list);
 
-        var it = self.cookies.iterator();
+        var it = self.shared.cookies.iterator();
         var first = true;
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
@@ -2634,90 +2995,121 @@ pub const Client = struct {
         defer self.allocator.free(values);
 
         const now = std.Io.Timestamp.now(io_util.defaultIo(), .real).toSeconds();
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
 
         for (values) |set_cookie| {
             const parsed = common.parseSetCookie(set_cookie) orelse continue;
-            // Use the cookie's domain if present, otherwise fall back to the request host
-            const domain = parsed.domain orelse request_host;
-            // Enforce max_cookie_size limit
-            if (self.config.max_cookie_size > 0 and (parsed.name.len + parsed.value.len) > self.config.max_cookie_size) continue;
-            // Enforce max_cookies limit
-            if (self.config.max_cookies > 0 and self.cookies.count() >= self.config.max_cookies) break;
-            // Store as "domain|name" key
-            const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}", .{ domain, parsed.name });
-            errdefer self.allocator.free(key);
-            const owned_value = try self.allocator.dupe(u8, parsed.value);
-            errdefer self.allocator.free(owned_value);
-
-            if (self.cookies.fetchRemove(key)) |removed| {
-                self.allocator.free(removed.key);
-                self.allocator.free(removed.value.value);
-            }
-            try self.cookies.put(self.allocator, key, .{
-                .value = owned_value,
-                .path = parsed.path orelse "/",
-                .domain = domain,
-                .secure = parsed.secure,
-                .http_only = parsed.http_only,
-                .same_site = parsed.same_site,
-                .max_age = parsed.max_age,
-                .stored_at = now,
-            });
+            if (self.shared.config.max_cookie_size > 0 and (parsed.name.len + parsed.value.len) > self.shared.config.max_cookie_size) continue;
+            if (self.shared.config.max_cookies > 0 and self.shared.cookies.count() >= self.shared.config.max_cookies) break;
+            try self.storeCookieLocked(parsed, request_host, now);
         }
+    }
+
+    fn storeCookieLocked(self: *Self, parsed: common.ParsedCookie, request_host: []const u8, now: i64) !void {
+        const domain = parsed.domain orelse request_host;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}", .{ domain, parsed.name });
+        errdefer self.allocator.free(key);
+        const owned_value = try self.allocator.dupe(u8, parsed.value);
+        errdefer self.allocator.free(owned_value);
+        const owned_path = try self.allocator.dupe(u8, parsed.path orelse "/");
+        errdefer self.allocator.free(owned_path);
+        const owned_domain = try self.allocator.dupe(u8, domain);
+        errdefer self.allocator.free(owned_domain);
+
+        if (self.shared.cookies.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            freeCookieEntry(self.allocator, removed.value);
+        }
+        try self.shared.cookies.put(self.allocator, key, .{
+            .value = owned_value,
+            .path = owned_path,
+            .domain = owned_domain,
+            .secure = parsed.secure,
+            .http_only = parsed.http_only,
+            .same_site = parsed.same_site,
+            .max_age = parsed.max_age,
+            .stored_at = now,
+        });
     }
 
     /// Adds or replaces a cookie in the in-memory client cookie jar.
     /// The cookie is stored with domain association using "domain|name" format.
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !void {
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
         // If name already contains a domain prefix, use it as-is
         const key = if (mem.lastIndexOfScalar(u8, name, '|') != null)
             name
         else
             name; // Legacy: no domain, matches all hosts
 
-        if (self.cookies.fetchRemove(key)) |removed| {
+        if (self.shared.cookies.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
-            self.allocator.free(removed.value.value);
+            freeCookieEntry(self.allocator, removed.value);
         }
 
         const owned_name = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_name);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
+        const owned_path = try self.allocator.dupe(u8, "/");
+        errdefer self.allocator.free(owned_path);
+        const owned_domain = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(owned_domain);
 
-        try self.cookies.put(self.allocator, owned_name, .{ .value = owned_value });
+        try self.shared.cookies.put(self.allocator, owned_name, .{
+            .value = owned_value,
+            .path = owned_path,
+            .domain = owned_domain,
+        });
     }
 
     /// Adds or replaces a cookie with explicit domain association.
     pub fn setCookieWithDomain(self: *Self, name: []const u8, value: []const u8, domain: []const u8) !void {
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
         const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}", .{ domain, name });
         errdefer self.allocator.free(key);
 
-        if (self.cookies.fetchRemove(key)) |removed| {
+        if (self.shared.cookies.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
-            self.allocator.free(removed.value.value);
+            freeCookieEntry(self.allocator, removed.value);
         }
 
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
+        const owned_path = try self.allocator.dupe(u8, "/");
+        errdefer self.allocator.free(owned_path);
+        const owned_domain = try self.allocator.dupe(u8, domain);
+        errdefer self.allocator.free(owned_domain);
 
-        try self.cookies.put(self.allocator, key, .{
+        try self.shared.cookies.put(self.allocator, key, .{
             .value = owned_value,
-            .domain = domain,
+            .path = owned_path,
+            .domain = owned_domain,
         });
     }
 
-    /// Returns a cookie value from the in-memory cookie jar.
-    pub fn getCookie(self: *const Self, name: []const u8) ?[]const u8 {
-        if (self.cookies.get(name)) |entry| return entry.value;
+    /// Returns an owned cookie value safe from concurrent jar mutation.
+    pub fn getCookie(self: *const Self, name: []const u8) !?[]u8 {
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        if (self.shared.cookies.get(name)) |entry| return try self.allocator.dupe(u8, entry.value);
         return null;
+    }
+
+    pub fn freeCookieValue(self: *const Self, value: []u8) void {
+        self.allocator.free(value);
     }
 
     /// Removes a cookie from the in-memory cookie jar.
     pub fn removeCookie(self: *Self, name: []const u8) bool {
-        if (self.cookies.fetchRemove(name)) |removed| {
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        if (self.shared.cookies.fetchRemove(name)) |removed| {
             self.allocator.free(removed.key);
-            self.allocator.free(removed.value.value);
+            freeCookieEntry(self.allocator, removed.value);
             return true;
         }
         return false;
@@ -2725,31 +3117,39 @@ pub const Client = struct {
 
     /// Clears all cookies from the in-memory cookie jar.
     pub fn clearCookies(self: *Self) void {
-        var it = self.cookies.iterator();
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        var it = self.shared.cookies.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*.value);
+            freeCookieEntry(self.allocator, entry.value_ptr.*);
         }
-        self.cookies.clearRetainingCapacity();
+        self.shared.cookies.clearRetainingCapacity();
     }
 
     /// Returns true if a cookie with the given name exists in the jar.
     pub fn hasCookie(self: *const Self, name: []const u8) bool {
-        return self.cookies.contains(name);
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        return self.shared.cookies.contains(name);
     }
 
     /// Returns the number of cookies currently stored in the jar.
     pub fn cookieCount(self: *const Self) usize {
-        return self.cookies.count();
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
+        return self.shared.cookies.count();
     }
 
     /// Removes all expired cookies from the jar.
     pub fn pruneExpiredCookies(self: *Self) void {
+        ClientState.lock(&self.shared.cookie_lock);
+        defer self.shared.cookie_lock.unlock();
         const now = std.Io.Timestamp.now(io_util.defaultIo(), .real).toSeconds();
         var to_remove = std.ArrayList([]const u8).empty;
         defer to_remove.deinit(self.allocator);
 
-        var it = self.cookies.iterator();
+        var it = self.shared.cookies.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.*.max_age) |max_age| {
                 if (max_age > 0) {
@@ -2761,9 +3161,9 @@ pub const Client = struct {
             }
         }
         for (to_remove.items) |key| {
-            if (self.cookies.fetchRemove(key)) |removed| {
+            if (self.shared.cookies.fetchRemove(key)) |removed| {
                 self.allocator.free(removed.key);
-                self.allocator.free(removed.value.value);
+                freeCookieEntry(self.allocator, removed.value);
             }
         }
     }
@@ -3287,16 +3687,44 @@ const PolicyTestServer = struct {
 };
 
 const PolicyInterceptorCounts = struct {
+    requests: u32 = 0,
+    responses: u32 = 0,
     retries: u32 = 0,
     redirects: u32 = 0,
+    last_retry_attempt: u32 = 0,
+    logical_request_id: u64 = 0,
+    context_mismatch: bool = false,
 
-    fn onRetry(_: u32, context: ?*anyopaque) void {
+    fn observe(self: *@This(), attempt: *const AttemptContext) void {
+        if (self.logical_request_id == 0) {
+            self.logical_request_id = attempt.logical_request_id;
+        } else if (self.logical_request_id != attempt.logical_request_id) {
+            self.context_mismatch = true;
+        }
+    }
+
+    fn onRequest(_: *Request, attempt: *const AttemptContext, context: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.observe(attempt);
+        self.requests += 1;
+    }
+
+    fn onResponse(_: *Response, attempt: *const AttemptContext, context: ?*anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.observe(attempt);
+        self.responses += 1;
+    }
+
+    fn onRetry(attempt: *const AttemptContext, context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.observe(attempt);
+        self.last_retry_attempt = attempt.attempt;
         self.retries += 1;
     }
 
-    fn onRedirect(_: []const u8, context: ?*anyopaque) void {
+    fn onRedirect(_: []const u8, attempt: *const AttemptContext, context: ?*anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.observe(attempt);
         self.redirects += 1;
     }
 };
@@ -3343,7 +3771,7 @@ test "Client initialization" {
     var client = Client.init(allocator);
     defer client.deinit();
 
-    try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
+    try std.testing.expectEqualStrings(meta.default_user_agent, client.configuration().user_agent);
 }
 
 test "Client with config" {
@@ -3354,7 +3782,7 @@ test "Client with config" {
     });
     defer client.deinit();
 
-    try std.testing.expectEqualStrings("http://httpbun.com", client.config.base_url.?);
+    try std.testing.expectEqualStrings("http://httpbun.com", client.configuration().base_url.?);
 }
 
 test "Client initForBaseUrl helper" {
@@ -3362,7 +3790,7 @@ test "Client initForBaseUrl helper" {
     var client = Client.initForBaseUrl(allocator, "http://httpbun.com");
     defer client.deinit();
 
-    try std.testing.expectEqualStrings("http://httpbun.com", client.config.base_url.?);
+    try std.testing.expectEqualStrings("http://httpbun.com", client.configuration().base_url.?);
 }
 
 test "Client initialization defaults" {
@@ -3370,12 +3798,12 @@ test "Client initialization defaults" {
     var client = Client.init(allocator);
     defer client.deinit();
 
-    try std.testing.expect(client.config.base_url == null);
-    try std.testing.expect(client.config.keep_alive);
-    try std.testing.expect(client.config.policy.redirect == .policy);
-    try std.testing.expect(client.config.verify_ssl);
-    try std.testing.expectEqual(@as(u32, 20), client.config.pool_max_connections);
-    try std.testing.expectEqual(@as(u32, 5), client.config.pool_max_per_host);
+    try std.testing.expect(client.configuration().base_url == null);
+    try std.testing.expect(client.configuration().keep_alive);
+    try std.testing.expect(client.configuration().policy.redirect == .policy);
+    try std.testing.expect(client.configuration().verify_ssl);
+    try std.testing.expectEqual(@as(u32, 20), client.configuration().pool_max_connections);
+    try std.testing.expectEqual(@as(u32, 5), client.configuration().pool_max_per_host);
 }
 
 test "ClientConfig builder helpers" {
@@ -3524,6 +3952,8 @@ test "embedding-owned request disables redirect cookies encoding and decompressi
 
     var counts = PolicyInterceptorCounts{};
     try client.addInterceptor(.{
+        .request_fn = PolicyInterceptorCounts.onRequest,
+        .response_fn = PolicyInterceptorCounts.onResponse,
         .retry_fn = PolicyInterceptorCounts.onRetry,
         .redirect_fn = PolicyInterceptorCounts.onRedirect,
         .context = &counts,
@@ -3544,7 +3974,10 @@ test "embedding-owned request disables redirect cookies encoding and decompressi
     try std.testing.expectEqualStrings("gzip", response.headers.get(HeaderName.CONTENT_ENCODING).?);
     try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.COOKIE) == null);
     try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
+    try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.USER_AGENT) == null);
     try std.testing.expectEqual(@as(usize, 1), client.cookieCount());
+    try std.testing.expectEqual(@as(u32, 1), counts.requests);
+    try std.testing.expectEqual(@as(u32, 1), counts.responses);
     try std.testing.expectEqual(@as(u32, 0), counts.retries);
     try std.testing.expectEqual(@as(u32, 0), counts.redirects);
 }
@@ -3576,6 +4009,8 @@ test "embedding-owned request returns first retryable response" {
 
     var counts = PolicyInterceptorCounts{};
     try client.addInterceptor(.{
+        .request_fn = PolicyInterceptorCounts.onRequest,
+        .response_fn = PolicyInterceptorCounts.onResponse,
         .retry_fn = PolicyInterceptorCounts.onRetry,
         .context = &counts,
     });
@@ -3624,6 +4059,8 @@ test "request retry override enables only retry behavior" {
 
     var counts = PolicyInterceptorCounts{};
     try client.addInterceptor(.{
+        .request_fn = PolicyInterceptorCounts.onRequest,
+        .response_fn = PolicyInterceptorCounts.onResponse,
         .retry_fn = PolicyInterceptorCounts.onRetry,
         .context = &counts,
     });
@@ -3646,7 +4083,11 @@ test "request retry override enables only retry behavior" {
     try std.testing.expect(server.failure == null);
     try std.testing.expectEqual(@as(usize, 2), server.request_count);
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(u32, 2), counts.requests);
+    try std.testing.expectEqual(@as(u32, 2), counts.responses);
     try std.testing.expectEqual(@as(u32, 1), counts.retries);
+    try std.testing.expectEqual(@as(u32, 1), counts.last_retry_attempt);
+    try std.testing.expect(!counts.context_mismatch);
     try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
 }
 
@@ -3770,7 +4211,12 @@ test "encoding and decompression overrides are independent and preserve caller h
 
     const first = try makePolicyTestResponse(allocator, "200 OK", &.{}, "first");
     defer allocator.free(first);
-    const encoded_headers = [_][2][]const u8{.{ "Content-Encoding", "gzip" }};
+    const encoded_headers = [_][2][]const u8{
+        .{ "X-A", "1" },
+        .{ "X-B", "x" },
+        .{ "X-A", "2" },
+        .{ "Content-Encoding", "gzip" },
+    };
     const second = try makePolicyTestResponse(allocator, "200 OK", &encoded_headers, encoded);
     defer allocator.free(second);
 
@@ -3819,6 +4265,107 @@ test "encoding and decompression overrides are independent and preserve caller h
     try std.testing.expectEqualStrings("caller-coding", requestHeaderValue(server.request(1), HeaderName.ACCEPT_ENCODING).?);
     try std.testing.expectEqualStrings(plaintext, second_response.body.?);
     try std.testing.expectEqualStrings("gzip", second_response.headers.get(HeaderName.CONTENT_ENCODING).?);
+    const response_entries = second_response.headers.iterator();
+    try std.testing.expectEqualStrings("X-A", response_entries[0].name);
+    try std.testing.expectEqualStrings("X-B", response_entries[1].name);
+    try std.testing.expectEqualStrings("X-A", response_entries[2].name);
+}
+
+test "request headers preserve ordered duplicates without automatic coalescing" {
+    const allocator = std.testing.allocator;
+    const response_bytes = try makePolicyTestResponse(allocator, "200 OK", &.{}, "ok");
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/duplicates");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    const request_headers = [_][2][]const u8{
+        .{ "x-ms-meta-value", "one" },
+        .{ "Cookie", "a=1" },
+        .{ "x-ms-other", "middle" },
+        .{ "x-ms-meta-value", "two" },
+        .{ "Cookie", "b=2" },
+    };
+    var response = try client.get(url, .{
+        .headers = &request_headers,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer response.deinit();
+
+    thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    const wire = server.request(0);
+    const first_xms = mem.indexOf(u8, wire, "x-ms-meta-value: one\r\n").?;
+    const first_cookie = mem.indexOf(u8, wire, "Cookie: a=1\r\n").?;
+    const middle_xms = mem.indexOf(u8, wire, "x-ms-other: middle\r\n").?;
+    const second_xms = mem.indexOf(u8, wire, "x-ms-meta-value: two\r\n").?;
+    const second_cookie = mem.indexOf(u8, wire, "Cookie: b=2\r\n").?;
+    try std.testing.expect(first_xms < first_cookie);
+    try std.testing.expect(first_cookie < middle_xms);
+    try std.testing.expect(middle_xms < second_xms);
+    try std.testing.expect(second_xms < second_cookie);
+}
+
+test "HTTP2 response header decoding preserves duplicates and order" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator);
+    defer client.deinit();
+    var manager = h2stream.StreamManager.init(allocator, true);
+    defer manager.deinit();
+
+    const encoded = try h2stream.buildHeadersFramePayload(&manager, &.{
+        .{ .name = ":status", .value = "200", .representation = .without_indexing },
+        .{ .name = "x-a", .value = "1", .representation = .without_indexing },
+        .{ .name = "x-b", .value = "x", .representation = .without_indexing },
+        .{ .name = "x-a", .value = "2", .representation = .without_indexing },
+        .{ .name = "set-cookie", .value = "a=1", .representation = .without_indexing },
+        .{ .name = "set-cookie", .value = "b=2", .representation = .without_indexing },
+    }, null, allocator);
+    defer allocator.free(encoded.payload);
+
+    var status_code: ?u16 = null;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+    try applyResponseHeaderBlock(
+        &client,
+        &manager,
+        encoded.payload,
+        encoded.flags,
+        true,
+        &status_code,
+        &headers,
+    );
+
+    try std.testing.expectEqual(@as(?u16, 200), status_code);
+    const entries = headers.iterator();
+    try std.testing.expectEqualStrings("x-a", entries[0].name);
+    try std.testing.expectEqualStrings("x-b", entries[1].name);
+    try std.testing.expectEqualStrings("x-a", entries[2].name);
+    const x_a = try headers.getAll("x-a", allocator);
+    defer allocator.free(x_a);
+    try std.testing.expectEqual(@as(usize, 2), x_a.len);
+    try std.testing.expectEqualStrings("1", x_a[0]);
+    try std.testing.expectEqualStrings("2", x_a[1]);
+    const cookies = try headers.getAll("set-cookie", allocator);
+    defer allocator.free(cookies);
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
 }
 
 test "managed policy keeps automatic cookies encoding storage and decompression" {
@@ -3869,6 +4416,326 @@ test "managed policy keeps automatic cookies encoding storage and decompression"
     try std.testing.expectEqual(@as(usize, 2), client.cookieCount());
 }
 
+test "Client supports concurrent requests cookie updates and interceptor callbacks" {
+    const allocator = std.testing.allocator;
+    const request_count = 8;
+    const response_bytes = try makePolicyTestResponse(allocator, "200 OK", &.{}, "ok");
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes} ** request_count;
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/concurrent");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .pool_max_connections = request_count,
+        .pool_max_per_host = request_count,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    const Counts = struct {
+        requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        responses: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        invalid_attempt: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn onRequest(_: *Request, attempt: *const AttemptContext, context: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (attempt.attempt != 1 or attempt.redirect_count != 0) {
+                self.invalid_attempt.store(true, .release);
+            }
+            _ = self.requests.fetchAdd(1, .acq_rel);
+        }
+
+        fn onResponse(_: *Response, attempt: *const AttemptContext, context: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (attempt.attempt != 1 or attempt.redirect_count != 0) {
+                self.invalid_attempt.store(true, .release);
+            }
+            _ = self.responses.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var counts = Counts{};
+    try client.addInterceptor(.{
+        .request_fn = Counts.onRequest,
+        .response_fn = Counts.onResponse,
+        .context = &counts,
+    });
+
+    const Worker = struct {
+        client: *Client,
+        url: []const u8,
+        index: usize,
+        failure: *?anyerror,
+
+        fn run(self: @This()) void {
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "cookie-{d}", .{self.index}) catch {
+                self.failure.* = error.NoSpaceLeft;
+                return;
+            };
+            self.client.setCookie(name, "value") catch |err| {
+                self.failure.* = err;
+                return;
+            };
+            var response = self.client.get(self.url, .{
+                .policy = types.RequestPolicyOverrides.embeddingOwned(),
+            }) catch |err| {
+                self.failure.* = err;
+                return;
+            };
+            defer response.deinit();
+            if (response.status.code != 200) self.failure.* = error.TestUnexpectedResult;
+        }
+    };
+
+    var failures = [_]?anyerror{null} ** request_count;
+    var threads: [request_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{
+            .client = &client,
+            .url = url,
+            .index = index,
+            .failure = &failures[index],
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    server_thread.join();
+    server_joined = true;
+
+    try std.testing.expect(server.failure == null);
+    for (failures) |failure| try std.testing.expect(failure == null);
+    try std.testing.expectEqual(@as(usize, request_count), client.cookieCount());
+    try std.testing.expectEqual(@as(u32, request_count), counts.requests.load(.acquire));
+    try std.testing.expectEqual(@as(u32, request_count), counts.responses.load(.acquire));
+    try std.testing.expect(!counts.invalid_attempt.load(.acquire));
+}
+
+test "pooled HTTPS transport reuses one encrypted TLS session" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x5a} ** 32;
+    const iv = [_]u8{0xa5} ** 12;
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+
+    const TlsTestServer = struct {
+        listener: *TcpListener,
+        key: [32]u8,
+        iv: [12]u8,
+        accepts: u32 = 0,
+        requests: u32 = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            try self.serveConnection(2, true);
+            try self.serveConnection(1, false);
+        }
+
+        fn serveConnection(self: *@This(), request_count: u32, close_last: bool) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            self.accepts += 1;
+            try accepted.socket.setRecvTimeout(5_000);
+
+            var connection = TLSConnection{
+                .allocator = std.testing.allocator,
+                .socket = &accepted.socket,
+                .tls_version = .tls_1_3,
+                .connected = true,
+                .app_write_key = self.key,
+                .app_write_iv = self.iv,
+                .app_read_key = self.key,
+                .app_read_iv = self.iv,
+                .cipher_suite = .AES_128_GCM_SHA256,
+            };
+
+            var request_buf: [4096]u8 = undefined;
+            var handled: u32 = 0;
+            while (handled < request_count) : (handled += 1) {
+                var length: usize = 0;
+                while (mem.indexOf(u8, request_buf[0..length], "\r\n\r\n") == null) {
+                    const n = try connection.read(request_buf[length..]);
+                    if (n == 0) return error.UnexpectedEndOfStream;
+                    length += n;
+                }
+                self.requests += 1;
+                if (close_last and handled + 1 == request_count) {
+                    try connection.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                } else {
+                    try connection.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                }
+            }
+        }
+    };
+
+    var server = TlsTestServer{ .listener = &listener, .key = key, .iv = iv };
+    const server_thread = try std.Thread.spawn(.{}, TlsTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    var client = Client.initWithConfig(allocator, .{
+        .verify_ssl = false,
+        .keep_alive = true,
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+    const context = IoContext.init(.{});
+    const pool_key = pool_mod.PoolKey{
+        .scheme = .tls,
+        .host = "127.0.0.1",
+        .port = address.getPort(),
+        .verify_tls = false,
+        .protocol = .http1,
+    };
+
+    var first_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
+    const stable_address = first_lease.entryAddress();
+    const session = first_lease.initializeTls(TLSConfig.insecure(allocator));
+    session.tls_version = .tls_1_3;
+    session.app_write_key = key;
+    session.app_write_iv = iv;
+    session.app_read_key = key;
+    session.app_read_iv = iv;
+    session.cipher_suite = .AES_128_GCM_SHA256;
+
+    try session.writeAll("GET /one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try session.flush();
+    var first = try client.readResponseFromTLS(session, true, .disabled);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("ok", first.body.?);
+    try first_lease.release(.reusable);
+
+    var second_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
+    try std.testing.expectEqual(stable_address, second_lease.entryAddress());
+    const reused_session = second_lease.tlsSession().?;
+    try std.testing.expect(reused_session.write_seq > 0);
+    try reused_session.writeAll("GET /two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try reused_session.flush();
+    var second = try client.readResponseFromTLS(reused_session, true, .disabled);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("ok", second.body.?);
+    try std.testing.expect(!Client.responseIsReusable(&second, true));
+    try second_lease.release(.draining);
+
+    var third_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
+    try std.testing.expect(third_lease.entryAddress() != stable_address);
+    const third_session = third_lease.initializeTls(TLSConfig.insecure(allocator));
+    third_session.tls_version = .tls_1_3;
+    third_session.app_write_key = key;
+    third_session.app_write_iv = iv;
+    third_session.app_read_key = key;
+    third_session.app_read_iv = iv;
+    third_session.cipher_suite = .AES_128_GCM_SHA256;
+    try third_session.writeAll("GET /three HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try third_session.flush();
+    var third = try client.readResponseFromTLS(third_session, true, .disabled);
+    defer third.deinit();
+    try std.testing.expectEqualStrings("ok", third.body.?);
+    try third_lease.release(.reusable);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(u32, 2), server.accepts);
+    try std.testing.expectEqual(@as(u32, 3), server.requests);
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+}
+
+test "pooled HTTP2 state persists sequential stream ids" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+
+    const AcceptServer = struct {
+        listener: *TcpListener,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var sockets: [2]Socket = undefined;
+            var count: usize = 0;
+            defer {
+                for (sockets[0..count]) |*socket| socket.close();
+            }
+            while (count < sockets.len) : (count += 1) {
+                const accepted = self.listener.accept() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                sockets[count] = accepted.socket;
+            }
+            while (!self.done.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+
+    var server = AcceptServer{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, AcceptServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.done.store(true, .release);
+        server_thread.join();
+    };
+
+    var pool = ConnectionPool.init(allocator);
+    defer pool.deinit();
+    const context = IoContext.init(.{});
+    const key_info = pool_mod.PoolKey{
+        .host = "127.0.0.1",
+        .port = address.getPort(),
+        .protocol = .http2,
+    };
+
+    var first_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
+    const address_before_growth = first_lease.entryAddress();
+    const first_state = first_lease.h2Session();
+    first_state.initialized = true;
+    const stream_one = try first_state.stream_manager.createStream();
+    try std.testing.expectEqual(@as(u31, 1), stream_one.id);
+    first_state.stream_manager.removeStream(stream_one.id);
+    try first_lease.release(.reusable);
+
+    var second_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
+    try std.testing.expectEqual(address_before_growth, second_lease.entryAddress());
+    const second_state = second_lease.h2Session();
+    try std.testing.expect(second_state.initialized);
+    const stream_three = try second_state.stream_manager.createStream();
+    try std.testing.expectEqual(@as(u31, 3), stream_three.id);
+    second_state.stream_manager.removeStream(stream_three.id);
+    second_state.draining = true;
+    try second_lease.release(.reusable);
+
+    var third_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
+    try std.testing.expect(third_lease.entryAddress() != address_before_growth);
+    try third_lease.release(.draining);
+
+    server.done.store(true, .release);
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
 test "Client stores Set-Cookie headers" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator);
@@ -3882,8 +4749,8 @@ test "Client stores Set-Cookie headers" {
 
     try client.storeCookies(&response, "httpbun.com");
 
-    try std.testing.expectEqualStrings("abc123", client.cookies.get("httpbun.com|session").?.value);
-    try std.testing.expectEqualStrings("dark", client.cookies.get("httpbun.com|theme").?.value);
+    try std.testing.expectEqualStrings("abc123", client.shared.cookies.get("httpbun.com|session").?.value);
+    try std.testing.expectEqualStrings("dark", client.shared.cookies.get("httpbun.com|theme").?.value);
 }
 
 test "Client attaches Cookie header from jar" {
@@ -3910,16 +4777,18 @@ test "Client cookie jar public API" {
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
-    try std.testing.expectEqualStrings("abc123", client.getCookie("session").?);
+    const value = (try client.getCookie("session")).?;
+    defer client.freeCookieValue(value);
+    try std.testing.expectEqualStrings("abc123", value);
 
     const removed = client.removeCookie("session");
     try std.testing.expect(removed);
-    try std.testing.expect(client.getCookie("session") == null);
+    try std.testing.expect((try client.getCookie("session")) == null);
 
     try client.setCookie("theme", "dark");
     try client.setCookie("lang", "en");
     client.clearCookies();
-    try std.testing.expectEqual(@as(usize, 0), client.cookies.count());
+    try std.testing.expectEqual(@as(usize, 0), client.shared.cookies.count());
 }
 
 test "Client send/fetch/options aliases" {
@@ -4184,7 +5053,7 @@ test "CookieEntry stores metadata" {
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
-    const entry = client.cookies.get("session").?;
+    const entry = client.shared.cookies.get("session").?;
     try std.testing.expectEqualStrings("abc123", entry.value);
     try std.testing.expectEqualStrings("/", entry.path);
     try std.testing.expect(!entry.secure);
@@ -4222,7 +5091,7 @@ test "Interceptor error_fn callback type" {
         var last_err: anyerror = undefined;
     };
     const onError = struct {
-        fn f(err: anyerror, ctx: ?*anyopaque) void {
+        fn f(err: anyerror, _: *const AttemptContext, ctx: ?*anyopaque) void {
             _ = ctx;
             TestContext.called = true;
             TestContext.last_err = err;
@@ -4231,7 +5100,14 @@ test "Interceptor error_fn callback type" {
     var interceptor = Interceptor{};
     interceptor.error_fn = onError;
     try std.testing.expect(interceptor.error_fn != null);
-    interceptor.error_fn.?(error.ConnectionRefused, null);
+    const attempt = AttemptContext{
+        .logical_request_id = 1,
+        .attempt = 1,
+        .redirect_count = 0,
+        .policy = types.ClientPolicy.managed().resolve(.{}),
+        .url = "https://example.com",
+    };
+    interceptor.error_fn.?(error.ConnectionRefused, &attempt, null);
     try std.testing.expect(TestContext.called);
     try std.testing.expectEqualStrings("ConnectionRefused", @errorName(TestContext.last_err));
 }
@@ -4242,16 +5118,23 @@ test "Interceptor retry_fn callback type" {
         var last_attempt: u32 = 0;
     };
     const onRetry = struct {
-        fn f(attempt: u32, ctx: ?*anyopaque) void {
+        fn f(attempt: *const AttemptContext, ctx: ?*anyopaque) void {
             _ = ctx;
             TestContext.called = true;
-            TestContext.last_attempt = attempt;
+            TestContext.last_attempt = attempt.attempt;
         }
     }.f;
     var interceptor = Interceptor{};
     interceptor.retry_fn = onRetry;
     try std.testing.expect(interceptor.retry_fn != null);
-    interceptor.retry_fn.?(3, null);
+    const attempt = AttemptContext{
+        .logical_request_id = 1,
+        .attempt = 3,
+        .redirect_count = 0,
+        .policy = types.ClientPolicy.managed().resolve(.{}),
+        .url = "https://example.com",
+    };
+    interceptor.retry_fn.?(&attempt, null);
     try std.testing.expect(TestContext.called);
     try std.testing.expectEqual(@as(u32, 3), TestContext.last_attempt);
 }
@@ -4262,7 +5145,7 @@ test "Interceptor redirect_fn callback type" {
         var last_url: []const u8 = "";
     };
     const onRedirect = struct {
-        fn f(url: []const u8, ctx: ?*anyopaque) void {
+        fn f(url: []const u8, _: *const AttemptContext, ctx: ?*anyopaque) void {
             _ = ctx;
             TestContext.called = true;
             TestContext.last_url = url;
@@ -4271,7 +5154,14 @@ test "Interceptor redirect_fn callback type" {
     var interceptor = Interceptor{};
     interceptor.redirect_fn = onRedirect;
     try std.testing.expect(interceptor.redirect_fn != null);
-    interceptor.redirect_fn.?("https://example.com/new", null);
+    const attempt = AttemptContext{
+        .logical_request_id = 1,
+        .attempt = 1,
+        .redirect_count = 0,
+        .policy = types.ClientPolicy.managed().resolve(.{}),
+        .url = "https://example.com",
+    };
+    interceptor.redirect_fn.?("https://example.com/new", &attempt, null);
     try std.testing.expect(TestContext.called);
     try std.testing.expectEqualStrings("https://example.com/new", TestContext.last_url);
 }

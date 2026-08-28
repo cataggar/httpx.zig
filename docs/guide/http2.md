@@ -5,7 +5,11 @@ httpx.zig provides a complete, from-scratch implementation of HTTP/2 (RFC 7540) 
 ::: warning Custom Implementation
 Zig's standard library does not provide HTTP/2 support. **httpx.zig implements HTTP/2 entirely from scratch**, following RFC 7540 and RFC 7541 specifications, including:
 - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
-- **HTTP/2** stream multiplexing, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and connection pooling (RFC 7540)
+- **HTTP/2** stream/multiplexing primitives, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and sequential high-level client session reuse (RFC 7540)
+
+The high-level `Client` leases one HTTP/2 session to one request at a time.
+Concurrent requests use separate pooled sessions; a frame-dispatching
+multiplexer is not currently exposed.
 - **ALPN** negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback
 :::
 
@@ -35,7 +39,7 @@ HTTP/2 support is validated across Linux, Windows, and macOS targets:
 - **Trailer Support** - Server sends trailers via `sendHttp2Trailers()`; client decodes trailers after END_STREAM
 - **Connection Preface Timeout** - Detects missing initial SETTINGS frame from peer
 - **ALPN Negotiation** - Client and server advertise `["h2", "http/1.1"]` during TLS handshake
-- **Connection Pooling** - HTTP/2 connections are pooled and reused across requests
+- **Connection Pooling** - HTTP/2 sessions are pooled and reused sequentially across requests
 
 ## High-level Client Usage
 

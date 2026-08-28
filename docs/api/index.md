@@ -66,6 +66,9 @@ The root module re-exports core types and convenience helpers so most apps can i
 - `httpx.ClientPolicy`
 - `httpx.RequestPolicyOverrides`
 - `httpx.EffectiveClientPolicy`
+- `httpx.UserAgentPolicy`
+- `httpx.AttemptContext`
+- `httpx.ConnectionLease`
 
 ### Server Types
 
