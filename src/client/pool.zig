@@ -234,6 +234,11 @@ pub const ConnectionLease = struct {
         return self.entry.requests_made;
     }
 
+    pub fn rekeyProtocol(self: *ConnectionLease, protocol: PoolProtocol) !void {
+        if (self.released) return error.LeaseAlreadyReleased;
+        try self.pool.rekeyProtocol(self.entry, self.generation, protocol);
+    }
+
     /// Stable identity useful for diagnostics and regression tests.
     pub fn entryAddress(self: *const ConnectionLease) usize {
         return @intFromPtr(self.entry);
@@ -351,13 +356,9 @@ pub const ConnectionPool = struct {
                 self.config.idle_timeout_ms,
                 self.config.max_requests_per_connection,
             )) {
-                entry.state = .leased;
-                entry.lease_count = 1;
-                entry.generation +%= 1;
-                entry.last_used = common.nowMillis();
-                const generation = entry.generation;
+                const lease = self.checkoutLocked(entry);
                 self.releaseLock();
-                return .{ .pool = self, .entry = entry, .generation = generation };
+                return lease;
             }
         }
 
@@ -416,6 +417,46 @@ pub const ConnectionPool = struct {
         entry.state = .leased;
         self.releaseLock();
         return .{ .pool = self, .entry = entry, .generation = entry.generation };
+    }
+
+    pub fn tryGetLeaseWithContext(
+        self: *Self,
+        key: PoolKey,
+        context: *const IoContext,
+    ) !?ConnectionLease {
+        try self.acquireLockWithContext(context);
+        defer self.releaseLock();
+        for (self.entries.items) |entry| {
+            if (entry.key.matches(key) and entry.isHealthy(
+                self.config.idle_timeout_ms,
+                self.config.max_requests_per_connection,
+            )) {
+                return self.checkoutLocked(entry);
+            }
+        }
+        return null;
+    }
+
+    fn checkoutLocked(self: *Self, entry: *Entry) ConnectionLease {
+        entry.state = .leased;
+        entry.lease_count = 1;
+        entry.generation +%= 1;
+        entry.last_used = common.nowMillis();
+        return .{ .pool = self, .entry = entry, .generation = entry.generation };
+    }
+
+    fn rekeyProtocol(
+        self: *Self,
+        entry: *Entry,
+        generation: u64,
+        protocol: PoolProtocol,
+    ) !void {
+        self.acquireLock();
+        defer self.releaseLock();
+        if (entry.generation != generation or entry.state != .leased or entry.lease_count != 1) {
+            return error.StaleLease;
+        }
+        entry.key.protocol = protocol;
     }
 
     fn connectEntry(

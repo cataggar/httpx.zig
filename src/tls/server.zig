@@ -81,12 +81,14 @@ fn findClientKeyShare(ch_data: []const u8, comptime group_id: u16, comptime expe
         const ext_data_len = mem.readInt(u16, ch_data[off + 2 ..][0..2], .big);
         off += 4;
         if (ext_type == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (ext_data_len < 2 or off + ext_data_len > ext_end) return null;
             // Key share entry list: each entry is group(2) + length(2) + key
-            // ClientHello key_share data begins with the uint16
-            // client_shares LIST LENGTH (RFC 8446 �4.2.8).
-            var koff = off + 2;
-            const shares_len: usize = mem.readInt(u16, ch_data[off..][0..2], .big);
-            var shares_end = off + 2 + shares_len;
+            // RFC 8446 uses a uint16 list length. Zig 0.16's std TLS client
+            // emits the entries directly, so accept either representation.
+            const first_u16: usize = mem.readInt(u16, ch_data[off..][0..2], .big);
+            const has_list_length = first_u16 + 2 == ext_data_len;
+            var koff = off + @as(usize, if (has_list_length) 2 else 0);
+            var shares_end = if (has_list_length) off + 2 + first_u16 else off + ext_data_len;
             if (shares_end > off + ext_data_len) shares_end = off + ext_data_len;
             if (shares_end > ch_data.len) shares_end = ch_data.len;
             while (koff + 4 <= shares_end) {
@@ -629,9 +631,26 @@ fn acceptServerTLS13Comptime(
     // Send EncryptedExtensions
     var ee_msg: [256]u8 = undefined;
     ee_msg[0] = 8; // encrypted_extensions handshake type
-    mem.writeInt(u24, ee_msg[1..][0..3], 2, .big); // body length = 2 (extensions length field)
-    mem.writeInt(u16, ee_msg[4..][0..2], 0, .big); // extensions length = 0
-    const ee_len: usize = 6;
+    var ee_len: usize = 6;
+    if (alpn.serverNegotiate(server_alpn, parsed.alpn_protocols.slice())) |negotiated| {
+        const extension_data_len: usize = 2 + 1 + negotiated.len;
+        if (negotiated.len > std.math.maxInt(u8) or ee_len + 4 + extension_data_len > ee_msg.len) {
+            return error.TlsRecordOverflow;
+        }
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+        ee_len += 2;
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intCast(extension_data_len), .big);
+        ee_len += 2;
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intCast(1 + negotiated.len), .big);
+        ee_len += 2;
+        ee_msg[ee_len] = @intCast(negotiated.len);
+        ee_len += 1;
+        @memcpy(ee_msg[ee_len..][0..negotiated.len], negotiated);
+        ee_len += negotiated.len;
+    }
+    const extensions_len = ee_len - 6;
+    mem.writeInt(u16, ee_msg[4..][0..2], @intCast(extensions_len), .big);
+    mem.writeInt(u24, ee_msg[1..][0..3], @intCast(2 + extensions_len), .big);
     try tls_mod.sendTLS13EncryptedHandshake(socket, ee_msg[0..ee_len], tls_mod.trafficKeyFor(negotiated_cs, &hs_keys), &hs_keys.iv, &conn.hs_write_seq, negotiated_cs);
 
     @memcpy(transcript[transcript_len..][0..ee_len], ee_msg[0..ee_len]);

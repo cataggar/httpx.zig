@@ -10,6 +10,11 @@ Zig's standard library does not provide HTTP/2 support. **httpx.zig implements H
 The high-level `Client` leases one HTTP/2 session to one request at a time.
 Concurrent requests use separate pooled sessions; a frame-dispatching
 multiplexer is not currently exposed.
+Session reuse retains peer SETTINGS, HPACK state, connection flow-control
+credit, and odd stream IDs. Partial SETTINGS update retained values rather than
+resetting omitted fields. GOAWAY drains the session while an allowed active
+stream is read through END_STREAM. Opportunistic ALPN selection of HTTP/1.1
+falls back to the pooled HTTP/1.1 path.
 - **ALPN** negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback
 :::
 

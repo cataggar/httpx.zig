@@ -31,9 +31,10 @@ const h2stream = @import("../protocol/stream.zig");
 const qpack = @import("../protocol/qpack.zig");
 const quic = @import("../protocol/quic.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
-const TLSConfig = @import("../tls/tls.zig").TLSConfig;
-const TLSSession = @import("../tls/tls.zig").TLSSession;
-const TLSConnection = @import("../tls/tls.zig").Connection;
+const tls_mod = @import("../tls/tls.zig");
+const TLSConfig = tls_mod.TLSConfig;
+const TLSSession = tls_mod.TLSSession;
+const TLSConnection = tls_mod.Connection;
 const pool_mod = @import("pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool;
 const ConnectionLease = pool_mod.ConnectionLease;
@@ -715,6 +716,71 @@ pub const Client = struct {
         return self.allocator.dupe(Interceptor, self.shared.interceptors.items);
     }
 
+    fn isRequestSingletonHeader(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, HeaderName.HOST) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.USER_AGENT) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.AUTHORIZATION) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.PROXY_AUTHORIZATION) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_TYPE) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.RANGE) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.REFERER);
+    }
+
+    fn applyConfiguredHeaders(req: *Request, configured: []const [2][]const u8) !void {
+        for (configured) |header| {
+            if (isRequestSingletonHeader(header[0])) {
+                try req.headers.set(header[0], header[1]);
+            } else {
+                try req.headers.append(header[0], header[1]);
+            }
+        }
+    }
+
+    fn validateRequestHeaders(req: *const Request) !void {
+        var host_count: usize = 0;
+        var content_length_count: usize = 0;
+        var transfer_encoding_count: usize = 0;
+        var content_length: ?usize = null;
+
+        for (req.headers.iterator()) |header| {
+            if (isRequestSingletonHeader(header.name)) {
+                var duplicate_count: usize = 0;
+                for (req.headers.iterator()) |candidate| {
+                    if (std.ascii.eqlIgnoreCase(candidate.name, header.name)) duplicate_count += 1;
+                }
+                if (duplicate_count > 1) return error.DuplicateSingletonHeader;
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.HOST)) {
+                host_count += 1;
+                if (mem.trim(u8, header.value, " \t").len == 0) return error.InvalidHostHeader;
+            } else if (std.ascii.eqlIgnoreCase(header.name, HeaderName.CONTENT_LENGTH)) {
+                content_length_count += 1;
+                content_length = std.fmt.parseInt(usize, mem.trim(u8, header.value, " \t"), 10) catch
+                    return error.InvalidContentLength;
+            } else if (std.ascii.eqlIgnoreCase(header.name, HeaderName.TRANSFER_ENCODING)) {
+                transfer_encoding_count += 1;
+            }
+        }
+
+        if (host_count != 1) return error.InvalidHostHeader;
+        if (content_length_count > 1 or transfer_encoding_count > 1) {
+            return error.DuplicateFramingHeader;
+        }
+        if (content_length_count > 0 and transfer_encoding_count > 0) {
+            return error.ConflictingFramingHeaders;
+        }
+        if (transfer_encoding_count > 0) return error.UnsupportedTransferEncoding;
+
+        const body_len = if (req.body) |body| body.len else 0;
+        if (content_length) |declared| {
+            if (declared != body_len) return error.InvalidContentLength;
+        } else if (body_len > 0) {
+            return error.MissingContentLength;
+        }
+    }
+
     /// Resolves a hostname to a single address using the configured DNS resolver
     /// (if any) or falling back to the system resolver.
     fn resolveAddress(
@@ -826,15 +892,11 @@ pub const Client = struct {
         }
 
         if (self.shared.config.default_headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.append(h[0], h[1]);
-            }
+            try applyConfiguredHeaders(&req, hdrs);
         }
 
         if (reqOpts.headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.append(h[0], h[1]);
-            }
+            try applyConfiguredHeaders(&req, hdrs);
         }
 
         if (effective_policy.user_agent == .enabled and
@@ -921,9 +983,13 @@ pub const Client = struct {
                             body,
                             self.shared.config.request_compression.?,
                         )) |compressed| {
+                            if (req.body_owned) self.allocator.free(body);
                             req.body = compressed;
                             req.body_owned = true;
                             try req.headers.set("Content-Encoding", "gzip");
+                            var len_buf: [32]u8 = undefined;
+                            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{compressed.len}) catch unreachable;
+                            try req.headers.set(HeaderName.CONTENT_LENGTH, len_str);
                             try req.headers.set("Vary", "Content-Encoding");
                         } else |_| {}
                     }
@@ -1084,6 +1150,7 @@ pub const Client = struct {
                     try callback(req, &attempt_context, interceptor.context);
                 }
             }
+            try validateRequestHeaders(req);
 
             var res = self.executeRequestOnce(req, reqOpts, effective_policy, context) catch |raw_err| {
                 const err = normalizeRequestContextError(context, raw_err);
@@ -1100,12 +1167,6 @@ pub const Client = struct {
                         };
                         if (self.shared.config.metrics) |m| {
                             m.recordError();
-                            m.retryAttempt();
-                        }
-                        for (interceptors) |interceptor| {
-                            if (interceptor.retry_fn) |fn_ptr| {
-                                fn_ptr(&attempt_context, interceptor.context);
-                            }
                         }
                         const delay_ms = policy.calculateDelay(attempt);
                         if (delay_ms > 0) {
@@ -1113,6 +1174,16 @@ pub const Client = struct {
                                 if (self.shared.config.metrics) |m| m.recordError();
                                 return context_err;
                             };
+                        }
+                        checkRequestContext(context) catch |context_err| {
+                            if (self.shared.config.metrics) |m| m.recordError();
+                            return context_err;
+                        };
+                        if (self.shared.config.metrics) |m| m.retryAttempt();
+                        for (interceptors) |interceptor| {
+                            if (interceptor.retry_fn) |fn_ptr| {
+                                fn_ptr(&attempt_context, interceptor.context);
+                            }
                         }
                         attempt += 1;
                         continue;
@@ -1151,17 +1222,21 @@ pub const Client = struct {
                     else
                         policy.calculateDelay(attempt);
                     res.deinit();
-                    if (self.shared.config.metrics) |m| m.retryAttempt();
-                    for (interceptors) |interceptor| {
-                        if (interceptor.retry_fn) |fn_ptr| {
-                            fn_ptr(&attempt_context, interceptor.context);
-                        }
-                    }
                     if (retry_after_ms > 0) {
                         waitForRetry(context, retry_after_ms) catch |err| {
                             if (self.shared.config.metrics) |m| m.recordError();
                             return err;
                         };
+                    }
+                    checkRequestContext(context) catch |err| {
+                        if (self.shared.config.metrics) |m| m.recordError();
+                        return err;
+                    };
+                    if (self.shared.config.metrics) |m| m.retryAttempt();
+                    for (interceptors) |interceptor| {
+                        if (interceptor.retry_fn) |fn_ptr| {
+                            fn_ptr(&attempt_context, interceptor.context);
+                        }
                     }
                     attempt += 1;
                     continue;
@@ -1526,6 +1601,26 @@ pub const Client = struct {
         return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
     }
 
+    fn executePooledTLSHTTP1(
+        self: *Self,
+        req: *Request,
+        lease: *ConnectionLease,
+        timeouts: RequestTimeouts,
+        decompression: types.DecompressionPolicy,
+    ) !Response {
+        const session = lease.tlsSession() orelse return error.InvalidConnectionState;
+        const socket = lease.socket();
+        try socket.setRecvTimeout(timeouts.read_ms);
+        try socket.setSendTimeout(timeouts.write_ms);
+
+        const request_data = try http.formatRequest(req, self.allocator);
+        defer self.allocator.free(request_data);
+        try session.writeAll(request_data);
+        try session.flush();
+        if (self.shared.config.metrics) |metrics| metrics.recordBytesSent(@intCast(request_data.len));
+        return self.readResponseFromTLS(session, req.method.hasResponseBody(), decompression);
+    }
+
     fn executeRequestHTTP2(
         self: *Self,
         req: *Request,
@@ -1542,6 +1637,33 @@ pub const Client = struct {
         }
         const verify_ssl = reqOpts.verify_ssl orelse self.shared.config.verify_ssl;
         const keep_alive = reqOpts.keep_alive orelse self.shared.config.keep_alive;
+        const opportunistic_http2 = req.version != .HTTP_2;
+
+        if (keep_alive and req.uri.isTLS() and opportunistic_http2) {
+            if (try self.shared.pool.tryGetLeaseWithContext(.{
+                .scheme = .tls,
+                .host = host,
+                .port = port,
+                .proxy = effective_proxy,
+                .verify_tls = verify_ssl,
+                .protocol = .http1,
+            }, context)) |fallback_lease| {
+                var lease = fallback_lease;
+                var disposition: pool_mod.LeaseDisposition = .broken;
+                defer lease.release(disposition) catch {};
+                const response = try self.executePooledTLSHTTP1(
+                    req,
+                    &lease,
+                    timeouts,
+                    effective_policy.decompression,
+                );
+                disposition = if (responseIsReusable(&response, req.method.hasResponseBody()))
+                    .reusable
+                else
+                    .draining;
+                return response;
+            }
+        }
 
         if (keep_alive) {
             var lease = try self.shared.pool.getLeaseWithContext(.{
@@ -1565,8 +1687,7 @@ pub const Client = struct {
                 }
             }
 
-            const h2_session = lease.h2Session();
-            const response = if (req.uri.isTLS()) blk: {
+            if (req.uri.isTLS()) {
                 const tls_session = lease.tlsSession() orelse tls_blk: {
                     const tls_config = if (verify_ssl)
                         TLSConfig.withH2(self.allocator)
@@ -1581,34 +1702,52 @@ pub const Client = struct {
                         port,
                         effective_proxy == null,
                     );
-                    if (http.negotiateVersion(new_session.negotiatedProtocol()) != .http_2) {
-                        return error.UnsupportedHttpVersion;
-                    }
                     break :tls_blk new_session;
                 };
                 try socket.setRecvTimeout(timeouts.read_ms);
                 try socket.setSendTimeout(timeouts.write_ms);
+                const negotiated = http.negotiateVersion(tls_session.negotiatedProtocol());
+                if (negotiated == .http_1_1 or negotiated == .http_1_0) {
+                    if (!opportunistic_http2) return error.UnsupportedHttpVersion;
+                    try lease.rekeyProtocol(.http1);
+                    const response = try self.executePooledTLSHTTP1(
+                        req,
+                        &lease,
+                        timeouts,
+                        effective_policy.decompression,
+                    );
+                    disposition = if (responseIsReusable(&response, req.method.hasResponseBody()))
+                        .reusable
+                    else
+                        .draining;
+                    return response;
+                }
+                if (negotiated != .http_2) return error.UnsupportedHttpVersion;
+
+                const h2_session = lease.h2Session();
                 var transport = TLSHTTP2Transport{ .session = tls_session };
-                break :blk try self.executeHTTP2WithTransport(
+                const response = try self.executeHTTP2WithTransport(
                     req,
                     &transport,
                     effective_policy.decompression,
                     h2_session,
                 );
-            } else blk: {
+                disposition = if (h2_session.draining) .draining else .reusable;
+                return response;
+            } else {
                 try socket.setRecvTimeout(timeouts.read_ms);
                 try socket.setSendTimeout(timeouts.write_ms);
+                const h2_session = lease.h2Session();
                 var transport = SocketHTTP2Transport{ .socket = socket };
-                break :blk try self.executeHTTP2WithTransport(
+                const response = try self.executeHTTP2WithTransport(
                     req,
                     &transport,
                     effective_policy.decompression,
                     h2_session,
                 );
-            };
-
-            disposition = if (h2_session.draining) .draining else .reusable;
-            return response;
+                disposition = if (h2_session.draining) .draining else .reusable;
+                return response;
+            }
         }
 
         const connect_host = if (effective_proxy) |p| p.host else host;
@@ -2076,6 +2215,55 @@ pub const Client = struct {
         from_early_buf: bool,
     };
 
+    fn applyHTTP2WindowUpdate(
+        stream_manager: *h2stream.StreamManager,
+        request_stream: *h2stream.Stream,
+        header: http.HTTP2FrameHeader,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != 4) return error.ProtocolError;
+        const increment_u32 = (@as(u32, payload[0] & 0x7F) << 24) |
+            (@as(u32, payload[1]) << 16) |
+            (@as(u32, payload[2]) << 8) |
+            payload[3];
+        if (increment_u32 == 0) return error.ProtocolError;
+        const increment: i32 = @intCast(increment_u32);
+        if (header.stream_id == 0) {
+            try stream_manager.updateConnectionSendWindow(increment);
+        } else if (header.stream_id == request_stream.id) {
+            try request_stream.updateSendWindow(increment);
+        }
+    }
+
+    fn applyHTTP2SettingsUpdate(
+        transport: anytype,
+        stream_manager: *h2stream.StreamManager,
+        header: http.HTTP2FrameHeader,
+        payload: []const u8,
+        peer_max_frame_size: *u32,
+    ) !void {
+        if (header.stream_id != 0) return error.ProtocolError;
+        const is_ack = (header.flags & 0x01) != 0;
+        if (is_ack) {
+            if (payload.len != 0) return error.ProtocolError;
+            return;
+        }
+
+        var updated_settings = stream_manager.peer_settings;
+        try http.applySettingsPayload(&updated_settings, payload);
+        try stream_manager.applyPeerSettings(updated_settings);
+        peer_max_frame_size.* = updated_settings.max_frame_size;
+        try writeHTTP2Frame(transport, .settings, 0x01, 0, &.{});
+    }
+
+    fn parseHTTP2GoAway(self: *Client, header: http.HTTP2FrameHeader, payload: []const u8) !u31 {
+        if (header.stream_id != 0) return error.ProtocolError;
+        const goaway = h2stream.parseGoawayPayload(payload, self.allocator) catch
+            return error.ProtocolError;
+        defer if (goaway.debug_data) |debug_data| self.allocator.free(debug_data);
+        return goaway.last_stream_id;
+    }
+
     /// Pumps incoming HTTP/2 frames until the send window is positive.
     ///
     /// Called when `request_stream.send_window` or
@@ -2095,6 +2283,7 @@ pub const Client = struct {
         request_stream: *h2stream.Stream,
         peer_max_frame_size: *u32,
         early_frames: *std.ArrayList(EarlyH2Frame),
+        session_state: *pool_mod.H2SessionState,
     ) !void {
         var pump_counter: usize = 0;
         while (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
@@ -2109,52 +2298,57 @@ pub const Client = struct {
             if (payload_len > self.shared.config.max_response_size) return error.FrameTooLarge;
 
             const payload = try self.allocator.alloc(u8, payload_len);
-            errdefer self.allocator.free(payload);
-            if (payload_len > 0) try transport.readNoEof(payload);
+            if (payload_len > 0) {
+                transport.readNoEof(payload) catch |err| {
+                    self.allocator.free(payload);
+                    return err;
+                };
+            }
 
             switch (fhdr.frame_type) {
                 .window_update => {
-                    if (payload.len != 4) {
+                    applyHTTP2WindowUpdate(stream_manager, request_stream, fhdr, payload) catch |err| {
                         self.allocator.free(payload);
-                        return error.ProtocolError;
-                    }
-                    const increment = ((@as(u32, payload[0] & 0x7F) << 24) |
-                        (@as(u32, payload[1]) << 16) |
-                        (@as(u32, payload[2]) << 8) |
-                        payload[3]);
+                        return err;
+                    };
                     self.allocator.free(payload);
-                    if (increment == 0) return error.ProtocolError;
-                    if (fhdr.stream_id == 0) {
-                        // Connection-level WINDOW_UPDATE.
-                        stream_manager.connection_send_window += @intCast(increment);
-                    } else if (fhdr.stream_id == request_stream.id) {
-                        // Stream-level WINDOW_UPDATE.
-                        request_stream.send_window += @intCast(increment);
-                    }
-                    // If both windows are positive now, we can stop pumping.
                 },
                 .settings => {
-                    const is_ack = (fhdr.flags & 0x01) != 0;
-                    if (!is_ack and fhdr.stream_id == 0) {
-                        var peer_settings = http.HTTP2Connection.HTTP2ConnectionSettings{};
-                        http.applySettingsPayload(&peer_settings, payload) catch return error.ProtocolError;
-                        stream_manager.applyPeerSettings(peer_settings) catch return error.ProtocolError;
-                        peer_max_frame_size.* = peer_settings.max_frame_size;
-                        // Send SETTINGS ACK.
-                        writeHTTP2Frame(transport, .settings, 0x01, 0, &.{}) catch return error.WriteFailed;
-                    }
+                    applyHTTP2SettingsUpdate(
+                        transport,
+                        stream_manager,
+                        fhdr,
+                        payload,
+                        peer_max_frame_size,
+                    ) catch |err| {
+                        self.allocator.free(payload);
+                        return err;
+                    };
+                    session_state.peer_max_frame_size = peer_max_frame_size.*;
                     self.allocator.free(payload);
                 },
                 .ping => {
+                    if (fhdr.stream_id != 0 or payload.len != 8) {
+                        self.allocator.free(payload);
+                        return error.ProtocolError;
+                    }
                     const is_ack = (fhdr.flags & 0x01) != 0;
-                    if (!is_ack and fhdr.stream_id == 0 and payload.len == 8) {
-                        writeHTTP2Frame(transport, .ping, 0x01, 0, payload) catch return error.WriteFailed;
+                    if (!is_ack) {
+                        writeHTTP2Frame(transport, .ping, 0x01, 0, payload) catch {
+                            self.allocator.free(payload);
+                            return error.WriteFailed;
+                        };
                     }
                     self.allocator.free(payload);
                 },
                 .goaway => {
+                    const last_stream_id = self.parseHTTP2GoAway(fhdr, payload) catch |err| {
+                        self.allocator.free(payload);
+                        return err;
+                    };
+                    session_state.draining = true;
                     self.allocator.free(payload);
-                    return error.GoAway;
+                    if (request_stream.id > last_stream_id) return error.GoAway;
                 },
                 .rst_stream => {
                     if (fhdr.stream_id == request_stream.id) {
@@ -2168,10 +2362,13 @@ pub const Client = struct {
                 },
                 .headers, .data, .continuation, .push_promise => {
                     // Early response frame -- buffer for replay in the response loop.
-                    try early_frames.append(self.allocator, .{
+                    early_frames.append(self.allocator, .{
                         .header = fhdr,
                         .payload = payload,
-                    });
+                    }) catch |err| {
+                        self.allocator.free(payload);
+                        return err;
+                    };
                 },
                 // RFC 7540 4.1: Unknown frame types MUST be ignored.
                 _ => {
@@ -2261,6 +2458,7 @@ pub const Client = struct {
                         request_stream,
                         &peer_max_frame_size,
                         &early_frames,
+                        session_state,
                     );
                 }
                 const window_stream = @as(i64, request_stream.send_window);
@@ -2308,8 +2506,6 @@ pub const Client = struct {
         var response_done = false;
         var got_end_stream = false;
 
-        var peer_settings = http.HTTP2Connection.HTTP2ConnectionSettings{};
-
         // Replay buffered early-response frames collected during body upload
         // (pumpUntilSendWindow may have buffered them).  We process them first
         // so the loop below sees a logically complete frame stream.
@@ -2351,15 +2547,14 @@ pub const Client = struct {
 
             switch (frame.header.frame_type) {
                 .settings => {
-                    if (frame.header.stream_id != 0) return error.ProtocolError;
-                    const is_ack = (frame.header.flags & 0x01) != 0;
-                    if (!is_ack) {
-                        try http.applySettingsPayload(&peer_settings, frame.payload);
-                        try stream_manager.applyPeerSettings(peer_settings);
-                        peer_max_frame_size = peer_settings.max_frame_size;
-                        session_state.peer_max_frame_size = peer_max_frame_size;
-                        try writeHTTP2Frame(transport, .settings, 0x01, 0, &.{});
-                    }
+                    try applyHTTP2SettingsUpdate(
+                        transport,
+                        stream_manager,
+                        frame.header,
+                        frame.payload,
+                        &peer_max_frame_size,
+                    );
+                    session_state.peer_max_frame_size = peer_max_frame_size;
                 },
                 .ping => {
                     if (frame.header.stream_id != 0) return error.ProtocolError;
@@ -2370,11 +2565,17 @@ pub const Client = struct {
                     }
                 },
                 .goaway => {
+                    const last_stream_id = try self.parseHTTP2GoAway(frame.header, frame.payload);
                     session_state.draining = true;
-                    if (status_code == null) return error.ProtocolError;
-                    response_done = true;
+                    if (request_stream.id > last_stream_id) return error.GoAway;
                 },
-                .window_update, .priority => {},
+                .window_update => try applyHTTP2WindowUpdate(
+                    stream_manager,
+                    request_stream,
+                    frame.header,
+                    frame.payload,
+                ),
+                .priority => {},
                 .push_promise => {
                     if (frame.header.stream_id == 0) return error.ProtocolError;
                     if (!self.shared.config.allow_push) {
@@ -3766,6 +3967,18 @@ fn requestHeaderValue(request_bytes: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn requestHeaderCount(request_bytes: []const u8, name: []const u8) usize {
+    var count: usize = 0;
+    var lines = mem.splitSequence(u8, request_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) count += 1;
+    }
+    return count;
+}
+
 test "Client initialization" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator);
@@ -4091,6 +4304,71 @@ test "request retry override enables only retry behavior" {
     try std.testing.expect(requestHeaderValue(server.request(0), HeaderName.ACCEPT_ENCODING) == null);
 }
 
+test "retry notification does not fire when cancellation prevents next attempt" {
+    const allocator = std.testing.allocator;
+    const unavailable = try makePolicyTestResponse(allocator, "503 Service Unavailable", &.{}, "stop");
+    defer allocator.free(unavailable);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{unavailable};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/cancel-retry");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    const CallbackState = struct {
+        token: *types.CancellationToken,
+        retries: u32 = 0,
+
+        fn onResponse(_: *Response, _: *const AttemptContext, context: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.token.cancel();
+        }
+
+        fn onRetry(_: *const AttemptContext, context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.retries += 1;
+        }
+    };
+
+    var token = types.CancellationToken.init();
+    var callback_state = CallbackState{ .token = &token };
+    try client.addInterceptor(.{
+        .response_fn = CallbackState.onResponse,
+        .retry_fn = CallbackState.onRetry,
+        .context = &callback_state,
+    });
+
+    try std.testing.expectError(error.Cancelled, client.get(url, .{
+        .cancel_token = &token,
+        .policy = .{ .retry = .{ .policy = .{
+            .max_retries = 1,
+            .initial_delay_ms = 100,
+            .max_delay_ms = 100,
+            .jitter = 0,
+        } } },
+    }));
+
+    thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+    try std.testing.expectEqual(@as(u32, 0), callback_state.retries);
+}
+
 test "request redirect override enables only redirect behavior" {
     const allocator = std.testing.allocator;
     const redirect_headers = [_][2][]const u8{.{ "Location", "/final" }};
@@ -4296,6 +4574,8 @@ test "request headers preserve ordered duplicates without automatic coalescing" 
     defer client.deinit();
 
     const request_headers = [_][2][]const u8{
+        .{ "Host", "first.example" },
+        .{ "Host", "override.example" },
         .{ "x-ms-meta-value", "one" },
         .{ "Cookie", "a=1" },
         .{ "x-ms-other", "middle" },
@@ -4312,6 +4592,8 @@ test "request headers preserve ordered duplicates without automatic coalescing" 
     joined = true;
     try std.testing.expect(server.failure == null);
     const wire = server.request(0);
+    try std.testing.expectEqual(@as(usize, 1), requestHeaderCount(wire, HeaderName.HOST));
+    try std.testing.expectEqualStrings("override.example", requestHeaderValue(wire, HeaderName.HOST).?);
     const first_xms = mem.indexOf(u8, wire, "x-ms-meta-value: one\r\n").?;
     const first_cookie = mem.indexOf(u8, wire, "Cookie: a=1\r\n").?;
     const middle_xms = mem.indexOf(u8, wire, "x-ms-other: middle\r\n").?;
@@ -4321,6 +4603,54 @@ test "request headers preserve ordered duplicates without automatic coalescing" 
     try std.testing.expect(first_cookie < middle_xms);
     try std.testing.expect(middle_xms < second_xms);
     try std.testing.expect(second_xms < second_cookie);
+}
+
+test "request framing headers are normalized and conflicting transfer encoding is rejected" {
+    const allocator = std.testing.allocator;
+    const response_bytes = try makePolicyTestResponse(allocator, "200 OK", &.{}, "ok");
+    defer allocator.free(response_bytes);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response_bytes};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/framing");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.fast(),
+    });
+    defer client.deinit();
+
+    const content_lengths = [_][2][]const u8{
+        .{ "Content-Length", "99" },
+        .{ "Content-Length", "100" },
+    };
+    var response = try client.post(url, .{ .headers = &content_lengths, .body = "abc" });
+    defer response.deinit();
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), requestHeaderCount(server.request(0), HeaderName.CONTENT_LENGTH));
+    try std.testing.expectEqualStrings("3", requestHeaderValue(server.request(0), HeaderName.CONTENT_LENGTH).?);
+
+    const transfer_encoding = [_][2][]const u8{.{ "Transfer-Encoding", "chunked" }};
+    try std.testing.expectError(
+        error.ConflictingFramingHeaders,
+        client.post("http://127.0.0.1:1/rejected", .{
+            .headers = &transfer_encoding,
+            .body = "abc",
+        }),
+    );
 }
 
 test "HTTP2 response header decoding preserves duplicates and order" {
@@ -4522,20 +4852,24 @@ test "Client supports concurrent requests cookie updates and interceptor callbac
     try std.testing.expect(!counts.invalid_attempt.load(.acquire));
 }
 
-test "pooled HTTPS transport reuses one encrypted TLS session" {
+test "public Client preserves HTTP1 ALPN fallback and TLS reuse" {
     const allocator = std.testing.allocator;
-    const key = [_]u8{0x5a} ** 32;
-    const iv = [_]u8{0xa5} ** 12;
+    var tls_config = try tls_mod.loadServerTLSConfig(
+        allocator,
+        "examples/certs/server_ec.crt",
+        "examples/certs/server_ec.key",
+    );
+    defer tls_config.deinit();
 
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
     const address = try listener.getLocalAddress();
 
-    const TlsTestServer = struct {
+    const LoopbackServer = struct {
         listener: *TcpListener,
-        key: [32]u8,
-        iv: [12]u8,
+        tls_config: *tls_mod.ServerTLSConfig,
         accepts: u32 = 0,
+        handshakes: u32 = 0,
         requests: u32 = 0,
         failure: ?anyerror = null,
 
@@ -4546,31 +4880,24 @@ test "pooled HTTPS transport reuses one encrypted TLS session" {
         }
 
         fn runFallible(self: *@This()) !void {
-            try self.serveConnection(2, true);
-            try self.serveConnection(1, false);
-        }
-
-        fn serveConnection(self: *@This(), request_count: u32, close_last: bool) !void {
             var accepted = try self.listener.accept();
             defer accepted.socket.close();
             self.accepts += 1;
-            try accepted.socket.setRecvTimeout(5_000);
+            try accepted.socket.setRecvTimeout(30_000);
+            try accepted.socket.setSendTimeout(30_000);
 
-            var connection = TLSConnection{
-                .allocator = std.testing.allocator,
-                .socket = &accepted.socket,
-                .tls_version = .tls_1_3,
-                .connected = true,
-                .app_write_key = self.key,
-                .app_write_iv = self.iv,
-                .app_read_key = self.key,
-                .app_read_iv = self.iv,
-                .cipher_suite = .AES_128_GCM_SHA256,
-            };
+            var connection = try tls_mod.acceptServer(
+                std.heap.page_allocator,
+                &accepted.socket,
+                &.{"http/1.1"},
+                self.tls_config.*,
+            );
+            self.handshakes += 1;
+            defer connection.closeNotify();
+            try std.testing.expectEqualStrings("http/1.1", connection.negotiatedAlpn().?);
 
-            var request_buf: [4096]u8 = undefined;
-            var handled: u32 = 0;
-            while (handled < request_count) : (handled += 1) {
+            var request_buf: [8192]u8 = undefined;
+            while (self.requests < 2) {
                 var length: usize = 0;
                 while (mem.indexOf(u8, request_buf[0..length], "\r\n\r\n") == null) {
                     const n = try connection.read(request_buf[length..]);
@@ -4578,17 +4905,13 @@ test "pooled HTTPS transport reuses one encrypted TLS session" {
                     length += n;
                 }
                 self.requests += 1;
-                if (close_last and handled + 1 == request_count) {
-                    try connection.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-                } else {
-                    try connection.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-                }
+                try connection.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfallback");
             }
         }
     };
 
-    var server = TlsTestServer{ .listener = &listener, .key = key, .iv = iv };
-    const server_thread = try std.Thread.spawn(.{}, TlsTestServer.run, .{&server});
+    var server = LoopbackServer{ .listener = &listener, .tls_config = &tls_config };
+    const server_thread = try std.Thread.spawn(.{}, LoopbackServer.run, .{&server});
     var joined = false;
     defer if (!joined) {
         listener.deinit();
@@ -4597,143 +4920,341 @@ test "pooled HTTPS transport reuses one encrypted TLS session" {
 
     var client = Client.initWithConfig(allocator, .{
         .verify_ssl = false,
+        .http2_enabled = true,
         .keep_alive = true,
-        .timeouts = types.Timeouts.fast(),
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(30_000),
     });
     defer client.deinit();
-    const context = IoContext.init(.{});
-    const pool_key = pool_mod.PoolKey{
-        .scheme = .tls,
-        .host = "127.0.0.1",
-        .port = address.getPort(),
-        .verify_tls = false,
-        .protocol = .http1,
-    };
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/fallback", .{address.getPort()});
+    defer allocator.free(url);
 
-    var first_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
-    const stable_address = first_lease.entryAddress();
-    const session = first_lease.initializeTls(TLSConfig.insecure(allocator));
-    session.tls_version = .tls_1_3;
-    session.app_write_key = key;
-    session.app_write_iv = iv;
-    session.app_read_key = key;
-    session.app_read_iv = iv;
-    session.cipher_suite = .AES_128_GCM_SHA256;
-
-    try session.writeAll("GET /one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-    try session.flush();
-    var first = try client.readResponseFromTLS(session, true, .disabled);
+    var first = try client.get(url, .{});
     defer first.deinit();
-    try std.testing.expectEqualStrings("ok", first.body.?);
-    try first_lease.release(.reusable);
+    try std.testing.expectEqual(types.Version.HTTP_1_1, first.version);
+    try std.testing.expectEqualStrings("fallback", first.body.?);
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
 
-    var second_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
-    try std.testing.expectEqual(stable_address, second_lease.entryAddress());
-    const reused_session = second_lease.tlsSession().?;
-    try std.testing.expect(reused_session.write_seq > 0);
-    try reused_session.writeAll("GET /two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-    try reused_session.flush();
-    var second = try client.readResponseFromTLS(reused_session, true, .disabled);
+    var second = try client.get(url, .{});
     defer second.deinit();
-    try std.testing.expectEqualStrings("ok", second.body.?);
-    try std.testing.expect(!Client.responseIsReusable(&second, true));
-    try second_lease.release(.draining);
-
-    var third_lease = try client.shared.pool.getLeaseWithContext(pool_key, 5_000, &context);
-    try std.testing.expect(third_lease.entryAddress() != stable_address);
-    const third_session = third_lease.initializeTls(TLSConfig.insecure(allocator));
-    third_session.tls_version = .tls_1_3;
-    third_session.app_write_key = key;
-    third_session.app_write_iv = iv;
-    third_session.app_read_key = key;
-    third_session.app_read_iv = iv;
-    third_session.cipher_suite = .AES_128_GCM_SHA256;
-    try third_session.writeAll("GET /three HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-    try third_session.flush();
-    var third = try client.readResponseFromTLS(third_session, true, .disabled);
-    defer third.deinit();
-    try std.testing.expectEqualStrings("ok", third.body.?);
-    try third_lease.release(.reusable);
+    try std.testing.expectEqual(types.Version.HTTP_1_1, second.version);
+    try std.testing.expectEqualStrings("fallback", second.body.?);
 
     server_thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
-    try std.testing.expectEqual(@as(u32, 2), server.accepts);
-    try std.testing.expectEqual(@as(u32, 3), server.requests);
-    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+    try std.testing.expectEqual(@as(u32, 1), server.accepts);
+    try std.testing.expectEqual(@as(u32, 1), server.handshakes);
+    try std.testing.expectEqual(@as(u32, 2), server.requests);
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().total);
 }
 
-test "pooled HTTP2 state persists sequential stream ids" {
+test "HTTP2 WINDOW_UPDATE persists connection credit and rejects invalid increments" {
+    var manager = h2stream.StreamManager.init(std.testing.allocator, true);
+    defer manager.deinit();
+    const stream = try manager.createStream();
+    const connection_header = http.HTTP2FrameHeader{
+        .length = 4,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    const stream_header = http.HTTP2FrameHeader{
+        .length = 4,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = stream.id,
+    };
+
+    manager.connection_send_window = 10;
+    stream.send_window = 20;
+    const five = h2stream.buildWindowUpdatePayload(5);
+    try Client.applyHTTP2WindowUpdate(&manager, stream, connection_header, &five);
+    try Client.applyHTTP2WindowUpdate(&manager, stream, stream_header, &five);
+    try std.testing.expectEqual(@as(i32, 15), manager.connection_send_window);
+    try std.testing.expectEqual(@as(i32, 25), stream.send_window);
+
+    const zero = [_]u8{0} ** 4;
+    try std.testing.expectError(
+        error.ProtocolError,
+        Client.applyHTTP2WindowUpdate(&manager, stream, connection_header, &zero),
+    );
+
+    manager.connection_send_window = std.math.maxInt(i32);
+    const one = h2stream.buildWindowUpdatePayload(1);
+    try std.testing.expectError(
+        error.FlowControlError,
+        Client.applyHTTP2WindowUpdate(&manager, stream, connection_header, &one),
+    );
+}
+
+test "HTTP2 partial SETTINGS update retained peer settings" {
+    var manager = h2stream.StreamManager.init(std.testing.allocator, true);
+    defer manager.deinit();
+    var initial = manager.peer_settings;
+    initial.initial_window_size = 70_000;
+    initial.max_concurrent_streams = 7;
+    try manager.applyPeerSettings(initial);
+
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+        }
+    };
+    var capture = Capture{};
+    defer capture.bytes.deinit(std.testing.allocator);
+
+    var payload: [6]u8 = undefined;
+    mem.writeInt(u16, payload[0..2], @intFromEnum(http.HTTP2Settings.max_frame_size), .big);
+    mem.writeInt(u32, payload[2..6], 32_768, .big);
+    const header = http.HTTP2FrameHeader{
+        .length = payload.len,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    var peer_max_frame_size: u32 = manager.peer_settings.max_frame_size;
+    try Client.applyHTTP2SettingsUpdate(
+        &capture,
+        &manager,
+        header,
+        &payload,
+        &peer_max_frame_size,
+    );
+
+    try std.testing.expectEqual(@as(u32, 70_000), manager.peer_settings.initial_window_size);
+    try std.testing.expectEqual(@as(u32, 7), manager.peer_settings.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 32_768), manager.peer_settings.max_frame_size);
+    try std.testing.expectEqual(@as(u32, 32_768), peer_max_frame_size);
+    try std.testing.expectEqual(@as(usize, 9), capture.bytes.items.len);
+}
+
+test "public Client reuses H2 with retained flow control settings and GOAWAY drain" {
     const allocator = std.testing.allocator;
+    var tls_config = try tls_mod.loadServerTLSConfig(
+        allocator,
+        "examples/certs/server_ec.crt",
+        "examples/certs/server_ec.key",
+    );
+    defer tls_config.deinit();
+
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
     const address = try listener.getLocalAddress();
 
-    const AcceptServer = struct {
+    const LoopbackH2Server = struct {
         listener: *TcpListener,
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        tls_config: *tls_mod.ServerTLSConfig,
+        accepts: u32 = 0,
+        handshakes: u32 = 0,
+        stream_ids: [2]u31 = .{ 0, 0 },
+        body_lengths: [2]usize = .{ 0, 0 },
         failure: ?anyerror = null,
+
+        const Frame = struct {
+            header: http.HTTP2FrameHeader,
+            payload: []const u8,
+        };
+
         fn run(self: *@This()) void {
-            var sockets: [2]Socket = undefined;
-            var count: usize = 0;
-            defer {
-                for (sockets[0..count]) |*socket| socket.close();
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(connection: *TLSConnection, buffer: []u8) !void {
+            var offset: usize = 0;
+            while (offset < buffer.len) {
+                const n = try connection.read(buffer[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
             }
-            while (count < sockets.len) : (count += 1) {
-                const accepted = self.listener.accept() catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                sockets[count] = accepted.socket;
+        }
+
+        fn readFrame(connection: *TLSConnection, payload_buffer: []u8) !Frame {
+            var header_bytes: [9]u8 = undefined;
+            try readExact(connection, &header_bytes);
+            const header = http.HTTP2FrameHeader.parse(header_bytes);
+            const payload_len: usize = @intCast(header.length);
+            if (payload_len > payload_buffer.len) return error.FrameTooLarge;
+            try readExact(connection, payload_buffer[0..payload_len]);
+            return .{ .header = header, .payload = payload_buffer[0..payload_len] };
+        }
+
+        fn sendSetting(connection: *TLSConnection, setting: http.HTTP2Settings, value: u32) !void {
+            var payload: [6]u8 = undefined;
+            mem.writeInt(u16, payload[0..2], @intFromEnum(setting), .big);
+            mem.writeInt(u32, payload[2..6], value, .big);
+            try writeHTTP2Frame(connection, .settings, 0, 0, &payload);
+        }
+
+        fn sendResponse(
+            connection: *TLSConnection,
+            manager: *h2stream.StreamManager,
+            stream_id: u31,
+            body: []const u8,
+            goaway: bool,
+        ) !void {
+            var len_buf: [32]u8 = undefined;
+            const content_length = try std.fmt.bufPrint(&len_buf, "{d}", .{body.len});
+            const headers = [_]hpack.HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                .{ .name = "content-length", .value = content_length, .representation = .without_indexing },
+            };
+            const header_frames = try h2stream.buildHeadersAndContinuations(
+                manager,
+                stream_id,
+                &headers,
+                null,
+                16_384,
+                false,
+                std.heap.page_allocator,
+            );
+            defer std.heap.page_allocator.free(header_frames);
+            try connection.writeAll(header_frames);
+
+            if (goaway) {
+                const goaway_payload = try h2stream.buildGoawayPayload(stream_id, .no_error, null, std.heap.page_allocator);
+                defer std.heap.page_allocator.free(goaway_payload);
+                try writeHTTP2Frame(connection, .goaway, 0, 0, goaway_payload);
+                const split = body.len / 2;
+                try writeHTTP2Frame(connection, .data, 0, stream_id, body[0..split]);
+                try writeHTTP2Frame(connection, .data, 0x01, stream_id, body[split..]);
+            } else {
+                try writeHTTP2Frame(connection, .data, 0x01, stream_id, body);
             }
-            while (!self.done.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            self.accepts += 1;
+            try accepted.socket.setRecvTimeout(30_000);
+            try accepted.socket.setSendTimeout(30_000);
+
+            var connection = try tls_mod.acceptServer(
+                std.heap.page_allocator,
+                &accepted.socket,
+                &.{"h2"},
+                self.tls_config.*,
+            );
+            self.handshakes += 1;
+            defer connection.closeNotify();
+            try std.testing.expectEqualStrings("h2", connection.negotiatedAlpn().?);
+
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&connection, &preface);
+            try std.testing.expectEqualStrings(http.HTTP2_PREFACE, &preface);
+
+            var payload_buffer: [64 * 1024]u8 = undefined;
+            const client_settings = try readFrame(&connection, &payload_buffer);
+            try std.testing.expectEqual(http.HTTP2FrameType.settings, client_settings.header.frame_type);
+
+            try sendSetting(&connection, .initial_window_size, 70_000);
+            try sendSetting(&connection, .max_concurrent_streams, 7);
+            const connection_credit = h2stream.buildWindowUpdatePayload(100_000);
+            try writeHTTP2Frame(&connection, .window_update, 0, 0, &connection_credit);
+
+            var first_done = false;
+            while (!first_done) {
+                const frame = try readFrame(&connection, &payload_buffer);
+                switch (frame.header.frame_type) {
+                    .headers => if (frame.header.stream_id != 0) {
+                        self.stream_ids[0] = frame.header.stream_id;
+                    },
+                    .data => if (frame.header.stream_id == self.stream_ids[0]) {
+                        self.body_lengths[0] += frame.payload.len;
+                        first_done = (frame.header.flags & 0x01) != 0;
+                    },
+                    else => {},
+                }
+            }
+
+            try sendSetting(&connection, .max_frame_size, 32_768);
+            const retained_connection_credit = h2stream.buildWindowUpdatePayload(1_000);
+            try writeHTTP2Frame(&connection, .window_update, 0, 0, &retained_connection_credit);
+
+            var response_manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+            defer response_manager.deinit();
+            try sendResponse(&connection, &response_manager, self.stream_ids[0], "one", false);
+
+            var second_done = false;
+            var stream_credit_sent = false;
+            while (!second_done) {
+                const frame = try readFrame(&connection, &payload_buffer);
+                switch (frame.header.frame_type) {
+                    .headers => if (frame.header.stream_id != 0) {
+                        self.stream_ids[1] = frame.header.stream_id;
+                    },
+                    .data => if (frame.header.stream_id == self.stream_ids[1]) {
+                        self.body_lengths[1] += frame.payload.len;
+                        if (!stream_credit_sent and self.body_lengths[1] == 70_000) {
+                            const stream_credit = h2stream.buildWindowUpdatePayload(30_000);
+                            try writeHTTP2Frame(&connection, .window_update, 0, self.stream_ids[1], &stream_credit);
+                            stream_credit_sent = true;
+                        }
+                        second_done = (frame.header.flags & 0x01) != 0;
+                    },
+                    else => {},
+                }
+            }
+
+            try sendResponse(&connection, &response_manager, self.stream_ids[1], "complete-body", true);
+            var response_window_updates: usize = 0;
+            while (response_window_updates < 4) {
+                const frame = try readFrame(&connection, &payload_buffer);
+                if (frame.header.frame_type == .window_update) response_window_updates += 1;
+            }
         }
     };
 
-    var server = AcceptServer{ .listener = &listener };
-    const server_thread = try std.Thread.spawn(.{}, AcceptServer.run, .{&server});
+    var server = LoopbackH2Server{ .listener = &listener, .tls_config = &tls_config };
+    const server_thread = try std.Thread.spawn(.{}, LoopbackH2Server.run, .{&server});
     var joined = false;
     defer if (!joined) {
-        server.done.store(true, .release);
+        listener.deinit();
         server_thread.join();
     };
 
-    var pool = ConnectionPool.init(allocator);
-    defer pool.deinit();
-    const context = IoContext.init(.{});
-    const key_info = pool_mod.PoolKey{
-        .host = "127.0.0.1",
-        .port = address.getPort(),
-        .protocol = .http2,
-    };
+    var client = Client.initWithConfig(allocator, .{
+        .verify_ssl = false,
+        .http2_enabled = true,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(30_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/h2", .{address.getPort()});
+    defer allocator.free(url);
 
-    var first_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
-    const address_before_growth = first_lease.entryAddress();
-    const first_state = first_lease.h2Session();
-    first_state.initialized = true;
-    const stream_one = try first_state.stream_manager.createStream();
-    try std.testing.expectEqual(@as(u31, 1), stream_one.id);
-    first_state.stream_manager.removeStream(stream_one.id);
-    try first_lease.release(.reusable);
+    const first_body = try allocator.alloc(u8, 70_000);
+    defer allocator.free(first_body);
+    @memset(first_body, 'a');
+    var first = try client.post(url, .{ .version = .HTTP_2, .body = first_body });
+    defer first.deinit();
+    try std.testing.expectEqual(types.Version.HTTP_2, first.version);
+    try std.testing.expectEqualStrings("one", first.body.?);
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
 
-    var second_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
-    try std.testing.expectEqual(address_before_growth, second_lease.entryAddress());
-    const second_state = second_lease.h2Session();
-    try std.testing.expect(second_state.initialized);
-    const stream_three = try second_state.stream_manager.createStream();
-    try std.testing.expectEqual(@as(u31, 3), stream_three.id);
-    second_state.stream_manager.removeStream(stream_three.id);
-    second_state.draining = true;
-    try second_lease.release(.reusable);
+    const second_body = try allocator.alloc(u8, 96_000);
+    defer allocator.free(second_body);
+    @memset(second_body, 'b');
+    var second = try client.post(url, .{ .version = .HTTP_2, .body = second_body });
+    defer second.deinit();
+    try std.testing.expectEqual(types.Version.HTTP_2, second.version);
+    try std.testing.expectEqualStrings("complete-body", second.body.?);
 
-    var third_lease = try pool.getLeaseWithContext(key_info, 5_000, &context);
-    try std.testing.expect(third_lease.entryAddress() != address_before_growth);
-    try third_lease.release(.draining);
-
-    server.done.store(true, .release);
     server_thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(u32, 1), server.accepts);
+    try std.testing.expectEqual(@as(u32, 1), server.handshakes);
+    try std.testing.expectEqual(@as(u31, 1), server.stream_ids[0]);
+    try std.testing.expectEqual(@as(u31, 3), server.stream_ids[1]);
+    try std.testing.expectEqual(@as(usize, first_body.len), server.body_lengths[0]);
+    try std.testing.expectEqual(@as(usize, second_body.len), server.body_lengths[1]);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
 }
 
 test "Client stores Set-Cookie headers" {

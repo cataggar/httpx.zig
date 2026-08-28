@@ -557,6 +557,33 @@ pub fn serveWithConfig(allocator: std.mem.Allocator, config: ServerConfig, path:
     try s.listen();
 }
 
+fn oneShotRequest(
+    allocator: std.mem.Allocator,
+    method: Method,
+    url: []const u8,
+    req_options: RequestOptions,
+) !Response {
+    var client = Client.init(allocator);
+    defer client.deinit();
+    var result = try client.request(method, url, req_options);
+    defer result.deinit();
+    return result.clone(allocator);
+}
+
+fn oneShotJson(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    method: Method,
+    url: []const u8,
+    req_options: RequestOptions,
+    parse_opts: std.json.ParseOptions,
+) !JsonBorrowedResult(T) {
+    var result = try oneShotRequest(allocator, method, url, req_options);
+    errdefer result.deinit();
+    const value = try result.jsonBorrowed(T, parse_opts);
+    return .{ .response = result, .value = value };
+}
+
 /// Convenience function to create a GET request.
 pub fn get(url: []const u8, req_options: RequestOptions) !Response {
     return getWithAllocator(default_alias_allocator, url, req_options);
@@ -564,9 +591,7 @@ pub fn get(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a GET request with an explicit allocator.
 pub fn getWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.get(url, req_options);
+    return oneShotRequest(allocator, .GET, url, req_options);
 }
 
 /// Convenience alias for GET requests.
@@ -591,9 +616,7 @@ pub fn sendWithAllocator(
     url: []const u8,
     req_options: RequestOptions,
 ) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.request(method, url, req_options);
+    return oneShotRequest(allocator, method, url, req_options);
 }
 
 /// Convenience function to create a POST request with JSON body.
@@ -603,9 +626,7 @@ pub fn postJson(url: []const u8, body: []const u8) !Response {
 
 /// Convenience function to create a POST request with JSON body and allocator.
 pub fn postJsonWithAllocator(allocator: std.mem.Allocator, url: []const u8, body: []const u8) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.post(url, .{ .json = body });
+    return oneShotRequest(allocator, .POST, url, .{ .json = body });
 }
 
 /// Convenience function to GET a URL and parse the JSON response into type T.
@@ -616,9 +637,9 @@ pub fn getJson(comptime T: type, url: []const u8, parse_opts: std.json.ParseOpti
 
 /// Convenience function to GET a URL and parse JSON with an explicit allocator.
 pub fn getJsonWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, parse_opts: std.json.ParseOptions) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.getJson(T, url, parse_opts);
+    return oneShotJson(allocator, T, .GET, url, .{
+        .headers = &.{.{ "Accept", "application/json" }},
+    }, parse_opts);
 }
 
 /// Convenience function to POST JSON and parse the response as type T.
@@ -629,9 +650,7 @@ pub fn postJsonAndParse(comptime T: type, url: []const u8, body: []const u8, par
 
 /// Convenience function to POST JSON and parse the response with an explicit allocator.
 pub fn postJsonAndParseWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, body: []const u8, parse_opts: std.json.ParseOptions) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.postJsonAndParse(T, url, body, parse_opts);
+    return oneShotJson(allocator, T, .POST, url, .{ .json = body }, parse_opts);
 }
 
 /// Convenience function to PUT JSON and parse the response as type T.
@@ -641,9 +660,7 @@ pub fn putJson(comptime T: type, url: []const u8, body: []const u8, parse_opts: 
 
 /// Convenience function to PUT JSON and parse the response with an explicit allocator.
 pub fn putJsonWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, body: []const u8, parse_opts: std.json.ParseOptions) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.putJson(T, url, body, parse_opts);
+    return oneShotJson(allocator, T, .PUT, url, .{ .json = body }, parse_opts);
 }
 
 /// Convenience function to PATCH JSON and parse the response as type T.
@@ -653,9 +670,7 @@ pub fn patchJson(comptime T: type, url: []const u8, body: []const u8, parse_opts
 
 /// Convenience function to PATCH JSON and parse the response with an explicit allocator.
 pub fn patchJsonWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, body: []const u8, parse_opts: std.json.ParseOptions) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.patchJson(T, url, body, parse_opts);
+    return oneShotJson(allocator, T, .PATCH, url, .{ .json = body }, parse_opts);
 }
 
 /// Convenience function to DELETE and parse the JSON response as type T.
@@ -665,9 +680,9 @@ pub fn deleteJson(comptime T: type, url: []const u8, parse_opts: std.json.ParseO
 
 /// Convenience function to DELETE and parse the JSON response with an explicit allocator.
 pub fn deleteJsonWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, parse_opts: std.json.ParseOptions) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.deleteJson(T, url, parse_opts);
+    return oneShotJson(allocator, T, .DELETE, url, .{
+        .headers = &.{.{ "Accept", "application/json" }},
+    }, parse_opts);
 }
 
 /// Zero-copy: GET and parse JSON with strings borrowing from the response body.
@@ -678,9 +693,9 @@ pub fn getJsonBorrowed(comptime T: type, url: []const u8) !JsonBorrowedResult(T)
 
 /// Zero-copy: GET with explicit allocator.
 pub fn getJsonBorrowedWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.getJsonBorrowed(T, url);
+    return oneShotJson(allocator, T, .GET, url, .{
+        .headers = &.{.{ "Accept", "application/json" }},
+    }, .{});
 }
 
 /// Zero-copy: POST JSON and parse response with strings borrowing from the body.
@@ -690,9 +705,7 @@ pub fn postJsonBorrowed(comptime T: type, url: []const u8, body: []const u8) !Js
 
 /// Zero-copy: POST with explicit allocator.
 pub fn postJsonBorrowedWithAllocator(allocator: std.mem.Allocator, comptime T: type, url: []const u8, body: []const u8) !JsonBorrowedResult(T) {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.postJsonBorrowed(T, url, body);
+    return oneShotJson(allocator, T, .POST, url, .{ .json = body }, .{});
 }
 
 /// Convenience function to create a POST request.
@@ -702,9 +715,7 @@ pub fn post(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a POST request with an explicit allocator.
 pub fn postWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.post(url, req_options);
+    return oneShotRequest(allocator, .POST, url, req_options);
 }
 
 /// Convenience function to create a PUT request.
@@ -714,9 +725,7 @@ pub fn put(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a PUT request with an explicit allocator.
 pub fn putWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.put(url, req_options);
+    return oneShotRequest(allocator, .PUT, url, req_options);
 }
 
 /// Convenience function to create a DELETE request.
@@ -726,9 +735,7 @@ pub fn del(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a DELETE request with an explicit allocator.
 pub fn delWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.delete(url, req_options);
+    return oneShotRequest(allocator, .DELETE, url, req_options);
 }
 
 /// Convenience alias for DELETE requests.
@@ -748,9 +755,7 @@ pub fn patch(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a PATCH request with an explicit allocator.
 pub fn patchWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.patch(url, req_options);
+    return oneShotRequest(allocator, .PATCH, url, req_options);
 }
 
 /// Convenience function to create a HEAD request.
@@ -760,9 +765,7 @@ pub fn head(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a HEAD request with an explicit allocator.
 pub fn headWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.head(url, req_options);
+    return oneShotRequest(allocator, .HEAD, url, req_options);
 }
 
 /// Convenience function to create a TRACE request.
@@ -772,9 +775,7 @@ pub fn trace(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a TRACE request with an explicit allocator.
 pub fn traceWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.trace(url, req_options);
+    return oneShotRequest(allocator, .TRACE, url, req_options);
 }
 
 /// Convenience function to create a CONNECT request.
@@ -784,9 +785,7 @@ pub fn connect(url: []const u8, req_options: RequestOptions) !Response {
 
 /// Convenience function to create a CONNECT request with an explicit allocator.
 pub fn connectWithAllocator(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.connect(url, req_options);
+    return oneShotRequest(allocator, .CONNECT, url, req_options);
 }
 
 /// Convenience function to create an OPTIONS request.
@@ -796,9 +795,7 @@ pub fn options(url: []const u8, options_in: RequestOptions) !Response {
 
 /// Convenience function to create an OPTIONS request with an explicit allocator.
 pub fn optionsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
-    var c = Client.init(allocator);
-    defer c.deinit();
-    return c.options(url, options_in);
+    return oneShotRequest(allocator, .OPTIONS, url, options_in);
 }
 
 /// Convenience alias for OPTIONS requests.

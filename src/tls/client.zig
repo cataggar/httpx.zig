@@ -659,17 +659,20 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             switch (et) {
                                 .server_name => {},
                                 .application_layer_protocol_negotiation => {
-                                    // Parse the negotiated ALPN protocol
-                                    try extd.ensure(1);
-                                    const selected_len = extd.decode(u8);
+                                    try extd.ensure(2);
+                                    const protocol_list_len = extd.decode(u16);
+                                    var protocol_list = try extd.sub(protocol_list_len);
+                                    try protocol_list.ensure(1);
+                                    const selected_len = protocol_list.decode(u8);
                                     if (selected_len > 0) {
-                                        try extd.ensure(selected_len);
-                                        const selected = extd.slice(selected_len);
+                                        try protocol_list.ensure(selected_len);
+                                        const selected = protocol_list.slice(selected_len);
                                         var buf: [256]u8 = undefined;
                                         @memcpy(buf[0..selected_len], selected);
                                         negotiated_alpn = buf;
                                         negotiated_alpn_len = selected_len;
                                     }
+                                    if (!protocol_list.eof() or !extd.eof()) return error.TlsDecodeError;
                                 },
                                 else => {},
                             }

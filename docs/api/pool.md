@@ -62,10 +62,14 @@ Cleanup removes only zero-lease entries.
 TLS is initialized in stable entry storage with `lease.initializeTls(config)`.
 Sequential HTTP/2 state is returned by `lease.h2Session()` and persists HPACK,
 SETTINGS, flow-control windows, and monotonically increasing client stream IDs.
-The high-level client does not concurrently multiplex a leased session. A
-GOAWAY already observed by the response loop drains the entry; a late GOAWAY
-can instead surface on the next request and is replayed only when retry policy
-permits replay of the buffered request.
+The high-level client does not concurrently multiplex a leased session.
+Partial SETTINGS and WINDOW_UPDATE frames modify retained state. GOAWAY drains
+the entry, but an active stream permitted by `last_stream_id` is read through
+END_STREAM.
+
+An opportunistic HTTP/2 TLS connection that negotiates HTTP/1.1 can be re-keyed
+to `.http1` while exclusively leased. Future opportunistic requests first
+reuse that published HTTP/1.1 entry.
 
 ## Statistics
 

@@ -140,9 +140,11 @@ defer response.deinit();
 
 Policy is resolved once per logical request. Disabling a feature never removes a caller-provided `Cookie` or `Accept-Encoding` header. With decompression disabled, the response retains its encoded bytes and `Content-Encoding` header.
 
-Caller-provided request headers are appended in order rather than coalesced.
-This preserves duplicate `Cookie`, `Set-Cookie`, and `x-ms-*` fields. Use
-`Headers.set` explicitly when replacement semantics are desired.
+Caller-provided request headers are appended in order when duplicates are
+legal. This preserves duplicate `Cookie`, `Set-Cookie`, and `x-ms-*` fields.
+Singleton fields such as `Host`, `Content-Length`, `Transfer-Encoding`,
+`Authorization`, and `User-Agent` use replacement semantics and are validated
+before I/O. Conflicting or unsupported framing is rejected explicitly.
 
 Migration: direct `retry_policy`, `redirect_policy`, `follow_redirects`, `accept_encoding`, and `auto_decompress` fields were replaced by `ClientConfig.policy`; per-request `follow_redirects` was replaced by `RequestOptions.policy.redirect`. `RequestSpec.follow_redirects` similarly became `RequestSpec.policy`. The `withRetryPolicy`, `withRedirectPolicy`, and `withFollowRedirects` helpers remain as compatibility adapters and write only the new policy fields.
 
@@ -506,6 +508,7 @@ pub const Response = struct {
 | Method | Description |
 |--------|-------------|
 | `deinit()` | Free response resources |
+| `clone(allocator)` | Deep-copy body, ordered headers, and trailers to another allocator |
 | `header(name)` | Get header value by name |
 | `ok()` | Status 200-299 |
 | `isRedirect()` | Status 300-399 |
@@ -520,8 +523,10 @@ pub const Response = struct {
 ## Interceptors
 
 Interceptors observe every transport attempt. Ordering is: automatic request
-mutations, request callback, I/O and configured decompression, response/error
-callback, then retry/redirect notification when that action will occur.
+mutations, request callback, validation, I/O and configured decompression,
+response/error callback, retry delay plus cancellation/deadline checks, then a
+retry notification immediately before the next attempt. Redirect notification
+similarly fires only when the redirect will be followed.
 
 ### Structure
 

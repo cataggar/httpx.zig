@@ -13,11 +13,14 @@ cleaning the pool cannot invalidate an in-use handle. HTTPS keeps its
 
 HTTP/2 keeps HPACK, SETTINGS, flow-control, and stream-id state with the pooled
 session. Reuse is deliberately sequential (stream IDs 1, 3, 5, ...), not
-concurrent multiplexing. GOAWAY marks a session draining and later requests
-open another connection. A GOAWAY that arrives after a completed response may
-be observed by the next lease; that request returns an error in embedding-owned
-mode, while an enabled retry policy may replay its buffered body on a new
-session.
+concurrent multiplexing. Partial SETTINGS and connection/stream WINDOW_UPDATE
+frames update the retained session state. GOAWAY marks a session draining; an
+active stream permitted by `last_stream_id` continues until END_STREAM, while
+a disallowed stream fails rather than returning a partial body.
+
+When HTTP/2 is enabled opportunistically and ALPN selects HTTP/1.1, the
+negotiated TLS session is safely re-keyed and reused as HTTP/1.1 rather than
+failing the request.
 
 ### Configuration
 

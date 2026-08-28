@@ -49,9 +49,30 @@ pub const Response = struct {
                 self.allocator.free(b);
             }
         }
+
         if (self.trailers) |*t| {
             t.deinit();
         }
+    }
+
+    /// Creates a deep copy owned by `allocator`.
+    pub fn clone(self: *const Self, allocator: Allocator) !Self {
+        var copy = Response.init(allocator, self.status.code);
+        errdefer copy.deinit();
+        copy.version = self.version;
+        copy.status = self.status;
+        copy.streaming_done = self.streaming_done;
+
+        copy.headers.deinit();
+        copy.headers = try self.headers.clone(allocator);
+        if (self.body) |body| {
+            copy.body = try allocator.dupe(u8, body);
+            copy.body_owned = true;
+        }
+        if (self.trailers) |trailers| {
+            copy.trailers = try trailers.clone(allocator);
+        }
+        return copy;
     }
 
     /// Returns true if the response indicates success (2xx).
@@ -359,6 +380,29 @@ test "Response status checks" {
     var error_resp = Response.init(allocator, 404);
     defer error_resp.deinit();
     try std.testing.expect(error_resp.isError());
+}
+
+test "Response clone deep-copies body headers and trailers" {
+    var response = Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    try response.headers.append("Set-Cookie", "a=1");
+    try response.headers.append("Set-Cookie", "b=2");
+    response.body = try std.testing.allocator.dupe(u8, "body");
+    response.body_owned = true;
+    var trailers = Headers.init(std.testing.allocator);
+    try trailers.append("X-Checksum", "abc");
+    response.trailers = trailers;
+
+    var copy = try response.clone(std.testing.allocator);
+    defer copy.deinit();
+    response.headers.clear();
+    @memset(@constCast(response.body.?), 'x');
+
+    try std.testing.expectEqualStrings("body", copy.body.?);
+    const cookies = try copy.headers.getAll("Set-Cookie", std.testing.allocator);
+    defer std.testing.allocator.free(cookies);
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
+    try std.testing.expectEqualStrings("abc", copy.trailers.?.get("X-Checksum").?);
 }
 
 test "ResponseBuilder" {
