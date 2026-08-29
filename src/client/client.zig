@@ -6583,6 +6583,26 @@ const PolicyTestServer = struct {
                     length += n;
                     if (mem.indexOf(u8, self.requests[index][0..length], "\r\n\r\n") != null) break;
                 }
+                const header_end = (mem.indexOf(
+                    u8,
+                    self.requests[index][0..length],
+                    "\r\n\r\n",
+                ) orelse return error.InvalidHeader) + 4;
+                const body_length = if (requestHeaderValue(
+                    self.requests[index][0..length],
+                    HeaderName.CONTENT_LENGTH,
+                )) |value|
+                    try std.fmt.parseInt(usize, value, 10)
+                else
+                    0;
+                if (header_end + body_length > self.requests[index].len) {
+                    return error.RequestTooLarge;
+                }
+                while (length < header_end + body_length) {
+                    const n = try accepted.socket.recv(self.requests[index][length..]);
+                    if (n == 0) return error.UnexpectedEndOfStream;
+                    length += n;
+                }
                 self.request_lengths[index] = length;
                 self.request_count += 1;
                 try accepted.socket.sendAll(response);
@@ -8153,6 +8173,9 @@ test "streaming TLS path reconnects a pooled socket after failed first handshake
         fn runFallible(self: *@This()) !void {
             var rejected = try self.listener.accept();
             self.accepts += 1;
+            var client_hello: [1]u8 = undefined;
+            const hello_bytes = try rejected.socket.recv(&client_hello);
+            if (hello_bytes == 0) return error.UnexpectedEndOfStream;
             try rejected.socket.setLinger(true, 0);
             rejected.socket.close();
 
@@ -8340,6 +8363,7 @@ test "cancellation interrupts SOCKS5 negotiation and cleans the lease" {
     var token = types.CancellationToken.init();
     var client = Client.initWithConfig(allocator, .{
         .keep_alive = true,
+        .max_request_size = 0,
         .policy = types.ClientPolicy.embeddingOwned(),
         .timeouts = types.Timeouts.uniform(5_000),
         .proxy = .{
@@ -8429,6 +8453,7 @@ test "cancellation interrupts incremental HTTP1 upload" {
     var token = types.CancellationToken.init();
     var client = Client.initWithConfig(allocator, .{
         .keep_alive = true,
+        .max_request_size = 0,
         .policy = types.ClientPolicy.embeddingOwned(),
         .timeouts = types.Timeouts.uniform(5_000),
     });
