@@ -1824,6 +1824,9 @@ pub const Server = struct {
         if (self.config.request_timeout_ms > 0) {
             try sock.setRecvTimeout(self.config.request_timeout_ms);
         }
+        if (self.config.write_timeout_ms > 0) {
+            try sock.setSendTimeout(self.config.write_timeout_ms);
+        }
         var frame_context = IoContext.init(.{});
         var contextual_reader = H2ServerContextReader{
             .source = .{ .socket = &sock },
@@ -1883,6 +1886,12 @@ pub const Server = struct {
         try stream.updateSendWindow(@intCast(increment));
     }
 
+    fn isImplicitlyClosedClientStream(stream_id: u31, last_client_stream_id: u31) bool {
+        return stream_id != 0 and
+            (stream_id & 1) == 1 and
+            stream_id < last_client_stream_id;
+    }
+
     fn pumpHTTP2SendWindow(
         self: *Self,
         conn: *http.HTTP2Connection,
@@ -1893,6 +1902,7 @@ pub const Server = struct {
         pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
         pending_frame_bytes: *usize,
         queued_continuation_stream: *?u31,
+        last_client_stream_id: u31,
     ) !void {
         const previous_deadline = frame_context.phase_deadline;
         frame_context.setPhaseDeadline(send_wait_deadline);
@@ -1913,11 +1923,23 @@ pub const Server = struct {
             return error.ProtocolError;
         }
         switch (frame.header.frame_type) {
-            .window_update => try applyHTTP2SendWindowUpdate(
-                stream_manager,
-                frame.header,
-                frame.payload,
-            ),
+            .window_update => {
+                if (frame.header.stream_id != 0 and
+                    stream_manager.getStream(frame.header.stream_id) == null and
+                    isImplicitlyClosedClientStream(
+                        frame.header.stream_id,
+                        last_client_stream_id,
+                    ))
+                {
+                    _ = try h2stream.parseWindowUpdatePayload(frame.payload);
+                } else {
+                    try applyHTTP2SendWindowUpdate(
+                        stream_manager,
+                        frame.header,
+                        frame.payload,
+                    );
+                }
+            },
             .settings => {
                 if (frame.header.stream_id != 0) return error.ProtocolError;
                 if ((frame.header.flags & 0x01) != 0) {
@@ -1955,6 +1977,14 @@ pub const Server = struct {
                 if (frame.header.stream_id == stream_id) {
                     if (stream_manager.getStream(stream_id)) |stream| stream.reset();
                     return error.StreamReset;
+                }
+                if (stream_manager.getStream(frame.header.stream_id)) |other_stream| {
+                    if (other_stream.state == .closed) return;
+                } else if (isImplicitlyClosedClientStream(
+                    frame.header.stream_id,
+                    last_client_stream_id,
+                )) {
+                    return;
                 }
                 try queueHTTP2Frame(
                     self,
@@ -2118,6 +2148,8 @@ pub const Server = struct {
         }
         var pending_frame_bytes: usize = 0;
         var queued_continuation_stream: ?u31 = null;
+        var closed_stream_order = std.ArrayList(u31).empty;
+        defer closed_stream_order.deinit(self.allocator);
 
         var continuation_stream: ?u31 = null;
         var all_done = false;
@@ -2227,13 +2259,11 @@ pub const Server = struct {
                         try context_map.put(stream_id, contexts.items.len - 1);
                         break :blk &contexts.items[contexts.items.len - 1];
                     };
-                    if (!ctx.initial_headers_parsed) {
-                        ctx.header_deadline = incoming_frame_deadline orelse
-                            if (self.config.request_timeout_ms > 0)
-                                Deadline.afterMs(self.config.request_timeout_ms)
-                            else
-                                null;
-                    }
+                    ctx.header_deadline = incoming_frame_deadline orelse
+                        if (self.config.request_timeout_ms > 0)
+                            Deadline.afterMs(self.config.request_timeout_ms)
+                        else
+                            null;
 
                     if ((frame.header.flags & 0x04) != 0) {
                         const parsed = try h2stream.parseHeadersFramePayloadWithLimit(
@@ -2419,6 +2449,13 @@ pub const Server = struct {
                         if (stream_manager.getStream(frame.header.stream_id)) |remote_stream| {
                             remote_stream.reset();
                         }
+                    } else if (stream_manager.getStream(frame.header.stream_id)) |closed_stream| {
+                        if (closed_stream.state != .closed) return error.ProtocolError;
+                    } else if (isImplicitlyClosedClientStream(
+                        frame.header.stream_id,
+                        last_client_stream_id,
+                    )) {
+                        // Lower skipped odd IDs are implicitly closed.
                     } else {
                         return error.ProtocolError;
                     }
@@ -2427,11 +2464,23 @@ pub const Server = struct {
                     return;
                 },
                 .push_promise => return error.ProtocolError,
-                .window_update => try applyHTTP2SendWindowUpdate(
-                    &stream_manager,
-                    frame.header,
-                    frame.payload,
-                ),
+                .window_update => {
+                    if (frame.header.stream_id != 0 and
+                        stream_manager.getStream(frame.header.stream_id) == null and
+                        isImplicitlyClosedClientStream(
+                            frame.header.stream_id,
+                            last_client_stream_id,
+                        ))
+                    {
+                        _ = try h2stream.parseWindowUpdatePayload(frame.payload);
+                    } else {
+                        try applyHTTP2SendWindowUpdate(
+                            &stream_manager,
+                            frame.header,
+                            frame.payload,
+                        );
+                    }
+                },
                 .priority => {},
                 _ => {},
             }
@@ -2503,6 +2552,7 @@ pub const Server = struct {
                         &pending_frames,
                         &pending_frame_bytes,
                         &queued_continuation_stream,
+                        last_client_stream_id,
                     ) catch |err| switch (err) {
                         error.StreamReset => {
                             ctx.done = true;
@@ -2529,6 +2579,7 @@ pub const Server = struct {
                     &pending_frames,
                     &pending_frame_bytes,
                     &queued_continuation_stream,
+                    last_client_stream_id,
                 ) catch |err| switch (err) {
                     error.StreamReset => {
                         ctx.done = true;
@@ -2553,7 +2604,14 @@ pub const Server = struct {
                 contexts.items[context_index].deinit(self.allocator);
                 _ = contexts.orderedRemove(context_index);
                 _ = context_map.remove(completed_stream_id);
-                stream_manager.removeStream(completed_stream_id);
+                if (stream_manager.getStream(completed_stream_id)) |completed_stream| {
+                    if (completed_stream.state != .closed) completed_stream.reset();
+                }
+                try closed_stream_order.append(self.allocator, completed_stream_id);
+                if (closed_stream_order.items.len > 1024) {
+                    const expired_stream = closed_stream_order.orderedRemove(0);
+                    stream_manager.removeStream(expired_stream);
+                }
                 var shifted = context_index;
                 while (shifted < contexts.items.len) : (shifted += 1) {
                     try context_map.put(contexts.items[shifted].stream_id, shifted);
@@ -2613,6 +2671,7 @@ pub const Server = struct {
         pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
         pending_frame_bytes: *usize,
         queued_continuation_stream: *?u31,
+        last_client_stream_id: u31,
     ) !void {
         try self.ensureContentLengthHeader(response);
         const response_stream = stream_manager.getStream(stream_id) orelse
@@ -2684,6 +2743,7 @@ pub const Server = struct {
                     pending_frames,
                     pending_frame_bytes,
                     queued_continuation_stream,
+                    last_client_stream_id,
                 );
                 if (!response_stream.canSend()) return error.StreamReset;
             }
@@ -4758,6 +4818,25 @@ test "HTTP2 server response obeys stream and connection send windows" {
         saw_end = (frame.flags & 0x01) != 0;
     }
     try std.testing.expectEqual(@as(usize, 70_000), total);
+
+    const late_reset = h2stream.buildRstStreamFrame(1, .cancel);
+    try socket.writeAll(&late_reset);
+    try Helpers.writeWindowUpdate(&socket, 1, 1);
+    const ping_header = (http.HTTP2FrameHeader{
+        .length = 8,
+        .frame_type = .ping,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&ping_header);
+    try socket.writeAll("lateping");
+    while (true) {
+        const frame = try Helpers.readFrame(&socket, &payload);
+        if (frame.frame_type == .ping and (frame.flags & 0x01) != 0) {
+            try std.testing.expectEqualStrings("lateping", payload[0..frame.length]);
+            break;
+        }
+    }
 }
 
 test "HTTP2 server send-window pump resets terminal stream state" {
@@ -4811,6 +4890,7 @@ test "HTTP2 server send-window pump resets terminal stream state" {
             &pending_frames,
             &pending_bytes,
             &queued_continuation,
+            1,
         ),
     );
     try std.testing.expectEqual(h2stream.StreamState.closed, stream.state);
@@ -4883,6 +4963,7 @@ test "HTTP2 server send-window pump queues multiplexed stream work" {
         &pending_frames,
         &pending_bytes,
         &queued_continuation,
+        1,
     );
     try std.testing.expectEqual(@as(usize, 1), pending_frames.items.len);
     try std.testing.expectEqual(@as(i32, 0), response_stream.send_window);
@@ -4895,6 +4976,7 @@ test "HTTP2 server send-window pump queues multiplexed stream work" {
         &pending_frames,
         &pending_bytes,
         &queued_continuation,
+        1,
     );
     try std.testing.expectEqual(@as(i32, 5), response_stream.send_window);
 }
@@ -4965,7 +5047,7 @@ test "cleartext HTTP2 preface probe has one bounded deadline" {
     try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));
 }
 
-test "HTTP2 continuation read uses one header-block deadline" {
+test "HTTP2 trailer continuation uses one anchored header-block deadline" {
     var server = Server.initWithConfig(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -5027,7 +5109,7 @@ test "HTTP2 continuation read uses one header-block deadline" {
     var encoder = hpack.HPACKContext.init(std.testing.allocator);
     defer encoder.deinit();
     const fields = [_]hpack.HeaderEntry{
-        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":method", .value = "POST" },
         .{ .name = ":scheme", .value = "http" },
         .{ .name = ":path", .value = "/" },
         .{ .name = ":authority", .value = "127.0.0.1" },
@@ -5037,11 +5119,25 @@ test "HTTP2 continuation read uses one header-block deadline" {
     const headers_frame = (http.HTTP2FrameHeader{
         .length = @intCast(block.len),
         .frame_type = .headers,
-        .flags = 0x01,
+        .flags = 0x04,
         .stream_id = 1,
     }).serialize();
     try socket.writeAll(&headers_frame);
     try socket.writeAll(block);
+    const trailers = try hpack.encodeHeaders(
+        &encoder,
+        &.{.{ .name = "x-trailer", .value = "value", .representation = .without_indexing }},
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(trailers);
+    const trailer_frame = (http.HTTP2FrameHeader{
+        .length = @intCast(trailers.len),
+        .frame_type = .headers,
+        .flags = 0x01,
+        .stream_id = 1,
+    }).serialize();
+    try socket.writeAll(&trailer_frame);
+    try socket.writeAll(trailers);
     try socket.setRecvTimeout(2_000);
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));

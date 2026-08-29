@@ -77,12 +77,12 @@ pub const Request = struct {
 
     pub fn setCustomMethod(self: *Self, method: []const u8) !void {
         if (!isValidMethodToken(method)) return error.InvalidMethod;
-        if (self.custom_method_owned) {
-            if (self.custom_method) |existing| self.allocator.free(existing);
-        }
-        self.custom_method = try self.allocator.dupe(u8, method);
+        const replacement = try self.allocator.dupe(u8, method);
+        const previous = if (self.custom_method_owned) self.custom_method else null;
+        self.custom_method = replacement;
         self.custom_method_owned = true;
         self.method = .CUSTOM;
+        if (previous) |existing| self.allocator.free(existing);
     }
 
     /// Sets the request body with ownership.
@@ -591,4 +591,22 @@ test "Accept quality value parsing" {
     try std.testing.expect(request.accepts("text/plain"));
     try std.testing.expect(request.accepts("application/json"));
     try std.testing.expect(!request.accepts("image/png"));
+}
+
+test "setCustomMethod is alias and allocation failure safe" {
+    var request = try Request.init(std.testing.allocator, .CUSTOM, "http://example.test/");
+    defer request.deinit();
+    try request.setCustomMethod("PURGE");
+    const alias = request.custom_method.?;
+    try request.setCustomMethod(alias);
+    try std.testing.expectEqualStrings("PURGE", request.custom_method.?);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    request.allocator = failing.allocator();
+    const result = request.setCustomMethod("BAN");
+    request.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqualStrings("PURGE", request.custom_method.?);
 }

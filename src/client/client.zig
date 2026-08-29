@@ -1976,7 +1976,10 @@ pub const Client = struct {
 
         var body_offset: usize = 0;
         while (body_offset < body.len) {
-            const written = try op.write(body[body_offset..]);
+            const written = op.write(body[body_offset..]) catch |err| switch (err) {
+                error.EarlyResponse => break,
+                else => return err,
+            };
             if (written == 0) break;
             body_offset += written;
         }
@@ -2703,6 +2706,106 @@ pub const Client = struct {
         return goaway.last_stream_id;
     }
 
+    fn appendEarlyHeaderFragment(
+        self: *Client,
+        block: *std.ArrayList(u8),
+        payload: []const u8,
+        flags: u8,
+        stream_id: u31,
+    ) !void {
+        var offset: usize = 0;
+        var padding: usize = 0;
+        if ((flags & 0x08) != 0) {
+            if (payload.len == 0) return error.ProtocolError;
+            padding = payload[0];
+            offset = 1;
+        }
+        if ((flags & 0x20) != 0) {
+            if (payload.len < offset + 5) return error.ProtocolError;
+            const dependency = (@as(u31, payload[offset] & 0x7f) << 24) |
+                (@as(u31, payload[offset + 1]) << 16) |
+                (@as(u31, payload[offset + 2]) << 8) |
+                payload[offset + 3];
+            if (dependency == stream_id) return error.ProtocolError;
+            offset += 5;
+        }
+        if (padding > payload.len - offset) return error.ProtocolError;
+        try block.appendSlice(self.allocator, payload[offset .. payload.len - padding]);
+    }
+
+    fn queueDecodedEarlyHeaders(
+        self: *Client,
+        stream_manager: *h2stream.StreamManager,
+        request_stream_id: u31,
+        block: []const u8,
+        end_stream: bool,
+        early_frames: *std.ArrayList(EarlyH2Frame),
+        early_frame_bytes: *usize,
+    ) !u16 {
+        const decoded = try hpack.decodeHeadersWithLimit(
+            &stream_manager.hpack_decoder,
+            block,
+            self.allocator,
+            self.shared.config.http2_settings.max_header_list_size,
+        );
+        defer {
+            for (decoded) |header| {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            }
+            self.allocator.free(decoded);
+        }
+
+        var status: ?u16 = null;
+        var saw_regular = false;
+        var fields = std.ArrayList(hpack.HeaderEntry).empty;
+        defer fields.deinit(self.allocator);
+        for (decoded) |header| {
+            if (header.name.len > 0 and header.name[0] == ':') {
+                if (saw_regular or status != null or !mem.eql(u8, header.name, ":status")) {
+                    return error.ProtocolError;
+                }
+                status = try parseHttp2StatusCode(header.value);
+            } else {
+                saw_regular = true;
+                if (!isValidHttp2HeaderName(header.name) or
+                    common.isConnectionSpecificHeader(header.name))
+                {
+                    return error.ProtocolError;
+                }
+            }
+            try fields.append(self.allocator, .{
+                .name = header.name,
+                .value = header.value,
+                .representation = .without_indexing,
+            });
+        }
+        const status_code = status orelse return error.InvalidResponse;
+
+        var synthetic_encoder = hpack.HPACKContext.init(self.allocator);
+        defer synthetic_encoder.deinit();
+        const encoded = try hpack.encodeHeaders(
+            &synthetic_encoder,
+            fields.items,
+            self.allocator,
+        );
+        errdefer self.allocator.free(encoded);
+        if (early_frame_bytes.* + encoded.len > 64 * 1024) {
+            return error.EarlyResponseBufferExceeded;
+        }
+        try early_frames.append(self.allocator, .{
+            .header = .{
+                .length = @intCast(encoded.len),
+                .frame_type = .headers,
+                .flags = 0x04 | if (end_stream) @as(u8, 0x01) else 0,
+                .stream_id = request_stream_id,
+            },
+            .payload = encoded,
+        });
+        early_frame_bytes.* += encoded.len;
+        return status_code;
+    }
+
     /// Pumps incoming HTTP/2 frames until the send window is positive.
     ///
     /// Called when `request_stream.send_window` or
@@ -2727,12 +2830,12 @@ pub const Client = struct {
     ) !H2PumpResult {
         var pump_counter: usize = 0;
         var continuation_stream: ?u31 = null;
-        var response_headers_complete = false;
-        var response_end_stream = false;
+        var header_flags: u8 = 0;
+        var header_block = std.ArrayList(u8).empty;
+        defer header_block.deinit(self.allocator);
         while (request_stream.send_window <= 0 or
             stream_manager.connection_send_window <= 0 or
-            continuation_stream != null or
-            response_headers_complete)
+            continuation_stream != null)
         {
             pump_counter += 1;
             if (pump_counter > 10_000) return error.ProtocolError;
@@ -2812,21 +2915,6 @@ pub const Client = struct {
                 },
                 .rst_stream => {
                     if (fhdr.stream_id == request_stream.id) {
-                        if (response_headers_complete) {
-                            if (early_frame_bytes.* + payload.len > 64 * 1024) {
-                                self.allocator.free(payload);
-                                return error.EarlyResponseBufferExceeded;
-                            }
-                            early_frames.append(self.allocator, .{
-                                .header = fhdr,
-                                .payload = payload,
-                            }) catch |err| {
-                                self.allocator.free(payload);
-                                return err;
-                            };
-                            early_frame_bytes.* += payload.len;
-                            return .response_started;
-                        }
                         self.allocator.free(payload);
                         return error.StreamError;
                     }
@@ -2844,30 +2932,46 @@ pub const Client = struct {
                         self.allocator.free(payload);
                         return error.ProtocolError;
                     }
-                    if (early_frame_bytes.* + payload.len > 64 * 1024) {
-                        self.allocator.free(payload);
-                        return error.EarlyResponseBufferExceeded;
-                    }
-                    early_frames.append(self.allocator, .{
-                        .header = fhdr,
-                        .payload = payload,
-                    }) catch |err| {
-                        self.allocator.free(payload);
-                        return err;
-                    };
-                    early_frame_bytes.* += payload.len;
                     if (fhdr.frame_type == .headers) {
-                        response_end_stream = (fhdr.flags & 0x01) != 0;
-                        if ((fhdr.flags & 0x04) == 0) {
-                            continuation_stream = fhdr.stream_id;
-                        } else {
-                            response_headers_complete = true;
-                            if ((fhdr.flags & 0x01) != 0) return .response_started;
-                        }
-                    } else if ((fhdr.flags & 0x04) != 0) {
-                        continuation_stream = null;
-                        response_headers_complete = true;
-                        if (response_end_stream) return .response_started;
+                        header_flags = fhdr.flags;
+                        header_block.clearRetainingCapacity();
+                        self.appendEarlyHeaderFragment(
+                            &header_block,
+                            payload,
+                            fhdr.flags,
+                            request_stream.id,
+                        ) catch |err| {
+                            self.allocator.free(payload);
+                            return err;
+                        };
+                    } else {
+                        header_block.appendSlice(self.allocator, payload) catch |err| {
+                            self.allocator.free(payload);
+                            return err;
+                        };
+                    }
+                    self.allocator.free(payload);
+                    if (fhdr.frame_type == .headers and (fhdr.flags & 0x04) == 0) {
+                        continuation_stream = fhdr.stream_id;
+                        continue;
+                    }
+                    if (fhdr.frame_type == .continuation and (fhdr.flags & 0x04) == 0) {
+                        continue;
+                    }
+                    continuation_stream = null;
+                    const status = self.queueDecodedEarlyHeaders(
+                        stream_manager,
+                        request_stream.id,
+                        header_block.items,
+                        (header_flags & 0x01) != 0,
+                        early_frames,
+                        early_frame_bytes,
+                    ) catch |err| return err;
+                    header_block.clearRetainingCapacity();
+                    if (status >= 100 and status < 200) {
+                        if ((header_flags & 0x01) != 0) return error.ProtocolError;
+                    } else {
+                        return .response_started;
                     }
                 },
                 .data => {
@@ -2875,22 +2979,8 @@ pub const Client = struct {
                         self.allocator.free(payload);
                         return error.ProtocolError;
                     }
-                    try debitHttp2ReceiveWindows(stream_manager, request_stream, payload.len);
-                    if (early_frame_bytes.* + payload.len > 64 * 1024) {
-                        self.allocator.free(payload);
-                        return error.EarlyResponseBufferExceeded;
-                    }
-                    early_frames.append(self.allocator, .{
-                        .header = fhdr,
-                        .payload = payload,
-                        .flow_debited = true,
-                    }) catch |err| {
-                        self.allocator.free(payload);
-                        return err;
-                    };
-                    early_frame_bytes.* += payload.len;
-                    if (!response_headers_complete) return error.ProtocolError;
-                    return .response_started;
+                    self.allocator.free(payload);
+                    return error.ProtocolError;
                 },
                 // RFC 7540 4.1: Unknown frame types MUST be ignored.
                 _ => {
@@ -3173,6 +3263,12 @@ pub const Client = struct {
                             &status_code,
                             &response_headers,
                         );
+                        if (status_code.? >= 100 and status_code.? < 200) {
+                            if ((frame.header.flags & 0x01) != 0) return error.ProtocolError;
+                            status_code = null;
+                            response_headers.clear();
+                            continue;
+                        }
                         if ((frame.header.flags & 0x01) != 0) {
                             got_end_stream = true;
                             request_stream.receiveEndStream();
@@ -3229,6 +3325,14 @@ pub const Client = struct {
                                 &status_code,
                                 &response_headers,
                             );
+                            if (status_code.? >= 100 and status_code.? < 200) {
+                                if ((pending_headers_flags & 0x01) != 0) return error.ProtocolError;
+                                status_code = null;
+                                response_headers.clear();
+                                pending_headers_block.clearRetainingCapacity();
+                                waiting_continuation = false;
+                                continue;
+                            }
                             pending_headers_block.clearRetainingCapacity();
                             waiting_continuation = false;
 
@@ -4635,6 +4739,7 @@ const OperationImpl = struct {
 
     fn writeRequest(self: *Self, data: []const u8) !usize {
         try self.context.check();
+        if (self.h2_early_response_started) return error.EarlyResponse;
         if (self.state != .request_body) {
             if (self.context.isCancelled()) return error.Cancelled;
             return error.InvalidOperationState;
@@ -6116,6 +6221,14 @@ const OperationImpl = struct {
                     };
                     self.response_head_ready = true;
                     self.response_keep_alive = true;
+                    if (self.http2ResponseHasNoBody()) {
+                        if (!end_stream) return error.ProtocolError;
+                        self.response_body_kind = .none;
+                        self.encoded_body_complete = true;
+                        self.decoded_body_complete = true;
+                        self.state = .response_complete;
+                        return status_code;
+                    }
                     try self.initializeContentDecoder();
                     try self.configureHttp2ResponseBody(end_stream);
                     return status_code;
@@ -6386,18 +6499,14 @@ const OperationImpl = struct {
                 }
             }
         }
-        const no_body = !self.req.method.hasResponseBody() or
-            self.response_head.status.code == 204 or
-            self.response_head.status.code == 304;
-        if (no_body) {
-            if (!end_stream) return error.ProtocolError;
-            self.response_body_kind = .none;
-            self.encoded_body_complete = true;
-            if (self.decoder_kind == .none) self.state = .response_complete;
-            return;
-        }
         self.response_body_kind = if (end_stream) .none else .http2;
         if (end_stream) try self.completeHttp2Response();
+    }
+
+    fn http2ResponseHasNoBody(self: *const Self) bool {
+        return !self.req.method.hasResponseBody() or
+            self.response_head.status.code == 204 or
+            self.response_head.status.code == 304;
     }
 
     fn completeHttp2Response(self: *Self) !void {
@@ -6544,7 +6653,7 @@ fn operationWrite(context: *anyopaque, data: []const u8) anyerror!usize {
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.writeRequest(data) catch |err| {
-        impl.fail(err);
+        if (err != error.EarlyResponse) impl.fail(err);
         return err;
     };
 }
@@ -9337,6 +9446,111 @@ test "HTTP2 upload pump rejects interleaving before CONTINUATION" {
             &session,
         ),
     );
+}
+
+test "HTTP2 upload pump resumes informational and stops on final headers" {
+    var encoder = hpack.HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const informational = try hpack.encodeHeaders(
+        &encoder,
+        &.{.{ .name = ":status", .value = "100", .representation = .without_indexing }},
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(informational);
+    const final = try hpack.encodeHeaders(
+        &encoder,
+        &.{
+            .{ .name = ":status", .value = "413", .representation = .without_indexing },
+            .{ .name = "content-length", .value = "0", .representation = .without_indexing },
+        },
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(final);
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const info_header = (http.HTTP2FrameHeader{
+        .length = @intCast(informational.len),
+        .frame_type = .headers,
+        .flags = 0x04,
+        .stream_id = 1,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &info_header);
+    try wire.appendSlice(std.testing.allocator, informational);
+    const update = h2stream.buildWindowUpdatePayload(5);
+    const update_header = (http.HTTP2FrameHeader{
+        .length = update.len,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = 1,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &update_header);
+    try wire.appendSlice(std.testing.allocator, &update);
+    const final_header = (http.HTTP2FrameHeader{
+        .length = @intCast(final.len),
+        .frame_type = .headers,
+        .flags = 0x04,
+        .stream_id = 1,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &final_header);
+    try wire.appendSlice(std.testing.allocator, final);
+
+    const Capture = struct {
+        input: []const u8,
+        offset: usize = 0,
+        fn readNoEof(self: *@This(), output: []u8) !void {
+            if (self.offset + output.len > self.input.len) return error.UnexpectedEof;
+            @memcpy(output, self.input[self.offset..][0..output.len]);
+            self.offset += output.len;
+        }
+        fn writeAll(_: *@This(), _: []const u8) !void {}
+    };
+    var capture = Capture{ .input = wire.items };
+    var session = pool_mod.H2SessionState.init(std.testing.allocator);
+    defer session.deinit();
+    session.received_initial_settings = true;
+    const request_stream = try session.stream_manager.createStream();
+    try request_stream.open();
+    request_stream.send_window = 0;
+    var early_frames = std.ArrayList(Client.EarlyH2Frame).empty;
+    defer {
+        for (early_frames.items) |*frame| frame.deinit(std.testing.allocator);
+        early_frames.deinit(std.testing.allocator);
+    }
+    var early_bytes: usize = 0;
+    var peer_max_frame_size: u32 = 16_384;
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    try std.testing.expectEqual(
+        Client.H2PumpResult.window_available,
+        try client.pumpUntilSendWindow(
+            &capture,
+            &session.stream_manager,
+            request_stream,
+            &peer_max_frame_size,
+            &early_frames,
+            &early_bytes,
+            &session,
+        ),
+    );
+    try std.testing.expectEqual(@as(i32, 5), request_stream.send_window);
+    try std.testing.expectEqual(@as(usize, 1), early_frames.items.len);
+
+    request_stream.send_window = 0;
+    try std.testing.expectEqual(
+        Client.H2PumpResult.response_started,
+        try client.pumpUntilSendWindow(
+            &capture,
+            &session.stream_manager,
+            request_stream,
+            &peer_max_frame_size,
+            &early_frames,
+            &early_bytes,
+            &session,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), early_frames.items.len);
 }
 
 fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
@@ -12418,7 +12632,7 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
         }
 
         fn runFallible(self: *@This()) !void {
-            for (0..2) |index| {
+            for (0..5) |index| {
                 var accepted = try self.listener.accept();
                 defer accepted.socket.close();
                 var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
@@ -12443,7 +12657,25 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
 
                 var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
                 defer manager.deinit();
-                if (index == 0) {
+                if (index == 3 or index == 4) {
+                    const status_value: []const u8 = if (index == 3) "204" else "200";
+                    const fields = [_]hpack.HeaderEntry{
+                        .{ .name = ":status", .value = status_value, .representation = .without_indexing },
+                        .{ .name = "content-length", .value = "999999", .representation = .without_indexing },
+                        .{ .name = "content-encoding", .value = "gzip", .representation = .without_indexing },
+                    };
+                    const frames = try h2stream.buildHeadersAndContinuations(
+                        &manager,
+                        stream_id,
+                        &fields,
+                        null,
+                        16_384,
+                        true,
+                        std.heap.page_allocator,
+                    );
+                    defer std.heap.page_allocator.free(frames);
+                    try accepted.socket.sendAll(frames);
+                } else if (index != 1) {
                     const fields = [_]hpack.HeaderEntry{
                         .{ .name = ":status", .value = "413", .representation = .without_indexing },
                         .{ .name = "content-length", .value = "0", .representation = .without_indexing },
@@ -12513,6 +12745,7 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
         });
         defer op.deinit();
         try std.testing.expectEqual(@as(usize, 65_535), try op.write(&upload));
+        try std.testing.expectError(error.EarlyResponse, op.write(upload[65_535..]));
         const head = try op.finishRequest(null);
         try std.testing.expectEqual(@as(u16, 413), head.status.code);
         try op.finish(.{});
@@ -12524,11 +12757,35 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
         });
         defer op.deinit();
         try std.testing.expectEqual(@as(usize, 65_535), try op.write(&upload));
+        try std.testing.expectError(error.EarlyResponse, op.write(upload[65_535..]));
         const head = try op.finishRequest(null);
         try std.testing.expectEqual(@as(u16, 200), head.status.code);
         var body: [2]u8 = undefined;
         try std.testing.expectEqual(@as(usize, 2), try op.read(&body));
         try std.testing.expectEqualStrings("ok", &body);
+        try op.finish(.{});
+    }
+    var buffered = try client.post(url, .{
+        .version = .HTTP_2,
+        .body = &upload,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer buffered.deinit();
+    try std.testing.expectEqual(@as(u16, 413), buffered.status.code);
+    for ([_]types.Method{ .GET, .HEAD }, 0..) |method, index| {
+        var op = try client.open(method, url, .{
+            .version = .HTTP_2,
+            .response_limit = .{ .bytes = 1 },
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        const head = try op.finishRequest(null);
+        try std.testing.expectEqual(
+            if (index == 0) @as(u16, 204) else @as(u16, 200),
+            head.status.code,
+        );
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try op.read(&byte));
         try op.finish(.{});
     }
 

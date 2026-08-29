@@ -760,9 +760,21 @@ pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
     }
 
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     const writer = list_writer.init(allocator, &buffer);
 
-    const method_str = req.method.toString();
+    const method_str = if (req.method == .CUSTOM)
+        req.custom_method orelse return error.InvalidMethod
+    else
+        req.method.toString();
+    if (method_str.len == 0) return error.InvalidMethod;
+    for (method_str) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null)
+        {
+            return error.InvalidMethod;
+        }
+    }
     try writer.print("{s} {s}", .{ method_str, req.uri.path });
     if (req.uri.query) |q| {
         try writer.print("?{s}", .{q});
@@ -1194,6 +1206,15 @@ test "writeChunkToWriter empty data is no-op" {
 
     try writeChunkToWriter(writer, "");
     try std.testing.expectEqualStrings("", buf.items);
+}
+
+test "formatRequest serializes the actual custom method token" {
+    var request = try Request.init(std.testing.allocator, .CUSTOM, "http://example.test/cache");
+    defer request.deinit();
+    try request.setCustomMethod("PURGE");
+    const formatted = try formatRequest(&request, std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expect(std.mem.startsWith(u8, formatted, "PURGE /cache HTTP/1.1\r\n"));
 }
 
 test "SETTINGS_ENABLE_PUSH is endpoint-role constrained" {

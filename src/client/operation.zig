@@ -157,7 +157,11 @@ pub const ClientOperation = struct {
             if (n == 0) return total;
             var offset: usize = 0;
             while (offset < n) {
-                const written = try self.write(buffer[offset..n]);
+                const written = self.write(buffer[offset..n]) catch |err| switch (err) {
+                    error.EarlyResponse => return std.math.add(u64, total, offset) catch
+                        return error.BodyLengthOverflow,
+                    else => return err,
+                };
                 if (written == 0) {
                     return std.math.add(u64, total, offset) catch
                         return error.BodyLengthOverflow;
