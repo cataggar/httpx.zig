@@ -367,6 +367,7 @@ fn validateDnsResponse(
     {
         return error.DnsQuestionMismatch;
     }
+    if (message.header.isTruncated()) return error.DnsUdpTruncated;
     if (message.header.rcode() == 3 and message.header.isAuthoritative()) {
         return error.AuthoritativeNameError;
     }
@@ -2044,6 +2045,11 @@ test "DNS response validation checks transaction question and compressed answer 
     message.header.flags = 0x8403;
     try std.testing.expectError(
         error.AuthoritativeNameError,
+        validateDnsResponse(&message, 0x1234, "example.com", .A),
+    );
+    message.header.flags = 0x8603;
+    try std.testing.expectError(
+        error.DnsUdpTruncated,
         validateDnsResponse(&message, 0x1234, "example.com", .A),
     );
     message.header.flags = 0x8182;

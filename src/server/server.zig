@@ -1280,6 +1280,56 @@ pub const Server = struct {
         return true;
     }
 
+    fn validateHTTP2Path(value: []const u8) !void {
+        if (mem.eql(u8, value, "*")) return;
+        if (value.len == 0 or value[0] != '/') return error.ProtocolError;
+        for (value) |byte| {
+            if (byte <= 0x20 or byte == 0x7f or byte == '#') {
+                return error.ProtocolError;
+            }
+        }
+    }
+
+    fn validateHTTP2Authority(value: []const u8) !void {
+        if (value.len == 0 or mem.indexOfAny(u8, value, "@/?#") != null) {
+            return error.ProtocolError;
+        }
+        for (value) |byte| {
+            if (byte <= 0x20 or byte == 0x7f) return error.ProtocolError;
+        }
+        if (value[0] == '[') {
+            const closing = mem.indexOfScalar(u8, value, ']') orelse
+                return error.ProtocolError;
+            if (closing == 1) return error.ProtocolError;
+            const host = value[1..closing];
+            if (mem.indexOfScalar(u8, host, ':') == null) return error.ProtocolError;
+            _ = net.Address.parseIp(host, 0) catch return error.ProtocolError;
+            const suffix = value[closing + 1 ..];
+            if (suffix.len == 0) return;
+            if (suffix[0] != ':' or suffix.len == 1) return error.ProtocolError;
+            _ = std.fmt.parseInt(u16, suffix[1..], 10) catch
+                return error.ProtocolError;
+            return;
+        }
+        const first_colon = mem.indexOfScalar(u8, value, ':');
+        const last_colon = mem.lastIndexOfScalar(u8, value, ':');
+        if (first_colon != last_colon) return error.ProtocolError;
+        const host = if (last_colon) |separator| value[0..separator] else value;
+        if (host.len == 0) return error.ProtocolError;
+        for (host) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and
+                mem.indexOfScalar(u8, "-._~!$&'()*+,;=%", byte) == null)
+            {
+                return error.ProtocolError;
+            }
+        }
+        if (last_colon) |separator| {
+            if (separator == 0 or separator + 1 == value.len) return error.ProtocolError;
+            _ = std.fmt.parseInt(u16, value[separator + 1 ..], 10) catch
+                return error.ProtocolError;
+        }
+    }
+
     /// Parses pseudo-headers (:method, :path, :scheme, :authority) from a
     /// decoded header block and appends regular headers to `request_headers`.
     fn parseHeaders(
@@ -1307,6 +1357,7 @@ pub const Server = struct {
                     method_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":path")) {
                     if (path_owned.*) return error.ProtocolError;
+                    try validateHTTP2Path(h.value);
                     path.* = try self.allocator.dupe(u8, h.value);
                     path_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":scheme")) {
@@ -1315,6 +1366,7 @@ pub const Server = struct {
                     scheme_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":authority")) {
                     if (authority_owned.*) return error.ProtocolError;
+                    try validateHTTP2Authority(h.value);
                     authority.* = try self.allocator.dupe(u8, h.value);
                     authority_owned.* = true;
                 } else return error.ProtocolError;
@@ -1894,6 +1946,40 @@ pub const Server = struct {
             stream_id < last_client_stream_id;
     }
 
+    fn consumeClosedStreamData(
+        conn: *http.HTTP2Connection,
+        stream_manager: *h2stream.StreamManager,
+        frame: *const http.HTTP2Connection.Frame,
+        connection_already_debited: bool,
+    ) !void {
+        if (frame.header.stream_id == 0) return error.ProtocolError;
+        if ((frame.header.flags & 0x08) != 0) {
+            if (frame.payload.len == 0 or
+                frame.payload.len < @as(usize, frame.payload[0]) + 1)
+            {
+                return error.ProtocolError;
+            }
+        }
+        const amount = std.math.cast(i32, frame.payload.len) orelse
+            return error.FlowControlError;
+        if (!connection_already_debited) {
+            if (amount > stream_manager.connection_recv_window) {
+                return error.FlowControlError;
+            }
+            stream_manager.connection_recv_window -= amount;
+        }
+        if (frame.payload.len == 0) return;
+        const increment: u31 = @intCast(frame.payload.len);
+        const update = h2stream.buildWindowUpdatePayload(increment);
+        try conn.writeFrame(.{
+            .length = update.len,
+            .frame_type = .window_update,
+            .flags = 0,
+            .stream_id = 0,
+        }, &update);
+        try stream_manager.updateConnectionRecvWindow(amount);
+    }
+
     fn pumpHTTP2SendWindow(
         self: *Self,
         conn: *http.HTTP2Connection,
@@ -1912,7 +1998,8 @@ pub const Server = struct {
             Deadline.afterMs(self.config.request_timeout_ms)
         else
             null;
-        const read_deadline = if (queued_header_deadline.*) |header_deadline|
+        const active_header_deadline = queued_header_deadline.* orelse request_header_deadline;
+        const read_deadline = if (active_header_deadline) |header_deadline|
             if (send_wait_deadline) |send_deadline|
                 Deadline.at(@min(header_deadline.at_ns, send_deadline.at_ns))
             else
@@ -2430,7 +2517,23 @@ pub const Server = struct {
                 },
                 .data => {
                     if (frame.header.stream_id == 0) return error.ProtocolError;
-                    const idx = context_map.get(frame.header.stream_id) orelse return error.ProtocolError;
+                    const idx = context_map.get(frame.header.stream_id) orelse {
+                        const closed = if (stream_manager.getStream(frame.header.stream_id)) |stream|
+                            stream.state == .closed
+                        else
+                            isImplicitlyClosedClientStream(
+                                frame.header.stream_id,
+                                last_client_stream_id,
+                            );
+                        if (!closed) return error.ProtocolError;
+                        try consumeClosedStreamData(
+                            conn,
+                            &stream_manager,
+                            &frame,
+                            frame_from_queue,
+                        );
+                        continue;
+                    };
                     var ctx = &contexts.items[idx];
                     if (ctx.done) return error.StreamClosed;
                     const remote_stream = stream_manager.getStream(ctx.stream_id) orelse
@@ -2562,20 +2665,33 @@ pub const Server = struct {
 
                 const scheme = if (is_connect) default_scheme else ctx.scheme_raw;
                 const path = if (is_connect) "/" else ctx.path_raw;
+                const host_header = ctx.request_headers.get(HeaderName.HOST);
+                if (ctx.authority_raw) |pseudo_authority| {
+                    if (host_header) |host_value| {
+                        if (!std.ascii.eqlIgnoreCase(
+                            mem.trim(u8, host_value, " \t"),
+                            pseudo_authority,
+                        )) {
+                            return error.ProtocolError;
+                        }
+                    }
+                }
                 const authority = ctx.authority_raw orelse
-                    ctx.request_headers.get(HeaderName.HOST) orelse
+                    host_header orelse
                     return error.ProtocolError;
-                if (authority.len == 0) return error.ProtocolError;
+                try validateHTTP2Authority(authority);
                 if (ctx.request_headers.get(HeaderName.HOST) == null) {
                     try ctx.request_headers.append(HeaderName.HOST, authority);
                 }
 
-                const url = try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, path });
+                const url_path = if (mem.eql(u8, path, "*")) "/" else path;
+                const url = try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, url_path });
                 defer self.allocator.free(url);
 
                 var req = try Request.init(self.allocator, method, url);
                 defer req.deinit();
                 req.version = .HTTP_2;
+                if (mem.eql(u8, path, "*")) req.uri.path = "*";
                 if (method == .CUSTOM) try req.setCustomMethod(ctx.method_raw);
 
                 req.headers.deinit();
@@ -4570,11 +4686,19 @@ test "HTTP2 server refuses only excess stream after decoding its headers" {
         &first_headers,
         null,
         16_384,
-        true,
+        false,
         std.testing.allocator,
     );
     defer std.testing.allocator.free(excess);
     try socket.writeAll(excess);
+    const late_data = (http.HTTP2FrameHeader{
+        .length = 4,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 3,
+    }).serialize();
+    try socket.writeAll(&late_data);
+    try socket.writeAll("late");
     const end_first = (http.HTTP2FrameHeader{
         .length = 0,
         .frame_type = .data,
@@ -4777,6 +4901,13 @@ test "HTTP2 server rejects malformed request header blocks" {
         &.{.{ .name = "X-Upper", .value = "value" }},
         &.{.{ .name = "connection", .value = "keep-alive" }},
         &.{.{ .name = ":unknown", .value = "value" }},
+        &.{.{ .name = ":path", .value = "http://attacker.test/" }},
+        &.{.{ .name = ":path", .value = "/path#fragment" }},
+        &.{.{ .name = ":authority", .value = "victim.test@attacker.test" }},
+        &.{.{ .name = ":authority", .value = "victim.test/path" }},
+        &.{.{ .name = ":authority", .value = "2001:db8::1" }},
+        &.{.{ .name = ":authority", .value = "[not-ipv6]" }},
+        &.{.{ .name = ":authority", .value = "victim\\attacker" }},
     };
 
     for (cases) |entries| {
@@ -4827,6 +4958,8 @@ test "HTTP2 server preserves custom methods and validates content length" {
         &ctx.authority_owned,
     );
     try std.testing.expectEqualStrings("PURGE", ctx.method_raw);
+    try Server.validateHTTP2Path("*");
+    try Server.validateHTTP2Authority("[2001:db8::1]:8443");
     try std.testing.expect(types.Method.fromString(ctx.method_raw) == null);
     try std.testing.expectEqual(@as(?u64, 5), try Server.requestContentLength(&ctx.request_headers));
     ctx.expected_content_length = 5;

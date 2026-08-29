@@ -4532,6 +4532,11 @@ const OperationImpl = struct {
             // protection, loss recovery, and mandatory control streams.
             return error.UnsupportedHttpVersion;
         }
+        if (self.req.uri.host) |request_host| {
+            if (self.proxy) |configured| {
+                if (configured.shouldBypassProxy(request_host)) self.proxy = null;
+            }
+        }
         if (self.shared.config.transport_adapter != null) {
             if (self.req.version == .HTTP_2) {
                 return error.UnsupportedStreamingTransport;
@@ -4544,11 +4549,6 @@ const OperationImpl = struct {
             self.protocol = .http1;
             try self.writeHttp1Head();
             return;
-        }
-        if (self.req.uri.host) |request_host| {
-            if (self.proxy) |configured| {
-                if (configured.shouldBypassProxy(request_host)) self.proxy = null;
-            }
         }
         if (self.unix_socket_path) |path| {
             if (wants_h2 or self.req.uri.isTLS()) return error.UnsupportedStreamingTransport;
@@ -7822,6 +7822,58 @@ test "Client.open header timeout bounds the whole trickle phase" {
     });
     defer operation_value.deinit();
     try std.testing.expectError(error.Timeout, operation_value.finishRequest(null));
+}
+
+test "Client.open applies no_proxy after interceptors select the final host" {
+    const Fixture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn write(context_ptr: *anyopaque, data: []const u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            try self.bytes.appendSlice(std.testing.allocator, data);
+            return data.len;
+        }
+        fn read(_: *anyopaque, _: []u8) !usize {
+            return 0;
+        }
+    };
+    var fixture = Fixture{};
+    defer fixture.bytes.deinit(std.testing.allocator);
+    var adapter = TransportAdapter{
+        .context = &fixture,
+        .writeFn = Fixture.write,
+        .readFn = Fixture.read,
+    };
+    var client = Client.initWithConfig(std.testing.allocator, .{
+        .transport_adapter = &adapter,
+        .proxy = .{
+            .kind = .http,
+            .host = "proxy.test",
+            .port = 8080,
+            .no_proxy = "target.test",
+        },
+        .policy = types.ClientPolicy.embeddingOwned(),
+    });
+    defer client.deinit();
+    try client.addInterceptor(.{
+        .request_fn = &struct {
+            fn selectTarget(
+                request: *Request,
+                _: *const AttemptContext,
+                _: ?*anyopaque,
+            ) anyerror!void {
+                request.uri = try Uri.parse("http://target.test/final");
+                try request.headers.set(HeaderName.HOST, "target.test");
+            }
+        }.selectTarget,
+    });
+    var operation_value = try client.open(.GET, "http://other.test/original", .{});
+    defer operation_value.deinit();
+    try std.testing.expect(mem.startsWith(
+        u8,
+        fixture.bytes.items,
+        "GET /final HTTP/1.1\r\n",
+    ));
+    operation_value.abort();
 }
 
 test "RequestOptions builder helpers" {
