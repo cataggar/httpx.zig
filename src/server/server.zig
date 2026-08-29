@@ -3981,7 +3981,8 @@ fn streamingTestSocketPair() ![2]Socket {
 }
 
 test "TLS streaming headers preserve values larger than one record" {
-    const modes = [_]enum { chunked, raw }{ .chunked, .raw };
+    const Mode = enum { chunked, raw };
+    const modes = [_]Mode{ .chunked, .raw };
     const key = [_]u8{0x5a} ** 32;
     const iv = [_]u8{0xa5} ** 12;
 
@@ -4026,11 +4027,35 @@ test "TLS streaming headers preserve values larger than one record" {
         defer context.deinit();
         try context.data.put("__stream_writer", @ptrCast(&stream_writer));
 
-        _ = switch (mode) {
-            .chunked => try context.startStreaming(200, &headers),
-            .raw => try context.startRawStreaming(200, &headers),
+        const Writer = struct {
+            context: *Context,
+            headers: *const Headers,
+            sender: *Socket,
+            mode: Mode,
+            failure: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                _ = switch (self.mode) {
+                    .chunked => self.context.startStreaming(200, self.headers),
+                    .raw => self.context.startRawStreaming(200, self.headers),
+                } catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.sender.shutdownWrite() catch |err| {
+                    self.failure = err;
+                };
+            }
         };
-        try sender.shutdownWrite();
+        var writer = Writer{
+            .context = &context,
+            .headers = &headers,
+            .sender = &sender,
+            .mode = mode,
+        };
+        const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+        var writer_joined = false;
+        defer if (!writer_joined) writer_thread.join();
 
         var expected = std.ArrayList(u8).empty;
         defer expected.deinit(std.testing.allocator);
@@ -4050,6 +4075,9 @@ test "TLS streaming headers preserve values larger than one record" {
             if (n == 0) return error.UnexpectedEof;
             try actual.appendSlice(std.testing.allocator, read_buf[0..n]);
         }
+        writer_thread.join();
+        writer_joined = true;
+        if (writer.failure) |err| return err;
 
         try std.testing.expect(context.streaming_done);
         try std.testing.expect(tls_sender.write_seq > 1);
