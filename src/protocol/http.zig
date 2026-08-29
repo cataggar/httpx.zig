@@ -750,10 +750,7 @@ fn containsCRLF(s: []const u8) bool {
 /// Validates that the request target and header values do not contain
 /// CRLF sequences to prevent HTTP request splitting attacks.
 pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
-    if (containsCRLF(req.uri.path)) return error.InvalidUri;
-    if (req.uri.query) |q| {
-        if (containsCRLF(q)) return error.InvalidUri;
-    }
+    try req.validateWireTarget();
     for (req.headers.entries.items) |h| {
         if (containsCRLF(h.name)) return error.InvalidHeaderName;
         if (containsCRLF(h.value)) return error.InvalidHeaderValue;
@@ -763,18 +760,7 @@ pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
     errdefer buffer.deinit(allocator);
     const writer = list_writer.init(allocator, &buffer);
 
-    const method_str = if (req.method == .CUSTOM)
-        req.custom_method orelse return error.InvalidMethod
-    else
-        req.method.toString();
-    if (method_str.len == 0) return error.InvalidMethod;
-    for (method_str) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null)
-        {
-            return error.InvalidMethod;
-        }
-    }
+    const method_str = try req.validateMethod();
     try writer.print("{s} {s}", .{ method_str, req.uri.path });
     if (req.uri.query) |q| {
         try writer.print("?{s}", .{q});
@@ -1215,6 +1201,29 @@ test "formatRequest serializes the actual custom method token" {
     const formatted = try formatRequest(&request, std.testing.allocator);
     defer std.testing.allocator.free(formatted);
     try std.testing.expect(std.mem.startsWith(u8, formatted, "PURGE /cache HTTP/1.1\r\n"));
+}
+
+test "all request serializers reject unsafe request targets" {
+    const targets = [_][]const u8{
+        "http://example.test/has space",
+        "http://example.test/has\ttab",
+        "http://example.test/has\x00nul",
+        "http://example.test/has\x7fdel",
+    };
+    for (targets) |target| {
+        var request = try Request.init(std.testing.allocator, .GET, target);
+        defer request.deinit();
+        try std.testing.expectError(
+            error.InvalidRequestTarget,
+            formatRequest(&request, std.testing.allocator),
+        );
+        var bytes = std.ArrayList(u8).empty;
+        defer bytes.deinit(std.testing.allocator);
+        try std.testing.expectError(
+            error.InvalidRequestTarget,
+            request.serialize(list_writer.init(std.testing.allocator, &bytes)),
+        );
+    }
 }
 
 test "SETTINGS_ENABLE_PUSH is endpoint-role constrained" {

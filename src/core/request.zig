@@ -85,6 +85,20 @@ pub const Request = struct {
         if (previous) |existing| self.allocator.free(existing);
     }
 
+    pub fn validateMethod(self: *const Self) ![]const u8 {
+        const method = if (self.method == .CUSTOM)
+            self.custom_method orelse return error.InvalidMethod
+        else
+            self.method.toString();
+        if (!isValidMethodToken(method)) return error.InvalidMethod;
+        return method;
+    }
+
+    pub fn validateWireTarget(self: *const Self) !void {
+        _ = try self.validateMethod();
+        try self.uri.validateRequestTarget();
+    }
+
     /// Sets the request body with ownership.
     pub fn setBody(self: *Self, body: []const u8) !void {
         if (self.body_owned) {
@@ -227,10 +241,8 @@ pub const Request = struct {
 
     /// Serializes the request to HTTP/1.1 wire format.
     pub fn serialize(self: *const Self, writer: anytype) !void {
-        const method_str = if (self.method == .CUSTOM)
-            self.custom_method orelse "CUSTOM"
-        else
-            self.method.toString();
+        try self.validateWireTarget();
+        const method_str = try self.validateMethod();
 
         const path = self.uri.path;
         const version_str = self.version.toString();

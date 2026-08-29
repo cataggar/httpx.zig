@@ -4960,6 +4960,19 @@ const OperationImpl = struct {
         };
         self.response_head_ready = status_code < 100 or status_code >= 200;
 
+        const no_body = !self.req.method.hasResponseBody() or
+            (status_code >= 100 and status_code < 200) or
+            status_code == 204 or
+            status_code == 304;
+        if (no_body) {
+            self.response_body_kind = .none;
+            if (self.response_head_ready) {
+                self.encoded_body_complete = true;
+                self.decoded_body_complete = true;
+            }
+            return status_code;
+        }
+
         const encoding = self.response_headers.get(HeaderName.CONTENT_ENCODING);
         const enforce_raw_limit = self.decompression == .disabled or
             encoding == null or
@@ -10506,6 +10519,55 @@ test "buffered Client.request preserves chunked response trailers" {
     server_thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
+}
+
+test "HTTP1 no-body responses ignore payload metadata before limits and decoders" {
+    const no_body_headers =
+        "Content-Length: 999999\r\n" ++
+        "Content-Encoding: gzip\r\n" ++
+        "Connection: close\r\n\r\n";
+    const responses = [_][]const u8{
+        "HTTP/1.1 200 OK\r\n" ++ no_body_headers,
+        "HTTP/1.1 204 No Content\r\n" ++ no_body_headers,
+        "HTTP/1.1 304 Not Modified\r\n" ++ no_body_headers,
+        "HTTP/1.1 103 Early Hints\r\n" ++ no_body_headers ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    };
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+    const url = try policyTestUrl(std.testing.allocator, &listener, "/no-body");
+    defer std.testing.allocator.free(url);
+    var client = Client.initWithConfig(std.testing.allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    const methods = [_]types.Method{ .HEAD, .GET, .GET, .GET };
+    const statuses = [_]u16{ 200, 204, 304, 200 };
+    for (methods, statuses) |method, expected_status| {
+        var op = try client.open(method, url, .{
+            .response_limit = .{ .bytes = 1 },
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        const head = try op.finishRequest(null);
+        try std.testing.expectEqual(expected_status, head.status.code);
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try op.read(&byte));
+        try op.finish(.{});
+    }
+    thread.join();
+    joined = true;
+    if (server.failure) |err| return err;
 }
 
 test "public streaming incrementally decodes gzip deflate brotli and zstd with decoded limits" {
