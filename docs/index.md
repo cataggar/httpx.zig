@@ -256,4 +256,29 @@ var response = client.get(url, .{ .timeout_ms = 10_000 }) catch |err| {
 defer response.deinit();
 ```
 
+For bounded-memory uploads and downloads, use the single-owner streaming
+operation:
+
+```zig
+var op = try client.open(.PUT, url, .{
+  .body_mode = .{ .content_length = size },
+  .cancel_token = &token,
+  .response_limit = .unlimited,
+});
+defer op.deinit();
+
+while (source.next()) |chunk| try op.writeAll(chunk);
+_ = try op.finishRequest(null);
+var buffer: [32 * 1024]u8 = undefined;
+while (try op.read(&buffer) != 0) {}
+try op.finish(.{ .drain_timeout_ms = 5_000 });
+```
+
+The same lifecycle drives HTTP/1, HTTP/2, HTTP/3, and buffered convenience
+requests. Cancellation is checked during DNS UDP/TCP, connect and pool waits,
+proxy negotiation, TLS records/handshake/reconnect, upload, response reads,
+flow-control waits, and drains. System `getaddrinfo` runs in a heap-owned
+worker: cancellation stops waiting immediately, while the non-interruptible
+platform call finishes and self-cleans in the background.
+
 For detailed target-matrix instructions, see [Installation](/guide/installation#validation-and-target-matrix).

@@ -985,6 +985,23 @@ pub const Socket = struct {
         timeout_ms: u64,
         context: *const IoContext,
     ) !void {
+        return self.connectSockaddrWithContext(
+            &addr.any,
+            addr.getOsSockLen(),
+            timeout_ms,
+            context,
+        );
+    }
+
+    /// Context-aware connect for address families represented by a raw
+    /// sockaddr, including Unix-domain sockets.
+    pub fn connectSockaddrWithContext(
+        self: *Self,
+        addr_ptr: *const posix.sockaddr,
+        addr_len: posix.socklen_t,
+        timeout_ms: u64,
+        context: *const IoContext,
+    ) !void {
         try context.check();
         const deadline_ns = if (timeout_ms > 0)
             io_context.monotonicNowNs() +| io_context.millisecondsToNanoseconds(timeout_ms)
@@ -995,12 +1012,12 @@ pub const Socket = struct {
         defer setSocketNonBlocking(self.handle, false) catch {};
 
         if (is_windows) {
-            const rc = winsock.connect(toWinsockSocket(self.handle), &addr.any, @intCast(addr.getOsSockLen()));
+            const rc = winsock.connect(toWinsockSocket(self.handle), addr_ptr, @intCast(addr_len));
             if (rc != 0 and winsock.WSAGetLastError() != winsock.WSAEWOULDBLOCK) {
                 return error.ConnectFailed;
             }
         } else {
-            const rc = posix.system.connect(self.handle, &addr.any, addr.getOsSockLen());
+            const rc = posix.system.connect(self.handle, addr_ptr, addr_len);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     self.connected = true;

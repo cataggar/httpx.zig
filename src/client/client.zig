@@ -31,6 +31,7 @@ const h2stream = @import("../protocol/stream.zig");
 const qpack = @import("../protocol/qpack.zig");
 const quic = @import("../protocol/quic.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
+const ParserBodySink = @import("../protocol/parser.zig").BodySink;
 const tls_mod = @import("../tls/tls.zig");
 const TLSConfig = tls_mod.TLSConfig;
 const TLSSession = tls_mod.TLSSession;
@@ -43,6 +44,8 @@ const PoolStats = @import("pool.zig").PoolStats;
 const common = @import("../data/common.zig");
 const list_writer = @import("../io/list_writer.zig");
 const compression_util = @import("../compress/compression.zig");
+const brotli_pkg = @import("brotli");
+const zstd_pkg = @import("zstd");
 const io_util = @import("../io/any_io.zig");
 const io_context = @import("../io/context.zig");
 const IoContext = io_context.IoContext;
@@ -62,6 +65,7 @@ pub const ResponseHead = operation.ResponseHead;
 pub const ContinueResult = operation.ContinueResult;
 pub const FinishOptions = operation.FinishOptions;
 pub const ClientOperation = operation.ClientOperation;
+const RequestProgress = operation.RequestProgress;
 
 const RequestTimeouts = struct {
     connect_ms: u64,
@@ -102,6 +106,8 @@ pub const ClientConfig = struct {
     dns_resolver: ?*dns_mod.DNSResolver = null,
     /// Compression options for request body compression. Null disables compression.
     request_compression: ?compression_util.CompressOptions = null,
+    /// Maximum time spent draining a partially consumed response in finish().
+    drain_timeout_ms: u64 = 5_000,
 
     /// Returns default client configuration.
     pub fn defaults() ClientConfig {
@@ -655,7 +661,13 @@ pub const Client = struct {
 
     /// Creates a new HTTP client with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ClientConfig) Self {
-        const shared = allocator.create(ClientState) catch @panic("httpx.Client state allocation failed");
+        return tryInitWithConfig(allocator, config) catch
+            @panic("httpx.Client state allocation failed");
+    }
+
+    /// Fallible initialization for allocation-constrained environments.
+    pub fn tryInitWithConfig(allocator: Allocator, config: ClientConfig) !Self {
+        const shared = try allocator.create(ClientState);
         shared.* = .{
             .backing_allocator = allocator,
             .config = config,
@@ -803,10 +815,7 @@ pub const Client = struct {
             return result.addresses[0];
         }
 
-        // The platform getaddrinfo path is blocking and cannot be
-        // synchronously cancelled. Check immediately before and after it.
-        const resolved = address_mod.resolve(self.allocator, hostname, port);
-        return context.unwrapAfterBlocking(address_mod.Address, resolved);
+        return address_mod.resolveWithContext(hostname, port, context);
     }
 
     /// Logs a formatted message. If config.log_fn is provided, delegates to it.
@@ -1594,32 +1603,23 @@ pub const Client = struct {
         const unix_socket_path = reqOpts.unix_socket_path orelse self.shared.config.unix_socket_path;
 
         const host = req.uri.host orelse return error.InvalidUri;
-        const port = req.uri.effectivePort();
 
         var effective_proxy = reqOpts.proxy orelse self.shared.config.proxy;
         if (effective_proxy) |p| {
             if (p.shouldBypassProxy(host)) effective_proxy = null;
         }
 
-        const wants_http2 = self.shared.config.http2_enabled or req.version == .HTTP_2;
-        const wants_http3 = self.shared.config.http3_enabled or req.version == .HTTP_3;
-
-        if (!wants_http3 or (effective_proxy != null and wants_http2)) {
-            return self.executeBufferedThroughOperation(
-                req,
-                reqOpts,
-                effective_policy,
-                context,
-                keep_alive,
-                effective_proxy,
-                verify_ssl,
-                unix_socket_path,
-                timeouts,
-            );
-        }
-
-        if (effective_proxy != null) return error.ProxyNotSupported;
-        return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, effective_policy, context);
+        return self.executeBufferedThroughOperation(
+            req,
+            reqOpts,
+            effective_policy,
+            context,
+            keep_alive,
+            effective_proxy,
+            verify_ssl,
+            unix_socket_path,
+            timeouts,
+        );
     }
 
     fn executeBufferedThroughOperation(
@@ -1648,7 +1648,7 @@ pub const Client = struct {
             unix_socket_path,
             timeouts,
             context.*,
-            .disabled,
+            effective_policy.decompression,
             0,
         );
         defer op.deinit();
@@ -1675,20 +1675,8 @@ pub const Client = struct {
         }
 
         if (collected.items.len > 0) {
-            if (effective_policy.decompression == .enabled) {
-                if (response.headers.get(HeaderName.CONTENT_ENCODING)) |encoding_text| {
-                    if (compression_util.ContentEncoding.fromString(encoding_text)) |encoding| {
-                        if (encoding != .identity) {
-                            response.body = try compression_util.decompress(self.allocator, encoding, collected.items);
-                            response.body_owned = true;
-                        }
-                    }
-                }
-            }
-            if (response.body == null) {
-                response.body = try collected.toOwnedSlice(self.allocator);
-                response.body_owned = true;
-            }
+            response.body = try collected.toOwnedSlice(self.allocator);
+            response.body_owned = true;
         }
 
         try op.finish(.{});
@@ -2915,22 +2903,40 @@ pub const Client = struct {
     /// When TLS 1.3 fails and the server closes the TCP connection,
     /// the reconnect callback creates a fresh socket for the TLS 1.2 retry.
     const ReconnectContext = struct {
+        client: *Client,
         allocator: Allocator,
         host: []const u8,
         port: u16,
+        connect_timeout_ms: u64,
+        io_context: ?*const IoContext = null,
         socket: ?*Socket = null,
+        failure: ?anyerror = null,
     };
 
     fn reconnectCallback(ctx_ptr: ?*anyopaque) ?*Socket {
         const ctx: *ReconnectContext = @ptrCast(@alignCast(ctx_ptr.?));
         // Resolve address first to create the correct socket family (IPv4/IPv6).
-        const addr = address_mod.resolve(ctx.allocator, ctx.host, ctx.port) catch return null;
+        const addr = if (ctx.io_context) |ctx_io|
+            ctx.client.resolveAddress(ctx.host, ctx.port, ctx_io) catch |err| {
+                ctx.failure = err;
+                return null;
+            }
+        else
+            address_mod.resolve(ctx.allocator, ctx.host, ctx.port) catch |err| {
+                ctx.failure = err;
+                return null;
+            };
         const socket = ctx.allocator.create(Socket) catch return null;
         socket.* = Socket.createForAddress(addr) catch {
             ctx.allocator.destroy(socket);
             return null;
         };
-        socket.connect(addr) catch {
+        const connect_result = if (ctx.io_context) |ctx_io|
+            socket.connectWithContext(addr, ctx.connect_timeout_ms, ctx_io)
+        else
+            socket.connectWithTimeout(addr, ctx.connect_timeout_ms);
+        connect_result catch |err| {
+            ctx.failure = err;
             socket.close();
             ctx.allocator.destroy(socket);
             return null;
@@ -2949,9 +2955,11 @@ pub const Client = struct {
         allow_reconnect: bool,
     ) !void {
         var reconnect_ctx = ReconnectContext{
+            .client = self,
             .allocator = self.allocator,
             .host = host,
             .port = port,
+            .connect_timeout_ms = self.shared.config.timeouts.connect_ms,
         };
         errdefer if (reconnect_ctx.socket) |socket| {
             socket.close();
@@ -2976,6 +2984,50 @@ pub const Client = struct {
         }
     }
 
+    fn handshakePooledTlsWithContext(
+        self: *Self,
+        lease: *ConnectionLease,
+        session: *TLSSession,
+        host: []const u8,
+        port: u16,
+        allow_reconnect: bool,
+        connect_timeout_ms: u64,
+        context: *const IoContext,
+    ) !void {
+        var reconnect_ctx = ReconnectContext{
+            .client = self,
+            .allocator = self.allocator,
+            .host = host,
+            .port = port,
+            .connect_timeout_ms = connect_timeout_ms,
+            .io_context = context,
+        };
+        errdefer if (reconnect_ctx.socket) |socket| {
+            socket.close();
+            self.allocator.destroy(socket);
+        };
+
+        if (allow_reconnect) {
+            session.reconnect_fn = reconnectCallback;
+            session.reconnect_ctx = &reconnect_ctx;
+        }
+        defer {
+            session.reconnect_fn = null;
+            session.reconnect_ctx = null;
+        }
+
+        session.handshakeWithContext(host, context) catch |err| {
+            try context.check();
+            return reconnect_ctx.failure orelse err;
+        };
+        if (reconnect_ctx.socket) |socket| {
+            const replacement = socket.*;
+            self.allocator.destroy(socket);
+            reconnect_ctx.socket = null;
+            lease.replaceSocket(replacement);
+        }
+    }
+
     fn executeTLSHttp(
         self: *Self,
         socket: *Socket,
@@ -2991,9 +3043,11 @@ pub const Client = struct {
         // When TLS 1.3 fails and the server closes the connection,
         // we need a fresh TCP socket for the TLS 1.2 retry.
         var reconnect_ctx = ReconnectContext{
+            .client = self,
             .allocator = self.allocator,
             .host = host,
             .port = port,
+            .connect_timeout_ms = self.shared.config.timeouts.connect_ms,
             .socket = null,
         };
         // Ensure reconnect socket is cleaned up on any error
@@ -3619,6 +3673,7 @@ pub fn JsonBorrowedResult(comptime T: type) type {
 const OperationProtocol = enum {
     http1,
     http2,
+    http3,
 };
 
 const OperationState = enum {
@@ -3634,6 +3689,100 @@ const Http1BodyKind = enum {
     chunked,
     close_delimited,
     http2,
+};
+
+const ContentDecoderKind = enum {
+    none,
+    gzip,
+    deflate,
+    br,
+    zstd,
+};
+
+const OperationEncodedReader = struct {
+    operation: *OperationImpl,
+    buffer: [16 * 1024]u8 = undefined,
+    reader: std.Io.Reader = undefined,
+
+    fn init(self: *@This(), operation_impl: *OperationImpl) void {
+        self.operation = operation_impl;
+        self.reader = .{
+            .vtable = &vtable,
+            .buffer = &self.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn parent(reader: *std.Io.Reader) *@This() {
+        return @fieldParentPtr("reader", reader);
+    }
+
+    fn readVec(reader: *std.Io.Reader, buffers: [][]u8) std.Io.Reader.Error!usize {
+        var vectors: [4][]u8 = undefined;
+        const destination_count, const data_size = try reader.writableVector(&vectors, buffers);
+        const destinations = vectors[0..destination_count];
+        if (destinations.len == 0 or destinations[0].len == 0) return 0;
+        const self = parent(reader);
+        const n = self.operation.readEncodedProtocol(destinations[0]) catch |err| {
+            self.operation.decoder_io_error = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            reader.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+        while (total < max_limit) {
+            const max_to_read = @min(reader.buffer.len, max_limit - total);
+            var buffers = [_][]u8{reader.buffer[0..max_to_read]};
+            const n = readVec(reader, &buffers) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            try writer.writeAll(reader.buffer[0..n]);
+            total += n;
+        }
+        return total;
+    }
+
+    fn discard(reader: *std.Io.Reader, limit: std.Io.Limit) error{ EndOfStream, ReadFailed }!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+        while (total < max_limit) {
+            const max_to_read = @min(reader.buffer.len, max_limit - total);
+            var buffers = [_][]u8{reader.buffer[0..max_to_read]};
+            const n = try readVec(reader, &buffers);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
+    fn rebase(reader: *std.Io.Reader, _: usize) std.Io.Reader.RebaseError!void {
+        const data = reader.buffer[reader.seek..reader.end];
+        @memmove(reader.buffer[0..data.len], data);
+        reader.seek = 0;
+        reader.end = data.len;
+    }
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = stream,
+        .discard = discard,
+        .readVec = readVec,
+        .rebase = rebase,
+    };
 };
 
 const OperationImpl = struct {
@@ -3663,7 +3812,7 @@ const OperationImpl = struct {
     terminal_disposition: ?pool_mod.LeaseDisposition = null,
     owner_lock: std.atomic.Value(u32) = .init(0),
 
-    request_bytes: u64 = 0,
+    request_progress: RequestProgress,
     request_framing_complete: bool = false,
     response_bytes: u64 = 0,
     response_headers: Headers,
@@ -3673,8 +3822,26 @@ const OperationImpl = struct {
     response_keep_alive: bool = false,
     response_body_kind: Http1BodyKind = .none,
     response_remaining: u64 = 0,
-    chunk_remaining: u64 = 0,
-    chunk_needs_crlf: bool = false,
+    http1_parser: Parser,
+    decoder_kind: ContentDecoderKind = .none,
+    decoder_initialized: bool = false,
+    encoded_body_complete: bool = false,
+    decoded_body_complete: bool = false,
+    decoded_bytes: u64 = 0,
+    decoder_io_error: ?anyerror = null,
+    encoded_reader: OperationEncodedReader = undefined,
+    flate_decoder: ?std.compress.flate.Decompress = null,
+    flate_window: [std.compress.flate.max_window_len]u8 = undefined,
+    brotli_decoder: ?brotli_pkg.Decoder = null,
+    zstd_decoder: ?zstd_pkg.StreamingDecompressor = null,
+    decoder_input: [16 * 1024]u8 = undefined,
+    decoder_input_pos: usize = 0,
+    decoder_input_len: usize = 0,
+    // Zstd blocks can expand to 128 KiB even though caller/transport buffers
+    // remain capped at 64 KiB.
+    decoder_output: [128 * 1024]u8 = undefined,
+    decoder_output_pos: usize = 0,
+    decoder_output_len: usize = 0,
 
     h2_stream_id: ?u31 = null,
     h2_peer_max_frame_size: u32 = 16_384,
@@ -3682,11 +3849,24 @@ const OperationImpl = struct {
     h2_early_frame_index: usize = 0,
     h2_early_frame_bytes: usize = 0,
     h2_pending_headers: std.ArrayList(u8) = .empty,
-    h2_pending_headers_flags: u8 = 0,
     h2_data_start: usize = 0,
     h2_data_end: usize = 0,
     h2_data_end_stream: bool = false,
     h2_expected_length: ?u64 = null,
+
+    udp_socket: ?UdpSocket = null,
+    h3_session: HTTP3QUICSession = undefined,
+    h3_qpack_encoder: ?qpack.QPACKContext = null,
+    h3_qpack_decoder: ?qpack.QPACKContext = null,
+    h3_request_offset: u64 = 0,
+    h3_control_offset: u64 = 0,
+    h3_stream_pos: usize = 0,
+    h3_stream_len: usize = 0,
+    h3_stream_fin: bool = false,
+    h3_frame_type: ?u64 = null,
+    h3_frame_remaining: u64 = 0,
+    h3_header_block: std.ArrayList(u8) = .empty,
+    h3_expected_length: ?u64 = null,
 
     read_buffer: [64 * 1024]u8 = undefined,
     read_pos: usize = 0,
@@ -3723,8 +3903,12 @@ const OperationImpl = struct {
             .owns_request = owns_request,
             .owned_url = owned_url,
             .body_mode = body_mode,
+            .request_progress = .{ .mode = body_mode },
             .response_limit = switch (response_limit) {
-                .inherit => client.shared.config.max_response_size,
+                .inherit => if (client.shared.config.max_response_size == 0)
+                    null
+                else
+                    client.shared.config.max_response_size,
                 .unlimited => null,
                 .bytes => |limit| limit,
             },
@@ -3739,6 +3923,7 @@ const OperationImpl = struct {
             .logical_request_id = logical_request_id,
             .response_headers = Headers.init(client.allocator),
             .response_trailers = Headers.init(client.allocator),
+            .http1_parser = Parser.initResponse(client.allocator),
         };
     }
 
@@ -3747,6 +3932,9 @@ const OperationImpl = struct {
     }
 
     fn acquireOwner(self: *Self) !void {
+        if (self.tryAcquireOwner()) return;
+        if (!self.context.isCancelled()) return error.ConcurrentOperationUse;
+        while (self.owner_lock.load(.acquire) != 0) std.Thread.yield() catch {};
         if (!self.tryAcquireOwner()) return error.ConcurrentOperationUse;
     }
 
@@ -3754,27 +3942,48 @@ const OperationImpl = struct {
         self.owner_lock.store(0, .release);
     }
 
-    fn setPhase(self: *Self, timeout_ms: u64) void {
-        self.context.setPhaseDeadline(if (timeout_ms > 0) Deadline.afterMs(timeout_ms) else null);
+    fn beginPhase(self: *Self, timeout_ms: u64) ?Deadline {
+        const previous = self.context.phase_deadline;
+        if (timeout_ms == 0) return previous;
+        const candidate = Deadline.afterMs(timeout_ms);
+        self.context.setPhaseDeadline(if (previous) |existing|
+            Deadline.at(@min(existing.at_ns, candidate.at_ns))
+        else
+            candidate);
+        return previous;
     }
 
-    fn clearPhase(self: *Self) void {
-        self.context.setPhaseDeadline(null);
+    fn endPhase(self: *Self, previous: ?Deadline) void {
+        self.context.setPhaseDeadline(previous);
     }
 
     fn start(self: *Self) !void {
         try self.context.check();
         const wants_h2 = self.client.shared.config.http2_enabled or self.req.version == .HTTP_2;
-        if (self.req.version == .HTTP_3 or self.client.shared.config.http3_enabled) {
-            return error.StreamingHTTP3Unsupported;
+        const wants_h3 = self.client.shared.config.http3_enabled or self.req.version == .HTTP_3;
+        if (self.req.uri.host) |request_host| {
+            if (self.proxy) |configured| {
+                if (configured.shouldBypassProxy(request_host)) self.proxy = null;
+            }
+        }
+        if (wants_h3) {
+            if (self.proxy == null) {
+                try self.startHttp3();
+                return;
+            }
+            if (!wants_h2) return error.ProxyNotSupported;
         }
 
         if (self.unix_socket_path) |path| {
             if (wants_h2 or self.req.uri.isTLS()) return error.UnsupportedStreamingTransport;
             const unix_mod = @import("../net/unix.zig");
-            try self.context.check();
-            const unix_sock = try unix_mod.UnixClient.connect(path);
-            try self.context.check();
+            const previous_phase = self.beginPhase(self.timeouts.connect_ms);
+            defer self.endPhase(previous_phase);
+            const unix_sock = try unix_mod.UnixClient.connectWithContext(
+                path,
+                self.timeouts.connect_ms,
+                &self.context,
+            );
             self.owned_socket = Socket.fromHandle(unix_sock.fd);
             try self.writeHttp1Head();
             return;
@@ -3782,14 +3991,10 @@ const OperationImpl = struct {
 
         const host = self.req.uri.host orelse return error.InvalidUri;
         const port = self.req.uri.effectivePort();
-        var effective_proxy = self.proxy;
-        if (effective_proxy) |configured| {
-            if (configured.shouldBypassProxy(host)) effective_proxy = null;
-        }
-        self.proxy = effective_proxy;
+        const effective_proxy = self.proxy;
 
-        self.setPhase(self.timeouts.connect_ms);
-        defer self.clearPhase();
+        const previous_phase = self.beginPhase(self.timeouts.connect_ms);
+        defer self.endPhase(previous_phase);
         self.lease = try self.client.shared.pool.getLeaseWithContext(.{
             .scheme = if (self.req.uri.isTLS()) .tls else .plain,
             .host = host,
@@ -3825,7 +4030,17 @@ const OperationImpl = struct {
                     TLSConfig.insecure(self.allocator);
                 break :session self.lease.?.initializeTls(config);
             };
-            if (existing_session == null) try session.handshakeWithContext(host, &self.context);
+            if (existing_session == null) {
+                try self.client.handshakePooledTlsWithContext(
+                    &self.lease.?,
+                    session,
+                    host,
+                    port,
+                    effective_proxy == null,
+                    self.timeouts.connect_ms,
+                    &self.context,
+                );
+            }
             self.tls_active = true;
 
             const negotiated = http.negotiateVersion(session.negotiatedProtocol());
@@ -3841,6 +4056,7 @@ const OperationImpl = struct {
         switch (self.protocol) {
             .http1 => try self.writeHttp1Head(),
             .http2 => try self.startHttp2(),
+            .http3 => unreachable,
         }
     }
 
@@ -3855,8 +4071,8 @@ const OperationImpl = struct {
 
     fn transportWriteAll(self: *Self, data: []const u8) !void {
         try self.context.check();
-        self.setPhase(self.timeouts.write_ms);
-        defer self.clearPhase();
+        const previous_phase = self.beginPhase(self.timeouts.write_ms);
+        defer self.endPhase(previous_phase);
         if (self.tls_active) {
             try self.tlsSession().writeAllWithContext(data, &self.context);
             try self.tlsSession().flush();
@@ -3868,8 +4084,8 @@ const OperationImpl = struct {
 
     fn transportRead(self: *Self, output: []u8) !usize {
         try self.context.check();
-        self.setPhase(self.timeouts.read_ms);
-        defer self.clearPhase();
+        const previous_phase = self.beginPhase(self.timeouts.read_ms);
+        defer self.endPhase(previous_phase);
         const n = if (self.tls_active)
             try self.tlsSession().readWithContext(output, &self.context)
         else
@@ -3938,17 +4154,16 @@ const OperationImpl = struct {
         switch (self.body_mode) {
             .none => return error.RequestBodyNotAllowed,
             .content_length => |length| {
-                const next = std.math.add(u64, self.request_bytes, data.len) catch
-                    return error.RequestBodyOverrun;
-                if (next > length) return error.RequestBodyOverrun;
+                _ = length;
+                const next = try self.request_progress.validateWrite(data.len);
                 try self.writeProtocolData(data);
-                self.request_bytes = next;
+                self.request_progress.commit(next);
                 return data.len;
             },
             .chunked => {
+                const next = try self.request_progress.validateWrite(data.len);
                 try self.writeProtocolData(data);
-                self.request_bytes = std.math.add(u64, self.request_bytes, data.len) catch
-                    return error.BodyLengthOverflow;
+                self.request_progress.commit(next);
                 return data.len;
             },
         }
@@ -3967,6 +4182,7 @@ const OperationImpl = struct {
                 else => try self.transportWriteAll(data),
             },
             .http2 => try self.writeHttp2Data(data, false),
+            .http3 => try self.writeHttp3Data(data),
         }
     }
 
@@ -3984,6 +4200,7 @@ const OperationImpl = struct {
             const code = switch (self.protocol) {
                 .http1 => try self.readHttp1Head(),
                 .http2 => try self.readHttp2Head(),
+                .http3 => try self.readHttp3Head(),
             };
             if (code == 100) {
                 self.continue_resolved = true;
@@ -3991,13 +4208,16 @@ const OperationImpl = struct {
             }
             if (code >= 100 and code < 200) continue;
             self.continue_resolved = true;
-            if (self.protocol == .http2) {
-                try self.writeHttp2Data(&.{}, true);
-                self.request_framing_complete = true;
-            } else {
-                self.response_keep_alive = false;
+            switch (self.protocol) {
+                .http2 => try self.writeHttp2Data(&.{}, true),
+                .http3 => try self.finishHttp3Request(null),
+                .http1 => self.response_keep_alive = false,
             }
-            self.state = if (self.response_body_kind == .none) .response_complete else .response_body;
+            self.request_framing_complete = self.protocol != .http1;
+            self.state = if (self.response_body_kind == .none and self.decoder_kind == .none)
+                .response_complete
+            else
+                .response_body;
             return .final_response;
         }
     }
@@ -4011,13 +4231,7 @@ const OperationImpl = struct {
             if (try self.waitForContinue() == .final_response) return &self.response_head;
         }
 
-        switch (self.body_mode) {
-            .none => {},
-            .content_length => |length| {
-                if (self.request_bytes != length) return error.RequestBodyUnderrun;
-            },
-            .chunked => {},
-        }
+        try self.request_progress.finish();
 
         switch (self.protocol) {
             .http1 => {
@@ -4053,6 +4267,7 @@ const OperationImpl = struct {
                     try self.writeHttp2Data(&.{}, true);
                 }
             },
+            .http3 => try self.finishHttp3Request(trailers),
         }
         self.request_framing_complete = true;
 
@@ -4060,48 +4275,16 @@ const OperationImpl = struct {
             const code = switch (self.protocol) {
                 .http1 => try self.readHttp1Head(),
                 .http2 => try self.readHttp2Head(),
+                .http3 => try self.readHttp3Head(),
             };
             if (code >= 100 and code < 200) continue;
             break;
         }
-        self.state = if (self.response_body_kind == .none) .response_complete else .response_body;
+        self.state = if (self.response_body_kind == .none and self.decoder_kind == .none)
+            .response_complete
+        else
+            .response_body;
         return &self.response_head;
-    }
-
-    fn fillReadBuffer(self: *Self) !bool {
-        if (self.read_pos < self.read_len) return true;
-        self.read_pos = 0;
-        self.read_len = try self.transportRead(&self.read_buffer);
-        return self.read_len != 0;
-    }
-
-    fn readRaw(self: *Self, output: []u8) !usize {
-        if (output.len == 0) return 0;
-        if (!try self.fillReadBuffer()) return 0;
-        const n = @min(output.len, self.read_len - self.read_pos);
-        @memcpy(output[0..n], self.read_buffer[self.read_pos..][0..n]);
-        self.read_pos += n;
-        return n;
-    }
-
-    fn readByte(self: *Self) !?u8 {
-        if (!try self.fillReadBuffer()) return null;
-        const byte = self.read_buffer[self.read_pos];
-        self.read_pos += 1;
-        return byte;
-    }
-
-    fn readLine(self: *Self) ![]const u8 {
-        var len: usize = 0;
-        while (true) {
-            const byte = (try self.readByte()) orelse return error.UnexpectedEof;
-            if (len >= self.line_buffer.len) return error.HeaderTooLarge;
-            self.line_buffer[len] = byte;
-            len += 1;
-            if (len >= 2 and self.line_buffer[len - 2] == '\r' and self.line_buffer[len - 1] == '\n') {
-                return self.line_buffer[0 .. len - 2];
-            }
-        }
     }
 
     fn readHttp1Head(self: *Self) !u16 {
@@ -4111,82 +4294,73 @@ const OperationImpl = struct {
         self.response_body_kind = .none;
         self.response_remaining = 0;
 
-        const status_line = try self.readLine();
-        var status_parts = mem.splitScalar(u8, status_line, ' ');
-        const version_text = status_parts.next() orelse return error.InvalidResponse;
-        const status_text = status_parts.next() orelse return error.InvalidResponse;
-        const version = types.Version.fromString(version_text) orelse return error.InvalidResponse;
-        const status_code = std.fmt.parseInt(u16, status_text, 10) catch return error.InvalidResponse;
-
-        var content_length: ?u64 = null;
-        var transfer_chunked = false;
-        var connection_close = false;
-        var connection_keep_alive = false;
-
-        while (true) {
-            const line = try self.readLine();
-            if (line.len == 0) break;
-            const separator = mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
-            const name = mem.trim(u8, line[0..separator], " \t");
-            const value = mem.trim(u8, line[separator + 1 ..], " \t");
-            if (name.len == 0) return error.InvalidHeader;
-            try self.response_headers.append(name, value);
-
-            if (std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH)) {
-                var values = mem.splitScalar(u8, value, ',');
-                var saw_value = false;
-                while (values.next()) |part| {
-                    const trimmed = mem.trim(u8, part, " \t");
-                    if (trimmed.len == 0) return error.InvalidContentLength;
-                    const parsed = std.fmt.parseInt(u64, trimmed, 10) catch
-                        return error.InvalidContentLength;
-                    saw_value = true;
-                    if (content_length) |existing| {
-                        if (existing != parsed) return error.InvalidContentLength;
-                    } else {
-                        content_length = parsed;
-                    }
+        self.http1_parser.reset();
+        self.http1_parser.mode = .response;
+        self.http1_parser.state = .status_line;
+        self.http1_parser.expect_body = self.req.method.hasResponseBody();
+        self.http1_parser.max_body_size = 0;
+        var sink = ParserBodySink{
+            .context = self,
+            .writeFn = struct {
+                fn reject(_: *anyopaque, _: []const u8) !usize {
+                    return 0;
                 }
-                if (!saw_value) return error.InvalidContentLength;
-            } else if (std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING)) {
-                if (transfer_chunked) return error.InvalidChunkEncoding;
-                var codings = mem.splitScalar(u8, value, ',');
-                var count: usize = 0;
-                while (codings.next()) |coding| {
-                    const trimmed = mem.trim(u8, coding, " \t");
-                    count += 1;
-                    if (!std.ascii.eqlIgnoreCase(trimmed, "chunked")) return error.InvalidChunkEncoding;
-                }
-                if (count != 1) return error.InvalidChunkEncoding;
-                transfer_chunked = true;
-            } else if (std.ascii.eqlIgnoreCase(name, HeaderName.CONNECTION)) {
-                if (std.ascii.indexOfIgnoreCase(value, "close") != null) connection_close = true;
-                if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) connection_keep_alive = true;
+            }.reject,
+        };
+
+        while (self.http1_parser.state == .status_line or
+            self.http1_parser.state == .headers or
+            self.http1_parser.state == .start)
+        {
+            if (self.read_pos == self.read_len) {
+                self.read_pos = 0;
+                self.read_len = try self.transportRead(&self.read_buffer);
+                if (self.read_len == 0) return error.UnexpectedEof;
+            }
+            const consumed = try self.http1_parser.feedTo(
+                self.read_buffer[self.read_pos..self.read_len],
+                &sink,
+            );
+            self.read_pos += consumed;
+            if (consumed == 0 and
+                (self.http1_parser.state == .status_line or self.http1_parser.state == .headers))
+            {
+                return error.ProtocolError;
             }
         }
 
-        if (transfer_chunked and content_length != null) return error.ConflictingFramingHeaders;
-        self.response_keep_alive = !connection_close and
-            (version == .HTTP_1_1 or connection_keep_alive);
+        const status_code = self.http1_parser.status_code orelse return error.InvalidResponse;
+        self.response_headers.deinit();
+        self.response_headers = self.http1_parser.headers;
+        self.http1_parser.headers = Headers.init(self.allocator);
+        self.response_keep_alive = self.http1_parser.isKeepAlive();
         self.response_head = .{
-            .version = version,
+            .version = self.http1_parser.version,
             .status = Status.fromCode(status_code),
             .headers = &self.response_headers,
         };
         self.response_head_ready = status_code < 100 or status_code >= 200;
 
-        const no_body = !self.req.method.hasResponseBody() or
-            (status_code >= 100 and status_code < 200) or
-            status_code == 204 or status_code == 304;
-        if (no_body) {
-            self.response_body_kind = .none;
-        } else if (transfer_chunked) {
-            self.response_body_kind = .chunked;
-        } else if (content_length) |length| {
+        const encoding = self.response_headers.get(HeaderName.CONTENT_ENCODING);
+        const enforce_raw_limit = self.decompression == .disabled or
+            encoding == null or
+            std.ascii.eqlIgnoreCase(encoding.?, "identity");
+        if (enforce_raw_limit) {
+            self.http1_parser.max_body_size = self.response_limit orelse 0;
             if (self.response_limit) |limit| {
-                if (length > limit) return error.ResponseTooLarge;
+                if (self.http1_parser.content_length) |length| {
+                    if (length > limit) return error.ResponseTooLarge;
+                }
             }
-            self.response_body_kind = if (length == 0) .none else .content_length;
+        }
+        try self.initializeContentDecoder();
+
+        if (self.http1_parser.isComplete()) {
+            self.response_body_kind = .none;
+        } else if (self.http1_parser.chunked) {
+            self.response_body_kind = .chunked;
+        } else if (self.http1_parser.content_length) |length| {
+            self.response_body_kind = .content_length;
             self.response_remaining = length;
         } else {
             self.response_body_kind = .close_delimited;
@@ -4209,101 +4383,276 @@ const OperationImpl = struct {
         if (self.state == .response_complete) return 0;
         if (self.state != .response_body) return error.InvalidOperationState;
         if (output.len == 0) return 0;
-        if (self.decompression == .enabled) {
-            if (self.response_headers.get(HeaderName.CONTENT_ENCODING)) |encoding| {
-                if (!std.ascii.eqlIgnoreCase(encoding, "identity")) {
-                    return error.StreamingDecompressionUnsupported;
-                }
-            }
-        }
+        if (self.decoder_kind != .none) return self.readDecodedResponse(output);
+        return self.readEncodedProtocol(output);
+    }
 
+    fn readEncodedProtocol(self: *Self, output: []u8) !usize {
         return switch (self.protocol) {
             .http1 => self.readHttp1Body(output),
             .http2 => self.readHttp2Body(output),
+            .http3 => self.readHttp3Body(output),
         };
     }
 
-    fn readHttp1Body(self: *Self, output: []u8) !usize {
-        switch (self.response_body_kind) {
-            .none => {
-                self.state = .response_complete;
-                return 0;
-            },
-            .content_length => {
-                if (self.response_remaining == 0) {
-                    if (self.read_pos != self.read_len) return error.ResponseBodyOverrun;
-                    self.state = .response_complete;
-                    return 0;
-                }
-                const want: usize = @intCast(@min(@as(u64, output.len), self.response_remaining));
-                const n = try self.readRaw(output[0..want]);
-                if (n == 0) return error.ResponseBodyUnderrun;
-                try self.countResponseBytes(n);
-                self.response_remaining -= n;
-                if (self.response_remaining == 0 and self.read_pos != self.read_len) {
-                    return error.ResponseBodyOverrun;
-                }
-                return n;
-            },
-            .close_delimited => {
-                const n = try self.readRaw(output);
-                if (n == 0) {
-                    self.state = .response_complete;
-                    return 0;
-                }
-                try self.countResponseBytes(n);
-                return n;
-            },
-            .chunked => {
-                while (true) {
-                    if (self.chunk_needs_crlf) {
-                        const first = (try self.readByte()) orelse return error.MalformedChunk;
-                        const second = (try self.readByte()) orelse return error.MalformedChunk;
-                        if (first != '\r' or second != '\n') return error.MalformedChunk;
-                        self.chunk_needs_crlf = false;
-                    }
-                    if (self.chunk_remaining == 0) {
-                        const line = try self.readLine();
-                        const separator = mem.indexOfScalar(u8, line, ';') orelse line.len;
-                        const size_text = mem.trim(u8, line[0..separator], " \t");
-                        if (size_text.len == 0) return error.InvalidChunkSize;
-                        self.chunk_remaining = std.fmt.parseInt(u64, size_text, 16) catch
-                            return error.InvalidChunkSize;
-                        if (self.chunk_remaining == 0) {
-                            try self.readHttp1Trailers();
-                            self.state = .response_complete;
-                            return 0;
-                        }
-                    }
+    fn initializeContentDecoder(self: *Self) !void {
+        if (self.decompression != .enabled or self.decoder_initialized) return;
+        const encoding_text = self.response_headers.get(HeaderName.CONTENT_ENCODING) orelse return;
+        const encoding = compression_util.ContentEncoding.fromString(encoding_text) orelse
+            return error.UnsupportedContentEncoding;
+        self.decoder_kind = switch (encoding) {
+            .identity => .none,
+            .gzip => .gzip,
+            .deflate => .deflate,
+            .br => .br,
+            .zstd => .zstd,
+        };
+        if (self.decoder_kind == .none) return;
 
-                    const want: usize = @intCast(@min(@as(u64, output.len), self.chunk_remaining));
-                    const n = try self.readRaw(output[0..want]);
-                    if (n == 0) return error.ResponseBodyUnderrun;
-                    try self.countResponseBytes(n);
-                    self.chunk_remaining -= n;
-                    if (self.chunk_remaining == 0) self.chunk_needs_crlf = true;
-                    return n;
-                }
+        self.encoded_reader.init(self);
+        switch (self.decoder_kind) {
+            .gzip, .deflate => {
+                self.flate_decoder = std.compress.flate.Decompress.init(
+                    &self.encoded_reader.reader,
+                    if (self.decoder_kind == .gzip) .gzip else .zlib,
+                    &self.flate_window,
+                );
             },
-            .http2 => return error.InvalidOperationState,
+            .br => self.brotli_decoder = brotli_pkg.Decoder.init(self.allocator, .{}),
+            .zstd => self.zstd_decoder = zstd_pkg.StreamingDecompressor.init(self.allocator),
+            .none => {},
+        }
+        self.decoder_initialized = true;
+    }
+
+    fn countDecodedBytes(self: *Self, amount: usize) !void {
+        const next = std.math.add(u64, self.decoded_bytes, amount) catch
+            return error.BodyLengthOverflow;
+        if (self.response_limit) |limit| {
+            if (next > limit) return error.ResponseTooLarge;
+        }
+        self.decoded_bytes = next;
+        self.response_bytes = next;
+    }
+
+    fn readDecodedResponse(self: *Self, output: []u8) !usize {
+        if (self.decoded_body_complete) return 0;
+        const produced = switch (self.decoder_kind) {
+            .gzip, .deflate => try self.readFlateDecoded(output),
+            .br => try self.readBrotliDecoded(output),
+            .zstd => try self.readZstdDecoded(output),
+            .none => return self.readEncodedProtocol(output),
+        };
+        try self.countDecodedBytes(produced);
+        if (self.decoded_body_complete) self.state = .response_complete;
+        return produced;
+    }
+
+    fn readFlateDecoded(self: *Self, output: []u8) !usize {
+        const decoder = &(self.flate_decoder orelse return error.DecompressionFailed);
+        self.decoder_io_error = null;
+        const n = decoder.reader.readSliceShort(output) catch {
+            if (self.decoder_io_error) |io_error| return io_error;
+            return if (self.encoded_body_complete)
+                error.TruncatedCompressedBody
+            else
+                error.DecompressionFailed;
+        };
+        if (n == 0) {
+            if (self.encoded_reader.reader.buffered().len != 0) {
+                return error.TrailingCompressedData;
+            }
+            try self.ensureEncodedBodyEnd();
+            self.decoded_body_complete = true;
+        }
+        return n;
+    }
+
+    fn fillDecoderInput(self: *Self) !bool {
+        if (self.decoder_input_pos < self.decoder_input_len) return true;
+        self.decoder_input_pos = 0;
+        self.decoder_input_len = try self.readEncodedProtocol(&self.decoder_input);
+        return self.decoder_input_len != 0;
+    }
+
+    fn readBrotliDecoded(self: *Self, output: []u8) !usize {
+        const decoder = &(self.brotli_decoder orelse return error.DecompressionFailed);
+        var output_remaining = output;
+        while (true) {
+            if (!try self.fillDecoderInput()) {
+                if (!self.encoded_body_complete) return error.TruncatedCompressedBody;
+                var empty: []const u8 = &.{};
+                const result = decoder.decompressStream(&empty, &output_remaining, null);
+                const produced = output.len - output_remaining.len;
+                return switch (result) {
+                    .success => {
+                        if (self.decoder_input_pos != self.decoder_input_len) {
+                            return error.TrailingCompressedData;
+                        }
+                        try self.ensureEncodedBodyEnd();
+                        self.decoded_body_complete = true;
+                        return produced;
+                    },
+                    .needs_more_output => produced,
+                    .needs_more_input => error.TruncatedCompressedBody,
+                    .err => self.brotliDecodeError(),
+                };
+            }
+
+            var input: []const u8 = self.decoder_input[self.decoder_input_pos..self.decoder_input_len];
+            const before = input.len;
+            const result = decoder.decompressStream(&input, &output_remaining, null);
+            self.decoder_input_pos += before - input.len;
+            const produced = output.len - output_remaining.len;
+            switch (result) {
+                .success => {
+                    self.decoded_body_complete = true;
+                    return produced;
+                },
+                .needs_more_output => return produced,
+                .needs_more_input => {
+                    if (produced > 0) return produced;
+                    if (self.decoder_input_pos == self.decoder_input_len) continue;
+                    return error.DecompressionFailed;
+                },
+                .err => return self.brotliDecodeError(),
+            }
         }
     }
 
-    fn readHttp1Trailers(self: *Self) !void {
-        while (true) {
-            const line = try self.readLine();
-            if (line.len == 0) return;
-            const separator = mem.indexOfScalar(u8, line, ':') orelse return error.InvalidTrailer;
-            const name = mem.trim(u8, line[0..separator], " \t");
-            const value = mem.trim(u8, line[separator + 1 ..], " \t");
-            if (name.len == 0 or
-                std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH) or
-                std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING))
-            {
-                return error.InvalidTrailer;
-            }
-            try self.response_trailers.append(name, value);
+    fn brotliDecodeError(self: *Self) anyerror {
+        return switch (self.brotli_decoder.?.errorCode()) {
+            .alloc_context_modes,
+            .alloc_tree_groups,
+            .alloc_context_map,
+            .alloc_ring_buffer_1,
+            .alloc_ring_buffer_2,
+            .alloc_block_type_trees,
+            => error.OutOfMemory,
+            else => error.DecompressionFailed,
+        };
+    }
+
+    fn ensureEncodedBodyEnd(self: *Self) !void {
+        if (self.encoded_body_complete) return;
+        var trailing: [1]u8 = undefined;
+        const n = try self.readEncodedProtocol(&trailing);
+        if (n != 0) return error.TrailingCompressedData;
+        if (!self.encoded_body_complete) return error.TruncatedCompressedBody;
+    }
+
+    fn readZstdDecoded(self: *Self, output: []u8) !usize {
+        const decoder = &(self.zstd_decoder orelse return error.DecompressionFailed);
+        if (self.decoder_output_pos < self.decoder_output_len) {
+            const amount = @min(output.len, self.decoder_output_len - self.decoder_output_pos);
+            @memcpy(output[0..amount], self.decoder_output[self.decoder_output_pos..][0..amount]);
+            self.decoder_output_pos += amount;
+            return amount;
         }
+        while (true) {
+            const has_input = try self.fillDecoderInput();
+            const input = if (has_input)
+                self.decoder_input[self.decoder_input_pos..self.decoder_input_len]
+            else
+                &.{};
+            const result = decoder.decompressStream(&self.decoder_output, input) catch
+                return error.DecompressionFailed;
+            self.decoder_input_pos += result.in_consumed;
+            if (decoder.frame_header) |frame_header| {
+                const window_size = std.math.cast(usize, frame_header.window_size) orelse
+                    return error.DecompressionWindowTooLarge;
+                if (window_size > 32 * 1024 * 1024) return error.DecompressionWindowTooLarge;
+                if (decoder.out_buffer.items.len > window_size) {
+                    const retained = decoder.out_buffer.items[decoder.out_buffer.items.len - window_size ..];
+                    @memmove(decoder.out_buffer.items[0..window_size], retained);
+                    decoder.out_buffer.shrinkRetainingCapacity(window_size);
+                }
+            }
+            if (result.out_produced > 0) {
+                self.decoder_output_pos = 0;
+                self.decoder_output_len = result.out_produced;
+                const amount = @min(output.len, result.out_produced);
+                @memcpy(output[0..amount], self.decoder_output[0..amount]);
+                self.decoder_output_pos = amount;
+                return amount;
+            }
+            if (!has_input) {
+                if (result.needs_more) return error.TruncatedCompressedBody;
+                self.decoded_body_complete = true;
+                return 0;
+            }
+            if (result.in_consumed == 0) return error.DecompressionFailed;
+        }
+    }
+
+    fn readHttp1Body(self: *Self, output: []u8) !usize {
+        if (self.response_body_kind == .none) {
+            self.encoded_body_complete = true;
+            if (self.decoder_kind == .none) self.state = .response_complete;
+            return 0;
+        }
+
+        const SinkState = struct {
+            output: []u8,
+            written: usize = 0,
+
+            fn write(context: *anyopaque, data: []const u8) !usize {
+                const sink_state: *@This() = @ptrCast(@alignCast(context));
+                const amount = @min(data.len, sink_state.output.len - sink_state.written);
+                if (amount == 0) return 0;
+                @memcpy(sink_state.output[sink_state.written..][0..amount], data[0..amount]);
+                sink_state.written += amount;
+                return amount;
+            }
+        };
+        var sink_state = SinkState{ .output = output };
+        var sink = ParserBodySink{
+            .context = &sink_state,
+            .writeFn = SinkState.write,
+            .stop_after_write = true,
+        };
+
+        while (sink_state.written < output.len and !self.http1_parser.isComplete()) {
+            if (self.read_pos < self.read_len) {
+                const consumed = self.http1_parser.feedTo(
+                    self.read_buffer[self.read_pos..self.read_len],
+                    &sink,
+                ) catch |err| switch (err) {
+                    error.BodyTooLarge => return error.ResponseTooLarge,
+                    error.InvalidChunkEncoding => return error.MalformedChunk,
+                    else => return err,
+                };
+                self.read_pos += consumed;
+                if (sink_state.written > 0 or self.http1_parser.isComplete()) break;
+                if (consumed > 0) continue;
+            }
+
+            self.read_pos = 0;
+            self.read_len = try self.transportRead(&self.read_buffer);
+            if (self.read_len == 0) {
+                self.http1_parser.finishEof();
+                if (!self.http1_parser.isComplete()) {
+                    return if (self.response_body_kind == .chunked)
+                        error.MalformedChunk
+                    else
+                        error.ResponseBodyUnderrun;
+                }
+                break;
+            }
+        }
+
+        if (self.decoder_kind == .none) self.response_bytes = self.http1_parser.body_bytes;
+        if (self.http1_parser.isComplete()) {
+            if (self.response_body_kind != .close_delimited and self.read_pos != self.read_len) {
+                return error.ResponseBodyOverrun;
+            }
+            self.response_trailers.deinit();
+            self.response_trailers = self.http1_parser.trailers;
+            self.http1_parser.trailers = Headers.init(self.allocator);
+            self.encoded_body_complete = true;
+            if (self.decoder_kind == .none) self.state = .response_complete;
+        }
+        return sink_state.written;
     }
 
     fn finish(self: *Self, options: FinishOptions) !void {
@@ -4315,11 +4664,19 @@ const OperationImpl = struct {
                 self.terminalCleanup(.broken);
                 return;
             }
+            const drain_timeout_ms = options.drain_timeout_ms orelse
+                self.client.shared.config.drain_timeout_ms;
+            const previous_phase = self.beginPhase(drain_timeout_ms);
+            defer self.endPhase(previous_phase);
             var discard: [32 * 1024]u8 = undefined;
             while (try self.readResponse(&discard) != 0) {}
         }
         if (self.state != .response_complete) return error.InvalidOperationState;
 
+        if (self.protocol == .http3) {
+            self.terminalCleanup(.broken);
+            return;
+        }
         if (self.protocol == .http2) {
             const draining = if (self.lease) |*lease| lease.h2Session().draining else true;
             self.terminalCleanup(if (draining) .draining else if (self.keep_alive and self.request_framing_complete) .reusable else .broken);
@@ -4352,13 +4709,27 @@ const OperationImpl = struct {
             owned.close();
             self.owned_socket = null;
         }
+        if (self.udp_socket) |*datagram_socket| {
+            datagram_socket.close();
+            self.udp_socket = null;
+        }
     }
 
     fn abort(self: *Self) void {
         if (self.state == .terminal) return;
         if (self.protocol == .http2 and self.lease != null) {
-            self.resetHttp2Stream();
-            self.terminalCleanup(if (self.lease.?.h2Session().draining) .draining else .reusable);
+            const session = self.lease.?.h2Session();
+            const reset_ok = self.resetHttp2Stream();
+            if (!reset_ok) session.poisoned = true;
+            self.terminalCleanup(if (!reset_ok)
+                .broken
+            else if (session.draining)
+                .draining
+            else
+                .reusable);
+        } else if (self.protocol == .http3) {
+            self.resetHttp3Stream();
+            self.terminalCleanup(.broken);
         } else {
             self.terminalCleanup(.broken);
         }
@@ -4376,6 +4747,12 @@ const OperationImpl = struct {
         if (self.state != .terminal) self.abort();
         self.response_headers.deinit();
         self.response_trailers.deinit();
+        self.http1_parser.deinit();
+        if (self.brotli_decoder) |*decoder| decoder.deinit();
+        if (self.zstd_decoder) |*decoder| decoder.deinit();
+        if (self.h3_qpack_encoder) |*encoder| encoder.deinit();
+        if (self.h3_qpack_decoder) |*decoder| decoder.deinit();
+        self.h3_header_block.deinit(self.allocator);
         for (self.h2_early_frames.items) |*frame| frame.deinit(self.allocator);
         self.h2_early_frames.deinit(self.allocator);
         self.h2_pending_headers.deinit(self.allocator);
@@ -4387,13 +4764,511 @@ const OperationImpl = struct {
         if (self.owns_request) self.client.endRequest();
     }
 
-    fn fail(self: *Self) void {
-        if (self.protocol == .http2 and self.lease != null) {
-            self.resetHttp2Stream();
-            self.terminalCleanup(if (self.lease.?.h2Session().draining) .draining else .reusable);
-        } else {
-            self.terminalCleanup(.broken);
+    const H2FailureClass = enum {
+        stream_local,
+        peer_reset,
+        draining,
+        connection_fatal,
+    };
+
+    fn classifyH2Failure(err: anyerror) H2FailureClass {
+        const name = @errorName(err);
+        if (mem.eql(u8, name, "GoAway")) return .draining;
+        if (mem.eql(u8, name, "StreamError") or mem.eql(u8, name, "StreamReset")) {
+            return .peer_reset;
         }
+        const stream_local = [_][]const u8{
+            "Cancelled",
+            "Timeout",
+            "RequestTimeout",
+            "RequestBodyOverrun",
+            "RequestBodyUnderrun",
+            "RequestBodyNotAllowed",
+            "RequestAlreadyFinished",
+            "RequestNotFinished",
+            "ResponseTooLarge",
+            "ResponseBodyOverrun",
+            "ResponseBodyUnderrun",
+            "InvalidContentLength",
+            "ConflictingFramingHeaders",
+            "InvalidTrailer",
+            "TrailersRequireChunkedBody",
+            "EarlyResponse",
+            "HeaderTooLarge",
+            "TooManyHeaders",
+            "BodyLengthOverflow",
+        };
+        for (stream_local) |candidate| {
+            if (mem.eql(u8, name, candidate)) return .stream_local;
+        }
+        return .connection_fatal;
+    }
+
+    fn fail(self: *Self, err: anyerror) void {
+        if (self.protocol != .http2 or self.lease == null) {
+            if (self.protocol == .http3) self.resetHttp3Stream();
+            self.terminalCleanup(.broken);
+            return;
+        }
+
+        const session = self.lease.?.h2Session();
+        switch (classifyH2Failure(err)) {
+            .stream_local => {
+                const reset_ok = self.resetHttp2Stream();
+                if (!reset_ok) session.poisoned = true;
+                self.terminalCleanup(if (!reset_ok)
+                    .broken
+                else if (session.draining)
+                    .draining
+                else
+                    .reusable);
+            },
+            .peer_reset => {
+                if (self.h2_stream_id) |stream_id| {
+                    if (session.stream_manager.getStream(stream_id)) |stream_value| {
+                        stream_value.reset();
+                    }
+                }
+                self.terminalCleanup(if (session.draining) .draining else .reusable);
+            },
+            .draining => {
+                session.draining = true;
+                self.terminalCleanup(.draining);
+            },
+            .connection_fatal => {
+                session.poisoned = true;
+                self.terminalCleanup(.broken);
+            },
+        }
+    }
+
+    fn startHttp3(self: *Self) !void {
+        if (self.unix_socket_path != null) return error.UnsupportedStreamingTransport;
+        const host = self.req.uri.host orelse return error.InvalidUri;
+        if (self.proxy != null) return error.ProxyNotSupported;
+
+        const previous_phase = self.beginPhase(self.timeouts.connect_ms);
+        defer self.endPhase(previous_phase);
+        const address = try self.client.resolveAddress(
+            host,
+            self.req.uri.effectivePort(),
+            &self.context,
+        );
+        self.udp_socket = try UdpSocket.createForAddress(address);
+        try self.context.check();
+        try self.udp_socket.?.connect(address);
+        try self.context.check();
+
+        self.h3_session = HTTP3QUICSession.initClient();
+        self.h3_qpack_encoder = qpack.QPACKContext.initWithCapacity(
+            self.allocator,
+            common.clampU64ToUsize(self.client.shared.config.http3_settings.qpack_max_table_capacity),
+        );
+        self.h3_qpack_decoder = qpack.QPACKContext.initWithCapacity(
+            self.allocator,
+            common.clampU64ToUsize(self.client.shared.config.http3_settings.qpack_max_table_capacity),
+        );
+        self.h3_qpack_encoder.?.max_blocked_streams =
+            self.client.shared.config.http3_settings.qpack_blocked_streams;
+        self.h3_qpack_decoder.?.max_blocked_streams =
+            self.client.shared.config.http3_settings.qpack_blocked_streams;
+        self.protocol = .http3;
+
+        var settings_payload = std.ArrayList(u8).empty;
+        defer settings_payload.deinit(self.allocator);
+        try http.encodeHTTP3SettingsPayload(
+            self.client.shared.config.http3_settings,
+            self.allocator,
+            &settings_payload,
+        );
+        var control_payload = std.ArrayList(u8).empty;
+        defer control_payload.deinit(self.allocator);
+        try http.appendVarInt(
+            &control_payload,
+            self.allocator,
+            @intFromEnum(quic.HTTP3StreamType.control),
+        );
+        try http.appendHTTP3Frame(
+            &control_payload,
+            self.allocator,
+            .settings,
+            settings_payload.items,
+        );
+        try self.sendHttp3StreamBytes(2, control_payload.items, false);
+
+        var path_buffer: ?[]u8 = null;
+        defer if (path_buffer) |buffer| self.allocator.free(buffer);
+        var authority_buffer: ?[]u8 = null;
+        defer if (authority_buffer) |buffer| self.allocator.free(buffer);
+        var header_entries = std.ArrayList(qpack.HeaderEntry).empty;
+        defer header_entries.deinit(self.allocator);
+        var owned_names = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_names.items) |name| self.allocator.free(name);
+            owned_names.deinit(self.allocator);
+        }
+        try buildPseudoHeaders(
+            self.allocator,
+            self.req,
+            &header_entries,
+            &owned_names,
+            &path_buffer,
+            &authority_buffer,
+        );
+        const header_block = try qpack.encodeHeaders(
+            &self.h3_qpack_encoder.?,
+            header_entries.items,
+            self.allocator,
+        );
+        defer self.allocator.free(header_block);
+        try self.sendHttp3FrameHeader(.headers, header_block.len);
+        try self.sendHttp3StreamBytes(0, header_block, false);
+    }
+
+    fn udpSendWithContext(self: *Self, data: []const u8, context: *const IoContext) !void {
+        const sent = try self.udp_socket.?.sendWithContext(data, context);
+        if (sent != data.len) return error.ShortWrite;
+    }
+
+    fn sendHttp3StreamBytes(self: *Self, stream_id: u64, data: []const u8, fin: bool) !void {
+        const previous_phase = self.beginPhase(self.timeouts.write_ms);
+        defer self.endPhase(previous_phase);
+        try self.sendHttp3StreamBytesWithContext(stream_id, data, fin, &self.context);
+    }
+
+    fn sendHttp3StreamBytesWithContext(
+        self: *Self,
+        stream_id: u64,
+        data: []const u8,
+        fin: bool,
+        context: *const IoContext,
+    ) !void {
+        const offset_ptr = if (stream_id == 0) &self.h3_request_offset else &self.h3_control_offset;
+        var input_offset: usize = 0;
+        var sent_any = false;
+        while (input_offset < data.len or !sent_any) {
+            const amount = if (input_offset < data.len)
+                @min(@as(usize, 1200), data.len - input_offset)
+            else
+                0;
+            const chunk = data[input_offset..][0..amount];
+            const chunk_fin = fin and input_offset + amount == data.len;
+            var frame_buffer: [1264]u8 = undefined;
+            const stream_frame = quic.StreamFrame{
+                .stream_id = stream_id,
+                .offset = offset_ptr.*,
+                .length = @intCast(amount),
+                .fin = chunk_fin,
+                .data = chunk,
+            };
+            const frame_len = try stream_frame.encode(&frame_buffer);
+            var packet = std.ArrayList(u8).empty;
+            defer packet.deinit(self.allocator);
+            try appendHTTP3PacketHeader(&packet, self.allocator, &self.h3_session);
+            try packet.appendSlice(self.allocator, frame_buffer[0..frame_len]);
+            try self.udpSendWithContext(packet.items, context);
+            offset_ptr.* += amount;
+            input_offset += amount;
+            sent_any = true;
+            if (data.len == 0) break;
+        }
+    }
+
+    fn sendHttp3FrameHeader(self: *Self, frame_type: http.HTTP3FrameType, length: usize) !void {
+        var header_buffer: [16]u8 = undefined;
+        const header_len = try (http.HTTP3FrameHeader{
+            .frame_type = @intFromEnum(frame_type),
+            .length = length,
+        }).encode(&header_buffer);
+        try self.sendHttp3StreamBytes(0, header_buffer[0..header_len], false);
+    }
+
+    fn writeHttp3Data(self: *Self, data: []const u8) !void {
+        try self.sendHttp3FrameHeader(.data, data.len);
+        try self.sendHttp3StreamBytes(0, data, false);
+    }
+
+    fn finishHttp3Request(self: *Self, trailers: ?[]const [2][]const u8) !void {
+        if (trailers) |fields| {
+            var entries = std.ArrayList(qpack.HeaderEntry).empty;
+            defer entries.deinit(self.allocator);
+            var owned_names = std.ArrayList([]u8).empty;
+            defer {
+                for (owned_names.items) |name| self.allocator.free(name);
+                owned_names.deinit(self.allocator);
+            }
+            for (fields) |field| {
+                if (field[0].len == 0 or field[0][0] == ':' or
+                    common.isConnectionSpecificHeader(field[0]) or
+                    std.ascii.eqlIgnoreCase(field[0], HeaderName.CONTENT_LENGTH))
+                {
+                    return error.InvalidTrailer;
+                }
+                const name = try common.dupLowerAscii(self.allocator, field[0]);
+                try owned_names.append(self.allocator, name);
+                try entries.append(self.allocator, .{ .name = name, .value = field[1] });
+            }
+            const block = try qpack.encodeHeaders(
+                &self.h3_qpack_encoder.?,
+                entries.items,
+                self.allocator,
+            );
+            defer self.allocator.free(block);
+            try self.sendHttp3FrameHeader(.headers, block.len);
+            try self.sendHttp3StreamBytes(0, block, true);
+            return;
+        }
+        try self.sendHttp3StreamBytes(0, &.{}, true);
+    }
+
+    fn resetHttp3Stream(self: *Self) void {
+        if (self.udp_socket == null or self.protocol != .http3) return;
+        const reset_timeout = if (self.timeouts.write_ms > 0) self.timeouts.write_ms else 1_000;
+        var cleanup_context = IoContext.init(.{
+            .request_deadline = self.context.request_deadline,
+            .phase_deadline = Deadline.afterMs(reset_timeout),
+        });
+        var transport = OperationHTTP3Transport{ .operation = self, .context = &cleanup_context };
+        sendHTTP3ResetStream(
+            &transport,
+            &self.h3_session,
+            0,
+            @intFromEnum(http.HTTP3ErrorCode.request_cancelled),
+            self.h3_request_offset,
+            self.allocator,
+        ) catch {};
+        sendHTTP3StopSending(
+            &transport,
+            &self.h3_session,
+            0,
+            @intFromEnum(http.HTTP3ErrorCode.request_cancelled),
+            self.allocator,
+        ) catch {};
+    }
+
+    fn receiveHttp3StreamData(self: *Self) !bool {
+        while (true) {
+            if (self.h3_stream_pos < self.h3_stream_len) return true;
+            if (self.h3_stream_fin) return false;
+            const previous_phase = self.beginPhase(self.timeouts.read_ms);
+            defer self.endPhase(previous_phase);
+            const n = try self.udp_socket.?.recvWithContext(&self.read_buffer, &self.context);
+            if (n == 0) continue;
+            const incoming = try decodeHTTP3StreamDatagram(
+                self.read_buffer[0..n],
+                &self.h3_session,
+            );
+            if (incoming.stream_id != 0) continue;
+            const data_start = @intFromPtr(incoming.data.ptr) - @intFromPtr(self.read_buffer[0..].ptr);
+            self.h3_stream_pos = data_start;
+            self.h3_stream_len = data_start + incoming.data.len;
+            self.h3_stream_fin = incoming.fin;
+            if (incoming.data.len == 0 and incoming.fin) return false;
+        }
+    }
+
+    fn readHttp3Byte(self: *Self) !?u8 {
+        if (!try self.receiveHttp3StreamData()) return null;
+        const byte = self.read_buffer[self.h3_stream_pos];
+        self.h3_stream_pos += 1;
+        return byte;
+    }
+
+    fn readHttp3VarInt(self: *Self) !u64 {
+        const first = (try self.readHttp3Byte()) orelse return error.InvalidResponse;
+        const length: usize = @as(usize, 1) << @intCast(first >> 6);
+        var value: u64 = first & 0x3f;
+        var index: usize = 1;
+        while (index < length) : (index += 1) {
+            value = (value << 8) | ((try self.readHttp3Byte()) orelse return error.InvalidResponse);
+        }
+        return value;
+    }
+
+    fn startNextHttp3Frame(self: *Self) !bool {
+        if (self.h3_frame_type != null and self.h3_frame_remaining != 0) return true;
+        self.h3_frame_type = null;
+        if (!try self.receiveHttp3StreamData()) {
+            if (self.h3_stream_fin) return false;
+            return error.InvalidResponse;
+        }
+        self.h3_frame_type = try self.readHttp3VarInt();
+        self.h3_frame_remaining = try self.readHttp3VarInt();
+        return true;
+    }
+
+    fn readHttp3FrameBytes(self: *Self, output: []u8) !usize {
+        if (self.h3_frame_remaining == 0 or output.len == 0) return 0;
+        if (!try self.receiveHttp3StreamData()) return error.InvalidResponse;
+        const amount: usize = @intCast(@min(
+            self.h3_frame_remaining,
+            @as(u64, @min(output.len, self.h3_stream_len - self.h3_stream_pos)),
+        ));
+        @memcpy(output[0..amount], self.read_buffer[self.h3_stream_pos..][0..amount]);
+        self.h3_stream_pos += amount;
+        self.h3_frame_remaining -= amount;
+        return amount;
+    }
+
+    fn collectHttp3Frame(self: *Self) ![]const u8 {
+        if (self.h3_frame_remaining > self.read_buffer.len) return error.HeaderTooLarge;
+        self.h3_header_block.clearRetainingCapacity();
+        while (self.h3_frame_remaining > 0) {
+            var temporary: [4096]u8 = undefined;
+            const amount = try self.readHttp3FrameBytes(
+                temporary[0..@min(temporary.len, @as(usize, @intCast(self.h3_frame_remaining)))],
+            );
+            if (amount == 0) return error.InvalidResponse;
+            try self.h3_header_block.appendSlice(self.allocator, temporary[0..amount]);
+        }
+        return self.h3_header_block.items;
+    }
+
+    fn parseHttp3HeaderBlock(self: *Self, destination: *Headers, require_status: bool) !u16 {
+        const decoded = try qpack.decodeHeaders(
+            &self.h3_qpack_decoder.?,
+            self.h3_header_block.items,
+            self.allocator,
+        );
+        defer {
+            for (decoded) |header| {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            }
+            self.allocator.free(decoded);
+        }
+        var status_code: ?u16 = null;
+        for (decoded) |header| {
+            if (header.name.len > 0 and header.name[0] == ':') {
+                if (!mem.eql(u8, header.name, ":status") or status_code != null) {
+                    return error.ProtocolError;
+                }
+                status_code = std.fmt.parseInt(u16, header.value, 10) catch
+                    return error.InvalidResponse;
+                continue;
+            }
+            if (common.isConnectionSpecificHeader(header.name)) return error.ProtocolError;
+            try destination.append(header.name, header.value);
+        }
+        if (require_status) return status_code orelse error.InvalidResponse;
+        if (status_code != null) return error.ProtocolError;
+        return 0;
+    }
+
+    fn configureHttp3Response(self: *Self) !void {
+        self.h3_expected_length = null;
+        for (self.response_headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.TRANSFER_ENCODING)) {
+                return error.ProtocolError;
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.CONTENT_LENGTH)) {
+                const length = std.fmt.parseInt(u64, mem.trim(u8, header.value, " \t"), 10) catch
+                    return error.InvalidContentLength;
+                if (self.h3_expected_length) |existing| {
+                    if (existing != length) return error.InvalidContentLength;
+                } else {
+                    self.h3_expected_length = length;
+                }
+            }
+        }
+        if (self.decoder_kind == .none) {
+            if (self.response_limit) |limit| {
+                if (self.h3_expected_length) |length| {
+                    if (length > limit) return error.ResponseTooLarge;
+                }
+            }
+        }
+        const no_body = !self.req.method.hasResponseBody() or
+            self.response_head.status.code == 204 or
+            self.response_head.status.code == 304;
+        if (no_body or (self.h3_stream_fin and self.h3_stream_pos == self.h3_stream_len)) {
+            self.response_body_kind = .none;
+            try self.completeHttp3Response();
+        } else {
+            self.response_body_kind = .http2;
+        }
+    }
+
+    fn readHttp3Head(self: *Self) !u16 {
+        self.response_headers.clear();
+        self.response_head_ready = false;
+        while (try self.startNextHttp3Frame()) {
+            const frame_type = self.h3_frame_type.?;
+            if (frame_type == @intFromEnum(http.HTTP3FrameType.headers)) {
+                _ = try self.collectHttp3Frame();
+                const status_code = try self.parseHttp3HeaderBlock(&self.response_headers, true);
+                self.h3_frame_type = null;
+                if (status_code >= 100 and status_code < 200) return status_code;
+                self.response_head = .{
+                    .version = .HTTP_3,
+                    .status = Status.fromCode(status_code),
+                    .headers = &self.response_headers,
+                };
+                self.response_head_ready = true;
+                self.response_keep_alive = false;
+                try self.initializeContentDecoder();
+                try self.configureHttp3Response();
+                return status_code;
+            }
+            if (frame_type == @intFromEnum(http.HTTP3FrameType.data)) return error.ProtocolError;
+            while (self.h3_frame_remaining > 0) {
+                var discard: [1024]u8 = undefined;
+                if (try self.readHttp3FrameBytes(&discard) == 0) return error.InvalidResponse;
+            }
+            self.h3_frame_type = null;
+        }
+        return error.InvalidResponse;
+    }
+
+    fn readHttp3Body(self: *Self, output: []u8) !usize {
+        if (self.encoded_body_complete) return 0;
+        while (true) {
+            if (!try self.startNextHttp3Frame()) {
+                try self.completeHttp3Response();
+                return 0;
+            }
+            const frame_type = self.h3_frame_type.?;
+            if (frame_type == @intFromEnum(http.HTTP3FrameType.data)) {
+                const amount = try self.readHttp3FrameBytes(output);
+                if (self.h3_expected_length) |remaining| {
+                    if (amount > remaining) return error.ResponseBodyOverrun;
+                    self.h3_expected_length = remaining - amount;
+                }
+                if (self.decoder_kind == .none) try self.countResponseBytes(amount);
+                if (self.h3_frame_remaining == 0) {
+                    self.h3_frame_type = null;
+                    if (self.h3_stream_fin and self.h3_stream_pos == self.h3_stream_len) {
+                        try self.completeHttp3Response();
+                    }
+                }
+                if (amount > 0) return amount;
+                continue;
+            }
+            if (frame_type == @intFromEnum(http.HTTP3FrameType.headers)) {
+                _ = try self.collectHttp3Frame();
+                _ = try self.parseHttp3HeaderBlock(&self.response_trailers, false);
+                self.h3_frame_type = null;
+                if (self.h3_stream_fin and self.h3_stream_pos == self.h3_stream_len) {
+                    try self.completeHttp3Response();
+                    return 0;
+                }
+                continue;
+            }
+            while (self.h3_frame_remaining > 0) {
+                var discard: [1024]u8 = undefined;
+                if (try self.readHttp3FrameBytes(&discard) == 0) return error.InvalidResponse;
+            }
+            self.h3_frame_type = null;
+        }
+    }
+
+    fn completeHttp3Response(self: *Self) !void {
+        if (self.h3_frame_remaining != 0) return error.InvalidResponse;
+        if (self.h3_expected_length) |remaining| {
+            if (remaining != 0) return error.ResponseBodyUnderrun;
+        }
+        self.encoded_body_complete = true;
+        if (self.decoder_kind == .none) self.state = .response_complete;
     }
 
     fn startHttp2(self: *Self) !void {
@@ -4455,6 +5330,8 @@ const OperationImpl = struct {
     }
 
     fn writeHttp2Data(self: *Self, data: []const u8, end_stream: bool) !void {
+        const previous_phase = self.beginPhase(self.timeouts.write_ms);
+        defer self.endPhase(previous_phase);
         const stream_id = self.h2_stream_id orelse return error.InvalidStreamState;
         const session = self.lease.?.h2Session();
         const request_stream = session.stream_manager.getStream(stream_id) orelse
@@ -4555,8 +5432,7 @@ const OperationImpl = struct {
             switch (frame.header.frame_type) {
                 .headers => {
                     if (frame.header.stream_id != self.h2_stream_id.?) continue;
-                    self.h2_pending_headers_flags = frame.header.flags;
-                    try self.appendH2HeaderBlock(frame.payload);
+                    try self.appendH2InitialHeaderBlock(frame.payload, frame.header.flags);
                     if ((frame.header.flags & 0x04) == 0) {
                         try self.readHttp2Continuations();
                     }
@@ -4574,6 +5450,7 @@ const OperationImpl = struct {
                     };
                     self.response_head_ready = true;
                     self.response_keep_alive = true;
+                    try self.initializeContentDecoder();
                     try self.configureHttp2ResponseBody(end_stream);
                     return status_code;
                 },
@@ -4584,6 +5461,7 @@ const OperationImpl = struct {
     }
 
     fn readHttp2Body(self: *Self, output: []u8) !usize {
+        if (self.encoded_body_complete) return 0;
         while (true) {
             if (self.h2_data_start < self.h2_data_end) {
                 const amount = @min(output.len, self.h2_data_end - self.h2_data_start);
@@ -4593,7 +5471,7 @@ const OperationImpl = struct {
                 }
                 @memcpy(output[0..amount], self.read_buffer[self.h2_data_start..][0..amount]);
                 self.h2_data_start += amount;
-                try self.countResponseBytes(amount);
+                if (self.decoder_kind == .none) try self.countResponseBytes(amount);
                 try self.sendHttp2WindowUpdate(amount);
                 if (self.h2_data_start == self.h2_data_end and self.h2_data_end_stream) {
                     try self.completeHttp2Response();
@@ -4626,8 +5504,7 @@ const OperationImpl = struct {
                 .headers => {
                     if (frame.header.stream_id != self.h2_stream_id.?) continue;
                     self.h2_pending_headers.clearRetainingCapacity();
-                    self.h2_pending_headers_flags = frame.header.flags;
-                    try self.appendH2HeaderBlock(frame.payload);
+                    try self.appendH2InitialHeaderBlock(frame.payload, frame.header.flags);
                     if ((frame.header.flags & 0x04) == 0) try self.readHttp2Continuations();
                     _ = try self.parseHttp2HeaderBlock(&self.response_trailers, false);
                     if ((frame.header.flags & 0x01) == 0) return error.ProtocolError;
@@ -4638,26 +5515,36 @@ const OperationImpl = struct {
         }
     }
 
-    fn resetHttp2Stream(self: *Self) void {
-        const stream_id = self.h2_stream_id orelse return;
+    fn resetHttp2Stream(self: *Self) bool {
+        const stream_id = self.h2_stream_id orelse return true;
         const frame = h2stream.buildRstStreamFrame(stream_id, .cancel);
+        const reset_timeout_ms = if (self.timeouts.write_ms > 0) self.timeouts.write_ms else 1_000;
+        const reset_deadline = Deadline.afterMs(reset_timeout_ms);
+        var reset_context = IoContext.init(.{
+            .request_deadline = self.context.request_deadline,
+            .phase_deadline = reset_deadline,
+        });
         if (self.tls_active) {
-            self.tlsSession().writeAll(&frame) catch {};
-            self.tlsSession().flush() catch {};
+            self.tlsSession().writeAllWithContext(&frame, &reset_context) catch return false;
+            self.tlsSession().flush() catch return false;
         } else {
-            self.socket().sendAll(&frame) catch {};
+            self.socket().sendAllWithContext(&frame, &reset_context) catch return false;
         }
         if (self.lease) |*lease| {
-            if (lease.h2Session().stream_manager.getStream(stream_id)) |stream_value| {
+            const session = lease.h2Session();
+            if (session.stream_manager.getStream(stream_id)) |stream_value| {
                 stream_value.reset();
             }
+            session.reset_count +%= 1;
         }
+        return true;
     }
 
     fn nextHttp2Frame(self: *Self) !H2FrameView {
         if (self.h2_early_frame_index < self.h2_early_frames.items.len) {
             const frame = &self.h2_early_frames.items[self.h2_early_frame_index];
             self.h2_early_frame_index += 1;
+            try self.validateIncomingHttp2FrameHeader(frame.header, frame.payload.len);
             if (frame.payload.len > self.read_buffer.len) return error.FrameTooLarge;
             @memcpy(self.read_buffer[0..frame.payload.len], frame.payload);
             return .{ .header = frame.header, .payload = self.read_buffer[0..frame.payload.len] };
@@ -4667,9 +5554,39 @@ const OperationImpl = struct {
         try self.transportReadNoEof(&raw_header);
         const header = http.HTTP2FrameHeader.parse(raw_header);
         const payload_len: usize = @intCast(header.length);
+        try self.validateIncomingHttp2FrameHeader(header, payload_len);
         if (payload_len > self.read_buffer.len) return error.FrameTooLarge;
         try self.transportReadNoEof(self.read_buffer[0..payload_len]);
         return .{ .header = header, .payload = self.read_buffer[0..payload_len] };
+    }
+
+    fn validateIncomingHttp2FrameHeader(
+        self: *const Self,
+        header: http.HTTP2FrameHeader,
+        payload_len: usize,
+    ) !void {
+        if (payload_len > self.client.shared.config.http2_settings.max_frame_size) {
+            return error.FrameTooLarge;
+        }
+        switch (header.frame_type) {
+            .data, .headers => if (header.stream_id == 0) return error.ProtocolError,
+            .priority => if (header.stream_id == 0 or payload_len != 5) return error.ProtocolError,
+            .rst_stream => if (header.stream_id == 0 or payload_len != 4) return error.ProtocolError,
+            .settings => {
+                if (header.stream_id != 0) return error.ProtocolError;
+                if ((header.flags & 0x01) != 0) {
+                    if (payload_len != 0) return error.ProtocolError;
+                } else if (payload_len % 6 != 0) {
+                    return error.ProtocolError;
+                }
+            },
+            .push_promise => if (header.stream_id == 0 or payload_len < 4) return error.ProtocolError,
+            .ping => if (header.stream_id != 0 or payload_len != 8) return error.ProtocolError,
+            .goaway => if (header.stream_id != 0 or payload_len < 8) return error.ProtocolError,
+            .window_update => if (payload_len != 4) return error.ProtocolError,
+            .continuation => if (header.stream_id == 0) return error.ProtocolError,
+            else => {},
+        }
     }
 
     fn transportReadNoEof(self: *Self, output: []u8) !void {
@@ -4688,6 +5605,27 @@ const OperationImpl = struct {
         try self.h2_pending_headers.appendSlice(self.allocator, payload);
     }
 
+    fn appendH2InitialHeaderBlock(self: *Self, payload: []const u8, flags: u8) !void {
+        var offset: usize = 0;
+        var padding: usize = 0;
+        if ((flags & 0x08) != 0) {
+            if (payload.len == 0) return error.ProtocolError;
+            padding = payload[0];
+            offset = 1;
+        }
+        if ((flags & 0x20) != 0) {
+            if (payload.len < offset + 5) return error.ProtocolError;
+            const dependency = (@as(u31, payload[offset] & 0x7f) << 24) |
+                (@as(u31, payload[offset + 1]) << 16) |
+                (@as(u31, payload[offset + 2]) << 8) |
+                payload[offset + 3];
+            if (dependency == self.h2_stream_id.?) return error.ProtocolError;
+            offset += 5;
+        }
+        if (padding > payload.len - offset) return error.ProtocolError;
+        try self.appendH2HeaderBlock(payload[offset .. payload.len - padding]);
+    }
+
     fn readHttp2Continuations(self: *Self) !void {
         while (true) {
             const continuation = try self.nextHttp2Frame();
@@ -4703,22 +5641,21 @@ const OperationImpl = struct {
 
     fn parseHttp2HeaderBlock(self: *Self, destination: *Headers, require_status: bool) !u16 {
         const session = self.lease.?.h2Session();
-        const parsed = try h2stream.parseHeadersFramePayload(
-            &session.stream_manager,
+        const decoded = try hpack.decodeHeaders(
+            &session.stream_manager.hpack_ctx,
             self.h2_pending_headers.items,
-            self.h2_pending_headers_flags,
             self.allocator,
         );
         defer {
-            for (parsed.headers) |header| {
+            for (decoded) |header| {
                 self.allocator.free(header.name);
                 self.allocator.free(header.value);
             }
-            self.allocator.free(parsed.headers);
+            self.allocator.free(decoded);
         }
 
         var status_code: ?u16 = null;
-        for (parsed.headers) |header| {
+        for (decoded) |header| {
             if (header.name.len > 0 and header.name[0] == ':') {
                 if (mem.eql(u8, header.name, ":status")) {
                     if (status_code != null) return error.InvalidResponse;
@@ -4751,9 +5688,11 @@ const OperationImpl = struct {
                 }
             }
         }
-        if (self.response_limit) |limit| {
-            if (self.h2_expected_length) |length| {
-                if (length > limit) return error.ResponseTooLarge;
+        if (self.decoder_kind == .none) {
+            if (self.response_limit) |limit| {
+                if (self.h2_expected_length) |length| {
+                    if (length > limit) return error.ResponseTooLarge;
+                }
             }
         }
         const no_body = !self.req.method.hasResponseBody() or
@@ -4762,7 +5701,8 @@ const OperationImpl = struct {
         if (no_body) {
             if (!end_stream) return error.ProtocolError;
             self.response_body_kind = .none;
-            self.state = .response_complete;
+            self.encoded_body_complete = true;
+            if (self.decoder_kind == .none) self.state = .response_complete;
             return;
         }
         self.response_body_kind = if (end_stream) .none else .http2;
@@ -4779,7 +5719,8 @@ const OperationImpl = struct {
                 stream_value.receiveEndStream();
             }
         }
-        self.state = .response_complete;
+        self.encoded_body_complete = true;
+        if (self.decoder_kind == .none) self.state = .response_complete;
     }
 
     fn sendHttp2WindowUpdate(self: *Self, amount: usize) !void {
@@ -4826,6 +5767,7 @@ const OperationImpl = struct {
             },
             .rst_stream => {
                 if (frame.header.stream_id == self.h2_stream_id.?) return error.StreamError;
+                return error.ProtocolError;
             },
             .priority, .push_promise => {},
             else => return error.ProtocolError,
@@ -4837,18 +5779,20 @@ const OperationHTTP2Transport = struct {
     operation: *OperationImpl,
 
     fn writeAll(self: *@This(), data: []const u8) !void {
-        try self.operation.context.check();
-        if (self.operation.tls_active) {
-            try self.operation.tlsSession().writeAllWithContext(data, &self.operation.context);
-            try self.operation.tlsSession().flush();
-        } else {
-            try self.operation.socket().sendAll(data);
-        }
-        try self.operation.context.check();
+        return self.operation.transportWriteAll(data);
     }
 
     fn readNoEof(self: *@This(), output: []u8) !void {
         return self.operation.transportReadNoEof(output);
+    }
+};
+
+const OperationHTTP3Transport = struct {
+    operation: *OperationImpl,
+    context: *const IoContext,
+
+    fn sendDatagram(self: *@This(), data: []const u8) !void {
+        return self.operation.udpSendWithContext(data, self.context);
     }
 };
 
@@ -4865,7 +5809,7 @@ fn operationWrite(context: *anyopaque, data: []const u8) anyerror!usize {
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.writeRequest(data) catch |err| {
-        impl.fail();
+        impl.fail(err);
         return err;
     };
 }
@@ -4875,7 +5819,7 @@ fn operationWaitForContinue(context: *anyopaque) anyerror!ContinueResult {
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.waitForContinue() catch |err| {
-        impl.fail();
+        impl.fail(err);
         return err;
     };
 }
@@ -4885,7 +5829,7 @@ fn operationFinishRequest(context: *anyopaque, trailers: ?[]const [2][]const u8)
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.finishRequest(trailers) catch |err| {
-        impl.fail();
+        impl.fail(err);
         return err;
     };
 }
@@ -4895,7 +5839,7 @@ fn operationRead(context: *anyopaque, output: []u8) anyerror!usize {
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.readResponse(output) catch |err| {
-        impl.fail();
+        impl.fail(err);
         return err;
     };
 }
@@ -4911,7 +5855,7 @@ fn operationFinish(context: *anyopaque, options: FinishOptions) anyerror!void {
     try impl.acquireOwner();
     defer impl.releaseOwner();
     return impl.finish(options) catch |err| {
-        impl.fail();
+        impl.fail(err);
         return err;
     };
 }
@@ -5484,6 +6428,7 @@ test "ClientConfig builder helpers" {
         .policy => |policy| try std.testing.expectEqual(@as(u32, 0), policy.max_retries),
         .disabled => return error.TestUnexpectedResult,
     }
+
     try std.testing.expect(cfg.default_headers != null);
     try std.testing.expectEqual(@as(usize, 1), cfg.default_headers.?.len);
     try std.testing.expectEqualStrings("MyClient/1.0", cfg.user_agent);
@@ -5510,6 +6455,133 @@ test "ClientConfig builder helpers" {
     const embedding_owned = ClientConfig.defaults().withPolicy(types.ClientPolicy.embeddingOwned());
     try std.testing.expect(embedding_owned.policy.retry == .disabled);
     try std.testing.expect(embedding_owned.policy.redirect == .disabled);
+}
+
+test "streaming request preparation is allocation failure safe" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var client = try Client.tryInitWithConfig(allocator, .{
+                .default_headers = &.{.{ "X-Default", "value" }},
+                .user_agent = "allocation-test",
+            });
+            defer client.deinit();
+            var request = try Request.init(
+                client.allocator,
+                .POST,
+                "https://example.test/resource",
+            );
+            defer request.deinit();
+            const effective = client.shared.config.policy.resolve(.{});
+            try client.prepareOpenRequest(&request, .{
+                .headers = &.{
+                    .{ "X-Dupe", "one" },
+                    .{ "X-Dupe", "two" },
+                },
+                .query_params = &.{.{ "query", "value with spaces" }},
+                .basic_auth = .{ .username = "user", .password = "password" },
+                .body_mode = .{ .content_length = 42 },
+            }, &effective);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "streaming operation releases sockets and leases on every allocation failure" {
+    const compressed = try compression_util.compress(std.testing.allocator, .br, "ok");
+    defer std.testing.allocator.free(compressed);
+    const response_headers = [_][2][]const u8{.{ "Content-Encoding", "br" }};
+    const encoded_response = try makePolicyTestResponse(
+        std.testing.allocator,
+        "200 OK",
+        &response_headers,
+        compressed,
+    );
+    defer std.testing.allocator.free(encoded_response);
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+    const Server = struct {
+        listener: *TcpListener,
+        response: []const u8,
+        stop: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (true) {
+                var accepted = self.listener.accept() catch |err| {
+                    if (!self.stop.load(.acquire)) self.failure = err;
+                    return;
+                };
+                defer accepted.socket.close();
+                if (self.stop.load(.acquire)) return;
+                var request: [8192]u8 = undefined;
+                var length: usize = 0;
+                while (length < request.len and
+                    mem.indexOf(u8, request[0..length], "\r\n\r\n") == null)
+                {
+                    const n = accepted.socket.recv(request[length..]) catch 0;
+                    if (n == 0) break;
+                    length += n;
+                }
+                if (mem.indexOf(u8, request[0..length], "\r\n\r\n") != null) {
+                    accepted.socket.sendAll(self.response) catch {};
+                }
+            }
+        }
+    };
+    var server = Server{ .listener = &listener, .response = encoded_response };
+    const server_thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.stop.store(true, .release);
+        if (Socket.createForAddress(address)) |wake_socket| {
+            var wake = wake_socket;
+            wake.connect(address) catch {};
+            wake.close();
+        } else |_| {}
+        server_thread.join();
+    };
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/alloc",
+        .{address.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+    const Case = struct {
+        fn run(allocator: Allocator, request_url: []const u8) !void {
+            var client = try Client.tryInitWithConfig(allocator, .{
+                .keep_alive = true,
+                .policy = types.ClientPolicy.embeddingOwned(),
+                .timeouts = types.Timeouts.uniform(5_000),
+            });
+            defer client.deinit();
+            var op = try client.open(.GET, request_url, .{
+                .policy = .{
+                    .retry = .disabled,
+                    .redirect = .disabled,
+                    .cookies = .disabled,
+                    .accept_encoding = .disabled,
+                    .decompression = .enabled,
+                    .user_agent = .disabled,
+                },
+            });
+            defer op.deinit();
+            _ = try op.finishRequest(null);
+            var body: [8]u8 = undefined;
+            while (try op.read(&body) != 0) {}
+            try op.finish(.{});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{url});
+
+    server.stop.store(true, .release);
+    var wake = try Socket.createForAddress(address);
+    try wake.connect(address);
+    wake.close();
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
 }
 
 test "RequestOptions builder helpers" {
@@ -6386,6 +7458,438 @@ test "public Client preserves HTTP1 ALPN fallback and TLS reuse" {
     try std.testing.expectEqual(@as(usize, 1), client.poolStats().total);
 }
 
+test "streaming TLS path reconnects a pooled socket after failed first handshake" {
+    const allocator = std.testing.allocator;
+    var tls_config = try tls_mod.loadServerTLSConfig(
+        allocator,
+        "examples/certs/server_ec.crt",
+        "examples/certs/server_ec.key",
+    );
+    defer tls_config.deinit();
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        tls_config: *tls_mod.ServerTLSConfig,
+        accepts: usize = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var rejected = try self.listener.accept();
+            self.accepts += 1;
+            try rejected.socket.setLinger(true, 0);
+            rejected.socket.close();
+
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            self.accepts += 1;
+            var connection = try tls_mod.acceptServer(
+                std.heap.page_allocator,
+                &accepted.socket,
+                &.{"http/1.1"},
+                self.tls_config.*,
+            );
+            defer connection.closeNotify();
+
+            var request: [4096]u8 = undefined;
+            var length: usize = 0;
+            while (mem.indexOf(u8, request[0..length], "\r\n\r\n") == null) {
+                const n = try connection.read(request[length..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                length += n;
+            }
+            try connection.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nreconnected",
+            );
+        }
+    };
+
+    var server = Loopback{ .listener = &listener, .tls_config = &tls_config };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    var client = Client.initWithConfig(allocator, .{
+        .verify_ssl = false,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://127.0.0.1:{d}/reconnect",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+    var response = try client.get(url, .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("reconnected", response.body.?);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 2), server.accepts);
+}
+
+test "cancellation interrupts a streaming TLS handshake and cleans the lease" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+    const Stall = struct {
+        listener: *TcpListener,
+        accepted: std.atomic.Value(bool) = .init(false),
+        saw_close: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var connection = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer connection.socket.close();
+            self.accepted.store(true, .release);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const n = connection.socket.recv(&buffer) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => 0,
+                    else => {
+                        self.failure = err;
+                        return;
+                    },
+                };
+                if (n == 0) {
+                    self.saw_close = true;
+                    return;
+                }
+            }
+        }
+    };
+    var stall = Stall{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Stall.run, .{&stall});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    var token = types.CancellationToken.init();
+    var client = Client.initWithConfig(allocator, .{
+        .verify_ssl = false,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://127.0.0.1:{d}/cancel-handshake",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+    const Worker = struct {
+        client: *Client,
+        url: []const u8,
+        token: *types.CancellationToken,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var op = self.client.open(.GET, self.url, .{
+                .cancel_token = self.token,
+                .policy = types.RequestPolicyOverrides.embeddingOwned(),
+            }) catch |err| {
+                self.result = err;
+                return;
+            };
+            op.deinit();
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+    var worker = Worker{ .client = &client, .url = url, .token = &token };
+    const client_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!stall.accepted.load(.acquire)) std.Thread.yield() catch {};
+    token.cancel();
+    client_thread.join();
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    server_joined = true;
+    try std.testing.expect(stall.failure == null);
+    try std.testing.expect(stall.saw_close);
+}
+
+test "cancellation interrupts SOCKS5 negotiation and cleans the lease" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+    const Stall = struct {
+        listener: *TcpListener,
+        greeting_read: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var connection = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer connection.socket.close();
+            var greeting: [3]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < greeting.len) {
+                const n = connection.socket.recv(greeting[offset..]) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (n == 0) return;
+                offset += n;
+            }
+            self.greeting_read.store(true, .release);
+            var byte: [1]u8 = undefined;
+            _ = connection.socket.recv(&byte) catch 0;
+        }
+    };
+    var stall = Stall{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Stall.run, .{&stall});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    var token = types.CancellationToken.init();
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+        .proxy = .{
+            .kind = .socks5h,
+            .host = "127.0.0.1",
+            .port = address.getPort(),
+        },
+    });
+    defer client.deinit();
+    const Worker = struct {
+        client: *Client,
+        token: *types.CancellationToken,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var op = self.client.open(.GET, "http://target.invalid/resource", .{
+                .cancel_token = self.token,
+                .policy = types.RequestPolicyOverrides.embeddingOwned(),
+            }) catch |err| {
+                self.result = err;
+                return;
+            };
+            op.deinit();
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+    var worker = Worker{ .client = &client, .token = &token };
+    const client_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!stall.greeting_read.load(.acquire)) std.Thread.yield() catch {};
+    token.cancel();
+    client_thread.join();
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    server_joined = true;
+    try std.testing.expect(stall.failure == null);
+}
+
+test "cancellation interrupts incremental HTTP1 upload" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+    const Stall = struct {
+        listener: *TcpListener,
+        head_read: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var connection = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer connection.socket.close();
+            var request: [8192]u8 = undefined;
+            var length: usize = 0;
+            while (mem.indexOf(u8, request[0..length], "\r\n\r\n") == null) {
+                const n = connection.socket.recv(request[length..]) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (n == 0) return;
+                length += n;
+            }
+            self.head_read.store(true, .release);
+            var byte: [1]u8 = undefined;
+            _ = connection.socket.recv(&byte) catch 0;
+        }
+    };
+    var stall = Stall{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Stall.run, .{&stall});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    var token = types.CancellationToken.init();
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/cancel-upload",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+    var op = try client.open(.POST, url, .{
+        .body_mode = .chunked,
+        .cancel_token = &token,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+
+    const Worker = struct {
+        operation: *ClientOperation,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var chunk: [64 * 1024]u8 = undefined;
+            @memset(&chunk, 'u');
+            while (true) {
+                self.operation.writeAll(&chunk) catch |err| {
+                    self.result = err;
+                    return;
+                };
+            }
+        }
+    };
+    var worker = Worker{ .operation = &op };
+    const upload_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!stall.head_read.load(.acquire)) std.Thread.yield() catch {};
+    token.cancel();
+    upload_thread.join();
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    server_joined = true;
+    try std.testing.expect(stall.failure == null);
+}
+
+test "cancellation interrupts HTTP3 response wait" {
+    const allocator = std.testing.allocator;
+    var udp_server = try UdpSocket.create();
+    defer udp_server.close();
+    try udp_server.bind(try address_mod.Address.parseIp("127.0.0.1", 0));
+    const address = try udp_server.getLocalAddress();
+
+    const Stall = struct {
+        socket: *UdpSocket,
+        request_fin: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var buffer: [64 * 1024]u8 = undefined;
+            while (!self.request_fin.load(.acquire)) {
+                const incoming = self.socket.recvFrom(&buffer) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                const datagram = buffer[0..incoming.n];
+                var offset: usize = 0;
+                if ((datagram[0] & 0x80) != 0) {
+                    const header = quic.LongHeader.decode(datagram) catch continue;
+                    offset = header.len;
+                } else {
+                    const header = quic.ShortHeader.decode(datagram, 8) catch continue;
+                    offset = header.len;
+                }
+                const packet_number = quic.decodeVarInt(datagram[offset..]) catch continue;
+                offset += packet_number.len;
+                const stream = quic.StreamFrame.decode(datagram[offset..]) catch continue;
+                if (stream.frame.stream_id == 0 and stream.frame.fin) {
+                    self.request_fin.store(true, .release);
+                }
+            }
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var stall = Stall{ .socket = &udp_server };
+    const server_thread = try std.Thread.spawn(.{}, Stall.run, .{&stall});
+    var joined = false;
+    defer if (!joined) {
+        stall.release.store(true, .release);
+        server_thread.join();
+    };
+
+    var token = types.CancellationToken.init();
+    var client = Client.initWithConfig(allocator, .{
+        .http3_enabled = true,
+        .http2_enabled = false,
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/cancel-h3",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_3,
+        .cancel_token = &token,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    const Worker = struct {
+        operation: *ClientOperation,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.operation.finishRequest(null) catch |err| {
+                self.result = err;
+                return;
+            };
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+    var worker = Worker{ .operation = &op };
+    const client_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!stall.request_fin.load(.acquire)) std.Thread.yield() catch {};
+    token.cancel();
+    client_thread.join();
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    stall.release.store(true, .release);
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(stall.failure == null);
+}
+
 test "HTTP2 WINDOW_UPDATE persists connection credit and rejects invalid increments" {
     var manager = h2stream.StreamManager.init(std.testing.allocator, true);
     defer manager.deinit();
@@ -7023,12 +8527,269 @@ test "public streaming cancellation interrupts response read and closes lease" {
     try std.testing.expect(server.saw_close);
 }
 
+test "operation cancel interrupts HTTP1 response head wait" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const Stall = struct {
+        listener: *TcpListener,
+        head_read: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var accepted = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer accepted.socket.close();
+            var request: [4096]u8 = undefined;
+            var length: usize = 0;
+            while (mem.indexOf(u8, request[0..length], "\r\n\r\n") == null) {
+                const n = accepted.socket.recv(request[length..]) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (n == 0) return;
+                length += n;
+            }
+            self.head_read.store(true, .release);
+            var byte: [1]u8 = undefined;
+            _ = accepted.socket.recv(&byte) catch 0;
+        }
+    };
+    var stall = Stall{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Stall.run, .{&stall});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/cancel-head");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    const Worker = struct {
+        operation: *ClientOperation,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.operation.finishRequest(null) catch |err| {
+                self.result = err;
+                return;
+            };
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+    var worker = Worker{ .operation = &op };
+    const client_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!stall.head_read.load(.acquire)) std.Thread.yield() catch {};
+    op.cancel();
+    client_thread.join();
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(stall.failure == null);
+}
+
+test "finish drain uses a distinct bounded deadline and closes on timeout" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const Loopback = struct {
+        listener: *TcpListener,
+        saw_close: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var request: [4096]u8 = undefined;
+            var length: usize = 0;
+            while (mem.indexOf(u8, request[0..length], "\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(request[length..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                length += n;
+            }
+            try accepted.socket.sendAll("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx");
+            var byte: [1]u8 = undefined;
+            self.saw_close = (accepted.socket.recv(&byte) catch 0) == 0;
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/drain-timeout");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = .{
+            .connect_ms = 5_000,
+            .read_ms = 5_000,
+            .write_ms = 5_000,
+            .request_ms = 5_000,
+        },
+        .drain_timeout_ms = 30,
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    _ = try op.finishRequest(null);
+    const started = common.nowMillis();
+    try std.testing.expectError(error.Timeout, op.finish(.{}));
+    const elapsed = common.nowMillis() - started;
+    try std.testing.expect(elapsed >= 0 and elapsed < 1_000);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expect(server.saw_close);
+}
+
+test "streaming HTTP1 response enforces aggregate header byte limit" {
+    const allocator = std.testing.allocator;
+    var response = std.ArrayList(u8).empty;
+    defer response.deinit(allocator);
+    try response.appendSlice(allocator, "HTTP/1.1 200 OK\r\n");
+    for (0..100) |index| {
+        var line: [128]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &line,
+            "X-Aggregate-{d}: {s}\r\n",
+            .{ index, "a" ** 80 },
+        );
+        try response.appendSlice(allocator, header);
+    }
+    try response.appendSlice(allocator, "Content-Length: 0\r\n\r\n");
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response.items};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/large-head");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    try std.testing.expectError(error.HeaderTooLarge, op.finishRequest(null));
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
+test "streaming HTTP1 request enforces aggregate header byte limit" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+    const Server = struct {
+        listener: *TcpListener,
+        closed: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var accepted = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer accepted.socket.close();
+            var buffer: [1024]u8 = undefined;
+            while (true) {
+                const n = accepted.socket.recv(&buffer) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => 0,
+                    else => {
+                        self.failure = err;
+                        return;
+                    },
+                };
+                if (n == 0) {
+                    self.closed = true;
+                    return;
+                }
+            }
+        }
+    };
+    var server = Server{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    var large_value: [8200]u8 = undefined;
+    @memset(&large_value, 'h');
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/large-request-head",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    try std.testing.expectError(
+        error.HeaderTooLarge,
+        client.open(.GET, url, .{
+            .headers = &.{.{ "X-Large", &large_value }},
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        }),
+    );
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expect(server.closed);
+}
+
 test "public streaming rejects short conflicting and malformed response framing" {
     const allocator = std.testing.allocator;
     const responses = [_][]const u8{
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc",
         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabcXX",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabcd",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\na\r\n0\r\nBad-Trailer\r\n\r\n",
     };
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
@@ -7076,11 +8837,113 @@ test "public streaming rejects short conflicting and malformed response framing"
         try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
         try std.testing.expectError(error.MalformedChunk, op.read(&buffer));
     }
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectError(error.ResponseBodyOverrun, op.read(&buffer));
+    }
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try op.read(&buffer));
+        try std.testing.expectError(error.InvalidHeader, op.read(&buffer));
+    }
 
     server_thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
     try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+}
+
+test "public streaming incrementally decodes gzip deflate brotli and zstd with decoded limits" {
+    const allocator = std.testing.allocator;
+    const sample = "incremental decoded response body across tiny caller reads";
+    const encodings = [_]compression_util.ContentEncoding{ .gzip, .deflate, .br, .zstd };
+    var compressed: [encodings.len + 1][]u8 = undefined;
+    var responses: [encodings.len + 1][]u8 = undefined;
+    var initialized: usize = 0;
+    defer {
+        for (0..initialized) |index| {
+            allocator.free(responses[index]);
+            allocator.free(compressed[index]);
+        }
+    }
+    for (encodings, 0..) |encoding, index| {
+        compressed[index] = try compression_util.compress(allocator, encoding, sample);
+        const headers = [_][2][]const u8{.{ "Content-Encoding", encoding.toString() }};
+        responses[index] = try makePolicyTestResponse(allocator, "200 OK", &headers, compressed[index]);
+        initialized += 1;
+    }
+    compressed[encodings.len] = try compression_util.compress(allocator, .gzip, sample);
+    const limit_headers = [_][2][]const u8{.{ "Content-Encoding", "gzip" }};
+    responses[encodings.len] = try makePolicyTestResponse(
+        allocator,
+        "200 OK",
+        &limit_headers,
+        compressed[encodings.len],
+    );
+    initialized += 1;
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/decoded");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    for (encodings) |_| {
+        var op = try client.open(.GET, url, .{
+            .response_limit = .unlimited,
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var decoded: [sample.len]u8 = undefined;
+        var decoded_len: usize = 0;
+        var tiny: [7]u8 = undefined;
+        while (true) {
+            const n = try op.read(&tiny);
+            if (n == 0) break;
+            @memcpy(decoded[decoded_len..][0..n], tiny[0..n]);
+            decoded_len += n;
+        }
+        try std.testing.expectEqualStrings(sample, decoded[0..decoded_len]);
+        try op.finish(.{});
+    }
+
+    {
+        var op = try client.open(.GET, url, .{
+            .response_limit = .{ .bytes = sample.len - 1 },
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var output: [64]u8 = undefined;
+        try std.testing.expectError(error.ResponseTooLarge, op.read(&output));
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
 }
 
 test "public streaming finish drains framing and reuses one HTTP1 connection" {
@@ -7318,7 +9181,7 @@ test "public HTTP2 streaming abort resets one stream and reuses session" {
             var payload_buffer: [64 * 1024]u8 = undefined;
             const settings = try readFrame(&accepted.socket, &payload_buffer);
             try std.testing.expectEqual(http.HTTP2FrameType.settings, settings.header.frame_type);
-            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &.{});
+            try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
 
             while (self.reset_stream_id == 0) {
                 const frame = try readFrame(&accepted.socket, &payload_buffer);
@@ -7423,6 +9286,478 @@ test "public HTTP2 streaming abort resets one stream and reuses session" {
     try std.testing.expect(server.failure == null);
     try std.testing.expectEqual(@as(u31, 1), server.reset_stream_id);
     try std.testing.expectEqual(@as(u31, 3), server.completed_stream_id);
+}
+
+test "HTTP2 operation decodes padded HEADERS followed by CONTINUATION" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            var payload: [64 * 1024]u8 = undefined;
+            _ = try readFrame(&accepted.socket, &payload);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
+
+            var stream_id: u31 = 0;
+            var request_done = false;
+            while (!request_done) {
+                const header = try readFrame(&accepted.socket, &payload);
+                if (header.stream_id != 0) stream_id = header.stream_id;
+                request_done = header.stream_id == stream_id and (header.flags & 0x01) != 0;
+            }
+
+            var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+            defer manager.deinit();
+            const fields = [_]hpack.HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                .{ .name = "content-length", .value = "2", .representation = .without_indexing },
+                .{ .name = "x-padded", .value = "yes", .representation = .without_indexing },
+            };
+            const encoded = try hpack.encodeHeaders(&manager.hpack_ctx, &fields, std.heap.page_allocator);
+            defer std.heap.page_allocator.free(encoded);
+            const split = @max(@as(usize, 1), encoded.len / 2);
+
+            var first = std.ArrayList(u8).empty;
+            defer first.deinit(std.heap.page_allocator);
+            try first.append(std.heap.page_allocator, 3);
+            try first.appendSlice(std.heap.page_allocator, encoded[0..split]);
+            try first.appendNTimes(std.heap.page_allocator, 0, 3);
+            try writeHTTP2Frame(&accepted.socket, .headers, 0x08, stream_id, first.items);
+            try writeHTTP2Frame(&accepted.socket, .continuation, 0x04, stream_id, encoded[split..]);
+            try writeHTTP2Frame(&accepted.socket, .data, 0x01, stream_id, "ok");
+
+            var updates: usize = 0;
+            while (updates < 2) {
+                const header = try readFrame(&accepted.socket, &payload);
+                if (header.frame_type == .window_update) updates += 1;
+            }
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/padded");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_2,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    const response_head = try op.finishRequest(null);
+    try std.testing.expectEqualStrings("yes", response_head.headers.get("x-padded").?);
+    var body: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try op.read(&body));
+    try std.testing.expectEqualStrings("ok", body[0..2]);
+    try op.finish(.{});
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
+test "HTTP2 operation classifies connection failures as non-reusable" {
+    try std.testing.expectEqual(
+        OperationImpl.H2FailureClass.connection_fatal,
+        OperationImpl.classifyH2Failure(error.UnexpectedEof),
+    );
+    try std.testing.expectEqual(
+        OperationImpl.H2FailureClass.connection_fatal,
+        OperationImpl.classifyH2Failure(error.ProtocolError),
+    );
+    try std.testing.expectEqual(
+        OperationImpl.H2FailureClass.stream_local,
+        OperationImpl.classifyH2Failure(error.ResponseTooLarge),
+    );
+    try std.testing.expectEqual(
+        OperationImpl.H2FailureClass.peer_reset,
+        OperationImpl.classifyH2Failure(error.StreamError),
+    );
+}
+
+test "HTTP2 flow-control wait honors write deadline and sends bounded reset" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        saw_reset: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            var payload: [64 * 1024]u8 = undefined;
+            _ = try readFrame(&accepted.socket, &payload);
+
+            var settings_payload: [6]u8 = undefined;
+            mem.writeInt(u16, settings_payload[0..2], @intFromEnum(http.HTTP2Settings.initial_window_size), .big);
+            mem.writeInt(u32, settings_payload[2..6], 0, .big);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &settings_payload);
+
+            while (!self.saw_reset) {
+                const header = try readFrame(&accepted.socket, &payload);
+                self.saw_reset = header.frame_type == .rst_stream;
+            }
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/flow-timeout");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = .{
+            .connect_ms = 5_000,
+            .read_ms = 5_000,
+            .write_ms = 30,
+            .request_ms = 5_000,
+        },
+    });
+    defer client.deinit();
+    var op = try client.open(.POST, url, .{
+        .version = .HTTP_2,
+        .body_mode = .{ .content_length = 70_000 },
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    var body: [70_000]u8 = undefined;
+    @memset(&body, 'x');
+    const started = common.nowMillis();
+    try std.testing.expectError(error.Timeout, op.writeAll(&body));
+    const elapsed = common.nowMillis() - started;
+    try std.testing.expect(elapsed >= 0 and elapsed < 1_000);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expect(server.saw_reset);
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+}
+
+test "HTTP2 failed stream reset poisons and closes the session" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            var payload: [64 * 1024]u8 = undefined;
+            _ = try readFrame(&accepted.socket, &payload);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
+
+            var stream_id: u31 = 0;
+            var request_done = false;
+            while (!request_done) {
+                const header = try readFrame(&accepted.socket, &payload);
+                if (header.stream_id != 0) stream_id = header.stream_id;
+                request_done = header.stream_id == stream_id and (header.flags & 0x01) != 0;
+            }
+
+            var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+            defer manager.deinit();
+            const fields = [_]hpack.HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                .{ .name = "content-length", .value = "100", .representation = .without_indexing },
+            };
+            const frames = try h2stream.buildHeadersAndContinuations(
+                &manager,
+                stream_id,
+                &fields,
+                null,
+                16_384,
+                false,
+                std.heap.page_allocator,
+            );
+            defer std.heap.page_allocator.free(frames);
+            try accepted.socket.sendAll(frames);
+            try accepted.socket.setLinger(true, 0);
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/failed-reset");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_2,
+        .response_limit = .{ .bytes = 1 },
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    try std.testing.expectError(error.ResponseTooLarge, op.finishRequest(null));
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
+test "HTTP2 transport EOF closes rather than reuses the session" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            var payload: [64 * 1024]u8 = undefined;
+            var raw: [9]u8 = undefined;
+            try readExact(&accepted.socket, &raw);
+            var header = http.HTTP2FrameHeader.parse(raw);
+            try readExact(&accepted.socket, payload[0..header.length]);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &.{});
+
+            var done = false;
+            while (!done) {
+                try readExact(&accepted.socket, &raw);
+                header = http.HTTP2FrameHeader.parse(raw);
+                try readExact(&accepted.socket, payload[0..header.length]);
+                done = header.stream_id != 0 and (header.flags & 0x01) != 0;
+            }
+            try accepted.socket.setLinger(true, 0);
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/eof");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_2,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    if (op.finishRequest(null)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
+test "public HTTP3 operation streams request and response bodies" {
+    const allocator = std.testing.allocator;
+    const State = struct {
+        var matched: std.atomic.Value(bool) = .init(false);
+        fn handle(ctx: *server_mod.Context) anyerror!Response {
+            matched.store(
+                ctx.request.body != null and mem.eql(u8, ctx.request.body.?, "hello h3"),
+                .release,
+            );
+            return ctx.text("h3-ok");
+        }
+    };
+    State.matched.store(false, .release);
+    var server = server_mod.Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http3_enabled = true,
+        .keep_alive = false,
+        .log_fn = &struct {
+            fn log(_: server_mod.LogLevel, _: []const u8) void {}
+        }.log,
+    });
+    defer server.deinit();
+    try server.post("/h3-stream", State.handle);
+    const server_thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        server_thread.join();
+    }
+    while (server.listeningPort() == 0) std.Thread.yield() catch {};
+
+    var client = Client.initWithConfig(allocator, .{
+        .http3_enabled = true,
+        .http2_enabled = false,
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/h3-stream",
+        .{server.listeningPort()},
+    );
+    defer allocator.free(url);
+
+    var op = try client.open(.POST, url, .{
+        .version = .HTTP_3,
+        .body_mode = .chunked,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    try op.writeAll("hello");
+    try op.writeAll(" h3");
+    const response_head = try op.finishRequest(null);
+    try std.testing.expectEqual(types.Version.HTTP_3, response_head.version);
+    var response: [16]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) {
+        const n = try op.read(response[response_len..]);
+        if (n == 0) break;
+        response_len += n;
+    }
+    try std.testing.expectEqualStrings("h3-ok", response[0..response_len]);
+    try op.finish(.{});
+    try std.testing.expect(State.matched.load(.acquire));
 }
 
 test "Client observes an already-cancelled borrowed token before request setup" {

@@ -336,20 +336,23 @@ try op.finish(.{});
 
 Use `.chunked` for an HTTP/1.1 request of unknown length. HTTP/2 maps both
 known and unknown lengths to DATA frames and sends END_STREAM only from
-`finishRequest`. `waitForContinue` exposes the `Expect: 100-continue`
-boundary. `finish(.{ .drain_response = true })` validates and drains before
-reuse; `abort` closes HTTP/1 or resets HTTP/2; `cancel` is the only operation
-method that may race active I/O.
+`finishRequest`; HTTP/3 maps them to incremental DATA frames and stream FIN.
+`waitForContinue` exposes the `Expect: 100-continue` boundary.
+`finish(.{ .drain_response = true, .drain_timeout_ms = 5_000 })` validates
+and drains before reuse; `abort` closes HTTP/1, resets HTTP/2, or sends
+HTTP/3 RESET_STREAM and STOP_SENDING. `cancel` is the only operation method
+that may race active I/O.
 
-Streaming counters and limits are `u64`; transport storage is fixed at 64 KiB.
+Streaming counters and limits are `u64`; caller and transport body buffers are
+fixed at 16–64 KiB. gzip/deflate, Brotli, and Zstandard are decoded
+incrementally, and response limits apply to decoded bytes. Decoder history is
+bounded by the format window (Zstandard windows above 32 MiB are rejected).
 TCP connect/read/write, pool waits, configured DNS UDP/TCP queries, and TLS
-record I/O check cancellation in bounded readiness waits. The platform system
-resolver fallback (`getaddrinfo`) and Unix-domain connect are only cooperative:
-cancellation is checked immediately before and after those platform calls,
-which cannot be portably interrupted.
-Automatic gzip/brotli/zstd response decoding remains a buffered-only feature;
-streaming operations return `error.StreamingDecompressionUnsupported` rather
-than buffering the complete encoded body.
+record I/O check cancellation in bounded readiness waits. System
+`getaddrinfo` runs in a detached, heap-owned worker: cancellation stops waiting
+immediately, while the worker self-cleans after the non-interruptible platform
+call returns. Unix-domain connects use the same nonblocking readiness loop as
+TCP.
 
 ### Simplified API Aliases
 

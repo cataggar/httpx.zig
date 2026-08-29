@@ -434,6 +434,24 @@ test "Request builder" {
     try std.testing.expectEqual(types.Method.POST, request.method);
 }
 
+test "request preparation is failure safe" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var request = try Request.init(allocator, .POST, "https://example.test/path");
+            defer request.deinit();
+            try request.headers.append("X-Dupe", "one");
+            try request.headers.append("X-Dupe", "two");
+            try request.setJson("{\"value\":42}");
+            try request.addQueryParams(&.{
+                .{ "first", "one" },
+                .{ "second", "two" },
+            });
+            try request.setBasicAuth("user", "password");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
 test "Request serialization" {
     const allocator = std.testing.allocator;
     var request = try Request.init(allocator, .GET, "http://httpbun.com/api");

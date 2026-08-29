@@ -6,8 +6,7 @@
 //!
 //! Supported encodings:
 //!   gzip / deflate  -- stateful incremental flate via std.compress.flate
-//!   brotli          -- accumulates per-frame, decompresses complete frames
-//!   zstd            -- accumulates per-frame, decompresses complete frames
+//!   brotli / zstd   -- native incremental decoders with bounded input/output
 //!   identity        -- passthrough
 //!
 //! The streaming API allows callers to consume decompressed data incrementally
@@ -34,8 +33,8 @@ pub const StreamingError = error{
 };
 
 pub const StreamingLimits = struct {
-    max_decompressed_size: usize = 100 * 1024 * 1024,
-    max_compressed_input: usize = 256 * 1024 * 1024,
+    max_decompressed_size: u64 = 100 * 1024 * 1024,
+    max_compressed_input: u64 = 256 * 1024 * 1024,
 };
 
 const FlateDecompressorState = struct {
@@ -55,12 +54,18 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         reader: ReaderType,
         output_buf: [16 * 1024]u8,
         flate_state: ?FlateDecompressorState = null,
-        brotli_accum: ?std.ArrayList(u8) = null,
-        zstd_accum: ?std.ArrayList(u8) = null,
+        brotli_decoder: ?brotli.Decoder = null,
+        zstd_decoder: ?zstd_pkg.StreamingDecompressor = null,
+        decoder_input: [16 * 1024]u8 = undefined,
+        decoder_input_pos: usize = 0,
+        decoder_input_len: usize = 0,
+        zstd_output: [128 * 1024]u8 = undefined,
+        zstd_output_pos: usize = 0,
+        zstd_output_len: usize = 0,
         brotli_finalized: bool = false,
         zstd_finalized: bool = false,
-        total_decompressed: usize = 0,
-        total_compressed: usize = 0,
+        total_decompressed: u64 = 0,
+        total_compressed: u64 = 0,
         limits: StreamingLimits,
 
         pub fn init(allocator: Allocator, encoding: ContentEncoding, reader: ReaderType) Self {
@@ -84,8 +89,8 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.brotli_accum) |*ba| ba.deinit(self.allocator);
-            if (self.zstd_accum) |*za| za.deinit(self.allocator);
+            if (self.brotli_decoder) |*decoder| decoder.deinit();
+            if (self.zstd_decoder) |*decoder| decoder.deinit();
         }
 
         pub fn readChunk(self: *Self) !?[]const u8 {
@@ -177,91 +182,127 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
             return written;
         }
 
-        // --- Brotli streaming (frame-aware accumulation) ---
+        fn refillDecoderInput(self: *Self) !bool {
+            if (self.decoder_input_pos < self.decoder_input_len) return true;
+            self.decoder_input_pos = 0;
+            self.decoder_input_len = self.reader.readSliceShort(&self.decoder_input) catch
+                return error.IoFailed;
+            if (self.decoder_input_len == 0) return false;
+            self.total_compressed +|= self.decoder_input_len;
+            if (self.total_compressed > self.limits.max_compressed_input) {
+                return error.DecompressionBombDetected;
+            }
+            return true;
+        }
+
+        fn recordOutput(self: *Self, amount: usize) !void {
+            self.total_decompressed +|= amount;
+            if (self.total_decompressed > self.limits.max_decompressed_size) {
+                return error.DecompressionBombDetected;
+            }
+        }
+
+        // --- Brotli streaming ---
 
         fn readBrotliChunk(self: *Self) !?[]const u8 {
-            if (self.brotli_accum == null) {
-                self.brotli_accum = .empty;
-            }
             if (self.brotli_finalized) return null;
-
-            var buf: [8192]u8 = undefined;
-            const n = self.reader.readSliceShort(&buf) catch return null;
-            if (n == 0) {
-                self.brotli_finalized = true;
-                return self.decompressBrotli();
+            if (self.brotli_decoder == null) {
+                self.brotli_decoder = brotli.Decoder.init(self.allocator, .{});
             }
-
-            self.total_compressed +|= n;
-            if (self.total_compressed > self.limits.max_compressed_input) return error.DecompressionBombDetected;
-
-            try self.brotli_accum.?.appendSlice(self.allocator, buf[0..n]);
-
-            if (self.decompressBrotli()) |result| return result;
-            return self.readBrotliChunk();
+            const decoder = &self.brotli_decoder.?;
+            var output: []u8 = &self.output_buf;
+            while (true) {
+                const has_input = try self.refillDecoderInput();
+                var input: []const u8 = if (has_input)
+                    self.decoder_input[self.decoder_input_pos..self.decoder_input_len]
+                else
+                    &.{};
+                const before = input.len;
+                const result = decoder.decompressStream(&input, &output, null);
+                self.decoder_input_pos += before - input.len;
+                const produced = self.output_buf.len - output.len;
+                switch (result) {
+                    .success => {
+                        self.brotli_finalized = true;
+                        try self.recordOutput(produced);
+                        return if (produced == 0) null else self.output_buf[0..produced];
+                    },
+                    .needs_more_output => {
+                        try self.recordOutput(produced);
+                        return self.output_buf[0..produced];
+                    },
+                    .needs_more_input => {
+                        if (produced > 0) {
+                            try self.recordOutput(produced);
+                            return self.output_buf[0..produced];
+                        }
+                        if (!has_input) return error.TruncatedStream;
+                    },
+                    .err => return switch (decoder.errorCode()) {
+                        .alloc_context_modes,
+                        .alloc_tree_groups,
+                        .alloc_context_map,
+                        .alloc_ring_buffer_1,
+                        .alloc_ring_buffer_2,
+                        .alloc_block_type_trees,
+                        => error.OutOfMemory,
+                        else => error.DecompressionFailed,
+                    },
+                }
+            }
         }
 
-        fn decompressBrotli(self: *Self) ?[]const u8 {
-            const accum = self.brotli_accum orelse return null;
-            if (accum.items.len == 0) return null;
-
-            const decompressed = brotli.decompress(self.allocator, accum.items) catch return null;
-            self.brotli_accum.?.clearRetainingCapacity();
-
-            self.total_decompressed +|= decompressed.len;
-            if (self.total_decompressed > self.limits.max_decompressed_size) {
-                self.allocator.free(decompressed);
-                return null;
-            }
-
-            const owned = self.allocator.dupe(u8, decompressed) catch {
-                self.allocator.free(decompressed);
-                return null;
-            };
-            self.allocator.free(decompressed);
-            return owned;
-        }
-
-        // --- Zstd streaming (frame-aware accumulation) ---
+        // --- Zstd streaming ---
 
         fn readZstdChunk(self: *Self) !?[]const u8 {
-            if (self.zstd_accum == null) {
-                self.zstd_accum = .empty;
-            }
             if (self.zstd_finalized) return null;
-
-            var buf: [8192]u8 = undefined;
-            const n = self.reader.readSliceShort(&buf) catch return null;
-            if (n == 0) {
-                self.zstd_finalized = true;
-                return self.decompressZstdChunk();
+            if (self.zstd_decoder == null) {
+                self.zstd_decoder = zstd_pkg.StreamingDecompressor.init(self.allocator);
             }
-
-            self.total_compressed +|= n;
-            if (self.total_compressed > self.limits.max_compressed_input) return error.DecompressionBombDetected;
-
-            try self.zstd_accum.?.appendSlice(self.allocator, buf[0..n]);
-
-            if (self.decompressZstdChunk()) |result| return result;
-            return self.readZstdChunk();
-        }
-
-        fn decompressZstdChunk(self: *Self) ?[]const u8 {
-            const accum = self.zstd_accum orelse return null;
-            if (accum.items.len == 0) return null;
-
-            const content_size = zstd_pkg.getFrameContentSize(accum.items);
-            if (content_size == zstd_pkg.CONTENTSIZE_UNKNOWN or content_size == zstd_pkg.CONTENTSIZE_ERROR) {
-                return null;
+            if (self.zstd_output_pos < self.zstd_output_len) {
+                const amount = @min(self.output_buf.len, self.zstd_output_len - self.zstd_output_pos);
+                @memcpy(self.output_buf[0..amount], self.zstd_output[self.zstd_output_pos..][0..amount]);
+                self.zstd_output_pos += amount;
+                try self.recordOutput(amount);
+                return self.output_buf[0..amount];
             }
-
-            if (content_size > self.limits.max_decompressed_size) return null;
-
-            const decompressed = zstd_pkg.decompress(self.allocator, accum.items) catch return null;
-            self.zstd_accum.?.clearRetainingCapacity();
-
-            self.total_decompressed +|= decompressed.len;
-            return decompressed;
+            const decoder = &self.zstd_decoder.?;
+            while (true) {
+                const has_input = try self.refillDecoderInput();
+                const input = if (has_input)
+                    self.decoder_input[self.decoder_input_pos..self.decoder_input_len]
+                else
+                    &.{};
+                const result = try decoder.decompressStream(&self.zstd_output, input);
+                self.decoder_input_pos += result.in_consumed;
+                if (decoder.frame_header) |frame_header| {
+                    const window = std.math.cast(usize, frame_header.window_size) orelse
+                        return error.DecompressionBombDetected;
+                    if (@as(u64, window) > self.limits.max_decompressed_size) {
+                        return error.DecompressionBombDetected;
+                    }
+                    if (decoder.out_buffer.items.len > window) {
+                        const retained = decoder.out_buffer.items[decoder.out_buffer.items.len - window ..];
+                        @memmove(decoder.out_buffer.items[0..window], retained);
+                        decoder.out_buffer.shrinkRetainingCapacity(window);
+                    }
+                }
+                if (result.out_produced > 0) {
+                    self.zstd_output_pos = 0;
+                    self.zstd_output_len = result.out_produced;
+                    const amount = @min(self.output_buf.len, result.out_produced);
+                    @memcpy(self.output_buf[0..amount], self.zstd_output[0..amount]);
+                    self.zstd_output_pos = amount;
+                    try self.recordOutput(amount);
+                    return self.output_buf[0..amount];
+                }
+                if (!has_input) {
+                    if (result.needs_more) return error.TruncatedStream;
+                    self.zstd_finalized = true;
+                    return null;
+                }
+                if (result.in_consumed == 0) return error.DecompressionFailed;
+            }
         }
     };
 }
@@ -480,7 +521,6 @@ test "streaming decompressor brotli round trip" {
     defer result.deinit(allocator);
 
     while (try decompressor.readChunk()) |chunk| {
-        defer allocator.free(chunk);
         try result.appendSlice(allocator, chunk);
     }
 
@@ -503,11 +543,37 @@ test "streaming decompressor zstd round trip" {
     defer result.deinit(allocator);
 
     while (try decompressor.readChunk()) |chunk| {
-        defer allocator.free(chunk);
         try result.appendSlice(allocator, chunk);
     }
 
     try testing.expectEqualStrings(sample, result.items);
+}
+
+test "streaming zstd decoder keeps large output incremental" {
+    const allocator = std.testing.allocator;
+    const input = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(input);
+    for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    const compressed = try compression.compress(allocator, .zstd, input);
+    defer allocator.free(compressed);
+
+    const reader: std.Io.Reader = .fixed(compressed);
+    var decoder = StreamingDecompressor(std.Io.Reader).initWithLimits(
+        allocator,
+        .zstd,
+        reader,
+        .{
+            .max_decompressed_size = input.len,
+            .max_compressed_input = compressed.len,
+        },
+    );
+    defer decoder.deinit();
+    var offset: usize = 0;
+    while (try decoder.readChunk()) |chunk| {
+        try std.testing.expectEqualSlices(u8, input[offset..][0..chunk.len], chunk);
+        offset += chunk.len;
+    }
+    try std.testing.expectEqual(input.len, offset);
 }
 
 test "streaming decompressor identity" {
@@ -617,7 +683,6 @@ test "streaming compressor brotli round trip" {
     defer result.deinit(allocator);
 
     while (try decompressor.readChunk()) |chunk| {
-        defer allocator.free(chunk);
         try result.appendSlice(allocator, chunk);
     }
 
@@ -652,7 +717,6 @@ test "streaming compressor zstd multi-chunk round trip" {
     defer result.deinit(allocator);
 
     while (try decompressor.readChunk()) |chunk| {
-        defer allocator.free(chunk);
         try result.appendSlice(allocator, chunk);
     }
 

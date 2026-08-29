@@ -5,6 +5,7 @@ const address_mod = @import("address.zig");
 const common = @import("../data/common.zig");
 const socket_mod = @import("socket.zig");
 const IoContext = @import("../io/context.zig").IoContext;
+const Deadline = @import("../io/context.zig").Deadline;
 const CancellationToken = @import("../core/types.zig").CancellationToken;
 
 const posix = std.posix;
@@ -387,24 +388,32 @@ fn queryViaUdp(
     defer sock.close();
 
     try sock.connect(server_addr);
-    if (context) |io_context| {
-        _ = sock.sendWithContext(buf[0..query_len], io_context) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
+    if (context) |caller_context| {
+        var query_context = IoContext.init(.{
+            .parent = caller_context,
+            .phase_deadline = if (timeout_ms > 0) Deadline.afterMs(timeout_ms) else null,
+        });
+        _ = sock.sendWithContext(buf[0..query_len], &query_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return mapQueryContextError(caller_context, err),
             else => return error.DnsUdpSendFailed,
         };
-    } else {
-        sock.setRecvTimeout(timeout_ms) catch {};
-        _ = sock.send(buf[0..query_len]) catch return error.DnsUdpSendFailed;
+        var resp_buf: [4096]u8 = undefined;
+        const n = sock.recvWithContext(&resp_buf, &query_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return mapQueryContextError(caller_context, err),
+            else => return error.DnsUdpRecvFailed,
+        };
+        var msg = try parseDnsMessage(resp_buf[0..n], allocator);
+        if (msg.header.isTruncated()) {
+            msg.deinit();
+            return error.DnsUdpTruncated;
+        }
+        return msg;
     }
 
+    sock.setRecvTimeout(timeout_ms) catch {};
+    _ = sock.send(buf[0..query_len]) catch return error.DnsUdpSendFailed;
     var resp_buf: [4096]u8 = undefined;
-    const n = if (context) |io_context|
-        sock.recvWithContext(&resp_buf, io_context) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
-            else => return error.DnsUdpRecvFailed,
-        }
-    else
-        sock.recv(&resp_buf) catch return error.DnsUdpRecvFailed;
+    const n = sock.recv(&resp_buf) catch return error.DnsUdpRecvFailed;
 
     var msg = try parseDnsMessage(resp_buf[0..n], allocator);
 
@@ -431,9 +440,18 @@ fn queryViaTcp(
     var sock = socket_mod.Socket.createForAddress(server_addr) catch return error.DnsTcpSocketFailed;
     defer sock.close();
 
-    if (context) |io_context| {
+    var query_context_storage: IoContext = undefined;
+    const query_context: ?*IoContext = if (context) |caller_context| blk: {
+        query_context_storage = IoContext.init(.{
+            .parent = caller_context,
+            .phase_deadline = if (timeout_ms > 0) Deadline.afterMs(timeout_ms) else null,
+        });
+        break :blk &query_context_storage;
+    } else null;
+
+    if (query_context) |io_context| {
         sock.connectWithContext(server_addr, timeout_ms, io_context) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
+            error.Cancelled, error.Timeout => return mapQueryContextError(context.?, err),
             else => return error.DnsTcpConnectFailed,
         };
     } else {
@@ -445,8 +463,9 @@ fn queryViaTcp(
     @memcpy(tcp_buf[2 .. 2 + query_len], buf[0..query_len]);
 
     if (context) |io_context| {
-        sock.sendAllWithContext(tcp_buf[0 .. 2 + query_len], io_context) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
+        _ = io_context;
+        sock.sendAllWithContext(tcp_buf[0 .. 2 + query_len], query_context.?) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return mapQueryContextError(context.?, err),
             else => return error.DnsTcpSendFailed,
         };
     } else {
@@ -456,9 +475,9 @@ fn queryViaTcp(
     var len_buf: [2]u8 = undefined;
     var read: usize = 0;
     while (read < 2) {
-        const n = if (context) |io_context|
+        const n = if (query_context) |io_context|
             sock.recvWithContext(len_buf[read..], io_context) catch |err| switch (err) {
-                error.Cancelled, error.Timeout => return err,
+                error.Cancelled, error.Timeout => return mapQueryContextError(context.?, err),
                 else => return error.DnsTcpRecvFailed,
             }
         else
@@ -473,9 +492,9 @@ fn queryViaTcp(
     var resp_buf: [4096]u8 = undefined;
     read = 0;
     while (read < resp_len) {
-        const n = if (context) |io_context|
+        const n = if (query_context) |io_context|
             sock.recvWithContext(resp_buf[read..resp_len], io_context) catch |err| switch (err) {
-                error.Cancelled, error.Timeout => return err,
+                error.Cancelled, error.Timeout => return mapQueryContextError(context.?, err),
                 else => return error.DnsTcpRecvFailed,
             }
         else
@@ -485,6 +504,13 @@ fn queryViaTcp(
     }
 
     return parseDnsMessage(resp_buf[0..resp_len], allocator);
+}
+
+fn mapQueryContextError(caller: *const IoContext, err: anyerror) anyerror {
+    if (caller.isCancelled()) return error.Cancelled;
+    if (caller.expiredDeadline() != null) return error.Timeout;
+    if (err == error.Timeout) return error.DnsQueryTimeout;
+    return err;
 }
 
 fn queryDns(
@@ -1556,6 +1582,75 @@ test "DNSResolver cancellation interrupts an in-flight UDP query" {
 
     try std.testing.expectEqual(error.Cancelled, worker.result.?);
     try std.testing.expectEqual(@as(u64, 0), resolver.getStats().failures);
+}
+
+test "DNS UDP query uses earliest caller and per-query deadlines" {
+    var dns_socket = try socket_mod.UdpSocket.create();
+    defer dns_socket.close();
+    try dns_socket.bind(try net.Address.parseIp("127.0.0.1", 0));
+    const address = try dns_socket.getLocalAddress();
+    const server = DnsServer{ .ip = "127.0.0.1", .port = address.getPort() };
+
+    const no_caller_deadline = IoContext.init(.{});
+    try std.testing.expectError(
+        error.DnsQueryTimeout,
+        queryViaUdp(server, "query-timeout.invalid", .A, 20, std.testing.allocator, &no_caller_deadline),
+    );
+
+    const caller_deadline = IoContext.init(.{ .phase_deadline = Deadline.afterMs(10) });
+    try std.testing.expectError(
+        error.Timeout,
+        queryViaUdp(server, "caller-timeout.invalid", .A, 5_000, std.testing.allocator, &caller_deadline),
+    );
+}
+
+test "DNS TCP query enforces its per-query deadline" {
+    var listener = try socket_mod.TcpListener.init(try net.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const address = try listener.getLocalAddress();
+
+    const Server = struct {
+        listener: *socket_mod.TcpListener,
+        accepted: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var connection = self.listener.accept() catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer connection.socket.close();
+            self.accepted.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+
+    var server_state = Server{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, Server.run, .{&server_state});
+    var joined = false;
+    defer if (!joined) {
+        server_state.release.store(true, .release);
+        thread.join();
+    };
+
+    const context = IoContext.init(.{});
+    try std.testing.expectError(
+        error.DnsQueryTimeout,
+        queryViaTcp(
+            .{ .ip = "127.0.0.1", .port = address.getPort() },
+            "tcp-timeout.invalid",
+            .A,
+            20,
+            std.testing.allocator,
+            &context,
+        ),
+    );
+    server_state.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(server_state.failure == null);
+    try std.testing.expect(server_state.accepted.load(.acquire));
 }
 
 test "DNSResolver context interrupts in-flight dedup wait" {

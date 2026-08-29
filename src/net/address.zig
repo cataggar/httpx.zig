@@ -10,6 +10,7 @@
 const std = @import("std");
 const net = @import("compat.zig");
 const Allocator = std.mem.Allocator;
+const IoContext = @import("../io/context.zig").IoContext;
 
 pub const Address = net.Address;
 pub const AddressList = net.AddressList;
@@ -32,6 +33,107 @@ pub fn resolve(allocator: Allocator, hostname: []const u8, port: u16) !net.Addre
     }
 
     return list.addrs[0];
+}
+
+pub const ResolverAdapter = struct {
+    context: ?*anyopaque = null,
+    resolveFn: *const fn (?*anyopaque, []const u8, u16) anyerror!net.Address,
+    cleanupFn: ?*const fn (?*anyopaque) void = null,
+
+    pub fn system() ResolverAdapter {
+        return .{ .resolveFn = struct {
+            fn call(_: ?*anyopaque, hostname: []const u8, port: u16) !net.Address {
+                return resolve(std.heap.page_allocator, hostname, port);
+            }
+        }.call };
+    }
+};
+
+const ResolveJob = struct {
+    hostname: []u8,
+    port: u16,
+    adapter: ResolverAdapter,
+    done: std.atomic.Value(bool) = .init(false),
+    waiter_done: std.atomic.Value(bool) = .init(false),
+    result: ?net.Address = null,
+    failure: ?anyerror = null,
+
+    fn destroy(self: *@This()) void {
+        std.heap.page_allocator.free(self.hostname);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn run(self: *@This()) void {
+        self.result = self.adapter.resolveFn(self.adapter.context, self.hostname, self.port) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        self.done.store(true, .release);
+    }
+
+    fn reap(worker: std.Thread, self: *@This()) void {
+        worker.join();
+        if (self.adapter.cleanupFn) |cleanup| cleanup(self.adapter.context);
+        while (!self.waiter_done.load(.acquire)) std.Thread.yield() catch {};
+        self.destroy();
+    }
+};
+
+/// Runs potentially blocking platform resolution in a detached heap-owned job.
+/// Cancellation stops waiting immediately; the worker owns its remaining
+/// references and self-cleans when the platform call eventually returns.
+pub fn resolveWithContext(
+    hostname: []const u8,
+    port: u16,
+    context: *const IoContext,
+) !net.Address {
+    try context.check();
+    if (parseIp4(hostname)) |ip4| return net.Address.initIp4(ip4, port);
+    if (parseIp6(hostname)) |ip6| return net.Address.initIp6(ip6, port, 0, 0);
+    return resolveWithAdapter(hostname, port, context, ResolverAdapter.system());
+}
+
+pub fn resolveWithAdapter(
+    hostname: []const u8,
+    port: u16,
+    context: *const IoContext,
+    adapter: ResolverAdapter,
+) !net.Address {
+    try context.check();
+    const job = try std.heap.page_allocator.create(ResolveJob);
+    const owned_hostname = std.heap.page_allocator.dupe(u8, hostname) catch |err| {
+        std.heap.page_allocator.destroy(job);
+        return err;
+    };
+    var transferred = false;
+    errdefer if (!transferred) {
+        std.heap.page_allocator.free(owned_hostname);
+        std.heap.page_allocator.destroy(job);
+    };
+    job.* = .{
+        .hostname = owned_hostname,
+        .port = port,
+        .adapter = adapter,
+    };
+
+    const worker = try std.Thread.spawn(.{}, ResolveJob.run, .{job});
+    const reaper = std.Thread.spawn(.{}, ResolveJob.reap, .{ worker, job }) catch |err| {
+        job.waiter_done.store(true, .release);
+        worker.join();
+        if (job.adapter.cleanupFn) |cleanup| cleanup(job.adapter.context);
+        return err;
+    };
+    transferred = true;
+    reaper.detach();
+    defer job.waiter_done.store(true, .release);
+
+    while (!job.done.load(.acquire)) {
+        try context.waitForMs(1);
+    }
+    try context.check();
+    if (job.failure) |err| return err;
+    return job.result orelse error.DNSResolutionFailed;
 }
 
 /// Resolves a hostname to all candidate addresses. Caller must free the returned slice.
@@ -751,6 +853,50 @@ test "isIp4Address and isIp6Address" {
     try std.testing.expect(isIp6Address("2001:db8::1"));
     try std.testing.expect(!isIp6Address("192.168.1.1"));
     try std.testing.expect(!isIp6Address("not-an-ip"));
+}
+
+test "system resolver worker stops waiting on cancellation and self-cleans" {
+    const Fake = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn resolve(context: ?*anyopaque, _: []const u8, port: u16) !net.Address {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            return net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        }
+
+        fn cleanup(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
+    const fake = try std.heap.page_allocator.create(Fake);
+    fake.* = .{};
+    var token = @import("../core/types.zig").CancellationToken.init();
+    const context = IoContext.init(.{ .external_cancel = &token });
+    const Canceller = struct {
+        fake: *Fake,
+        token: *@import("../core/types.zig").CancellationToken,
+
+        fn run(self: @This()) void {
+            while (!self.fake.entered.load(.acquire)) std.Thread.yield() catch {};
+            self.token.cancel();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{Canceller{ .fake = fake, .token = &token }});
+    try std.testing.expectError(
+        error.Cancelled,
+        resolveWithAdapter("blocked.invalid", 80, &context, .{
+            .context = fake,
+            .resolveFn = Fake.resolve,
+            .cleanupFn = Fake.cleanup,
+        }),
+    );
+    thread.join();
+    fake.release.store(true, .release);
 }
 
 test "formatAddress produces valid output" {

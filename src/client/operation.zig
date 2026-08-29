@@ -15,6 +15,34 @@ pub const BodyMode = union(enum) {
     chunked,
 };
 
+pub const RequestProgress = struct {
+    mode: BodyMode,
+    bytes: u64 = 0,
+
+    pub fn validateWrite(self: *const RequestProgress, amount: usize) !u64 {
+        if (amount == 0) return self.bytes;
+        const next = std.math.add(u64, self.bytes, amount) catch
+            return error.BodyLengthOverflow;
+        switch (self.mode) {
+            .none => return error.RequestBodyNotAllowed,
+            .content_length => |length| if (next > length) return error.RequestBodyOverrun,
+            .chunked => {},
+        }
+        return next;
+    }
+
+    pub fn commit(self: *RequestProgress, next: u64) void {
+        self.bytes = next;
+    }
+
+    pub fn finish(self: *const RequestProgress) !void {
+        switch (self.mode) {
+            .content_length => |length| if (self.bytes != length) return error.RequestBodyUnderrun,
+            else => {},
+        }
+    }
+};
+
 pub const ResponseLimit = union(enum) {
     inherit,
     unlimited,
@@ -64,6 +92,8 @@ pub const ContinueResult = enum {
 
 pub const FinishOptions = struct {
     drain_response: bool = true,
+    /// Independent upper bound for draining. Null uses ClientConfig.
+    drain_timeout_ms: ?u64 = null,
 };
 
 pub const VTable = struct {

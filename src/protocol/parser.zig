@@ -37,6 +37,16 @@ pub const ParserMode = enum {
     response,
 };
 
+pub const BodySink = struct {
+    context: *anyopaque,
+    writeFn: *const fn (*anyopaque, []const u8) anyerror!usize,
+    stop_after_write: bool = false,
+
+    pub fn write(self: *BodySink, data: []const u8) !usize {
+        return self.writeFn(self.context, data);
+    }
+};
+
 /// Incremental HTTP message parser.
 pub const Parser = struct {
     allocator: Allocator,
@@ -53,6 +63,7 @@ pub const Parser = struct {
     chunked: bool = false,
     current_chunk_size: u64 = 0,
     bytes_read: u64 = 0,
+    body_bytes: u64 = 0,
     chunk_crlf_read: u2 = 0,
     line_buffer: std.ArrayList(u8) = .empty,
     max_header_size: usize = 8192,
@@ -114,25 +125,51 @@ pub const Parser = struct {
 
     /// Feeds data to the parser, returning the number of bytes consumed.
     pub fn feed(self: *Self, data: []const u8) !usize {
+        var sink = BodySink{
+            .context = self,
+            .writeFn = struct {
+                fn write(context: *anyopaque, body: []const u8) !usize {
+                    const parser: *Parser = @ptrCast(@alignCast(context));
+                    try parser.body_buffer.appendSlice(parser.allocator, body);
+                    return body.len;
+                }
+            }.write,
+        };
+        return self.feedTo(data, &sink);
+    }
+
+    /// Feeds data while delivering decoded body bytes to a bounded sink.
+    /// The sink may accept fewer bytes than supplied; unconsumed input remains
+    /// with the caller. Returning zero pauses parsing without spinning.
+    pub fn feedTo(self: *Self, data: []const u8, sink: *BodySink) !usize {
         var consumed: usize = 0;
 
         while (consumed < data.len and self.state != .complete and self.state != .err) {
             const remaining = data[consumed..];
-            consumed += switch (self.state) {
+            const previous_state = self.state;
+            const step = switch (self.state) {
                 .start => self.parseStart(remaining),
                 .request_line => try self.parseRequestLine(remaining),
                 .status_line => try self.parseStatusLine(remaining),
                 .headers => try self.parseHeaders(remaining),
-                .body => try self.parseBody(remaining),
+                .body => try self.parseBody(remaining, sink),
                 .chunk_size => try self.parseChunkSize(remaining),
-                .chunk_data => try self.parseChunkData(remaining),
+                .chunk_data => try self.parseChunkData(remaining, sink),
                 .chunk_crlf => try self.parseChunkCrlf(remaining),
                 .chunk_trailer => try self.parseChunkTrailer(remaining),
                 .complete, .err => break,
             };
+            if (step == 0) {
+                if (self.state == previous_state) break;
+                continue;
+            }
+            consumed += step;
+            if (sink.stop_after_write and
+                (previous_state == .body or previous_state == .chunk_data))
+            {
+                break;
+            }
         }
-
-        if (self.state == .complete) {}
 
         return consumed;
     }
@@ -177,6 +214,7 @@ pub const Parser = struct {
         self.chunked = false;
         self.current_chunk_size = 0;
         self.bytes_read = 0;
+        self.body_bytes = 0;
         self.chunk_crlf_read = 0;
         self.header_bytes = 0;
         self.header_count = 0;
@@ -313,7 +351,7 @@ pub const Parser = struct {
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             try self.bumpHeaderBytes(0);
-            self.determineBodyState();
+            try self.determineBodyState();
             return line_end + 2;
         }
 
@@ -419,7 +457,7 @@ pub const Parser = struct {
         return false;
     }
 
-    fn determineBodyState(self: *Self) void {
+    fn determineBodyState(self: *Self) !void {
         if (!self.expect_body or self.noBodyByStatus()) {
             self.state = .complete;
             return;
@@ -427,6 +465,10 @@ pub const Parser = struct {
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {
+            if (self.max_body_size > 0 and len > self.max_body_size) {
+                self.state = .err;
+                return error.BodyTooLarge;
+            }
             if (len > 0) {
                 self.state = .body;
             } else {
@@ -439,31 +481,42 @@ pub const Parser = struct {
         }
     }
 
-    fn parseBody(self: *Self, data: []const u8) !usize {
+    fn parseBody(self: *Self, data: []const u8, sink: *BodySink) !usize {
         if (self.content_length) |len| {
             const remaining = len - self.bytes_read;
             const to_read: usize = @intCast(@min(@as(u64, data.len), remaining));
-            // Enforce body size limit
-            if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + to_read > self.max_body_size) {
+            if (self.max_body_size > 0 and self.body_bytes + to_read > self.max_body_size) {
                 self.state = .err;
                 return error.BodyTooLarge;
             }
-            try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
-            self.bytes_read += to_read;
+            const written = try sink.write(data[0..to_read]);
+            if (written > to_read) return error.InvalidSinkProgress;
+            self.bytes_read += written;
+            self.body_bytes += written;
 
             if (self.bytes_read >= len) {
                 self.state = .complete;
             }
-            return to_read;
+            return written;
         }
 
-        // EOF-delimited body: enforce body size limit
-        if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + data.len > self.max_body_size) {
+        var to_read = data.len;
+        if (self.max_body_size > 0) {
+            const remaining = self.max_body_size -| self.body_bytes;
+            if (remaining == 0 and data.len > 0) {
+                self.state = .err;
+                return error.BodyTooLarge;
+            }
+            to_read = @intCast(@min(@as(u64, data.len), remaining));
+        }
+        const written = try sink.write(data[0..to_read]);
+        if (written > to_read) return error.InvalidSinkProgress;
+        self.body_bytes += written;
+        if (written < data.len and self.max_body_size > 0 and self.body_bytes == self.max_body_size) {
             self.state = .err;
             return error.BodyTooLarge;
         }
-        try self.body_buffer.appendSlice(self.allocator, data);
-        return data.len;
+        return written;
     }
 
     fn parseChunkSize(self: *Self, data: []const u8) !usize {
@@ -505,24 +558,24 @@ pub const Parser = struct {
         return line_end + 2;
     }
 
-    fn parseChunkData(self: *Self, data: []const u8) !usize {
+    fn parseChunkData(self: *Self, data: []const u8, sink: *BodySink) !usize {
         const remaining = self.current_chunk_size - self.bytes_read;
         const to_read: usize = @intCast(@min(@as(u64, data.len), remaining));
 
-        // Enforce body size limit
-        if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + to_read > self.max_body_size) {
+        if (self.max_body_size > 0 and self.body_bytes + to_read > self.max_body_size) {
             self.state = .err;
             return error.BodyTooLarge;
         }
-
-        try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
-        self.bytes_read += to_read;
+        const written = try sink.write(data[0..to_read]);
+        if (written > to_read) return error.InvalidSinkProgress;
+        self.bytes_read += written;
+        self.body_bytes += written;
 
         if (self.bytes_read >= self.current_chunk_size) {
             self.state = .chunk_crlf;
         }
 
-        return to_read;
+        return written;
     }
 
     fn parseChunkCrlf(self: *Self, data: []const u8) !usize {
@@ -936,4 +989,102 @@ test "Parser multiple Content-Length with spaces" {
 
     try std.testing.expect(parser.isComplete());
     try std.testing.expectEqual(@as(?u64, 5), parser.content_length);
+}
+
+test "sink parser and request progress handle greater than four GiB with bounded memory" {
+    const target: u64 = 5 * 1024 * 1024 * 1024 + 123;
+    var body_chunk: [64 * 1024]u8 = undefined;
+    @memset(&body_chunk, 0xa5);
+
+    const Counter = struct {
+        total: u64 = 0,
+        checksum: u64 = 0,
+
+        fn write(context: *anyopaque, data: []const u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.total += data.len;
+            if (data.len > 0) self.checksum +%= @as(u64, data[0]) *% data.len;
+            return data.len;
+        }
+    };
+
+    var storage: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var parser = Parser.initResponse(fixed.allocator());
+    defer parser.deinit();
+    var counter = Counter{};
+    var sink = BodySink{ .context = &counter, .writeFn = Counter.write };
+    var header_buffer: [128]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buffer,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n",
+        .{target},
+    );
+    _ = try parser.feedTo(header, &sink);
+    var remaining = target;
+    while (remaining > 0) {
+        const amount: usize = @intCast(@min(remaining, body_chunk.len));
+        const consumed = try parser.feedTo(body_chunk[0..amount], &sink);
+        try std.testing.expectEqual(amount, consumed);
+        remaining -= amount;
+    }
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqual(target, counter.total);
+    try std.testing.expectEqual(target, parser.body_bytes);
+
+    const RequestProgress = @import("../client/operation.zig").RequestProgress;
+    var known = RequestProgress{ .mode = .{ .content_length = target } };
+    remaining = target;
+    while (remaining > 0) {
+        const amount: usize = @intCast(@min(remaining, body_chunk.len));
+        const next = try known.validateWrite(amount);
+        known.commit(next);
+        remaining -= amount;
+    }
+    try known.finish();
+    try std.testing.expectEqual(target, known.bytes);
+
+    var chunk_storage: [64 * 1024]u8 = undefined;
+    var chunk_fixed = std.heap.FixedBufferAllocator.init(&chunk_storage);
+    var chunked = Parser.initResponse(chunk_fixed.allocator());
+    defer chunked.deinit();
+    var chunk_counter = Counter{};
+    var chunk_sink = BodySink{ .context = &chunk_counter, .writeFn = Counter.write };
+    _ = try chunked.feedTo(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        &chunk_sink,
+    );
+    remaining = target;
+    while (remaining > 0) {
+        const amount: usize = @intCast(@min(remaining, body_chunk.len));
+        var size_buffer: [32]u8 = undefined;
+        const size_line = try std.fmt.bufPrint(&size_buffer, "{x}\r\n", .{amount});
+        _ = try chunked.feedTo(size_line, &chunk_sink);
+        const consumed = try chunked.feedTo(body_chunk[0..amount], &chunk_sink);
+        try std.testing.expectEqual(amount, consumed);
+        _ = try chunked.feedTo("\r\n", &chunk_sink);
+        remaining -= amount;
+    }
+    _ = try chunked.feedTo("0\r\n\r\n", &chunk_sink);
+    try std.testing.expect(chunked.isComplete());
+    try std.testing.expectEqual(target, chunk_counter.total);
+}
+
+test "parser headers trailers and buffering clean up on every allocation failure" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var parser = Parser.initResponse(allocator);
+            defer parser.deinit();
+            _ = try parser.feed(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Transfer-Encoding: chunked\r\n" ++
+                    "X-Dupe: one\r\n" ++
+                    "X-Dupe: two\r\n\r\n" ++
+                    "5\r\nhello\r\n" ++
+                    "0\r\nX-Trailer: done\r\n\r\n",
+            );
+            try std.testing.expect(parser.isComplete());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
