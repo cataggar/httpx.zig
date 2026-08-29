@@ -434,9 +434,13 @@ pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, 
     try out.appendSlice(allocator, &buf);
 
     // MAX_HEADER_LIST_SIZE (0x6)
-    writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_header_list_size));
-    writeU32BE(buf[2..6], settings.max_header_list_size);
-    try out.appendSlice(allocator, &buf);
+    // Library convention: zero means unlimited, represented by omitting the
+    // advisory setting rather than advertising a literal zero-byte limit.
+    if (settings.max_header_list_size != 0) {
+        writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_header_list_size));
+        writeU32BE(buf[2..6], settings.max_header_list_size);
+        try out.appendSlice(allocator, &buf);
+    }
 }
 
 pub fn applySettingsPayload(settings: *HTTP2Connection.HTTP2ConnectionSettings, payload: []const u8) !void {
@@ -1066,6 +1070,20 @@ test "HTTP/2 SETTINGS payload roundtrip with custom values" {
     try std.testing.expectEqual(@as(u32, 65535), decoded.initial_window_size);
     try std.testing.expectEqual(@as(u32, 32768), decoded.max_frame_size);
     try std.testing.expectEqual(@as(u32, 65535), decoded.max_header_list_size);
+}
+
+test "HTTP2 zero max header list size omits advisory setting" {
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(std.testing.allocator);
+    var settings = HTTP2Connection.HTTP2ConnectionSettings{};
+    settings.max_header_list_size = 0;
+    try encodeSettingsPayload(settings, std.testing.allocator, &payload);
+    try std.testing.expectEqual(@as(usize, 30), payload.items.len);
+    var offset: usize = 0;
+    while (offset < payload.items.len) : (offset += 6) {
+        const id = readU16BE(payload.items[offset..][0..2]);
+        try std.testing.expect(id != @intFromEnum(HTTP2Settings.max_header_list_size));
+    }
 }
 
 test "ChunkedWriter -- single chunk" {

@@ -565,7 +565,13 @@ test "streaming zstd decoder keeps large output incremental" {
     const allocator = std.testing.allocator;
     const input = try allocator.alloc(u8, 1024 * 1024);
     defer allocator.free(input);
-    for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    var random_state: u64 = 0xd1b54a32d192ed03;
+    for (input) |*byte| {
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 7;
+        random_state ^= random_state << 17;
+        byte.* = @truncate(random_state);
+    }
     const compressed = try compression.compress(allocator, .zstd, input);
     defer allocator.free(compressed);
 

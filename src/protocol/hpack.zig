@@ -151,21 +151,22 @@ pub const DynamicTable = struct {
     pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
         const entry_size = name.len + value.len + 32;
 
-        // Evict entries until we have room
-        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
-            self.evictOne();
+        if (entry_size > self.max_size) {
+            while (self.entries.items.len > 0) self.evictOne();
+            return;
         }
 
-        // If single entry is larger than max_size, don't add it
-        if (entry_size > self.max_size) return;
-
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
         const value_copy = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(value_copy);
 
-        // Insert at the beginning (index 0)
-        try self.entries.insert(self.allocator, 0, .{
+        // Mutate only after every fallible allocation succeeds.
+        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
+            self.evictOne();
+        }
+        self.entries.insertAssumeCapacity(0, .{
             .name = name_copy,
             .value = value_copy,
         });
@@ -205,6 +206,7 @@ pub const DynamicTable = struct {
 pub const HPACKContext = struct {
     allocator: Allocator,
     dynamic_table: DynamicTable,
+    max_allowed_table_size: usize = 4096,
 
     const Self = @This();
 
@@ -212,6 +214,7 @@ pub const HPACKContext = struct {
         return .{
             .allocator = allocator,
             .dynamic_table = DynamicTable.init(allocator),
+            .max_allowed_table_size = 4096,
         };
     }
 
@@ -219,11 +222,19 @@ pub const HPACKContext = struct {
         return .{
             .allocator = allocator,
             .dynamic_table = DynamicTable.initWithSize(allocator, max_table_size),
+            .max_allowed_table_size = max_table_size,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.dynamic_table.deinit();
+    }
+
+    pub fn setMaxAllowedTableSize(self: *Self, max_table_size: usize) void {
+        self.max_allowed_table_size = max_table_size;
+        if (self.dynamic_table.max_size > max_table_size) {
+            self.dynamic_table.setMaxSize(max_table_size);
+        }
     }
 
     /// Looks up a header by combined index (static + dynamic).
@@ -558,7 +569,10 @@ pub fn encodeHeaders(
 
     for (headers) |header| {
         // Try to find in static table first
-        if (StaticTable.findNameValue(header.name, header.value)) |index| {
+        if (header.representation == .incremental_indexing and
+            StaticTable.findNameValue(header.name, header.value) != null)
+        {
+            const index = StaticTable.findNameValue(header.name, header.value).?;
             // Indexed header field (fully matched)
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(index, 7, &buf);
@@ -648,10 +662,11 @@ pub fn decodeHeadersWithLimit(
                 entry.value.len,
                 max_header_list_size,
             );
-            try headers.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
-                .value = try allocator.dupe(u8, entry.value),
-            });
+            const name = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, entry.value);
+            errdefer allocator.free(value);
+            try headers.append(allocator, .{ .name = name, .value = value });
         } else if (first & 0x40 != 0) {
             // Literal with incremental indexing
             const idx_result = try decodeInteger(data[offset..], 6);
@@ -669,6 +684,7 @@ pub fn decodeHeadersWithLimit(
             errdefer allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
+            errdefer allocator.free(value_result.value);
             offset += value_result.len;
 
             try accountHeaderListSize(
@@ -677,12 +693,18 @@ pub fn decodeHeadersWithLimit(
                 value_result.value.len,
                 max_header_list_size,
             );
+            try headers.ensureUnusedCapacity(allocator, 1);
             try ctx.dynamic_table.add(name, value_result.value);
-            try headers.append(allocator, .{ .name = name, .value = value_result.value });
+            headers.appendAssumeCapacity(.{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
             // Dynamic table size update
             const size_result = try decodeInteger(data[offset..], 5);
             offset += size_result.len;
+            if (size_result.value > @as(u64, ctx.max_allowed_table_size) or
+                size_result.value > std.math.maxInt(usize))
+            {
+                return error.InvalidDynamicTableSize;
+            }
             ctx.dynamic_table.setMaxSize(@intCast(size_result.value));
         } else {
             // Literal without indexing or never indexed
@@ -702,6 +724,7 @@ pub fn decodeHeadersWithLimit(
             errdefer allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
+            errdefer allocator.free(value_result.value);
             offset += value_result.len;
 
             try accountHeaderListSize(
@@ -793,26 +816,86 @@ test "HPACK context combined lookup" {
 }
 
 test "HPACK decode enforces header list limit without leaking partial entries" {
-    const Case = struct {
-        fn run(allocator: Allocator) !void {
-            var encoder = HPACKContext.init(allocator);
-            defer encoder.deinit();
-            const fields = [_]HeaderEntry{
-                .{ .name = ":status", .value = "200", .representation = .without_indexing },
-                .{ .name = "x-large", .value = "0123456789", .representation = .without_indexing },
-            };
-            const encoded = try encodeHeaders(&encoder, &fields, allocator);
-            defer allocator.free(encoded);
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]HeaderEntry{
+        .{ .name = ":status", .value = "200", .representation = .without_indexing },
+        .{ .name = "x-large", .value = "0123456789", .representation = .without_indexing },
+    };
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    var limited_decoder = HPACKContext.init(std.testing.allocator);
+    defer limited_decoder.deinit();
+    try std.testing.expectError(
+        error.HeaderListTooLarge,
+        decodeHeadersWithLimit(&limited_decoder, encoded, std.testing.allocator, 40),
+    );
 
+    const Case = struct {
+        fn run(allocator: Allocator, wire: []const u8) !void {
             var decoder = HPACKContext.init(allocator);
             defer decoder.deinit();
-            try std.testing.expectError(
-                error.HeaderListTooLarge,
-                decodeHeadersWithLimit(&decoder, encoded, allocator, 40),
-            );
+            const decoded = try decodeHeadersWithLimit(&decoder, wire, allocator, 0);
+            defer {
+                for (decoded) |header| {
+                    allocator.free(header.name);
+                    allocator.free(header.value);
+                }
+                allocator.free(decoded);
+            }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Case.run,
+        .{encoded},
+    );
+}
+
+test "HPACK decoder rejects table updates above local advertised maximum" {
+    var context = HPACKContext.initWithTableSize(std.testing.allocator, 4096);
+    defer context.deinit();
+    var bytes: [16]u8 = undefined;
+    const len = try encodeInteger(8192, 5, &bytes);
+    bytes[0] |= 0x20;
+    try std.testing.expectError(
+        error.InvalidDynamicTableSize,
+        decodeHeaders(&context, bytes[0..len], std.testing.allocator),
+    );
+    try std.testing.expectEqual(@as(usize, 4096), context.dynamic_table.max_size);
+}
+
+test "HPACK incremental decode allocation failure does not mutate decoder table" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]HeaderEntry{.{
+        .name = "x-transactional",
+        .value = "value",
+        .representation = .incremental_indexing,
+    }};
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+
+    const Case = struct {
+        fn run(allocator: Allocator, wire: []const u8) !void {
+            var decoder = HPACKContext.init(allocator);
+            defer decoder.deinit();
+            const decoded = try decodeHeaders(&decoder, wire, allocator);
+            defer {
+                for (decoded) |header| {
+                    allocator.free(header.name);
+                    allocator.free(header.value);
+                }
+                allocator.free(decoded);
+            }
+            try std.testing.expectEqual(@as(usize, 1), decoder.dynamic_table.len());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Case.run,
+        .{encoded},
+    );
 }
 
 test "Huffman encode/decode roundtrip" {

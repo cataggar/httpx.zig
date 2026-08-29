@@ -589,7 +589,7 @@ pub const ClientPolicy = struct {
 /// HTTP/2 specific settings as defined in RFC 7540.
 pub const HTTP2Settings = struct {
     header_table_size: u32 = 4096,
-    enable_push: bool = true,
+    enable_push: bool = false,
     max_concurrent_streams: u32 = 100,
     initial_window_size: u32 = 65535,
     max_frame_size: u32 = 16384,

@@ -522,6 +522,7 @@ pub const ConnectionPool = struct {
             entry.socket != null and
             entry.socket.?.isValid() and
             entry.requests_made < self.config.max_requests_per_connection and
+            !(if (entry.tls_session) |tls_session| tls_session.write_poisoned else false) and
             !(if (entry.h2_session) |h2| h2.draining or h2.poisoned else false);
 
         if (can_reuse) {

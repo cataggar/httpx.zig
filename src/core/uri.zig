@@ -80,15 +80,29 @@ pub const Uri = struct {
         return uri;
     }
 
+    /// Validates schemes accepted by HTTP request APIs.
+    pub fn validateHttpScheme(self: Self) !void {
+        const scheme = self.scheme orelse return;
+        if (mem.eql(u8, scheme, "")) return error.InvalidUriScheme;
+        if (std.ascii.eqlIgnoreCase(scheme, "http") or
+            std.ascii.eqlIgnoreCase(scheme, "https") or
+            std.ascii.eqlIgnoreCase(scheme, "ws") or
+            std.ascii.eqlIgnoreCase(scheme, "wss"))
+        {
+            return;
+        }
+        return error.UnsupportedUriScheme;
+    }
+
     /// Returns the effective port, using scheme defaults if not specified.
     pub fn effectivePort(self: Self) u16 {
         if (self.port) |p| return p;
         if (self.scheme) |s| {
-            if (mem.eql(u8, s, "https")) return 443;
-            if (mem.eql(u8, s, "http")) return 80;
-            if (mem.eql(u8, s, "ws")) return 80;
-            if (mem.eql(u8, s, "wss")) return 443;
-            if (mem.eql(u8, s, "ftp")) return 21;
+            if (std.ascii.eqlIgnoreCase(s, "https")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "http")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "ws")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "wss")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "ftp")) return 21;
         }
         return 80;
     }
@@ -96,17 +110,57 @@ pub const Uri = struct {
     /// Returns true if the scheme requires TLS.
     pub fn isTLS(self: Self) bool {
         if (self.scheme) |s| {
-            return mem.eql(u8, s, "https") or mem.eql(u8, s, "wss");
+            return std.ascii.eqlIgnoreCase(s, "https") or
+                std.ascii.eqlIgnoreCase(s, "wss");
         }
         return false;
     }
 
     /// Builds the request path including query string.
     pub fn requestPath(self: Self, allocator: Allocator) ![]u8 {
+        try self.validateRequestTarget();
         if (self.query) |q| {
             return std.fmt.allocPrint(allocator, "{s}?{s}", .{ self.path, q });
         }
         return allocator.dupe(u8, self.path);
+    }
+
+    pub fn validateRequestTarget(self: Self) !void {
+        try validateRequestTargetComponent(self.path);
+        if (self.query) |query| try validateRequestTargetComponent(query);
+    }
+
+    /// Builds RFC 9112 absolute-form for an HTTP proxy. Userinfo and fragment
+    /// are deliberately excluded.
+    pub fn proxyRequestTarget(self: Self, allocator: Allocator) ![]u8 {
+        try self.validateHttpScheme();
+        const scheme = self.scheme orelse return error.InvalidUri;
+        const host = self.host orelse return error.InvalidUri;
+        try validateRequestTargetComponent(host);
+        try validateRequestTargetComponent(self.path);
+        if (self.query) |query| try validateRequestTargetComponent(query);
+
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
+        const writer = list_writer.init(allocator, &buffer);
+        const normalized_scheme = if (std.ascii.eqlIgnoreCase(scheme, "https") or
+            std.ascii.eqlIgnoreCase(scheme, "wss"))
+            "https"
+        else
+            "http";
+        try writer.print("{s}://", .{normalized_scheme});
+        if (mem.indexOfScalar(u8, host, ':') != null) {
+            try writer.print("[{s}]", .{host});
+        } else {
+            try writer.writeAll(host);
+        }
+        const default_port: u16 = if (mem.eql(u8, normalized_scheme, "https")) 443 else 80;
+        if (self.port) |port| {
+            if (port != default_port) try writer.print(":{d}", .{port});
+        }
+        try writer.writeAll(if (self.path.len == 0) "/" else self.path);
+        if (self.query) |query| try writer.print("?{s}", .{query});
+        return buffer.toOwnedSlice(allocator);
     }
 
     /// Reconstructs the full URI string.
@@ -137,6 +191,12 @@ pub const Uri = struct {
         return buffer.toOwnedSlice(allocator);
     }
 };
+
+fn validateRequestTargetComponent(value: []const u8) !void {
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequestTarget;
+    }
+}
 
 /// Resolves a relative URI against a base URI per RFC 3986 Section 5.
 pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
@@ -343,6 +403,39 @@ test "URI TLS detection" {
 
     const http = try Uri.parse("http://httpbun.com/");
     try std.testing.expect(!http.isTLS());
+}
+
+test "URI HTTP scheme handling is case insensitive and rejects unsupported schemes" {
+    const secure = try Uri.parse("HTTPS://example.test/resource");
+    try secure.validateHttpScheme();
+    try std.testing.expect(secure.isTLS());
+    try std.testing.expectEqual(@as(u16, 443), secure.effectivePort());
+
+    const unsupported = try Uri.parse("gopher://example.test/resource");
+    try std.testing.expectError(error.UnsupportedUriScheme, unsupported.validateHttpScheme());
+}
+
+test "URI request targets reject injection and proxy form strips secrets" {
+    const injected = try Uri.parse("http://example.test/path with-space");
+    try std.testing.expectError(
+        error.InvalidRequestTarget,
+        injected.requestPath(std.testing.allocator),
+    );
+    const crlf = try Uri.parse("http://example.test/path\r\nInjected:value");
+    try std.testing.expectError(
+        error.InvalidRequestTarget,
+        crlf.requestPath(std.testing.allocator),
+    );
+
+    const proxy_uri = try Uri.parse(
+        "HTTP://user:password@example.test:8080/path?query=value#secret",
+    );
+    const target = try proxy_uri.proxyRequestTarget(std.testing.allocator);
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings(
+        "http://example.test:8080/path?query=value",
+        target,
+    );
 }
 
 test "URI resolve relative path" {

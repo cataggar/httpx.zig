@@ -318,6 +318,7 @@ fn writeBoundedEncryptedRecord(
     const plaintext_len = @min(data.len, max_plaintext_len);
     if (plaintext_len == 0) return 0;
     const plaintext = data[0..plaintext_len];
+    const record_sequence = seq.*;
 
     switch (version) {
         .tls_1_3 => {
@@ -333,7 +334,7 @@ fn writeBoundedEncryptedRecord(
                 .length = @intCast(inner.len + 16),
             };
             hdr_val.format(&hdr);
-            const nonce_val = nonceTLS13(&iv, seq.*);
+            const nonce_val = nonceTLS13(&iv, record_sequence);
 
             var out_buf: [max_record_len]u8 = undefined;
             @memcpy(out_buf[0..record_header_len], &hdr);
@@ -358,6 +359,7 @@ fn writeBoundedEncryptedRecord(
                 },
                 else => return error.TlsUnsupportedCipherSuite,
             };
+            seq.* +%= 1;
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
         },
         .tls_1_2 => {
@@ -376,19 +378,19 @@ fn writeBoundedEncryptedRecord(
                 out_buf[record_header_len..],
                 plaintext,
                 &hdr,
-                seq.*,
+                record_sequence,
                 &iv,
                 &key,
                 cipher_suite,
             );
             const enc_len = encrypted.len;
             std.debug.assert(enc_len == ciphertext_len);
+            seq.* +%= 1;
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
         },
         else => return error.TlsUnsupportedCipherSuite,
     }
 
-    seq.* += 1;
     return plaintext.len;
 }
 
@@ -431,6 +433,7 @@ const ApplicationRecord = struct {
 const ApplicationReadState = struct {
     socket: *Socket,
     context: ?*const IoContext = null,
+    write_poisoned: ?*bool = null,
     version: tls.ProtocolVersion,
     is_server: bool,
     cipher_suite: tls.CipherSuite,
@@ -589,11 +592,12 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
                 &response,
                 .handshake,
             ) catch |err| {
+                if (state.write_poisoned) |poisoned| poisoned.* = true;
                 try context.check();
                 return err;
             };
         } else {
-            _ = try writeBoundedEncryptedRecord(
+            _ = writeBoundedEncryptedRecord(
                 state.socket,
                 .tls_1_3,
                 write_key.?.*,
@@ -602,7 +606,10 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
                 state.write_seq,
                 &response,
                 .handshake,
-            );
+            ) catch |err| {
+                if (state.write_poisoned) |poisoned| poisoned.* = true;
+                return err;
+            };
         }
         try updateTLS13TrafficKeys(state.cipher_suite, write_secret.?, write_key.?, write_iv.?);
         state.write_seq.* = 0;
@@ -1494,6 +1501,7 @@ pub const Connection = struct {
     app_read_iv: ?[12]u8 = null,
     app_read_secret: ?[48]u8 = null,
     write_seq: u64 = 0,
+    write_poisoned: bool = false,
     read_seq: u64 = 0,
     hs_write_seq: u64 = 0,
     hs_read_seq: u64 = 0,
@@ -1586,10 +1594,14 @@ pub const Connection = struct {
     }
 
     fn writeRecord(self: *Connection, data: []const u8, ctype: tls.ContentType) !usize {
+        if (self.write_poisoned) return error.TlsWriteStatePoisoned;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-        return writeBoundedEncryptedRecord(self.socket, self.tls_version, key, iv, cs, &self.write_seq, data, ctype);
+        return writeBoundedEncryptedRecord(self.socket, self.tls_version, key, iv, cs, &self.write_seq, data, ctype) catch |err| {
+            self.write_poisoned = true;
+            return err;
+        };
     }
 
     /// Sends at most one TLS application-data record.
@@ -1598,11 +1610,13 @@ pub const Connection = struct {
     }
 
     pub fn writeWithContext(self: *Connection, data: []const u8, context: *const IoContext) !usize {
+        if (self.write_poisoned) return error.TlsWriteStatePoisoned;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var sender = ContextSocketSender{ .socket = self.socket, .context = context };
         return writeBoundedEncryptedRecord(&sender, self.tls_version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+            self.write_poisoned = true;
             try context.check();
             return err;
         };
@@ -1637,6 +1651,7 @@ pub const Connection = struct {
         var state = ApplicationReadState{
             .socket = self.socket,
             .context = context,
+            .write_poisoned = &self.write_poisoned,
             .version = self.tls_version,
             .is_server = self.is_server,
             .cipher_suite = cs,
@@ -1733,6 +1748,7 @@ pub const TLSSession = struct {
     app_read_iv: ?[12]u8 = null,
     app_read_secret: ?[48]u8 = null,
     write_seq: u64 = 0,
+    write_poisoned: bool = false,
     read_seq: u64 = 0,
     read_buf: [max_record_len]u8 = undefined,
     read_buf_len: usize = 0,
@@ -1912,6 +1928,7 @@ pub const TLSSession = struct {
         }
         self.write_seq = self.stored_client.?.write_seq;
         self.read_seq = self.stored_client.?.read_seq;
+        self.write_poisoned = false;
 
         const buffered_encrypted = io_reader.reader.buffered();
         if (buffered_encrypted.len > self.encrypted_buf.len) {
@@ -1935,15 +1952,20 @@ pub const TLSSession = struct {
 
     /// Sends at most one TLS application-data record.
     pub fn write(self: *TLSSession, data: []const u8) !usize {
+        if (self.write_poisoned) return error.TlsWriteStatePoisoned;
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-        return writeBoundedEncryptedRecord(socket, version, key, iv, cs, &self.write_seq, data, .application_data);
+        return writeBoundedEncryptedRecord(socket, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+            self.write_poisoned = true;
+            return err;
+        };
     }
 
     pub fn writeWithContext(self: *TLSSession, data: []const u8, context: *const IoContext) !usize {
+        if (self.write_poisoned) return error.TlsWriteStatePoisoned;
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
@@ -1951,6 +1973,7 @@ pub const TLSSession = struct {
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var sender = ContextSocketSender{ .socket = socket, .context = context };
         return writeBoundedEncryptedRecord(&sender, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+            self.write_poisoned = true;
             try context.check();
             return err;
         };
@@ -1987,6 +2010,7 @@ pub const TLSSession = struct {
         var state = ApplicationReadState{
             .socket = socket,
             .context = context,
+            .write_poisoned = &self.write_poisoned,
             .version = version,
             .is_server = false,
             .cipher_suite = cs,
@@ -3036,7 +3060,7 @@ test "TLS record send-all handles partial writes and failed records" {
             error.WriteFailed,
             writeAllBoundedRecords(&failing_writer, plaintext),
         );
-        try std.testing.expectEqual(@as(u64, 1), failing_writer.sequence);
+        try std.testing.expectEqual(@as(u64, 2), failing_writer.sequence);
         try std.testing.expectEqual(first_record_len + 7, failing_sender.bytes.items.len);
         const completed_records = try expectApplicationRecords(
             failing_sender.bytes.items[0..first_record_len],
@@ -3051,6 +3075,22 @@ test "TLS writeAll rejects zero progress and preserves errors" {
     const ZeroProgressWriter = struct {
         fn write(_: *@This(), _: []const u8) !usize {
             return 0;
+        }
+
+        test "TLS session poisons write state after a potentially partial record failure" {
+            var socket = try Socket.create();
+            defer socket.close();
+            var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+            session.attachSocket(&socket);
+            session.tls_version = .tls_1_3;
+            session.cipher_suite = .AES_128_GCM_SHA256;
+            session.app_write_key = test_write_key;
+            session.app_write_iv = test_write_iv;
+            try std.testing.expectError(error.WriteFailed, session.write("payload"));
+            try std.testing.expectEqual(@as(u64, 1), session.write_seq);
+            try std.testing.expect(session.write_poisoned);
+            try std.testing.expectError(error.TlsWriteStatePoisoned, session.write("retry"));
+            try std.testing.expectEqual(@as(u64, 1), session.write_seq);
         }
     };
     var zero_writer = ZeroProgressWriter{};

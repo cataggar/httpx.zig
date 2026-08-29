@@ -239,6 +239,32 @@ pub const Parser = struct {
         }
     }
 
+    fn nextLine(self: *Self, data: []const u8) !struct {
+        line: ?[]const u8,
+        consumed: usize,
+    } {
+        if (self.line_buffer.items.len > 0 and
+            self.line_buffer.items[self.line_buffer.items.len - 1] == '\r' and
+            data.len > 0 and data[0] == '\n')
+        {
+            self.line_buffer.items.len -= 1;
+            return .{ .line = self.line_buffer.items, .consumed = 1 };
+        }
+
+        if (mem.indexOf(u8, data, "\r\n")) |line_end| {
+            if (self.line_buffer.items.len > 0) {
+                try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+                try self.checkLineBufferLimit();
+                return .{ .line = self.line_buffer.items, .consumed = line_end + 2 };
+            }
+            return .{ .line = data[0..line_end], .consumed = line_end + 2 };
+        }
+
+        try self.line_buffer.appendSlice(self.allocator, data);
+        try self.checkLineBufferLimit();
+        return .{ .line = null, .consumed = data.len };
+    }
+
     fn bumpHeaderBytes(self: *Self, line_len: usize) !void {
         // Account for CRLF too.
         self.header_bytes += line_len + 2;
@@ -260,34 +286,26 @@ pub const Parser = struct {
     }
 
     fn parseRequestLine(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const result = try self.nextLine(data);
+        const line = result.line orelse return result.consumed;
 
         var parts = mem.splitScalar(u8, line, ' ');
 
         const method_str = parts.next() orelse {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
         self.method = types.Method.fromString(method_str) orelse .CUSTOM;
 
         const path = parts.next() orelse {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
         self.path = try self.allocator.dupe(u8, path);
 
         const version_str = parts.next() orelse {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
@@ -295,62 +313,46 @@ pub const Parser = struct {
 
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
-        return line_end + 2;
+        return result.consumed;
     }
 
     fn parseStatusLine(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const result = try self.nextLine(data);
+        const line = result.line orelse return result.consumed;
 
         var parts = mem.splitScalar(u8, line, ' ');
 
         const version_str = parts.next() orelse {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
         const status_str = parts.next() orelse {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
         self.status_code = std.fmt.parseInt(u16, status_str, 10) catch {
             self.state = .err;
-            return line_end + 2;
+            return result.consumed;
         };
 
         try self.bumpHeaderBytes(line.len);
 
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
-        return line_end + 2;
+        return result.consumed;
     }
 
     fn parseHeaders(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const result = try self.nextLine(data);
+        const line = result.line orelse return result.consumed;
 
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             try self.bumpHeaderBytes(0);
             try self.determineBodyState();
-            return line_end + 2;
+            return result.consumed;
         }
 
         try self.bumpHeaderBytes(line.len);
@@ -427,7 +429,7 @@ pub const Parser = struct {
         }
 
         self.line_buffer.clearRetainingCapacity();
-        return line_end + 2;
+        return result.consumed;
     }
 
     fn noBodyByStatus(self: *const Self) bool {
@@ -500,16 +502,8 @@ pub const Parser = struct {
     }
 
     fn parseChunkSize(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const result = try self.nextLine(data);
+        const line = result.line orelse return result.consumed;
 
         const size_part = if (mem.indexOfScalar(u8, line, ';')) |semi|
             mem.trim(u8, line[0..semi], " \t")
@@ -535,7 +529,7 @@ pub const Parser = struct {
             self.state = .chunk_data;
         }
 
-        return line_end + 2;
+        return result.consumed;
     }
 
     fn parseChunkData(self: *Self, data: []const u8, sink: *BodySink) !usize {
@@ -588,21 +582,13 @@ pub const Parser = struct {
     }
 
     fn parseChunkTrailer(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const result = try self.nextLine(data);
+        const line = result.line orelse return result.consumed;
 
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             self.state = .complete;
-            return line_end + 2;
+            return result.consumed;
         }
 
         try self.bumpHeaderBytes(line.len);
@@ -627,7 +613,7 @@ pub const Parser = struct {
         self.header_count += 1;
 
         self.line_buffer.clearRetainingCapacity();
-        return line_end + 2;
+        return result.consumed;
     }
 };
 
@@ -991,6 +977,32 @@ test "Parser multiple Content-Length with spaces" {
 
     try std.testing.expect(parser.isComplete());
     try std.testing.expectEqual(@as(?u64, 5), parser.content_length);
+}
+
+test "Parser handles CRLF split across every line-oriented state" {
+    var response = Parser.initResponse(std.testing.allocator);
+    defer response.deinit();
+    const wire =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "X-Test: value\r\n\r\n" ++
+        "1\r\na\r\n" ++
+        "0\r\nX-Trailer: done\r\n\r\n";
+    for (wire) |byte| {
+        _ = try response.feed(&.{byte});
+    }
+    try std.testing.expect(response.isComplete());
+    try std.testing.expectEqualStrings("a", response.getBody());
+    try std.testing.expectEqualStrings("done", response.trailers.get("X-Trailer").?);
+
+    var request = Parser.init(std.testing.allocator);
+    defer request.deinit();
+    const request_wire = "GET /split HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    for (request_wire) |byte| {
+        _ = try request.feed(&.{byte});
+    }
+    try std.testing.expect(request.isComplete());
+    try std.testing.expectEqualStrings("/split", request.path.?);
 }
 
 test "sink parser and request progress handle greater than four GiB with bounded memory" {

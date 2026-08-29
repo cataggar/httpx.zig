@@ -39,6 +39,7 @@ pub const Request = struct {
     /// Creates a new request with the given method and URL.
     pub fn init(allocator: Allocator, method: types.Method, url: []const u8) !Self {
         const uri = try Uri.parse(url);
+        try uri.validateHttpScheme();
         var headers = Headers.init(allocator);
 
         if (uri.host) |host| {
@@ -447,6 +448,13 @@ test "request preparation is failure safe" {
                 .{ "second", "two" },
             });
             try request.setBasicAuth("user", "password");
+        }
+
+        test "Request rejects unsupported URI schemes" {
+            try std.testing.expectError(
+                error.UnsupportedUriScheme,
+                Request.init(std.testing.allocator, .GET, "gopher://example.test/resource"),
+            );
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});

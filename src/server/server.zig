@@ -2084,7 +2084,8 @@ pub const Server = struct {
                 .goaway => {
                     return;
                 },
-                .window_update, .priority, .push_promise => {},
+                .push_promise => return error.ProtocolError,
+                .window_update, .priority => {},
                 _ => {},
             }
 
@@ -2332,7 +2333,7 @@ pub const Server = struct {
         defer promise_payload.deinit(self.allocator);
 
         const encoded_headers = try h2stream.hpack.encodeHeaders(
-            &stream_manager.hpack_ctx,
+            &stream_manager.hpack_decoder,
             promise_header_block.items,
             self.allocator,
         );
