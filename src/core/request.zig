@@ -31,6 +31,7 @@ pub const Request = struct {
     body: ?[]const u8 = null,
     body_owned: bool = false,
     custom_method: ?[]const u8 = null,
+    custom_method_owned: bool = false,
     query_owned: bool = false,
     context: ?*anyopaque = null,
 
@@ -39,21 +40,13 @@ pub const Request = struct {
     /// Creates a new request with the given method and URL.
     pub fn init(allocator: Allocator, method: types.Method, url: []const u8) !Self {
         const uri = try Uri.parse(url);
+        try uri.validateHttpScheme();
         var headers = Headers.init(allocator);
 
-        if (uri.host) |host| {
-            const default_port: u16 = if (uri.isTLS()) 443 else 80;
-            if (uri.port) |port| {
-                if (port != default_port) {
-                    const host_with_port = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
-                    defer allocator.free(host_with_port);
-                    try headers.set(HeaderName.HOST, host_with_port);
-                } else {
-                    try headers.set(HeaderName.HOST, host);
-                }
-            } else {
-                try headers.set(HeaderName.HOST, host);
-            }
+        if (uri.host != null) {
+            const authority = try uri.requestAuthority(allocator);
+            defer allocator.free(authority);
+            try headers.set(HeaderName.HOST, authority);
         }
 
         return .{
@@ -77,6 +70,33 @@ pub const Request = struct {
                 self.allocator.free(q);
             }
         }
+        if (self.custom_method_owned) {
+            if (self.custom_method) |method| self.allocator.free(method);
+        }
+    }
+
+    pub fn setCustomMethod(self: *Self, method: []const u8) !void {
+        if (!isValidMethodToken(method)) return error.InvalidMethod;
+        const replacement = try self.allocator.dupe(u8, method);
+        const previous = if (self.custom_method_owned) self.custom_method else null;
+        self.custom_method = replacement;
+        self.custom_method_owned = true;
+        self.method = .CUSTOM;
+        if (previous) |existing| self.allocator.free(existing);
+    }
+
+    pub fn validateMethod(self: *const Self) ![]const u8 {
+        const method = if (self.method == .CUSTOM)
+            self.custom_method orelse return error.InvalidMethod
+        else
+            self.method.toString();
+        if (!isValidMethodToken(method)) return error.InvalidMethod;
+        return method;
+    }
+
+    pub fn validateWireTarget(self: *const Self) !void {
+        _ = try self.validateMethod();
+        try self.uri.validateRequestTarget();
     }
 
     /// Sets the request body with ownership.
@@ -221,10 +241,8 @@ pub const Request = struct {
 
     /// Serializes the request to HTTP/1.1 wire format.
     pub fn serialize(self: *const Self, writer: anytype) !void {
-        const method_str = if (self.method == .CUSTOM)
-            self.custom_method orelse "CUSTOM"
-        else
-            self.method.toString();
+        try self.validateWireTarget();
+        const method_str = try self.validateMethod();
 
         const path = self.uri.path;
         const version_str = self.version.toString();
@@ -251,6 +269,18 @@ pub const Request = struct {
         return buffer.toOwnedSlice(allocator);
     }
 };
+
+fn isValidMethodToken(method: []const u8) bool {
+    if (method.len == 0) return false;
+    for (method) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 /// Fluent builder for constructing requests.
 pub const RequestBuilder = struct {
@@ -434,6 +464,44 @@ test "Request builder" {
     try std.testing.expectEqual(types.Method.POST, request.method);
 }
 
+test "request preparation is failure safe" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var request = try Request.init(allocator, .POST, "https://example.test/path");
+            defer request.deinit();
+            try request.headers.append("X-Dupe", "one");
+            try request.headers.append("X-Dupe", "two");
+            try request.setJson("{\"value\":42}");
+            try request.addQueryParams(&.{
+                .{ "first", "one" },
+                .{ "second", "two" },
+            });
+            try request.setBasicAuth("user", "password");
+        }
+
+        test "Request rejects unsupported URI schemes" {
+            try std.testing.expectError(
+                error.UnsupportedUriScheme,
+                Request.init(std.testing.allocator, .GET, "gopher://example.test/resource"),
+            );
+        }
+
+        test "Request brackets IPv6 Host authority" {
+            var request = try Request.init(
+                std.testing.allocator,
+                .GET,
+                "https://[2001:db8::1]:8443/resource",
+            );
+            defer request.deinit();
+            try std.testing.expectEqualStrings(
+                "[2001:db8::1]:8443",
+                request.headers.get(HeaderName.HOST).?,
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
 test "Request serialization" {
     const allocator = std.testing.allocator;
     var request = try Request.init(allocator, .GET, "http://httpbun.com/api");
@@ -535,4 +603,22 @@ test "Accept quality value parsing" {
     try std.testing.expect(request.accepts("text/plain"));
     try std.testing.expect(request.accepts("application/json"));
     try std.testing.expect(!request.accepts("image/png"));
+}
+
+test "setCustomMethod is alias and allocation failure safe" {
+    var request = try Request.init(std.testing.allocator, .CUSTOM, "http://example.test/");
+    defer request.deinit();
+    try request.setCustomMethod("PURGE");
+    const alias = request.custom_method.?;
+    try request.setCustomMethod(alias);
+    try std.testing.expectEqualStrings("PURGE", request.custom_method.?);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    request.allocator = failing.allocator();
+    const result = request.setCustomMethod("BAN");
+    request.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqualStrings("PURGE", request.custom_method.?);
 }

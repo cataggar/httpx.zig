@@ -1,7 +1,7 @@
 ---
 layout: home
 title: httpx.zig
-description: A production-ready, high-performance HTTP client and server library for Zig with HTTP/1.x, HTTP/2, HTTP/3, proxy support, concurrency, and protocol primitives.
+description: A production-ready, high-performance HTTP client and server library for Zig with HTTP/1.x, HTTP/2, proxy support, concurrency, and experimental QUIC/HTTP3 protocol primitives.
 
 hero:
   name: httpx.zig
@@ -23,7 +23,7 @@ hero:
 
 features:
   - title: All HTTP Versions
-    details: Full HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 client/server runtime support, plus full protocol primitives.
+    details: High-level HTTP/1.0, HTTP/1.1, and HTTP/2 support, plus experimental QUIC/HTTP3 framing and QPACK primitives.
   - title: Robust Client
     details: Connection pooling, automatic retries, interceptors, typed API, and default-safe chainable config/option overrides.
   - title: Powerful Server
@@ -134,14 +134,14 @@ httpx.zig is built with production-readiness as a core goal. It is still a relat
 
 For full setup details, including local path dependencies and `build.zig` wiring, see `/guide/installation`.
 
-::: warning Custom HTTP/2, HTTP/3, and TLS Implementation
-Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN support. **httpx.zig implements these protocols entirely from scratch**, including:
-- **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — key exchange: X25519 (TLS 1.2/1.3); AEAD cipher suites: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback; handshake message encryption (TLS 1.3); X.509 certificate parsing and verification (client-side); custom record-layer encryption/decryption
+::: warning Custom HTTP/2, QUIC/HTTP3 primitives, and TLS Implementation
+Zig's standard library does not provide HTTP/2, QUIC, HTTP/3, or TLS/ALPN support. **httpx.zig implements HTTP/2 and TCP TLS plus experimental QUIC/HTTP3 primitives**, including:
+- **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) for TCP, with HTTP/2 ALPN and HTTP/1.1 fallback
 - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
 - **HTTP/2** stream/multiplexing primitives, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and sequential high-level client session reuse (RFC 7540)
 - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
 - **QUIC** transport frame encoding/decoding (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation, version negotiation, and transport parameters
-- **HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE handling
+- **Experimental HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE codecs. Public clients and servers reject HTTP/3 until authenticated QUIC TLS 1.3, packet/header protection, loss recovery, and mandatory control streams exist.
 - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 :::
 
@@ -152,7 +152,7 @@ Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN suppor
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
 | HTTP/2 | ✅ Client + Server Runtime + Primitives | TCP/TLS | High-level client/server execution paths plus full framing/HPACK/stream primitives |
-| HTTP/3 | ✅ Client + Server Runtime + Primitives | QUIC/UDP | High-level client/server runtime over UDP + QUIC/HTTP3/QPACK primitives |
+| HTTP/3 | ⚠️ Experimental Primitives Only | none | Public clients and servers return `error.UnsupportedHttpVersion`; framing/QPACK fixtures are unauthenticated and non-production |
 
 ## Platform Support
 
@@ -194,11 +194,11 @@ Available examples (see the `/examples` folder):
 - `http2_client_runtime.zig`: local end-to-end high-level HTTP/2 client runtime demo
 - `http2_server_runtime.zig`: local end-to-end high-level HTTP/2 server runtime demo
 - `http3_example.zig`: HTTP/3 QPACK compression and QUIC framing
-- `http3_client_runtime.zig`: local end-to-end high-level HTTP/3 client runtime demo
-- `http3_server_runtime.zig`: local end-to-end high-level HTTP/3 server runtime demo
+- `http3_client_runtime.zig`: explicit public HTTP/3 rejection demo
+- `http3_server_runtime.zig`: experimental unauthenticated protocol fixture
 - `http2_advanced.zig`: HTTP/2 production features (SETTINGS enforcement, GOAWAY/RST_STREAM, HPACK security, trailers)
-- `http3_advanced.zig`: HTTP/3 production features (QPACK stream instructions, QUIC stream cancellation, transport parameters)
-- `tls_https_get.zig`: Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3)
+- `http3_advanced.zig`: experimental QPACK/QUIC codec features (stream instructions, cancellation frames, transport parameters)
+- `tls_https_get.zig`: Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2)
 - `tls_config_options.zig`: TLS configuration constructors and ALPN negotiation
 - `tls_handshake_details.zig`: TLS handshake info and cipher suites
 - `tls_custom_ca.zig`: Custom CA certificate verification with self-signed certs
@@ -255,5 +255,31 @@ var response = client.get(url, .{ .timeout_ms = 10_000 }) catch |err| {
 };
 defer response.deinit();
 ```
+
+For bounded-memory uploads and downloads, use the single-owner streaming
+operation:
+
+```zig
+var op = try client.open(.PUT, url, .{
+  .body_mode = .{ .content_length = size },
+  .cancel_token = &token,
+  .response_limit = .unlimited,
+});
+defer op.deinit();
+
+while (source.next()) |chunk| try op.writeAll(chunk);
+_ = try op.finishRequest(null);
+var buffer: [32 * 1024]u8 = undefined;
+while (try op.read(&buffer) != 0) {}
+try op.finish(.{ .drain_timeout_ms = 5_000 });
+```
+
+The same lifecycle drives HTTP/1, HTTP/2, and buffered convenience requests.
+Public HTTP/3 clients and servers are rejected until authenticated QUIC is implemented.
+Cancellation is checked during DNS UDP/TCP, connect and pool waits,
+proxy negotiation, TLS records/handshake/reconnect, upload, response reads,
+flow-control waits, and drains. System `getaddrinfo` runs in a heap-owned
+worker: cancellation stops waiting immediately, while the non-interruptible
+platform call finishes and self-cleans in the background.
 
 For detailed target-matrix instructions, see [Installation](/guide/installation#validation-and-target-matrix).

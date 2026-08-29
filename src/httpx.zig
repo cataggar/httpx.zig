@@ -200,7 +200,15 @@ pub const negotiateVersion = http.negotiateVersion;
 
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
+pub const TransportAdapter = client_mod.TransportAdapter;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const BodyMode = client_mod.BodyMode;
+pub const ResponseLimit = client_mod.ResponseLimit;
+pub const OpenOptions = client_mod.OpenOptions;
+pub const ResponseHead = client_mod.ResponseHead;
+pub const ContinueResult = client_mod.ContinueResult;
+pub const FinishOptions = client_mod.FinishOptions;
+pub const ClientOperation = client_mod.ClientOperation;
 pub const BasicAuth = client_mod.BasicAuth;
 pub const CookieEntry = client_mod.CookieEntry;
 pub const Interceptor = client_mod.Interceptor;

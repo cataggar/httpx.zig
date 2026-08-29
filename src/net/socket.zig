@@ -15,6 +15,8 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const address = @import("address.zig");
 const any_io = @import("../io/any_io.zig");
+const io_context = @import("../io/context.zig");
+const IoContext = io_context.IoContext;
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -250,6 +252,128 @@ fn posixConnectWithTimeout(sock: posix.socket_t, addr_ptr: *const posix.sockaddr
     try waitConnectWritable(sock, timeout_ms);
     try checkConnectCompleted(sock);
     try setSocketNonBlocking(sock, false);
+}
+
+fn waitSocketReady(
+    sock: posix.socket_t,
+    writable: bool,
+    context: *const IoContext,
+    explicit_deadline_ns: ?u64,
+) !void {
+    while (true) {
+        try context.check();
+        const now_ns = io_context.monotonicNowNs();
+        if (explicit_deadline_ns) |deadline| {
+            if (now_ns >= deadline) return error.ConnectionTimeout;
+        }
+
+        var wait_ns = io_context.max_wait_slice_ns;
+        if (context.remainingNsAt(now_ns)) |remaining| {
+            wait_ns = @min(wait_ns, remaining);
+        }
+        if (explicit_deadline_ns) |deadline| {
+            wait_ns = @min(wait_ns, deadline -| now_ns);
+        }
+        if (wait_ns == 0) {
+            try context.check();
+            return error.ConnectionTimeout;
+        }
+        const wait_ms: u64 = @max(1, (wait_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+
+        if (is_windows) {
+            var read_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+            var write_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+            const handle = toWinsockSocket(sock);
+            if (writable) {
+                write_set.fd_array[0] = handle;
+                write_set.fd_count = 1;
+            } else {
+                read_set.fd_array[0] = handle;
+                read_set.fd_count = 1;
+            }
+            var tv = posix.timeval{
+                .sec = @intCast(wait_ms / 1000),
+                .usec = @intCast((wait_ms % 1000) * 1000),
+            };
+            const rc = winsock.select(
+                0,
+                if (writable) null else &read_set,
+                if (writable) &write_set else null,
+                null,
+                &tv,
+            );
+            if (rc == winsock.SOCKET_ERROR) return if (writable) error.SendFailed else error.RecvFailed;
+            if (rc > 0) {
+                try context.check();
+                return;
+            }
+        } else {
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = if (writable) std.posix.POLL.OUT else std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const timeout: i32 = @intCast(@min(wait_ms, @as(u64, std.math.maxInt(i32))));
+            const rc = std.posix.poll(&poll_fds, timeout) catch
+                return if (writable) error.SendFailed else error.RecvFailed;
+            if (rc > 0) {
+                if ((poll_fds[0].revents & std.posix.POLL.NVAL) != 0) {
+                    return if (writable) error.SendFailed else error.RecvFailed;
+                }
+                if (writable and (poll_fds[0].revents & std.posix.POLL.ERR) != 0) return error.SendFailed;
+                try context.check();
+                return;
+            }
+        }
+    }
+}
+
+fn sendNonBlocking(sock: posix.socket_t, data: []const u8) !usize {
+    if (is_windows) {
+        const chunk = data[0..@min(data.len, MAX_WINSOCK_SEND_CHUNK)];
+        const send_len: i32 = std.math.cast(i32, chunk.len) orelse return error.SendFailed;
+        const rc = winsock.send(toWinsockSocket(sock), chunk.ptr, send_len, 0);
+        if (rc == winsock.SOCKET_ERROR) {
+            if (winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK) return error.WouldBlock;
+            return error.SendFailed;
+        }
+        return @intCast(rc);
+    }
+
+    while (true) {
+        const rc = posix.system.sendto(sock, data.ptr, data.len, @intCast(posix.MSG.NOSIGNAL), null, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
+    }
+}
+
+fn recvNonBlocking(sock: posix.socket_t, buffer: []u8) !usize {
+    if (is_windows) {
+        const recv_len: i32 = std.math.cast(i32, buffer.len) orelse return error.RecvFailed;
+        const rc = winsock.recv(toWinsockSocket(sock), buffer.ptr, recv_len, 0);
+        if (rc == winsock.SOCKET_ERROR) {
+            const err = winsock.WSAGetLastError();
+            if (err == winsock.WSAEWOULDBLOCK) return error.WouldBlock;
+            if (err == winsock.WSAECONNRESET) return error.ConnectionResetByPeer;
+            return error.RecvFailed;
+        }
+        return @intCast(rc);
+    }
+
+    while (true) {
+        const rc = posix.system.recvfrom(sock, buffer.ptr, buffer.len, 0, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            else => return error.RecvFailed,
+        }
+    }
 }
 
 fn posixBind(sock: posix.socket_t, addr_ptr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
@@ -577,6 +701,7 @@ pub fn deinit() void {
 /// This is used to integrate with the custom TLS implementation in `tls.zig`.
 pub const SocketIoReader = struct {
     socket: *Socket,
+    context: ?*const IoContext = null,
     reader: Io.Reader,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoReader {
@@ -589,6 +714,12 @@ pub const SocketIoReader = struct {
                 .end = 0,
             },
         };
+    }
+
+    pub fn initWithContext(socket: *Socket, buffer: []u8, context: *const IoContext) SocketIoReader {
+        var out = SocketIoReader.init(socket, buffer);
+        out.context = context;
+        return out;
     }
 
     fn parent(r: *Io.Reader) *SocketIoReader {
@@ -640,7 +771,10 @@ pub const SocketIoReader = struct {
         if (dest.len == 0 or dest[0].len == 0) return 0;
 
         const p = parent(r);
-        const n = p.socket.recv(dest[0]) catch |err| switch (err) {
+        const n = (if (p.context) |context|
+            p.socket.recvWithContext(dest[0], context)
+        else
+            p.socket.recv(dest[0])) catch |err| switch (err) {
             error.ConnectionResetByPeer => return error.EndOfStream,
             else => return error.ReadFailed,
         };
@@ -673,6 +807,7 @@ pub const SocketIoReader = struct {
 /// This is used to integrate with the custom TLS implementation in `tls.zig`.
 pub const SocketIoWriter = struct {
     socket: *Socket,
+    context: ?*const IoContext = null,
     writer: Io.Writer,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoWriter {
@@ -686,6 +821,22 @@ pub const SocketIoWriter = struct {
         };
     }
 
+    pub fn initWithContext(socket: *Socket, buffer: []u8, context: *const IoContext) SocketIoWriter {
+        var out = SocketIoWriter.init(socket, buffer);
+        out.context = context;
+        return out;
+    }
+
+    fn send(p: *SocketIoWriter, data: []const u8) !usize {
+        if (p.context) |context| return p.socket.sendWithContext(data, context);
+        return p.socket.send(data);
+    }
+
+    fn sendAll(p: *SocketIoWriter, data: []const u8) !void {
+        if (p.context) |context| return p.socket.sendAllWithContext(data, context);
+        return p.socket.sendAll(data);
+    }
+
     fn parent(w: *Io.Writer) *SocketIoWriter {
         return @fieldParentPtr("writer", w);
     }
@@ -696,7 +847,7 @@ pub const SocketIoWriter = struct {
 
         const buffered = w.buffered();
         if (buffered.len > 0) {
-            const num = p.socket.send(buffered) catch return error.WriteFailed;
+            const num = p.send(buffered) catch return error.WriteFailed;
             total_sent += num;
             if (num < buffered.len) return w.consume(total_sent);
         }
@@ -704,7 +855,7 @@ pub const SocketIoWriter = struct {
         const data_bufs = bufs[0 .. bufs.len - 1];
         for (data_bufs) |bytes| {
             if (bytes.len == 0) continue;
-            const num = p.socket.send(bytes) catch return error.WriteFailed;
+            const num = p.send(bytes) catch return error.WriteFailed;
             total_sent += num;
             if (num < bytes.len) return w.consume(total_sent);
         }
@@ -713,7 +864,7 @@ pub const SocketIoWriter = struct {
         if (pattern.len > 0 and splat > 0) {
             var i: usize = 0;
             while (i < splat) : (i += 1) {
-                const num = p.socket.send(pattern) catch return error.WriteFailed;
+                const num = p.send(pattern) catch return error.WriteFailed;
                 total_sent += num;
                 if (num < pattern.len) return w.consume(total_sent);
             }
@@ -735,7 +886,7 @@ pub const SocketIoWriter = struct {
             const n_read = file_reader.interface.readVec(&vec) catch return error.ReadFailed;
             if (n_read == 0) break;
 
-            p.socket.sendAll(w.buffer[0..n_read]) catch return error.WriteFailed;
+            p.sendAll(w.buffer[0..n_read]) catch return error.WriteFailed;
             total += n_read;
         }
 
@@ -826,6 +977,63 @@ pub const Socket = struct {
         self.connected = true;
     }
 
+    /// Connects with cancellation and monotonic deadline checks between
+    /// bounded readiness waits.
+    pub fn connectWithContext(
+        self: *Self,
+        addr: net.Address,
+        timeout_ms: u64,
+        context: *const IoContext,
+    ) !void {
+        return self.connectSockaddrWithContext(
+            &addr.any,
+            addr.getOsSockLen(),
+            timeout_ms,
+            context,
+        );
+    }
+
+    /// Context-aware connect for address families represented by a raw
+    /// sockaddr, including Unix-domain sockets.
+    pub fn connectSockaddrWithContext(
+        self: *Self,
+        addr_ptr: *const posix.sockaddr,
+        addr_len: posix.socklen_t,
+        timeout_ms: u64,
+        context: *const IoContext,
+    ) !void {
+        try context.check();
+        const deadline_ns = if (timeout_ms > 0)
+            io_context.monotonicNowNs() +| io_context.millisecondsToNanoseconds(timeout_ms)
+        else
+            null;
+
+        try setSocketNonBlocking(self.handle, true);
+        defer setSocketNonBlocking(self.handle, false) catch {};
+
+        if (is_windows) {
+            const rc = winsock.connect(toWinsockSocket(self.handle), addr_ptr, @intCast(addr_len));
+            if (rc != 0 and winsock.WSAGetLastError() != winsock.WSAEWOULDBLOCK) {
+                return error.ConnectFailed;
+            }
+        } else {
+            const rc = posix.system.connect(self.handle, addr_ptr, addr_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    self.connected = true;
+                    return;
+                },
+                .INPROGRESS, .ALREADY => {},
+                else => return error.ConnectFailed,
+            }
+        }
+
+        try waitSocketReady(self.handle, true, context, deadline_ns);
+        try checkConnectCompleted(self.handle);
+        try context.check();
+        self.connected = true;
+    }
+
     /// Resolves and connects to `host:port`.
     pub fn connectHost(self: *Self, host: []const u8, port: u16) !void {
         const addr = try address.resolve(std.heap.page_allocator, host, port);
@@ -868,6 +1076,33 @@ pub const Socket = struct {
         }
     }
 
+    /// Sends some bytes while observing cancellation/deadlines.
+    pub fn sendWithContext(self: *Self, data: []const u8, context: *const IoContext) !usize {
+        if (data.len == 0) return 0;
+        try setSocketNonBlocking(self.handle, true);
+        defer setSocketNonBlocking(self.handle, false) catch {};
+        while (true) {
+            try context.check();
+            return sendNonBlocking(self.handle, data) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try waitSocketReady(self.handle, true, context, null);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    /// Sends all bytes while observing cancellation/deadlines.
+    pub fn sendAllWithContext(self: *Self, data: []const u8, context: *const IoContext) !void {
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const n = try self.sendWithContext(data[sent..], context);
+            if (n == 0 or n > data.len - sent) return error.SendFailed;
+            sent += n;
+        }
+    }
+
     /// Compatibility alias for stream-style write-all APIs.
     pub fn writeAll(self: *Self, data: []const u8) !void {
         return self.sendAll(data);
@@ -879,6 +1114,23 @@ pub const Socket = struct {
             return err;
         };
         return n;
+    }
+
+    /// Receives bytes while observing cancellation/deadlines.
+    pub fn recvWithContext(self: *Self, buffer: []u8, context: *const IoContext) !usize {
+        if (buffer.len == 0) return 0;
+        try setSocketNonBlocking(self.handle, true);
+        defer setSocketNonBlocking(self.handle, false) catch {};
+        while (true) {
+            try context.check();
+            return recvNonBlocking(self.handle, buffer) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try waitSocketReady(self.handle, false, context, null);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     /// Compatibility alias for stream-style read APIs.
@@ -1326,6 +1578,22 @@ pub const UdpSocket = struct {
         return posixSend(self.handle, data, 0);
     }
 
+    pub fn sendWithContext(self: *Self, data: []const u8, context: *const IoContext) !usize {
+        if (data.len == 0) return 0;
+        try setSocketNonBlocking(self.handle, true);
+        defer setSocketNonBlocking(self.handle, false) catch {};
+        while (true) {
+            try context.check();
+            return sendNonBlocking(self.handle, data) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try waitSocketReady(self.handle, true, context, null);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     /// Compatibility alias for stream-style write APIs.
     pub fn write(self: *Self, data: []const u8) !usize {
         return self.send(data);
@@ -1345,6 +1613,22 @@ pub const UdpSocket = struct {
     /// Receives a datagram from the connected peer.
     pub fn recv(self: *Self, buffer: []u8) !usize {
         return posixRecv(self.handle, buffer, 0);
+    }
+
+    pub fn recvWithContext(self: *Self, buffer: []u8, context: *const IoContext) !usize {
+        if (buffer.len == 0) return 0;
+        try setSocketNonBlocking(self.handle, true);
+        defer setSocketNonBlocking(self.handle, false) catch {};
+        while (true) {
+            try context.check();
+            return recvNonBlocking(self.handle, buffer) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try waitSocketReady(self.handle, false, context, null);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     /// Compatibility alias for stream-style read APIs.

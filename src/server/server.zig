@@ -40,6 +40,8 @@ const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../data/common.zig");
 const list_writer = @import("../io/list_writer.zig");
 const io_util = @import("../io/any_io.zig");
+const IoContext = @import("../io/context.zig").IoContext;
+const Deadline = @import("../io/context.zig").Deadline;
 const Executor = @import("../concurrency/executor.zig").Executor;
 
 const Metrics = @import("../io/metrics.zig").Metrics;
@@ -96,7 +98,9 @@ pub const ServerConfig = struct {
     threads: u32 = 0,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
-    enable_push: bool = true,
+    /// Deprecated. HTTP/2 server push is disabled until its stream and HPACK
+    /// state can be synchronized with concurrent request processing.
+    enable_push: bool = false,
     http2_settings: types.HTTP2Settings = .{},
     http3_settings: types.HTTP3Settings = .{},
     log_fn: ?LogFn = null,
@@ -105,7 +109,7 @@ pub const ServerConfig = struct {
     tls_enabled: bool = false,
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
-    tls_alpn_protocols: []const []const u8 = &.{ "h3", "h2", "http/1.1" },
+    tls_alpn_protocols: []const []const u8 = &.{ "h2", "http/1.1" },
     on_starting: ?LifecycleHook = null,
     on_started: ?LifecycleHook = null,
     on_stopping: ?LifecycleHook = null,
@@ -903,67 +907,14 @@ pub const Server = struct {
 
     /// Starts the server and begins accepting connections.
     ///
-    /// When both `http2_enabled` and `http3_enabled` are set, the server
-    /// binds a TCP listener (for HTTP/1.1 and HTTP/2) and a UDP socket (for
-    /// HTTP/3 over QUIC) and runs both accept loops concurrently.
+    /// HTTP/3 is rejected until authenticated QUIC transport exists.
     pub fn listen(self: *Self) !void {
+        if (self.config.http3_enabled) return error.UnsupportedHttpVersion;
         if (self.config.on_starting) |hook| hook(self);
+        if (self.config.http3_enabled) return error.UnsupportedHttpVersion;
 
         if (self.config.unix_path) |path| {
             return self.listenUnix(path);
-        }
-
-        if (self.config.http3_enabled) {
-            // Ensure TCP listener is bound for HTTP/1.1 and HTTP/2.
-            if (self.listener == null) {
-                const backlog_u32: u32 = @max(self.config.max_connections, 1);
-                const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-                try self.bindTcpListener(backlog);
-            }
-            // Also bind UDP for HTTP/3 (graceful fallback).
-            const udp_ok = blk: {
-                self.bindUdpSocket() catch |err| {
-                    self.log(.warn, "HTTP/3 UDP bind failed: {} — falling back to HTTP/1.1 + HTTP/2\n", .{err});
-                    break :blk false;
-                };
-                break :blk true;
-            };
-            self.running.store(true, .release);
-
-            if (udp_ok) {
-                self.log(.info, "Server listening on {s}:{d} (HTTP/1.1 + HTTP/2 + HTTP/3)\n", .{
-                    self.config.host,
-                    self.config.port,
-                });
-            } else {
-                self.config.http3_enabled = false;
-                self.log(.info, "Server listening on {s}:{d} (HTTP/1.1 + HTTP/2)\n", .{
-                    self.config.host,
-                    self.config.port,
-                });
-            }
-
-            if (self.config.on_started) |hook| hook(self);
-
-            // Spawn TCP accept loop in a separate thread.
-            const tcp_thread = try std.Thread.spawn(.{}, struct {
-                fn run(s: *Self) void {
-                    s.listenTcpAcceptLoop() catch |err| {
-                        if (s.running.load(.acquire)) {
-                            s.log(.err, "TCP accept error: {}\n", .{err});
-                        }
-                    };
-                }
-            }.run, .{self});
-            defer tcp_thread.join();
-
-            // Run HTTP/3 UDP recv loop only if UDP socket was bound.
-            if (udp_ok) {
-                return self.listenHTTP3AcceptLoop();
-            }
-            // Otherwise wait for the TCP thread.
-            tcp_thread.join();
-            return;
         }
 
         return self.listenTcp();
@@ -972,6 +923,7 @@ pub const Server = struct {
     /// Spawns a background thread to run the server's listening loop.
     /// The caller is responsible for joining the returned Thread.
     pub fn listenInBackground(self: *Self) !std.Thread {
+        if (self.config.http3_enabled) return error.UnsupportedHttpVersion;
         if (self.config.unix_path) |path| {
             if (self.unix_listener == null) {
                 const unix_mod = @import("../net/unix.zig");
@@ -986,73 +938,6 @@ pub const Server = struct {
                     };
                 }
             }.run, .{self});
-        }
-
-        if (self.config.http3_enabled) {
-            // Bind TCP listener for HTTP/1.1 and HTTP/2.
-            if (self.listener == null) {
-                const backlog_u32: u32 = @max(self.config.max_connections, 1);
-                const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-                try self.bindTcpListener(backlog);
-            }
-            // Bind UDP socket for HTTP/3 over QUIC (graceful fallback if bind fails).
-            const tcp_port = self.config.port;
-            const udp_ok = blk: {
-                self.bindUdpSocket() catch |err| {
-                    self.log(.warn, "HTTP/3 UDP bind failed: {} — falling back to HTTP/1.1 + HTTP/2\n", .{err});
-                    break :blk false;
-                };
-                break :blk true;
-            };
-            // Restore TCP port — UDP bind may overwrite config.port with a different
-            // ephemeral port when port=0, but the TCP port is the canonical one the
-            // client connects to.
-            self.config.port = tcp_port;
-
-            self.running.store(true, .release);
-
-            if (self.executor) |*e| {
-                try e.start();
-            }
-
-            if (udp_ok) {
-                self.log(.info, "Server listening on {s}:{d} (HTTP/1.1 + HTTP/2 + HTTP/3)\n", .{
-                    self.config.host,
-                    self.config.port,
-                });
-            } else {
-                self.config.http3_enabled = false;
-                self.log(.info, "Server listening on {s}:{d} (HTTP/1.1 + HTTP/2)\n", .{
-                    self.config.host,
-                    self.config.port,
-                });
-            }
-
-            // Spawn TCP accept loop in a background thread.
-            const tcp_thread = try std.Thread.spawn(.{}, struct {
-                fn run(s: *Self) void {
-                    s.listenTcpAcceptLoop() catch |err| {
-                        if (s.running.load(.acquire)) {
-                            s.log(.err, "TCP accept error: {}\n", .{err});
-                        }
-                    };
-                }
-            }.run, .{self});
-
-            // Run HTTP/3 UDP recv loop only if UDP socket was successfully bound.
-            if (udp_ok) {
-                self.udp_thread = try std.Thread.spawn(.{}, struct {
-                    fn run(s: *Self) void {
-                        s.listenHTTP3AcceptLoop() catch |err| {
-                            if (s.running.load(.acquire)) {
-                                s.log(.err, "HTTP/3 accept error: {}\n", .{err});
-                            }
-                        };
-                    }
-                }.run, .{self});
-            }
-
-            return tcp_thread;
         }
 
         // Standard HTTP/1.1 + HTTP/2 path.
@@ -1293,6 +1178,8 @@ pub const Server = struct {
                         }
                     }
                     ctx.server.executor_conn_mutex.unlock(io);
+                    var owned_socket = ctx.socket;
+                    owned_socket.close();
                     _ = ctx.server.active_conn_count.fetchSub(1, .monotonic);
                     ctx.server.allocator.destroy(ctx);
                 }
@@ -1300,6 +1187,7 @@ pub const Server = struct {
             const job_ctx = self.allocator.create(ConnJob) catch {
                 var s = socket;
                 s.close();
+                _ = self.active_conn_count.fetchSub(1, .monotonic);
                 return;
             };
             job_ctx.* = .{
@@ -1332,6 +1220,7 @@ pub const Server = struct {
                 var s = socket;
                 s.close();
                 self.allocator.destroy(job_ctx);
+                _ = self.active_conn_count.fetchSub(1, .monotonic);
             };
         } else {
             {
@@ -1349,6 +1238,8 @@ pub const Server = struct {
                 }
             };
             self.removeFromActive(socket);
+            var owned_socket = socket;
+            owned_socket.close();
         }
     }
 
@@ -1367,6 +1258,78 @@ pub const Server = struct {
         _ = self.active_conn_count.fetchSub(1, .monotonic);
     }
 
+    fn isValidHttpToken(value: []const u8) bool {
+        if (value.len == 0) return false;
+        for (value) |c| {
+            if (!std.ascii.isAlphanumeric(c) and
+                c != '!' and c != '#' and c != '$' and c != '%' and c != '&' and
+                c != '\'' and c != '*' and c != '+' and c != '-' and c != '.' and
+                c != '^' and c != '_' and c != '`' and c != '|' and c != '~')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn isValidHttp2HeaderName(name: []const u8) bool {
+        if (!isValidHttpToken(name)) return false;
+        for (name) |c| {
+            if (c >= 'A' and c <= 'Z') return false;
+        }
+        return true;
+    }
+
+    fn validateHTTP2Path(value: []const u8) !void {
+        if (mem.eql(u8, value, "*")) return;
+        if (value.len == 0 or value[0] != '/') return error.ProtocolError;
+        for (value) |byte| {
+            if (byte <= 0x20 or byte == 0x7f or byte == '#') {
+                return error.ProtocolError;
+            }
+        }
+    }
+
+    fn validateHTTP2Authority(value: []const u8) !void {
+        if (value.len == 0 or mem.indexOfAny(u8, value, "@/?#") != null) {
+            return error.ProtocolError;
+        }
+        for (value) |byte| {
+            if (byte <= 0x20 or byte == 0x7f) return error.ProtocolError;
+        }
+        if (value[0] == '[') {
+            const closing = mem.indexOfScalar(u8, value, ']') orelse
+                return error.ProtocolError;
+            if (closing == 1) return error.ProtocolError;
+            const host = value[1..closing];
+            if (mem.indexOfScalar(u8, host, ':') == null) return error.ProtocolError;
+            _ = net.Address.parseIp(host, 0) catch return error.ProtocolError;
+            const suffix = value[closing + 1 ..];
+            if (suffix.len == 0) return;
+            if (suffix[0] != ':' or suffix.len == 1) return error.ProtocolError;
+            _ = std.fmt.parseInt(u16, suffix[1..], 10) catch
+                return error.ProtocolError;
+            return;
+        }
+        const first_colon = mem.indexOfScalar(u8, value, ':');
+        const last_colon = mem.lastIndexOfScalar(u8, value, ':');
+        if (first_colon != last_colon) return error.ProtocolError;
+        const host = if (last_colon) |separator| value[0..separator] else value;
+        if (host.len == 0) return error.ProtocolError;
+        for (host) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and
+                mem.indexOfScalar(u8, "-._~!$&'()*+,;=%", byte) == null)
+            {
+                return error.ProtocolError;
+            }
+        }
+        if (last_colon) |separator| {
+            if (separator == 0 or separator + 1 == value.len) return error.ProtocolError;
+            _ = std.fmt.parseInt(u16, value[separator + 1 ..], 10) catch
+                return error.ProtocolError;
+        }
+    }
+
     /// Parses pseudo-headers (:method, :path, :scheme, :authority) from a
     /// decoded header block and appends regular headers to `request_headers`.
     fn parseHeaders(
@@ -1383,31 +1346,39 @@ pub const Server = struct {
         authority: *?[]const u8,
         authority_owned: *bool,
     ) !void {
+        var saw_regular_header = false;
         for (entries) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
+                if (saw_regular_header) return error.ProtocolError;
                 if (mem.eql(u8, h.name, ":method")) {
-                    if (method_owned.*) self.allocator.free(method.*);
+                    if (method_owned.*) return error.ProtocolError;
+                    if (!isValidHttpToken(h.value)) return error.ProtocolError;
                     method.* = try self.allocator.dupe(u8, h.value);
                     method_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":path")) {
-                    if (path_owned.*) self.allocator.free(path.*);
+                    if (path_owned.*) return error.ProtocolError;
+                    try validateHTTP2Path(h.value);
                     path.* = try self.allocator.dupe(u8, h.value);
                     path_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":scheme")) {
-                    if (scheme_owned.*) self.allocator.free(scheme.*);
+                    if (scheme_owned.*) return error.ProtocolError;
                     scheme.* = try self.allocator.dupe(u8, h.value);
                     scheme_owned.* = true;
                 } else if (mem.eql(u8, h.name, ":authority")) {
-                    if (authority_owned.*) {
-                        if (authority.*) |a| self.allocator.free(a);
-                    }
+                    if (authority_owned.*) return error.ProtocolError;
+                    try validateHTTP2Authority(h.value);
                     authority.* = try self.allocator.dupe(u8, h.value);
                     authority_owned.* = true;
-                }
+                } else return error.ProtocolError;
                 continue;
             }
 
-            if (common.isConnectionSpecificHeader(h.name)) continue;
+            saw_regular_header = true;
+            if (!isValidHttp2HeaderName(h.name)) return error.ProtocolError;
+            if (common.isConnectionSpecificHeader(h.name)) return error.ProtocolError;
+            if (mem.eql(u8, h.name, "te") and !std.ascii.eqlIgnoreCase(mem.trim(u8, h.value, " \t"), "trailers")) {
+                return error.ProtocolError;
+            }
             try request_headers.append(h.name, h.value);
         }
     }
@@ -1453,21 +1424,19 @@ pub const Server = struct {
             const io = defaultIo();
             self.active_conn_mutex.lock(io) catch unreachable;
             for (self.active_connections.items) |*s| {
-                s.close();
+                s.shutdownBoth() catch {};
             }
-            self.active_connections.clearRetainingCapacity();
             self.active_conn_mutex.unlock(io);
         }
-        self.active_conn_count.store(0, .monotonic);
 
-        // Close executor-tracked sockets so worker threads unblock from recv().
+        // Interrupt executor-tracked sockets; each connection handler remains
+        // the sole close owner.
         {
             const io = defaultIo();
             self.executor_conn_mutex.lock(io) catch unreachable;
             for (self.executor_connections.items) |*s| {
-                s.close();
+                s.shutdownBoth() catch {};
             }
-            self.executor_connections.clearRetainingCapacity();
             self.executor_conn_mutex.unlock(io);
         }
 
@@ -1583,18 +1552,26 @@ pub const Server = struct {
             // otherwise those bytes are the start of an HTTP/1.1 request.
             var probe: [http.HTTP2_PREFACE.len]u8 = undefined;
             var total: usize = 0;
+            var preface_context = IoContext.init(.{
+                .phase_deadline = if (self.config.request_timeout_ms > 0)
+                    Deadline.afterMs(self.config.request_timeout_ms)
+                else
+                    null,
+            });
             while (total < probe.len) {
-                const n = sock.recv(probe[total..]) catch break;
+                const n = try sock.recvWithContext(probe[total..], &preface_context);
                 if (n == 0) return;
                 total += n;
+                if (!mem.eql(
+                    u8,
+                    probe[0..total],
+                    http.HTTP2_PREFACE[0..total],
+                )) {
+                    return self.handleHttp1WithPrefix(sock, probe[0..total]);
+                }
             }
 
-            if (total == probe.len and mem.eql(u8, &probe, http.HTTP2_PREFACE)) {
-                return self.handleHTTP2Connection(sock);
-            }
-
-            // Not HTTP/2 -- handle as HTTP/1.1 with the already-read prefix.
-            return self.handleHttp1WithPrefix(sock, probe[0..total]);
+            return self.handleHTTP2Connection(sock);
         }
 
         return self.handleHttp1Connection(sock);
@@ -1658,6 +1635,7 @@ pub const Server = struct {
             );
             defer req.deinit();
             req.version = parser.version;
+            if (parser.custom_method) |method| try req.setCustomMethod(method);
 
             for (parser.headers.entries.items) |h| {
                 try req.headers.append(h.name, h.value);
@@ -1746,6 +1724,7 @@ pub const Server = struct {
             );
             defer req.deinit();
             req.version = parser.version;
+            if (parser.custom_method) |method| try req.setCustomMethod(method);
 
             for (parser.headers.entries.items) |h| {
                 try req.headers.append(h.name, h.value);
@@ -1801,27 +1780,39 @@ pub const Server = struct {
         authority_owned: bool,
         pending_headers_block: std.ArrayList(u8),
         pending_headers_flags: u8,
+        pending_is_trailers: bool,
         waiting_continuation: bool,
+        header_deadline: ?Deadline,
+        initial_headers_parsed: bool,
         headers_complete: bool,
+        expected_content_length: ?u64,
+        received_body_bytes: u64,
+        refuse_after_headers: bool,
         done: bool,
 
-        fn init(allocator: Allocator, stream_id: u31, default_scheme: []const u8) @This() {
+        fn init(allocator: Allocator, stream_id: u31) @This() {
             return .{
                 .stream_id = stream_id,
                 .request_headers = Headers.init(allocator),
                 .request_body = .empty,
-                .method_raw = "GET",
+                .method_raw = "",
                 .method_owned = false,
-                .path_raw = "/",
+                .path_raw = "",
                 .path_owned = false,
-                .scheme_raw = default_scheme,
+                .scheme_raw = "",
                 .scheme_owned = false,
                 .authority_raw = null,
                 .authority_owned = false,
                 .pending_headers_block = .empty,
                 .pending_headers_flags = 0,
+                .pending_is_trailers = false,
                 .waiting_continuation = false,
+                .header_deadline = null,
+                .initial_headers_parsed = false,
                 .headers_complete = false,
+                .expected_content_length = null,
+                .received_body_bytes = 0,
+                .refuse_after_headers = false,
                 .done = false,
             };
         }
@@ -1837,52 +1828,439 @@ pub const Server = struct {
         }
     };
 
+    const H2ServerContextReader = struct {
+        const Source = union(enum) {
+            socket: *Socket,
+            tls: *tls_mod.Connection,
+        };
+
+        source: Source,
+        context: *const IoContext,
+
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            return switch (self.source) {
+                .socket => |socket| socket.recvWithContext(output, self.context),
+                .tls => |connection| connection.readWithContext(output, self.context),
+            };
+        }
+
+        fn anyReader(self: *@This()) io_util.AnyReader {
+            return .{ .context = self, .readFn = read };
+        }
+    };
+
     /// Handles an HTTP/2 connection over TLS.
+    fn validateHTTP2Preface(preface: []const u8) !void {
+        if (!mem.eql(u8, preface, http.HTTP2_PREFACE)) return error.ProtocolError;
+    }
+
     fn handleHTTP2WithTLS(self: *Self, tls_conn: *tls_mod.Connection) !void {
+        var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+        try tls_conn.reader().readNoEof(&preface);
+        try validateHTTP2Preface(&preface);
+        var frame_context = IoContext.init(.{});
+        var contextual_reader = H2ServerContextReader{
+            .source = .{ .tls = tls_conn },
+            .context = &frame_context,
+        };
         var conn = http.HTTP2Connection.init(
             self.allocator,
-            tls_conn.reader(),
+            contextual_reader.anyReader(),
             tls_conn.writer(),
         );
-        try self.handleHTTP2Frames(&conn);
+        try self.handleHTTP2Frames(&conn, true, &frame_context);
     }
 
     /// Handles an HTTP/2 connection over plain TCP.
     fn handleHTTP2Connection(self: *Self, socket: Socket) !void {
         var sock = socket;
-        defer sock.close();
         if (self.config.request_timeout_ms > 0) {
             try sock.setRecvTimeout(self.config.request_timeout_ms);
         }
+        if (self.config.write_timeout_ms > 0) {
+            try sock.setSendTimeout(self.config.write_timeout_ms);
+        }
+        var frame_context = IoContext.init(.{});
+        var contextual_reader = H2ServerContextReader{
+            .source = .{ .socket = &sock },
+            .context = &frame_context,
+        };
         var conn = http.HTTP2Connection.init(
             self.allocator,
-            sock.reader(),
+            contextual_reader.anyReader(),
             sock.writer(),
         );
-        try self.handleHTTP2Frames(&conn);
+        try self.handleHTTP2Frames(&conn, false, &frame_context);
         sock.shutdownWrite() catch {};
         sleepMs(25);
+    }
+
+    fn appendHTTP2HeaderFragment(
+        self: *Self,
+        destination: *std.ArrayList(u8),
+        payload: []const u8,
+        flags: u8,
+    ) !void {
+        var offset: usize = 0;
+        var padding: usize = 0;
+        if ((flags & 0x08) != 0) {
+            if (payload.len == 0) return error.ProtocolError;
+            padding = payload[0];
+            offset = 1;
+        }
+        if ((flags & 0x20) != 0) {
+            if (payload.len - offset < 5) return error.ProtocolError;
+            offset += 5;
+        }
+        if (padding > payload.len - offset) return error.ProtocolError;
+        const fragment = payload[offset .. payload.len - padding];
+        if (destination.items.len > self.config.max_header_size or
+            fragment.len > self.config.max_header_size - destination.items.len)
+        {
+            return error.HeaderTooLarge;
+        }
+        try destination.appendSlice(self.allocator, fragment);
+    }
+
+    fn applyHTTP2SendWindowUpdate(
+        stream_manager: *h2stream.StreamManager,
+        header: http.HTTP2FrameHeader,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != 4) return error.ProtocolError;
+        const increment = try h2stream.parseWindowUpdatePayload(payload);
+        if (header.stream_id == 0) {
+            try stream_manager.updateConnectionSendWindow(@intCast(increment));
+            return;
+        }
+        const stream = stream_manager.getStream(header.stream_id) orelse
+            return error.ProtocolError;
+        if (stream.state == .closed) return;
+        try stream.updateSendWindow(@intCast(increment));
+    }
+
+    fn isImplicitlyClosedClientStream(stream_id: u31, last_client_stream_id: u31) bool {
+        return stream_id != 0 and
+            (stream_id & 1) == 1 and
+            stream_id < last_client_stream_id;
+    }
+
+    fn consumeClosedStreamData(
+        conn: *http.HTTP2Connection,
+        stream_manager: *h2stream.StreamManager,
+        frame: *const http.HTTP2Connection.Frame,
+        connection_already_debited: bool,
+    ) !void {
+        if (frame.header.stream_id == 0) return error.ProtocolError;
+        if ((frame.header.flags & 0x08) != 0) {
+            if (frame.payload.len == 0 or
+                frame.payload.len < @as(usize, frame.payload[0]) + 1)
+            {
+                return error.ProtocolError;
+            }
+        }
+        const amount = std.math.cast(i32, frame.payload.len) orelse
+            return error.FlowControlError;
+        if (!connection_already_debited) {
+            if (amount > stream_manager.connection_recv_window) {
+                return error.FlowControlError;
+            }
+            stream_manager.connection_recv_window -= amount;
+        }
+        if (frame.payload.len == 0) return;
+        const increment: u31 = @intCast(frame.payload.len);
+        const update = h2stream.buildWindowUpdatePayload(increment);
+        try conn.writeFrame(.{
+            .length = update.len,
+            .frame_type = .window_update,
+            .flags = 0,
+            .stream_id = 0,
+        }, &update);
+        try stream_manager.updateConnectionRecvWindow(amount);
+    }
+
+    fn pumpHTTP2SendWindow(
+        self: *Self,
+        conn: *http.HTTP2Connection,
+        stream_manager: *h2stream.StreamManager,
+        stream_id: u31,
+        frame_context: *IoContext,
+        send_wait_deadline: ?Deadline,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        queued_continuation_stream: *?u31,
+        queued_header_deadline: *?Deadline,
+        last_client_stream_id: *u31,
+    ) !void {
+        const previous_deadline = frame_context.phase_deadline;
+        const request_header_deadline = if (self.config.request_timeout_ms > 0)
+            Deadline.afterMs(self.config.request_timeout_ms)
+        else
+            null;
+        const active_header_deadline = queued_header_deadline.* orelse request_header_deadline;
+        const read_deadline = if (active_header_deadline) |header_deadline|
+            if (send_wait_deadline) |send_deadline|
+                Deadline.at(@min(header_deadline.at_ns, send_deadline.at_ns))
+            else
+                header_deadline
+        else
+            send_wait_deadline;
+        frame_context.setPhaseDeadline(read_deadline);
+        var frame = conn.readFrame(self.allocator, conn.settings.max_frame_size) catch |err| {
+            frame_context.setPhaseDeadline(previous_deadline);
+            return err;
+        };
+        frame_context.setPhaseDeadline(previous_deadline);
+        var frame_owned = true;
+        defer if (frame_owned) frame.deinit(self.allocator);
+        if (queued_continuation_stream.*) |required_stream| {
+            if (frame.header.frame_type != .continuation or
+                frame.header.stream_id != required_stream)
+            {
+                return error.ProtocolError;
+            }
+        } else if (frame.header.frame_type == .continuation) {
+            return error.ProtocolError;
+        }
+        switch (frame.header.frame_type) {
+            .window_update => {
+                if (frame.header.stream_id != 0 and
+                    stream_manager.getStream(frame.header.stream_id) == null and
+                    isImplicitlyClosedClientStream(
+                        frame.header.stream_id,
+                        last_client_stream_id.*,
+                    ))
+                {
+                    _ = try h2stream.parseWindowUpdatePayload(frame.payload);
+                } else {
+                    try applyHTTP2SendWindowUpdate(
+                        stream_manager,
+                        frame.header,
+                        frame.payload,
+                    );
+                }
+            },
+            .settings => {
+                if (frame.header.stream_id != 0) return error.ProtocolError;
+                if ((frame.header.flags & 0x01) != 0) {
+                    if (frame.payload.len != 0) return error.ProtocolError;
+                    return;
+                }
+                var peer_settings = conn.peer_settings;
+                try http.applySettingsPayloadForPeer(&peer_settings, frame.payload, .client);
+                try stream_manager.applyPeerSettings(peer_settings);
+                conn.peer_settings = peer_settings;
+                try conn.writeFrame(.{
+                    .length = 0,
+                    .frame_type = .settings,
+                    .flags = 0x01,
+                    .stream_id = 0,
+                }, &.{});
+            },
+            .ping => {
+                if (frame.header.stream_id != 0 or frame.payload.len != 8) {
+                    return error.ProtocolError;
+                }
+                if ((frame.header.flags & 0x01) == 0) {
+                    try conn.writeFrame(.{
+                        .length = 8,
+                        .frame_type = .ping,
+                        .flags = 0x01,
+                        .stream_id = 0,
+                    }, frame.payload);
+                }
+            },
+            .rst_stream => {
+                if (frame.header.stream_id == 0 or frame.payload.len != 4) {
+                    return error.ProtocolError;
+                }
+                if (frame.header.stream_id == stream_id) {
+                    if (stream_manager.getStream(stream_id)) |stream| stream.reset();
+                    return error.StreamReset;
+                }
+                if (stream_manager.getStream(frame.header.stream_id)) |other_stream| {
+                    if (other_stream.state == .closed) return;
+                } else if (isImplicitlyClosedClientStream(
+                    frame.header.stream_id,
+                    last_client_stream_id.*,
+                )) {
+                    return;
+                }
+                try queueHTTP2Frame(
+                    self,
+                    pending_frames,
+                    pending_frame_bytes,
+                    frame,
+                );
+                frame_owned = false;
+            },
+            .goaway => return error.GoAway,
+            .headers, .continuation, .data => {
+                if (frame.header.frame_type == .headers and
+                    stream_manager.getStream(frame.header.stream_id) == null)
+                {
+                    if ((frame.header.stream_id & 1) == 0 or
+                        frame.header.stream_id <= last_client_stream_id.*)
+                    {
+                        return error.ProtocolError;
+                    }
+                    const provisional = try stream_manager.getOrCreateStream(frame.header.stream_id);
+                    provisional.recv_window = @intCast(conn.settings.initial_window_size);
+                    provisional.send_window = @intCast(stream_manager.peer_settings.initial_window_size);
+                    try provisional.open();
+                    last_client_stream_id.* = frame.header.stream_id;
+                }
+                if (frame.header.frame_type == .data) {
+                    const debit = std.math.cast(i32, frame.payload.len) orelse
+                        return error.FlowControlError;
+                    if (debit > stream_manager.connection_recv_window) {
+                        return error.FlowControlError;
+                    }
+                    stream_manager.connection_recv_window -= debit;
+                }
+                try queueHTTP2Frame(
+                    self,
+                    pending_frames,
+                    pending_frame_bytes,
+                    frame,
+                );
+                frame_owned = false;
+                if (frame.header.frame_type == .headers and
+                    (frame.header.flags & 0x04) == 0)
+                {
+                    queued_continuation_stream.* = frame.header.stream_id;
+                    queued_header_deadline.* = request_header_deadline;
+                } else if (frame.header.frame_type == .continuation and
+                    (frame.header.flags & 0x04) != 0)
+                {
+                    queued_continuation_stream.* = null;
+                    queued_header_deadline.* = null;
+                }
+            },
+            .push_promise => return error.ProtocolError,
+            // PRIORITY and unknown extension frames are connection-neutral.
+            else => {},
+        }
+    }
+
+    fn queueHTTP2Frame(
+        self: *Self,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        frame: http.HTTP2Connection.Frame,
+    ) !void {
+        const max_pending_bytes = 256 * 1024;
+        if (pending_frames.items.len >= 1024 or
+            frame.payload.len > max_pending_bytes -| pending_frame_bytes.*)
+        {
+            return error.EnhanceYourCalm;
+        }
+        try pending_frames.append(self.allocator, frame);
+        pending_frame_bytes.* += frame.payload.len;
+    }
+
+    fn requestContentLength(headers: *const Headers) !?u64 {
+        var expected: ?u64 = null;
+        for (headers.entries.items) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, HeaderName.CONTENT_LENGTH)) continue;
+            var values = mem.splitScalar(u8, entry.value, ',');
+            var saw_value = false;
+            while (values.next()) |raw| {
+                const value = mem.trim(u8, raw, " \t");
+                if (value.len == 0) return error.InvalidContentLength;
+                for (value) |byte| {
+                    if (byte < '0' or byte > '9') return error.InvalidContentLength;
+                }
+                const parsed = std.fmt.parseInt(u64, value, 10) catch
+                    return error.InvalidContentLength;
+                if (expected) |existing| {
+                    if (existing != parsed) return error.InvalidContentLength;
+                } else {
+                    expected = parsed;
+                }
+                saw_value = true;
+            }
+            if (!saw_value) return error.InvalidContentLength;
+        }
+        return expected;
+    }
+
+    fn enforceContinuation(required_stream: ?u31, header: http.HTTP2FrameHeader) !void {
+        const stream_id = required_stream orelse return;
+        if (header.frame_type != .continuation or header.stream_id != stream_id) {
+            return error.ProtocolError;
+        }
+    }
+
+    fn validateRequestBodyLength(ctx: *const H2ServerStreamContext) !void {
+        const expected = ctx.expected_content_length orelse return;
+        if (ctx.received_body_bytes < expected) return error.RequestBodyUnderrun;
+        if (ctx.received_body_bytes > expected) return error.RequestBodyOverrun;
+    }
+
+    fn validateRequestTrailers(comptime HeaderT: type, entries: []const HeaderT) !void {
+        for (entries) |entry| {
+            if (entry.name.len == 0 or entry.name[0] == ':' or
+                !isValidHttp2HeaderName(entry.name) or
+                common.isConnectionSpecificHeader(entry.name) or
+                std.ascii.eqlIgnoreCase(entry.name, HeaderName.CONTENT_LENGTH) or
+                std.ascii.eqlIgnoreCase(entry.name, HeaderName.HOST))
+            {
+                return error.ProtocolError;
+            }
+        }
+    }
+
+    fn refuseHTTP2Stream(
+        conn: *http.HTTP2Connection,
+        stream_manager: *h2stream.StreamManager,
+        ctx: *H2ServerStreamContext,
+    ) !void {
+        const reset = h2stream.buildRstStreamFrame(ctx.stream_id, .refused_stream);
+        try conn.writer.writeAll(&reset);
+        if (stream_manager.getStream(ctx.stream_id)) |stream| stream.reset();
+        ctx.done = true;
     }
 
     /// Common HTTP/2 frame processing loop for both TLS and plain TCP connections.
     /// Supports concurrent streams: processes each stream's request/response before
     /// moving to the next. Sends GOAWAY only after all streams complete.
-    fn handleHTTP2Frames(self: *Self, conn: *http.HTTP2Connection) !void {
-        const header_deadline_ms: u64 = if (self.config.request_timeout_ms > 0)
-            @intCast(@max(0, common.nowMillis() +| @as(i64, @intCast(@min(self.config.request_timeout_ms, @as(u64, std.math.maxInt(i64)))))))
-        else
-            0;
+    fn handleHTTP2Frames(
+        self: *Self,
+        conn: *http.HTTP2Connection,
+        is_tls: bool,
+        frame_context: *IoContext,
+    ) !void {
+        const local_settings = http.HTTP2Connection.HTTP2ConnectionSettings{
+            .header_table_size = self.config.http2_settings.header_table_size,
+            .enable_push = false,
+            .max_concurrent_streams = self.config.http2_settings.max_concurrent_streams,
+            .initial_window_size = self.config.http2_settings.initial_window_size,
+            .max_frame_size = self.config.http2_settings.max_frame_size,
+            .max_header_list_size = self.config.http2_settings.max_header_list_size,
+        };
+        if (local_settings.initial_window_size > 0x7fff_ffff or
+            local_settings.max_frame_size < 16_384 or
+            local_settings.max_frame_size > 16_777_215)
+        {
+            return error.InvalidHTTP2Settings;
+        }
+        conn.settings = local_settings;
 
-        // Send initial SETTINGS.
+        var settings_payload = std.ArrayList(u8).empty;
+        defer settings_payload.deinit(self.allocator);
+        try http.encodeSettingsPayloadForRole(local_settings, self.allocator, &settings_payload, .server);
         try conn.writeFrame(.{
-            .length = 0,
+            .length = @intCast(settings_payload.items.len),
             .frame_type = .settings,
             .flags = 0,
             .stream_id = 0,
-        }, &.{});
+        }, settings_payload.items);
 
         var stream_manager = h2stream.StreamManager.init(self.allocator, false);
         defer stream_manager.deinit();
+        stream_manager.hpack_decoder.setMaxAllowedTableSize(local_settings.header_table_size);
 
         var contexts = std.ArrayList(H2ServerStreamContext).empty;
         defer {
@@ -1891,40 +2269,83 @@ pub const Server = struct {
         }
         var context_map = std.AutoHashMap(u31, usize).init(self.allocator);
         defer context_map.deinit();
+        var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+        defer {
+            for (pending_frames.items) |*pending| pending.deinit(self.allocator);
+            pending_frames.deinit(self.allocator);
+        }
+        var pending_frame_bytes: usize = 0;
+        var queued_continuation_stream: ?u31 = null;
+        var queued_header_deadline: ?Deadline = null;
+        var closed_stream_order = std.ArrayList(u31).empty;
+        defer closed_stream_order.deinit(self.allocator);
 
         var continuation_stream: ?u31 = null;
         var all_done = false;
         var processed_this_iteration = false;
+        var last_client_stream_id: u31 = 0;
+        var last_processed_stream_id: u31 = 0;
+        var received_initial_settings = false;
 
-        const max_frame_payload = self.config.max_body_size + (1024 * 1024);
-        const default_scheme: []const u8 = "https";
+        const max_frame_payload: usize = local_settings.max_frame_size;
+        const default_scheme: []const u8 = if (is_tls) "https" else "http";
 
         while (!all_done) {
-            if (header_deadline_ms > 0) {
-                const now_ms: u64 = @intCast(@max(0, common.nowMillis()));
-                if (now_ms >= header_deadline_ms) return error.HeaderTimeout;
-            }
-            var frame = try conn.readFrame(self.allocator, max_frame_payload);
+            var incoming_frame_deadline: ?Deadline = null;
+            var frame_from_queue = false;
+            var frame = if (pending_frames.items.len > 0) blk: {
+                const queued = pending_frames.orderedRemove(0);
+                pending_frame_bytes -= queued.payload.len;
+                frame_from_queue = true;
+                break :blk queued;
+            } else blk: {
+                const frame_deadline = if (continuation_stream) |stream_id|
+                    contexts.items[context_map.get(stream_id) orelse return error.ProtocolError].header_deadline
+                else if (self.config.request_timeout_ms > 0)
+                    Deadline.afterMs(self.config.request_timeout_ms)
+                else
+                    null;
+                incoming_frame_deadline = frame_deadline;
+                const previous_deadline = frame_context.phase_deadline;
+                frame_context.setPhaseDeadline(frame_deadline);
+                const incoming = conn.readFrame(self.allocator, max_frame_payload) catch |err| {
+                    frame_context.setPhaseDeadline(previous_deadline);
+                    return err;
+                };
+                frame_context.setPhaseDeadline(previous_deadline);
+                break :blk incoming;
+            };
             defer frame.deinit(self.allocator);
 
             processed_this_iteration = false;
+            if (!received_initial_settings and
+                (frame.header.frame_type != .settings or (frame.header.flags & 0x01) != 0))
+            {
+                return error.ProtocolError;
+            }
+            try enforceContinuation(continuation_stream, frame.header);
             switch (frame.header.frame_type) {
                 .settings => {
+                    if (frame.header.stream_id != 0) return error.ProtocolError;
                     if ((frame.header.flags & 0x01) == 0) {
                         var parsed_settings = conn.peer_settings;
-                        try http.applySettingsPayload(&parsed_settings, frame.payload);
+                        try http.applySettingsPayloadForPeer(&parsed_settings, frame.payload, .client);
                         try stream_manager.applyPeerSettings(parsed_settings);
                         conn.peer_settings = parsed_settings;
+                        received_initial_settings = true;
                         try conn.writeFrame(.{
                             .length = 0,
                             .frame_type = .settings,
                             .flags = 0x01,
                             .stream_id = 0,
                         }, &.{});
+                    } else if (frame.payload.len != 0) {
+                        return error.ProtocolError;
                     }
                 },
                 .ping => {
-                    if ((frame.header.flags & 0x01) == 0 and frame.payload.len == 8) {
+                    if (frame.header.stream_id != 0 or frame.payload.len != 8) return error.ProtocolError;
+                    if ((frame.header.flags & 0x01) == 0) {
                         try conn.writeFrame(.{
                             .length = 8,
                             .frame_type = .ping,
@@ -1939,24 +2360,51 @@ pub const Server = struct {
                     if (continuation_stream != null) return error.ProtocolError;
 
                     const stream_id = frame.header.stream_id;
-                    var ctx = if (context_map.get(stream_id)) |idx|
-                        &contexts.items[idx]
-                    else blk: {
-                        try contexts.append(self.allocator, H2ServerStreamContext.init(self.allocator, stream_id, default_scheme));
+                    var ctx = if (context_map.get(stream_id)) |idx| blk: {
+                        if (contexts.items[idx].headers_complete or
+                            contexts.items[idx].waiting_continuation)
+                        {
+                            return error.ProtocolError;
+                        }
+                        if ((frame.header.flags & 0x01) == 0) return error.ProtocolError;
+                        break :blk &contexts.items[idx];
+                    } else blk: {
+                        const remote_stream = if (stream_manager.getStream(stream_id)) |provisional| provisional else create: {
+                            if ((stream_id & 1) == 0 or stream_id <= last_client_stream_id) {
+                                return error.ProtocolError;
+                            }
+                            last_client_stream_id = stream_id;
+                            const created = try stream_manager.getOrCreateStream(stream_id);
+                            created.recv_window = @intCast(local_settings.initial_window_size);
+                            created.send_window = @intCast(stream_manager.peer_settings.initial_window_size);
+                            try created.open();
+                            break :create created;
+                        };
+                        if (remote_stream.state == .closed) return error.ProtocolError;
+                        try contexts.append(self.allocator, H2ServerStreamContext.init(self.allocator, stream_id));
                         errdefer {
                             contexts.items[contexts.items.len - 1].deinit(self.allocator);
                             _ = contexts.pop();
                         }
                         try context_map.put(stream_id, contexts.items.len - 1);
-                        break :blk &contexts.items[contexts.items.len - 1];
+                        const new_ctx = &contexts.items[contexts.items.len - 1];
+                        new_ctx.refuse_after_headers =
+                            stream_manager.activeStreamCount() > local_settings.max_concurrent_streams;
+                        break :blk new_ctx;
                     };
+                    ctx.header_deadline = incoming_frame_deadline orelse
+                        if (self.config.request_timeout_ms > 0)
+                            Deadline.afterMs(self.config.request_timeout_ms)
+                        else
+                            null;
 
                     if ((frame.header.flags & 0x04) != 0) {
-                        const parsed = try h2stream.parseHeadersFramePayload(
+                        const parsed = try h2stream.parseHeadersFramePayloadWithLimit(
                             &stream_manager,
                             frame.payload,
                             frame.header.flags,
                             self.allocator,
+                            local_settings.max_header_list_size,
                         );
                         defer {
                             for (parsed.headers) |header| {
@@ -1966,81 +2414,140 @@ pub const Server = struct {
                             self.allocator.free(parsed.headers);
                         }
 
-                        try self.parseHeaders(
-                            @TypeOf(parsed.headers[0]),
-                            parsed.headers,
-                            &ctx.request_headers,
-                            &ctx.method_raw,
-                            &ctx.method_owned,
-                            &ctx.path_raw,
-                            &ctx.path_owned,
-                            &ctx.scheme_raw,
-                            &ctx.scheme_owned,
-                            &ctx.authority_raw,
-                            &ctx.authority_owned,
-                        );
-
-                        if ((frame.header.flags & 0x01) != 0) {
-                            ctx.headers_complete = true;
+                        if (ctx.initial_headers_parsed) {
+                            try validateRequestTrailers(@TypeOf(parsed.headers[0]), parsed.headers);
+                        } else {
+                            try self.parseHeaders(
+                                @TypeOf(parsed.headers[0]),
+                                parsed.headers,
+                                &ctx.request_headers,
+                                &ctx.method_raw,
+                                &ctx.method_owned,
+                                &ctx.path_raw,
+                                &ctx.path_owned,
+                                &ctx.scheme_raw,
+                                &ctx.scheme_owned,
+                                &ctx.authority_raw,
+                                &ctx.authority_owned,
+                            );
+                            ctx.expected_content_length = try requestContentLength(&ctx.request_headers);
+                            ctx.initial_headers_parsed = true;
                         }
+
+                        if (ctx.refuse_after_headers) {
+                            try refuseHTTP2Stream(conn, &stream_manager, ctx);
+                        } else if ((frame.header.flags & 0x01) != 0) {
+                            ctx.headers_complete = true;
+                            stream_manager.getStream(stream_id).?.receiveEndStream();
+                        }
+                        ctx.header_deadline = null;
                     } else {
                         ctx.pending_headers_flags = frame.header.flags;
-                        try ctx.pending_headers_block.appendSlice(self.allocator, frame.payload);
+                        ctx.pending_is_trailers = ctx.initial_headers_parsed;
+                        try self.appendHTTP2HeaderFragment(
+                            &ctx.pending_headers_block,
+                            frame.payload,
+                            frame.header.flags,
+                        );
                         ctx.waiting_continuation = true;
                         continuation_stream = stream_id;
                     }
                 },
                 .continuation => {
                     if (continuation_stream == null) return error.ProtocolError;
-                    if (frame.header.stream_id != continuation_stream.?) continue;
+                    if (frame.header.stream_id != continuation_stream.?) return error.ProtocolError;
 
                     const idx = context_map.get(continuation_stream.?) orelse return error.ProtocolError;
                     var ctx = &contexts.items[idx];
 
+                    if (ctx.pending_headers_block.items.len > self.config.max_header_size or
+                        frame.payload.len > self.config.max_header_size - ctx.pending_headers_block.items.len)
+                    {
+                        return error.HeaderTooLarge;
+                    }
                     try ctx.pending_headers_block.appendSlice(self.allocator, frame.payload);
                     if ((frame.header.flags & 0x04) != 0) {
-                        const parsed = try h2stream.parseHeadersFramePayload(
-                            &stream_manager,
+                        const decoded = try hpack.decodeHeadersWithLimit(
+                            &stream_manager.hpack_decoder,
                             ctx.pending_headers_block.items,
-                            ctx.pending_headers_flags,
                             self.allocator,
+                            local_settings.max_header_list_size,
                         );
                         defer {
-                            for (parsed.headers) |header| {
+                            for (decoded) |header| {
                                 self.allocator.free(header.name);
                                 self.allocator.free(header.value);
                             }
-                            self.allocator.free(parsed.headers);
+                            self.allocator.free(decoded);
                         }
 
-                        try self.parseHeaders(
-                            @TypeOf(parsed.headers[0]),
-                            parsed.headers,
-                            &ctx.request_headers,
-                            &ctx.method_raw,
-                            &ctx.method_owned,
-                            &ctx.path_raw,
-                            &ctx.path_owned,
-                            &ctx.scheme_raw,
-                            &ctx.scheme_owned,
-                            &ctx.authority_raw,
-                            &ctx.authority_owned,
-                        );
+                        if (ctx.pending_is_trailers) {
+                            try validateRequestTrailers(@TypeOf(decoded[0]), decoded);
+                        } else {
+                            try self.parseHeaders(
+                                @TypeOf(decoded[0]),
+                                decoded,
+                                &ctx.request_headers,
+                                &ctx.method_raw,
+                                &ctx.method_owned,
+                                &ctx.path_raw,
+                                &ctx.path_owned,
+                                &ctx.scheme_raw,
+                                &ctx.scheme_owned,
+                                &ctx.authority_raw,
+                                &ctx.authority_owned,
+                            );
+                            ctx.expected_content_length = try requestContentLength(&ctx.request_headers);
+                            ctx.initial_headers_parsed = true;
+                        }
 
                         ctx.pending_headers_block.clearRetainingCapacity();
                         ctx.waiting_continuation = false;
+                        ctx.pending_is_trailers = false;
                         continuation_stream = null;
+                        ctx.header_deadline = null;
 
-                        if ((ctx.pending_headers_flags & 0x01) != 0) {
+                        if (ctx.refuse_after_headers) {
+                            try refuseHTTP2Stream(conn, &stream_manager, ctx);
+                        } else if ((ctx.pending_headers_flags & 0x01) != 0) {
                             ctx.headers_complete = true;
+                            stream_manager.getStream(ctx.stream_id).?.receiveEndStream();
                         }
                     }
                 },
                 .data => {
-                    if (frame.header.stream_id == 0) continue;
-                    const idx = context_map.get(frame.header.stream_id) orelse continue;
+                    if (frame.header.stream_id == 0) return error.ProtocolError;
+                    const idx = context_map.get(frame.header.stream_id) orelse {
+                        const closed = if (stream_manager.getStream(frame.header.stream_id)) |stream|
+                            stream.state == .closed
+                        else
+                            isImplicitlyClosedClientStream(
+                                frame.header.stream_id,
+                                last_client_stream_id,
+                            );
+                        if (!closed) return error.ProtocolError;
+                        try consumeClosedStreamData(
+                            conn,
+                            &stream_manager,
+                            &frame,
+                            frame_from_queue,
+                        );
+                        continue;
+                    };
                     var ctx = &contexts.items[idx];
-                    if (ctx.done) continue;
+                    if (ctx.done) return error.StreamClosed;
+                    const remote_stream = stream_manager.getStream(ctx.stream_id) orelse
+                        return error.ProtocolError;
+                    if (!remote_stream.canReceive()) return error.StreamClosed;
+                    const flow_amount = std.math.cast(i32, frame.payload.len) orelse
+                        return error.FlowControlError;
+                    if (flow_amount > remote_stream.recv_window or
+                        (!frame_from_queue and flow_amount > stream_manager.connection_recv_window))
+                    {
+                        return error.FlowControlError;
+                    }
+                    remote_stream.recv_window -= flow_amount;
+                    if (!frame_from_queue) stream_manager.connection_recv_window -= flow_amount;
 
                     var data_slice = frame.payload;
                     if ((frame.header.flags & 0x08) != 0) {
@@ -2053,10 +2560,19 @@ pub const Server = struct {
                     if (ctx.request_body.items.len + data_slice.len > self.config.max_body_size) {
                         return error.RequestTooLarge;
                     }
+                    const next_body_bytes = std.math.add(
+                        u64,
+                        ctx.received_body_bytes,
+                        data_slice.len,
+                    ) catch return error.RequestTooLarge;
+                    if (ctx.expected_content_length) |expected| {
+                        if (next_body_bytes > expected) return error.RequestBodyOverrun;
+                    }
                     try ctx.request_body.appendSlice(self.allocator, data_slice);
+                    ctx.received_body_bytes = next_body_bytes;
 
-                    if (data_slice.len > 0) {
-                        const window_increment: u31 = @intCast(data_slice.len);
+                    if (frame.payload.len > 0) {
+                        const window_increment: u31 = @intCast(frame.payload.len);
                         const window_update = h2stream.buildWindowUpdatePayload(window_increment);
                         try conn.writeFrame(.{
                             .length = @intCast(window_update.len),
@@ -2070,21 +2586,55 @@ pub const Server = struct {
                             .flags = 0,
                             .stream_id = 0,
                         }, &window_update);
+                        try remote_stream.updateRecvWindow(flow_amount);
+                        try stream_manager.updateConnectionRecvWindow(flow_amount);
                     }
 
                     if ((frame.header.flags & 0x01) != 0) {
                         ctx.headers_complete = true;
+                        remote_stream.receiveEndStream();
                     }
                 },
                 .rst_stream => {
+                    if (frame.header.stream_id == 0 or frame.payload.len != 4) return error.ProtocolError;
                     if (context_map.get(frame.header.stream_id)) |idx| {
                         contexts.items[idx].done = true;
+                        if (stream_manager.getStream(frame.header.stream_id)) |remote_stream| {
+                            remote_stream.reset();
+                        }
+                    } else if (stream_manager.getStream(frame.header.stream_id)) |closed_stream| {
+                        if (closed_stream.state != .closed) return error.ProtocolError;
+                    } else if (isImplicitlyClosedClientStream(
+                        frame.header.stream_id,
+                        last_client_stream_id,
+                    )) {
+                        // Lower skipped odd IDs are implicitly closed.
+                    } else {
+                        return error.ProtocolError;
                     }
                 },
                 .goaway => {
                     return;
                 },
-                .window_update, .priority, .push_promise => {},
+                .push_promise => return error.ProtocolError,
+                .window_update => {
+                    if (frame.header.stream_id != 0 and
+                        stream_manager.getStream(frame.header.stream_id) == null and
+                        isImplicitlyClosedClientStream(
+                            frame.header.stream_id,
+                            last_client_stream_id,
+                        ))
+                    {
+                        _ = try h2stream.parseWindowUpdatePayload(frame.payload);
+                    } else {
+                        try applyHTTP2SendWindowUpdate(
+                            &stream_manager,
+                            frame.header,
+                            frame.payload,
+                        );
+                    }
+                },
+                .priority => {},
                 _ => {},
             }
 
@@ -2092,20 +2642,57 @@ pub const Server = struct {
             for (contexts.items) |*ctx| {
                 if (ctx.done or !ctx.headers_complete) continue;
 
-                const scheme = if (ctx.scheme_raw.len == 0) default_scheme else ctx.scheme_raw;
-                const path = if (ctx.path_raw.len == 0) "/" else ctx.path_raw;
-                const authority = ctx.authority_raw orelse ctx.request_headers.get(HeaderName.HOST) orelse self.config.host;
+                if (!ctx.method_owned) return error.ProtocolError;
+                try validateRequestBodyLength(ctx);
+                const method = types.Method.fromString(ctx.method_raw) orelse .CUSTOM;
+                const is_connect = method == .CONNECT;
+                if (is_connect) {
+                    if (ctx.authority_raw == null or ctx.authority_raw.?.len == 0 or
+                        ctx.scheme_owned or ctx.path_owned)
+                    {
+                        return error.ProtocolError;
+                    }
+                } else {
+                    if (!ctx.scheme_owned or !ctx.path_owned or ctx.path_raw.len == 0) {
+                        return error.ProtocolError;
+                    }
+                    if (!std.ascii.eqlIgnoreCase(ctx.scheme_raw, "http") and
+                        !std.ascii.eqlIgnoreCase(ctx.scheme_raw, "https"))
+                    {
+                        return error.ProtocolError;
+                    }
+                }
+
+                const scheme = if (is_connect) default_scheme else ctx.scheme_raw;
+                const path = if (is_connect) "/" else ctx.path_raw;
+                const host_header = ctx.request_headers.get(HeaderName.HOST);
+                if (ctx.authority_raw) |pseudo_authority| {
+                    if (host_header) |host_value| {
+                        if (!std.ascii.eqlIgnoreCase(
+                            mem.trim(u8, host_value, " \t"),
+                            pseudo_authority,
+                        )) {
+                            return error.ProtocolError;
+                        }
+                    }
+                }
+                const authority = ctx.authority_raw orelse
+                    host_header orelse
+                    return error.ProtocolError;
+                try validateHTTP2Authority(authority);
                 if (ctx.request_headers.get(HeaderName.HOST) == null) {
                     try ctx.request_headers.append(HeaderName.HOST, authority);
                 }
 
-                const method = types.Method.fromString(ctx.method_raw) orelse .GET;
-                const url = try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, path });
+                const url_path = if (mem.eql(u8, path, "*")) "/" else path;
+                const url = try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, url_path });
                 defer self.allocator.free(url);
 
                 var req = try Request.init(self.allocator, method, url);
                 defer req.deinit();
                 req.version = .HTTP_2;
+                if (mem.eql(u8, path, "*")) req.uri.path = "*";
+                if (method == .CUSTOM) try req.setCustomMethod(ctx.method_raw);
 
                 req.headers.deinit();
                 req.headers = Headers.init(self.allocator);
@@ -2122,17 +2709,81 @@ pub const Server = struct {
                     var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
                     defer internal.deinit();
                     internal.version = .HTTP_2;
-                    try self.sendHTTP2Response(conn, &stream_manager, ctx.stream_id, &internal);
+                    self.sendHTTP2Response(
+                        conn,
+                        &stream_manager,
+                        ctx.stream_id,
+                        &internal,
+                        frame_context,
+                        &pending_frames,
+                        &pending_frame_bytes,
+                        &queued_continuation_stream,
+                        &queued_header_deadline,
+                        &last_client_stream_id,
+                    ) catch |err| switch (err) {
+                        error.StreamReset => {
+                            ctx.done = true;
+                            last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
+                            processed_this_iteration = true;
+                            continue;
+                        },
+                        else => return err,
+                    };
                     ctx.done = true;
+                    last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
                     processed_this_iteration = true;
                     continue;
                 };
                 defer response.deinit();
                 response.version = .HTTP_2;
 
-                try self.sendHTTP2Response(conn, &stream_manager, ctx.stream_id, &response);
+                self.sendHTTP2Response(
+                    conn,
+                    &stream_manager,
+                    ctx.stream_id,
+                    &response,
+                    frame_context,
+                    &pending_frames,
+                    &pending_frame_bytes,
+                    &queued_continuation_stream,
+                    &queued_header_deadline,
+                    &last_client_stream_id,
+                ) catch |err| switch (err) {
+                    error.StreamReset => {
+                        ctx.done = true;
+                        last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
+                        processed_this_iteration = true;
+                        continue;
+                    },
+                    else => return err,
+                };
                 ctx.done = true;
+                last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
                 processed_this_iteration = true;
+            }
+
+            var context_index: usize = 0;
+            while (context_index < contexts.items.len) {
+                if (!contexts.items[context_index].done) {
+                    context_index += 1;
+                    continue;
+                }
+                const completed_stream_id = contexts.items[context_index].stream_id;
+                contexts.items[context_index].deinit(self.allocator);
+                _ = contexts.orderedRemove(context_index);
+                _ = context_map.remove(completed_stream_id);
+                if (stream_manager.getStream(completed_stream_id)) |completed_stream| {
+                    if (completed_stream.state != .closed) completed_stream.reset();
+                }
+                try closed_stream_order.append(self.allocator, completed_stream_id);
+                if (closed_stream_order.items.len > 1024) {
+                    const expired_stream = closed_stream_order.orderedRemove(0);
+                    stream_manager.removeStream(expired_stream);
+                }
+                var shifted = context_index;
+                while (shifted < contexts.items.len) : (shifted += 1) {
+                    try context_map.put(contexts.items[shifted].stream_id, shifted);
+                }
             }
 
             // Check if all streams are done.
@@ -2155,10 +2806,7 @@ pub const Server = struct {
         }
 
         // Determine last stream ID for GOAWAY.
-        const last_stream_id: u31 = if (contexts.items.len > 0)
-            contexts.items[contexts.items.len - 1].stream_id
-        else
-            0;
+        const last_stream_id = last_processed_stream_id;
 
         const goaway_frame = try h2stream.buildGoawayFrame(last_stream_id, .no_error, null, self.allocator);
         defer self.allocator.free(goaway_frame);
@@ -2187,8 +2835,17 @@ pub const Server = struct {
         stream_manager: *h2stream.StreamManager,
         stream_id: u31,
         response: *Response,
+        frame_context: *IoContext,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        queued_continuation_stream: *?u31,
+        queued_header_deadline: *?Deadline,
+        last_client_stream_id: *u31,
     ) !void {
         try self.ensureContentLengthHeader(response);
+        const response_stream = stream_manager.getStream(stream_id) orelse
+            return error.InvalidStreamState;
+        if (!response_stream.canSend()) return error.InvalidStreamState;
 
         var response_headers = std.ArrayList(hpack.HeaderEntry).empty;
         defer response_headers.deinit(self.allocator);
@@ -2230,22 +2887,57 @@ pub const Server = struct {
 
         try conn.writer.writeAll(headers_frames);
 
-        if (has_body) {
-            const body = response.body.?;
-            const data_max_frame_size: usize = @intCast(max_frame_size);
+        if (!has_body) {
+            response_stream.sendEndStream();
+            return;
+        }
 
-            var offset: usize = 0;
-            while (offset < body.len) {
-                const chunk_len = @min(body.len - offset, data_max_frame_size);
-                const is_last = offset + chunk_len == body.len;
-                try conn.writeFrame(.{
-                    .length = @intCast(chunk_len),
-                    .frame_type = .data,
-                    .flags = if (is_last) 0x01 else 0,
-                    .stream_id = stream_id,
-                }, body[offset .. offset + chunk_len]);
-                offset += chunk_len;
+        const body = response.body.?;
+        const data_max_frame_size: usize = @intCast(max_frame_size);
+        const send_wait_deadline = if (self.config.write_timeout_ms > 0)
+            Deadline.afterMs(self.config.write_timeout_ms)
+        else
+            null;
+        var offset: usize = 0;
+        while (offset < body.len) {
+            while (response_stream.send_window <= 0 or
+                stream_manager.connection_send_window <= 0)
+            {
+                try self.pumpHTTP2SendWindow(
+                    conn,
+                    stream_manager,
+                    stream_id,
+                    frame_context,
+                    send_wait_deadline,
+                    pending_frames,
+                    pending_frame_bytes,
+                    queued_continuation_stream,
+                    queued_header_deadline,
+                    last_client_stream_id,
+                );
+                if (!response_stream.canSend()) return error.StreamReset;
             }
+            const stream_window: usize = @intCast(response_stream.send_window);
+            const connection_window: usize = @intCast(stream_manager.connection_send_window);
+            const chunk_len = @min(
+                body.len - offset,
+                data_max_frame_size,
+                stream_window,
+                connection_window,
+            );
+            if (chunk_len == 0) continue;
+            const is_last = offset + chunk_len == body.len;
+            try conn.writeFrame(.{
+                .length = @intCast(chunk_len),
+                .frame_type = .data,
+                .flags = if (is_last) 0x01 else 0,
+                .stream_id = stream_id,
+            }, body[offset .. offset + chunk_len]);
+            const debit: i32 = @intCast(chunk_len);
+            try response_stream.updateSendWindow(-debit);
+            try stream_manager.updateConnectionSendWindow(-debit);
+            offset += chunk_len;
+            if (is_last) response_stream.sendEndStream();
         }
     }
 
@@ -2294,107 +2986,18 @@ pub const Server = struct {
         try conn.writer.writeAll(headers_frames);
     }
 
-    /// Sends an HTTP/2 PUSH_PROMISE frame to the client, then sends the
-    /// promised response on the new server-initiated stream.
-    ///
-    /// Returns the promised stream ID on success.
+    /// Server push is intentionally disabled. The method remains for source
+    /// compatibility and always returns `error.PushDisabled`.
     pub fn pushPromise(
-        self: *Self,
-        conn: *http.HTTP2Connection,
-        stream_manager: *h2stream.StreamManager,
-        original_stream_id: u31,
-        method: types.Method,
-        path: []const u8,
-        promise_headers: ?[]const hpack.HeaderEntry,
+        _: *Self,
+        _: *http.HTTP2Connection,
+        _: *h2stream.StreamManager,
+        _: u31,
+        _: types.Method,
+        _: []const u8,
+        _: ?[]const hpack.HeaderEntry,
     ) !u31 {
-        if (!self.config.enable_push) return error.PushDisabled;
-
-        var promised_stream = try stream_manager.createStream();
-        const promised_id = promised_stream.id;
-        try promised_stream.open();
-
-        var promise_header_block = std.ArrayList(hpack.HeaderEntry).empty;
-        defer promise_header_block.deinit(self.allocator);
-
-        try promise_header_block.append(self.allocator, .{ .name = ":method", .value = method.toString() });
-        try promise_header_block.append(self.allocator, .{ .name = ":path", .value = path });
-        try promise_header_block.append(self.allocator, .{ .name = ":scheme", .value = "https" });
-
-        if (promise_headers) |extra| {
-            for (extra) |h| {
-                try promise_header_block.append(self.allocator, h);
-            }
-        }
-
-        const max_frame_size: u32 = @max(conn.peer_settings.max_frame_size, 16 * 1024);
-
-        var promise_payload = std.ArrayList(u8).empty;
-        defer promise_payload.deinit(self.allocator);
-
-        const encoded_headers = try h2stream.hpack.encodeHeaders(
-            &stream_manager.hpack_ctx,
-            promise_header_block.items,
-            self.allocator,
-        );
-        defer self.allocator.free(encoded_headers);
-
-        const promised_id_buf: [4]u8 = .{
-            @intCast((promised_id >> 24) & 0x7F),
-            @intCast((promised_id >> 16) & 0xFF),
-            @intCast((promised_id >> 8) & 0xFF),
-            @intCast(promised_id & 0xFF),
-        };
-        try promise_payload.appendSlice(self.allocator, &promised_id_buf);
-        try promise_payload.appendSlice(self.allocator, encoded_headers);
-
-        const max_fragment: usize = if (max_frame_size > 9) @intCast(max_frame_size - 9) else 0;
-
-        if (promise_payload.items.len <= max_fragment) {
-            const frame_header = http.HTTP2FrameHeader{
-                .length = @intCast(promise_payload.items.len),
-                .frame_type = .push_promise,
-                .flags = 0x04,
-                .stream_id = original_stream_id,
-            };
-            const hdr = frame_header.serialize();
-            try conn.writer.writeAll(&hdr);
-            try conn.writer.writeAll(promise_payload.items);
-        } else {
-            const first_chunk_len = @min(promise_payload.items.len, max_fragment);
-            {
-                const frame_header = http.HTTP2FrameHeader{
-                    .length = @intCast(first_chunk_len),
-                    .frame_type = .push_promise,
-                    .flags = 0,
-                    .stream_id = original_stream_id,
-                };
-                const hdr = frame_header.serialize();
-                try conn.writer.writeAll(&hdr);
-                try conn.writer.writeAll(promise_payload.items[0..first_chunk_len]);
-            }
-
-            var offset = first_chunk_len;
-            while (offset < promise_payload.items.len) {
-                const chunk_len = @min(promise_payload.items.len - offset, max_fragment);
-                const is_last = (offset + chunk_len) == promise_payload.items.len;
-                const cont_flags: u8 = if (is_last) 0x04 else 0;
-
-                const frame_header = http.HTTP2FrameHeader{
-                    .length = @intCast(chunk_len),
-                    .frame_type = .continuation,
-                    .flags = cont_flags,
-                    .stream_id = original_stream_id,
-                };
-                const hdr = frame_header.serialize();
-                try conn.writer.writeAll(&hdr);
-                try conn.writer.writeAll(promise_payload.items[offset .. offset + chunk_len]);
-                offset += chunk_len;
-            }
-        }
-
-        promised_stream.sendEndStream();
-
-        return promised_id;
+        return error.PushDisabled;
     }
 
     fn handleHTTP3Transaction(self: *Self, peer_addr: net.Address, first_datagram: []const u8) !void {
@@ -3821,6 +4424,13 @@ test "HTTP/2 server handles concurrent streams" {
         .threads = 2,
         .keep_alive = false,
         .http2_enabled = true,
+        .http2_settings = .{
+            .header_table_size = 2048,
+            .max_concurrent_streams = 2,
+            .initial_window_size = 70_000,
+            .max_frame_size = 32_768,
+            .max_header_list_size = 12_345,
+        },
         .request_timeout_ms = 5000,
         .log_fn = &struct {
             fn log_fn(_: LogLevel, _: []const u8) void {}
@@ -3878,7 +4488,32 @@ test "HTTP/2 server handles concurrent streams" {
 
     // Read server SETTINGS.
     var server_settings_buf: [9]u8 = undefined;
-    _ = try tcp_sock.read(&server_settings_buf);
+    var server_settings_offset: usize = 0;
+    while (server_settings_offset < server_settings_buf.len) {
+        const n = try tcp_sock.read(server_settings_buf[server_settings_offset..]);
+        if (n == 0) return error.UnexpectedEof;
+        server_settings_offset += n;
+    }
+    const server_settings_header = http.HTTP2FrameHeader.parse(server_settings_buf);
+    var server_settings_payload: [64]u8 = undefined;
+    if (server_settings_header.length > server_settings_payload.len) return error.FrameTooLarge;
+    var server_payload_offset: usize = 0;
+    while (server_payload_offset < server_settings_header.length) {
+        const n = try tcp_sock.read(server_settings_payload[server_payload_offset..server_settings_header.length]);
+        if (n == 0) return error.UnexpectedEof;
+        server_payload_offset += n;
+    }
+    var advertised = http.HTTP2Connection.HTTP2ConnectionSettings{};
+    try http.applySettingsPayloadForPeer(
+        &advertised,
+        server_settings_payload[0..server_settings_header.length],
+        .server,
+    );
+    try std.testing.expectEqual(@as(u32, 2048), advertised.header_table_size);
+    try std.testing.expectEqual(@as(u32, 2), advertised.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 70_000), advertised.initial_window_size);
+    try std.testing.expectEqual(@as(u32, 32_768), advertised.max_frame_size);
+    try std.testing.expectEqual(@as(u32, 12_345), advertised.max_header_list_size);
 
     // Send SETTINGS ACK.
     const ack_hdr = http.HTTP2FrameHeader{
@@ -3966,6 +4601,141 @@ test "HTTP/2 server handles concurrent streams" {
     try std.testing.expect(found_stream_3);
 }
 
+test "HTTP2 server refuses only excess stream after decoding its headers" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .http2_settings = .{ .max_concurrent_streams = 1 },
+        .request_timeout_ms = 5_000,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    try server.get("/one", &struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("one");
+        }
+    }.handler);
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    const Helpers = struct {
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEof;
+                offset += n;
+            }
+        }
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+    };
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll(http.HTTP2_PREFACE);
+    var settings_payload = std.ArrayList(u8).empty;
+    defer settings_payload.deinit(std.testing.allocator);
+    try http.encodeSettingsPayload(.{}, std.testing.allocator, &settings_payload);
+    const settings_header = (http.HTTP2FrameHeader{
+        .length = @intCast(settings_payload.items.len),
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&settings_header);
+    try socket.writeAll(settings_payload.items);
+    var payload: [64 * 1024]u8 = undefined;
+    _ = try Helpers.readFrame(&socket, &payload);
+    _ = try Helpers.readFrame(&socket, &payload);
+
+    var manager = h2stream.StreamManager.init(std.testing.allocator, true);
+    defer manager.deinit();
+    const first_headers = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/one" },
+        .{ .name = ":authority", .value = "127.0.0.1" },
+    };
+    const first = try h2stream.buildHeadersAndContinuations(
+        &manager,
+        1,
+        &first_headers,
+        null,
+        16_384,
+        false,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(first);
+    try socket.writeAll(first);
+    const excess = try h2stream.buildHeadersAndContinuations(
+        &manager,
+        3,
+        &first_headers,
+        null,
+        16_384,
+        false,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(excess);
+    try socket.writeAll(excess);
+    const late_data = (http.HTTP2FrameHeader{
+        .length = 4,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 3,
+    }).serialize();
+    try socket.writeAll(&late_data);
+    try socket.writeAll("late");
+    const end_first = (http.HTTP2FrameHeader{
+        .length = 0,
+        .frame_type = .data,
+        .flags = 0x01,
+        .stream_id = 1,
+    }).serialize();
+    try socket.writeAll(&end_first);
+
+    var saw_refused = false;
+    var saw_first_response = false;
+    while (!saw_refused or !saw_first_response) {
+        const frame = try Helpers.readFrame(&socket, &payload);
+        if (frame.frame_type == .rst_stream and frame.stream_id == 3) {
+            try std.testing.expectEqual(@as(u32, @intFromEnum(http.HTTP2ErrorCode.refused_stream)), std.mem.readInt(u32, payload[0..4], .big));
+            saw_refused = true;
+        }
+        if (frame.stream_id == 1 and (frame.flags & 0x01) != 0) {
+            saw_first_response = true;
+        }
+    }
+    const after_refusal = try h2stream.buildHeadersAndContinuations(
+        &manager,
+        5,
+        &first_headers,
+        null,
+        16_384,
+        true,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(after_refusal);
+    try socket.writeAll(after_refusal);
+    while (true) {
+        const frame = try Helpers.readFrame(&socket, &payload);
+        if (frame.stream_id == 5 and (frame.flags & 0x01) != 0) break;
+    }
+}
+
 fn streamingTestSocketPair() ![2]Socket {
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
@@ -3981,7 +4751,8 @@ fn streamingTestSocketPair() ![2]Socket {
 }
 
 test "TLS streaming headers preserve values larger than one record" {
-    const modes = [_]enum { chunked, raw }{ .chunked, .raw };
+    const Mode = enum { chunked, raw };
+    const modes = [_]Mode{ .chunked, .raw };
     const key = [_]u8{0x5a} ** 32;
     const iv = [_]u8{0xa5} ** 12;
 
@@ -4026,11 +4797,35 @@ test "TLS streaming headers preserve values larger than one record" {
         defer context.deinit();
         try context.data.put("__stream_writer", @ptrCast(&stream_writer));
 
-        _ = switch (mode) {
-            .chunked => try context.startStreaming(200, &headers),
-            .raw => try context.startRawStreaming(200, &headers),
+        const Writer = struct {
+            context: *Context,
+            headers: *const Headers,
+            sender: *Socket,
+            mode: Mode,
+            failure: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                _ = switch (self.mode) {
+                    .chunked => self.context.startStreaming(200, self.headers),
+                    .raw => self.context.startRawStreaming(200, self.headers),
+                } catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.sender.shutdownWrite() catch |err| {
+                    self.failure = err;
+                };
+            }
         };
-        try sender.shutdownWrite();
+        var writer = Writer{
+            .context = &context,
+            .headers = &headers,
+            .sender = &sender,
+            .mode = mode,
+        };
+        const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+        var writer_joined = false;
+        defer if (!writer_joined) writer_thread.join();
 
         var expected = std.ArrayList(u8).empty;
         defer expected.deinit(std.testing.allocator);
@@ -4050,9 +4845,645 @@ test "TLS streaming headers preserve values larger than one record" {
             if (n == 0) return error.UnexpectedEof;
             try actual.appendSlice(std.testing.allocator, read_buf[0..n]);
         }
+        writer_thread.join();
+        writer_joined = true;
+        if (writer.failure) |err| return err;
 
         try std.testing.expect(context.streaming_done);
         try std.testing.expect(tls_sender.write_seq > 1);
         try std.testing.expectEqualSlices(u8, expected.items, actual.items);
     }
+}
+
+test "Server rejects public HTTP3 before binding" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http3_enabled = true,
+    });
+    defer server.deinit();
+    try std.testing.expectError(error.UnsupportedHttpVersion, server.listenInBackground());
+    try std.testing.expect(server.listener == null);
+    try std.testing.expect(server.udp_socket == null);
+}
+
+test "HTTP2 server validates TLS preface and disables push" {
+    try Server.validateHTTP2Preface(http.HTTP2_PREFACE);
+    try std.testing.expectError(
+        error.ProtocolError,
+        Server.validateHTTP2Preface("GET / HTTP/1.1\r\n\r\n"),
+    );
+
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var conn: http.HTTP2Connection = undefined;
+    var manager = h2stream.StreamManager.init(std.testing.allocator, false);
+    defer manager.deinit();
+    try std.testing.expectError(
+        error.PushDisabled,
+        server.pushPromise(&conn, &manager, 1, .GET, "/", null),
+    );
+}
+
+test "HTTP2 server rejects malformed request header blocks" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    const cases = [_][]const hpack.HeaderEntry{
+        &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":method", .value = "POST" },
+        },
+        &.{
+            .{ .name = "x-first", .value = "value" },
+            .{ .name = ":path", .value = "/" },
+        },
+        &.{.{ .name = "X-Upper", .value = "value" }},
+        &.{.{ .name = "connection", .value = "keep-alive" }},
+        &.{.{ .name = ":unknown", .value = "value" }},
+        &.{.{ .name = ":path", .value = "http://attacker.test/" }},
+        &.{.{ .name = ":path", .value = "/path#fragment" }},
+        &.{.{ .name = ":authority", .value = "victim.test@attacker.test" }},
+        &.{.{ .name = ":authority", .value = "victim.test/path" }},
+        &.{.{ .name = ":authority", .value = "2001:db8::1" }},
+        &.{.{ .name = ":authority", .value = "[not-ipv6]" }},
+        &.{.{ .name = ":authority", .value = "victim\\attacker" }},
+    };
+
+    for (cases) |entries| {
+        var ctx = Server.H2ServerStreamContext.init(std.testing.allocator, 1);
+        defer ctx.deinit(std.testing.allocator);
+        try std.testing.expectError(
+            error.ProtocolError,
+            server.parseHeaders(
+                hpack.HeaderEntry,
+                entries,
+                &ctx.request_headers,
+                &ctx.method_raw,
+                &ctx.method_owned,
+                &ctx.path_raw,
+                &ctx.path_owned,
+                &ctx.scheme_raw,
+                &ctx.scheme_owned,
+                &ctx.authority_raw,
+                &ctx.authority_owned,
+            ),
+        );
+    }
+}
+
+test "HTTP2 server preserves custom methods and validates content length" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var ctx = Server.H2ServerStreamContext.init(std.testing.allocator, 1);
+    defer ctx.deinit(std.testing.allocator);
+    const entries = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "PURGE" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/cache" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = "content-length", .value = "5, 5" },
+    };
+    try server.parseHeaders(
+        hpack.HeaderEntry,
+        &entries,
+        &ctx.request_headers,
+        &ctx.method_raw,
+        &ctx.method_owned,
+        &ctx.path_raw,
+        &ctx.path_owned,
+        &ctx.scheme_raw,
+        &ctx.scheme_owned,
+        &ctx.authority_raw,
+        &ctx.authority_owned,
+    );
+    try std.testing.expectEqualStrings("PURGE", ctx.method_raw);
+    try Server.validateHTTP2Path("*");
+    try Server.validateHTTP2Authority("[2001:db8::1]:8443");
+    try std.testing.expect(types.Method.fromString(ctx.method_raw) == null);
+    try std.testing.expectEqual(@as(?u64, 5), try Server.requestContentLength(&ctx.request_headers));
+    ctx.expected_content_length = 5;
+    ctx.received_body_bytes = 4;
+    try std.testing.expectError(error.RequestBodyUnderrun, Server.validateRequestBodyLength(&ctx));
+    ctx.received_body_bytes = 6;
+    try std.testing.expectError(error.RequestBodyOverrun, Server.validateRequestBodyLength(&ctx));
+    ctx.received_body_bytes = 5;
+    try Server.validateRequestBodyLength(&ctx);
+
+    try ctx.request_headers.append("content-length", "6");
+    try std.testing.expectError(
+        error.InvalidContentLength,
+        Server.requestContentLength(&ctx.request_headers),
+    );
+
+    try std.testing.expectError(
+        error.ProtocolError,
+        Server.enforceContinuation(1, .{
+            .length = 8,
+            .frame_type = .ping,
+            .flags = 0,
+            .stream_id = 0,
+        }),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        Server.enforceContinuation(1, .{
+            .length = 0,
+            .frame_type = .continuation,
+            .flags = 0x04,
+            .stream_id = 3,
+        }),
+    );
+    try Server.enforceContinuation(1, .{
+        .length = 0,
+        .frame_type = .continuation,
+        .flags = 0x04,
+        .stream_id = 1,
+    });
+    const bad_trailers = [_]hpack.HeaderEntry{
+        .{ .name = "content-length", .value = "5" },
+    };
+    try std.testing.expectError(
+        error.ProtocolError,
+        Server.validateRequestTrailers(hpack.HeaderEntry, &bad_trailers),
+    );
+}
+
+test "HTTP2 server response obeys stream and connection send windows" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .request_timeout_ms = 5_000,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    try server.get("/large", &struct {
+        const body = "x" ** 70_000;
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text(body);
+        }
+    }.handler);
+    const server_thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        server_thread.join();
+    }
+
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+
+    const Helpers = struct {
+        fn readExact(sock: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try sock.read(output[offset..]);
+                if (n == 0) return error.UnexpectedEof;
+                offset += n;
+            }
+        }
+
+        fn readFrame(sock: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(sock, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(sock, payload[0..header.length]);
+            return header;
+        }
+
+        fn writeWindowUpdate(sock: *Socket, stream_id: u31, increment: u31) !void {
+            const payload = h2stream.buildWindowUpdatePayload(increment);
+            const header = http.HTTP2FrameHeader{
+                .length = payload.len,
+                .frame_type = .window_update,
+                .flags = 0,
+                .stream_id = stream_id,
+            };
+            const serialized = header.serialize();
+            try sock.writeAll(&serialized);
+            try sock.writeAll(&payload);
+        }
+    };
+
+    try socket.writeAll(http.HTTP2_PREFACE);
+    var client_settings = http.HTTP2Connection.HTTP2ConnectionSettings{};
+    client_settings.initial_window_size = 32_768;
+    var settings_payload = std.ArrayList(u8).empty;
+    defer settings_payload.deinit(allocator);
+    try http.encodeSettingsPayload(client_settings, allocator, &settings_payload);
+    const client_settings_header = (http.HTTP2FrameHeader{
+        .length = @intCast(settings_payload.items.len),
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&client_settings_header);
+    try socket.writeAll(settings_payload.items);
+
+    var payload: [64 * 1024]u8 = undefined;
+    const server_settings = try Helpers.readFrame(&socket, &payload);
+    try std.testing.expectEqual(http.HTTP2FrameType.settings, server_settings.frame_type);
+    const settings_ack = (http.HTTP2FrameHeader{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0x01,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&settings_ack);
+
+    var manager = h2stream.StreamManager.init(allocator, true);
+    defer manager.deinit();
+    const request_headers = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/large" },
+        .{ .name = ":authority", .value = "127.0.0.1" },
+    };
+    const request_frames = try h2stream.buildHeadersAndContinuations(
+        &manager,
+        1,
+        &request_headers,
+        null,
+        16_384,
+        true,
+        allocator,
+    );
+    defer allocator.free(request_frames);
+    try socket.writeAll(request_frames);
+
+    var total: usize = 0;
+    var saw_end = false;
+    while (!saw_end) {
+        const frame = try Helpers.readFrame(&socket, &payload);
+        if (frame.frame_type != .data) continue;
+        total += frame.length;
+        if (total == 32_768) {
+            try std.testing.expect(!socket.waitReadable(50));
+            try Helpers.writeWindowUpdate(&socket, 1, 40_000);
+        } else if (total == 65_535) {
+            try std.testing.expect(!socket.waitReadable(50));
+            try Helpers.writeWindowUpdate(&socket, 0, 10_000);
+        }
+        saw_end = (frame.flags & 0x01) != 0;
+    }
+    try std.testing.expectEqual(@as(usize, 70_000), total);
+
+    const late_reset = h2stream.buildRstStreamFrame(1, .cancel);
+    try socket.writeAll(&late_reset);
+    try Helpers.writeWindowUpdate(&socket, 1, 1);
+    const ping_header = (http.HTTP2FrameHeader{
+        .length = 8,
+        .frame_type = .ping,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&ping_header);
+    try socket.writeAll("lateping");
+    while (true) {
+        const frame = try Helpers.readFrame(&socket, &payload);
+        if (frame.frame_type == .ping and (frame.flags & 0x01) != 0) {
+            try std.testing.expectEqualStrings("lateping", payload[0..frame.length]);
+            break;
+        }
+    }
+}
+
+test "HTTP2 server send-window pump resets terminal stream state" {
+    const rst = h2stream.buildRstStreamFrame(1, .cancel);
+    const Fixture = struct {
+        input: []const u8,
+        offset: usize = 0,
+
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            if (self.offset == self.input.len) return 0;
+            const amount = @min(output.len, self.input.len - self.offset);
+            @memcpy(output[0..amount], self.input[self.offset..][0..amount]);
+            self.offset += amount;
+            return amount;
+        }
+
+        fn write(_: *anyopaque, data: []const u8) !usize {
+            return data.len;
+        }
+    };
+    var fixture = Fixture{ .input = &rst };
+    var conn = http.HTTP2Connection.init(
+        std.testing.allocator,
+        .{ .context = &fixture, .readFn = Fixture.read },
+        .{ .context = &fixture, .writeFn = Fixture.write },
+    );
+    var manager = h2stream.StreamManager.init(std.testing.allocator, false);
+    defer manager.deinit();
+    const stream = try manager.getOrCreateStream(1);
+    try stream.open();
+    stream.receiveEndStream();
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var frame_context = IoContext.init(.{});
+    var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+    defer {
+        for (pending_frames.items) |*pending| pending.deinit(std.testing.allocator);
+        pending_frames.deinit(std.testing.allocator);
+    }
+    var pending_bytes: usize = 0;
+    var queued_continuation: ?u31 = null;
+    var queued_header_deadline: ?Deadline = null;
+    var last_client_stream: u31 = 1;
+    try std.testing.expectError(
+        error.StreamReset,
+        server.pumpHTTP2SendWindow(
+            &conn,
+            &manager,
+            1,
+            &frame_context,
+            null,
+            &pending_frames,
+            &pending_bytes,
+            &queued_continuation,
+            &queued_header_deadline,
+            &last_client_stream,
+        ),
+    );
+    try std.testing.expectEqual(h2stream.StreamState.closed, stream.state);
+}
+
+test "HTTP2 server send-window pump queues multiplexed stream work" {
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const other_headers = (http.HTTP2FrameHeader{
+        .length = 0,
+        .frame_type = .headers,
+        .flags = 0x01,
+        .stream_id = 3,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &other_headers);
+    const continuation = (http.HTTP2FrameHeader{
+        .length = 0,
+        .frame_type = .continuation,
+        .flags = 0x04,
+        .stream_id = 3,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &continuation);
+    const update_payload = h2stream.buildWindowUpdatePayload(5);
+    const update_header = (http.HTTP2FrameHeader{
+        .length = update_payload.len,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = 3,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &update_header);
+    try wire.appendSlice(std.testing.allocator, &update_payload);
+
+    const Fixture = struct {
+        input: []const u8,
+        offset: usize = 0,
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            if (self.offset == self.input.len) return 0;
+            const amount = @min(output.len, self.input.len - self.offset);
+            @memcpy(output[0..amount], self.input[self.offset..][0..amount]);
+            self.offset += amount;
+            return amount;
+        }
+        fn write(_: *anyopaque, data: []const u8) !usize {
+            return data.len;
+        }
+    };
+    var fixture = Fixture{ .input = wire.items };
+    var conn = http.HTTP2Connection.init(
+        std.testing.allocator,
+        .{ .context = &fixture, .readFn = Fixture.read },
+        .{ .context = &fixture, .writeFn = Fixture.write },
+    );
+    var manager = h2stream.StreamManager.init(std.testing.allocator, false);
+    defer manager.deinit();
+    const response_stream = try manager.getOrCreateStream(1);
+    try response_stream.open();
+    response_stream.receiveEndStream();
+    response_stream.send_window = 0;
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var frame_context = IoContext.init(.{});
+    var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+    defer {
+        for (pending_frames.items) |*pending| pending.deinit(std.testing.allocator);
+        pending_frames.deinit(std.testing.allocator);
+    }
+    var pending_bytes: usize = 0;
+    var queued_continuation: ?u31 = null;
+    var queued_header_deadline: ?Deadline = null;
+    var last_client_stream: u31 = 1;
+
+    try server.pumpHTTP2SendWindow(
+        &conn,
+        &manager,
+        1,
+        &frame_context,
+        null,
+        &pending_frames,
+        &pending_bytes,
+        &queued_continuation,
+        &queued_header_deadline,
+        &last_client_stream,
+    );
+    try std.testing.expectEqual(@as(usize, 1), pending_frames.items.len);
+    try std.testing.expectEqual(@as(i32, 0), response_stream.send_window);
+    try std.testing.expect(queued_header_deadline != null);
+    const provisional = manager.getStream(3) orelse return error.TestUnexpectedResult;
+    const provisional_window = provisional.send_window;
+    try server.pumpHTTP2SendWindow(
+        &conn,
+        &manager,
+        1,
+        &frame_context,
+        null,
+        &pending_frames,
+        &pending_bytes,
+        &queued_continuation,
+        &queued_header_deadline,
+        &last_client_stream,
+    );
+    try std.testing.expectEqual(@as(usize, 2), pending_frames.items.len);
+    try std.testing.expect(queued_header_deadline == null);
+    try server.pumpHTTP2SendWindow(
+        &conn,
+        &manager,
+        1,
+        &frame_context,
+        null,
+        &pending_frames,
+        &pending_bytes,
+        &queued_continuation,
+        &queued_header_deadline,
+        &last_client_stream,
+    );
+    try std.testing.expectEqual(provisional_window + 5, provisional.send_window);
+}
+
+test "Server connection owner closes accepted HTTP1 sockets" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .keep_alive = false,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    try server.get("/close", &struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("ok");
+        }
+    }.handler);
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll(
+        "GET /close HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    try socket.setRecvTimeout(2_000);
+    var response: [1024]u8 = undefined;
+    var length: usize = 0;
+    while (mem.indexOf(u8, response[0..length], "\r\n\r\n") == null or
+        mem.indexOf(u8, response[0..length], "\r\n\r\n").? + 6 > length)
+    {
+        const n = try socket.recv(response[length..]);
+        if (n == 0) return error.UnexpectedEof;
+        length += n;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&response));
+}
+
+test "cleartext HTTP2 preface probe has one bounded deadline" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .request_timeout_ms = 50,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll("PRI");
+    try socket.setRecvTimeout(2_000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));
+}
+
+test "HTTP2 trailer continuation uses one anchored header-block deadline" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .request_timeout_ms = 50,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll(http.HTTP2_PREFACE);
+
+    var settings_payload = std.ArrayList(u8).empty;
+    defer settings_payload.deinit(std.testing.allocator);
+    try http.encodeSettingsPayload(
+        .{},
+        std.testing.allocator,
+        &settings_payload,
+    );
+    const settings_header = (http.HTTP2FrameHeader{
+        .length = @intCast(settings_payload.items.len),
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&settings_header);
+    try socket.writeAll(settings_payload.items);
+
+    const Helpers = struct {
+        fn readExact(sock: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try sock.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEof;
+                offset += n;
+            }
+        }
+        fn readFrame(sock: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(sock, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(sock, payload[0..header.length]);
+            return header;
+        }
+    };
+    var payload: [256]u8 = undefined;
+    _ = try Helpers.readFrame(&socket, &payload);
+    _ = try Helpers.readFrame(&socket, &payload);
+
+    var encoder = hpack.HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "127.0.0.1" },
+    };
+    const block = try hpack.encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(block);
+    const headers_frame = (http.HTTP2FrameHeader{
+        .length = @intCast(block.len),
+        .frame_type = .headers,
+        .flags = 0x04,
+        .stream_id = 1,
+    }).serialize();
+    try socket.writeAll(&headers_frame);
+    try socket.writeAll(block);
+    const trailers = try hpack.encodeHeaders(
+        &encoder,
+        &.{.{ .name = "x-trailer", .value = "value", .representation = .without_indexing }},
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(trailers);
+    const trailer_frame = (http.HTTP2FrameHeader{
+        .length = @intCast(trailers.len),
+        .frame_type = .headers,
+        .flags = 0x01,
+        .stream_id = 1,
+    }).serialize();
+    try socket.writeAll(&trailer_frame);
+    try socket.writeAll(trailers);
+    try socket.setRecvTimeout(2_000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));
 }

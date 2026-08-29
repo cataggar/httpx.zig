@@ -60,10 +60,17 @@ pub const Uri = struct {
         }
 
         if (remaining.len > 0 and remaining[0] == '[') {
-            if (mem.indexOf(u8, remaining, "]")) |bracket_end| {
-                uri.host = remaining[1..bracket_end];
-                remaining = remaining[bracket_end + 1 ..];
+            const bracket_end = mem.indexOf(u8, remaining, "]") orelse
+                return error.InvalidUri;
+            if (bracket_end == 1) return error.InvalidUri;
+            uri.host = remaining[1..bracket_end];
+            const suffix = remaining[bracket_end + 1 ..];
+            if (suffix.len > 0) {
+                if (suffix[0] != ':' or suffix.len == 1) return error.InvalidUri;
+                uri.port = std.fmt.parseInt(u16, suffix[1..], 10) catch
+                    return error.InvalidUri;
             }
+            remaining = "";
         }
 
         if (mem.lastIndexOf(u8, remaining, ":")) |port_sep| {
@@ -80,15 +87,29 @@ pub const Uri = struct {
         return uri;
     }
 
+    /// Validates schemes accepted by HTTP request APIs.
+    pub fn validateHttpScheme(self: Self) !void {
+        const scheme = self.scheme orelse return;
+        if (mem.eql(u8, scheme, "")) return error.InvalidUriScheme;
+        if (std.ascii.eqlIgnoreCase(scheme, "http") or
+            std.ascii.eqlIgnoreCase(scheme, "https") or
+            std.ascii.eqlIgnoreCase(scheme, "ws") or
+            std.ascii.eqlIgnoreCase(scheme, "wss"))
+        {
+            return;
+        }
+        return error.UnsupportedUriScheme;
+    }
+
     /// Returns the effective port, using scheme defaults if not specified.
     pub fn effectivePort(self: Self) u16 {
         if (self.port) |p| return p;
         if (self.scheme) |s| {
-            if (mem.eql(u8, s, "https")) return 443;
-            if (mem.eql(u8, s, "http")) return 80;
-            if (mem.eql(u8, s, "ws")) return 80;
-            if (mem.eql(u8, s, "wss")) return 443;
-            if (mem.eql(u8, s, "ftp")) return 21;
+            if (std.ascii.eqlIgnoreCase(s, "https")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "http")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "ws")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "wss")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "ftp")) return 21;
         }
         return 80;
     }
@@ -96,28 +117,82 @@ pub const Uri = struct {
     /// Returns true if the scheme requires TLS.
     pub fn isTLS(self: Self) bool {
         if (self.scheme) |s| {
-            return mem.eql(u8, s, "https") or mem.eql(u8, s, "wss");
+            return std.ascii.eqlIgnoreCase(s, "https") or
+                std.ascii.eqlIgnoreCase(s, "wss");
         }
         return false;
     }
 
     /// Builds the request path including query string.
     pub fn requestPath(self: Self, allocator: Allocator) ![]u8 {
+        try self.validateRequestTarget();
         if (self.query) |q| {
             return std.fmt.allocPrint(allocator, "{s}?{s}", .{ self.path, q });
         }
         return allocator.dupe(u8, self.path);
     }
 
+    pub fn validateRequestTarget(self: Self) !void {
+        try validateRequestTargetComponent(self.path);
+        if (self.query) |query| try validateRequestTargetComponent(query);
+    }
+
+    /// Builds RFC 9112 absolute-form for an HTTP proxy. Userinfo and fragment
+    /// are deliberately excluded.
+    pub fn proxyRequestTarget(self: Self, allocator: Allocator) ![]u8 {
+        try self.validateHttpScheme();
+        const scheme = self.scheme orelse return error.InvalidUri;
+        const host = self.host orelse return error.InvalidUri;
+        try validateRequestTargetComponent(host);
+        try validateRequestTargetComponent(self.path);
+        if (self.query) |query| try validateRequestTargetComponent(query);
+
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
+        const writer = list_writer.init(allocator, &buffer);
+        const normalized_scheme = if (std.ascii.eqlIgnoreCase(scheme, "https") or
+            std.ascii.eqlIgnoreCase(scheme, "wss"))
+            "https"
+        else
+            "http";
+        try writer.print("{s}://", .{normalized_scheme});
+        if (mem.indexOfScalar(u8, host, ':') != null) {
+            try writer.print("[{s}]", .{host});
+        } else {
+            try writer.writeAll(host);
+        }
+        const default_port: u16 = if (mem.eql(u8, normalized_scheme, "https")) 443 else 80;
+        if (self.port) |port| {
+            if (port != default_port) try writer.print(":{d}", .{port});
+        }
+        try writer.writeAll(if (self.path.len == 0) "/" else self.path);
+        if (self.query) |query| try writer.print("?{s}", .{query});
+        return buffer.toOwnedSlice(allocator);
+    }
+
+    pub fn requestAuthority(self: Self, allocator: Allocator) ![]u8 {
+        const host = self.host orelse return error.InvalidUri;
+        const default_port: u16 = if (self.isTLS()) 443 else 80;
+        const port = if (self.port) |explicit|
+            if (explicit == default_port) null else explicit
+        else
+            null;
+        return formatAuthorityHost(allocator, host, port);
+    }
+
     /// Reconstructs the full URI string.
     pub fn format(self: Self, allocator: Allocator) ![]u8 {
         var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
         const writer = list_writer.init(allocator, &buffer);
 
         if (self.scheme) |s| try writer.print("{s}://", .{s});
         if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
+        if (self.host) |host| {
+            const formatted_authority = try formatAuthorityHost(allocator, host, self.port);
+            defer allocator.free(formatted_authority);
+            try writer.writeAll(formatted_authority);
+        }
         try writer.print("{s}", .{self.path});
         if (self.query) |q| try writer.print("?{s}", .{q});
         if (self.fragment) |f| try writer.print("#{s}", .{f});
@@ -128,15 +203,91 @@ pub const Uri = struct {
     /// Returns the authority component (userinfo@host:port).
     pub fn authority(self: Self, allocator: Allocator) ![]u8 {
         var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
         const writer = list_writer.init(allocator, &buffer);
 
         if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
+        if (self.host) |host| {
+            const formatted_authority = try formatAuthorityHost(allocator, host, self.port);
+            defer allocator.free(formatted_authority);
+            try writer.writeAll(formatted_authority);
+        }
 
         return buffer.toOwnedSlice(allocator);
     }
 };
+
+pub fn formatAuthorityHost(
+    allocator: Allocator,
+    host: []const u8,
+    port: ?u16,
+) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    const writer = list_writer.init(allocator, &buffer);
+    if (mem.indexOfScalar(u8, host, ':') != null) {
+        try writer.print("[{s}]", .{host});
+    } else {
+        try writer.writeAll(host);
+    }
+    if (port) |value| try writer.print(":{d}", .{value});
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn validateRequestTargetComponent(value: []const u8) !void {
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequestTarget;
+    }
+}
+
+const AuthorityParts = struct {
+    userinfo: ?[]const u8 = null,
+    host: []const u8,
+    port: ?u16 = null,
+};
+
+fn parseAuthority(authority: []const u8) !AuthorityParts {
+    var remaining = authority;
+    var userinfo: ?[]const u8 = null;
+    if (mem.lastIndexOfScalar(u8, remaining, '@')) |separator| {
+        userinfo = remaining[0..separator];
+        remaining = remaining[separator + 1 ..];
+    }
+    if (remaining.len == 0) return error.InvalidUri;
+
+    if (remaining[0] == '[') {
+        const bracket_end = mem.indexOfScalar(u8, remaining, ']') orelse
+            return error.InvalidUri;
+        if (bracket_end == 1) return error.InvalidUri;
+        const suffix = remaining[bracket_end + 1 ..];
+        const port = if (suffix.len == 0)
+            null
+        else blk: {
+            if (suffix[0] != ':' or suffix.len == 1) return error.InvalidUri;
+            break :blk std.fmt.parseInt(u16, suffix[1..], 10) catch
+                return error.InvalidUri;
+        };
+        return .{
+            .userinfo = userinfo,
+            .host = remaining[1..bracket_end],
+            .port = port,
+        };
+    }
+
+    const first_colon = mem.indexOfScalar(u8, remaining, ':');
+    const last_colon = mem.lastIndexOfScalar(u8, remaining, ':');
+    if (first_colon != last_colon) return error.InvalidUri;
+    if (last_colon) |separator| {
+        if (separator == 0 or separator + 1 == remaining.len) return error.InvalidUri;
+        return .{
+            .userinfo = userinfo,
+            .host = remaining[0..separator],
+            .port = std.fmt.parseInt(u16, remaining[separator + 1 ..], 10) catch
+                return error.InvalidUri,
+        };
+    }
+    return .{ .userinfo = userinfo, .host = remaining };
+}
 
 /// Resolves a relative URI against a base URI per RFC 3986 Section 5.
 pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
@@ -151,13 +302,14 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         rel_scheme = remaining[0..scheme_end];
         remaining = remaining[scheme_end + 3 ..];
 
-        if (mem.indexOf(u8, remaining, "/")) |path_start| {
-            rel_authority = remaining[0..path_start];
-            remaining = remaining[path_start..];
-        } else {
-            rel_authority = remaining;
-            remaining = "";
-        }
+        const authority_end = mem.indexOfAny(u8, remaining, "/?#") orelse remaining.len;
+        rel_authority = remaining[0..authority_end];
+        remaining = remaining[authority_end..];
+    } else if (mem.startsWith(u8, remaining, "//")) {
+        remaining = remaining[2..];
+        const authority_end = mem.indexOfAny(u8, remaining, "/?#") orelse remaining.len;
+        rel_authority = remaining[0..authority_end];
+        remaining = remaining[authority_end..];
     }
 
     if (mem.indexOf(u8, remaining, "#")) |frag_start| {
@@ -179,9 +331,12 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
     }
 
     if (rel_scheme) |scheme| {
+        const authority = try parseAuthority(rel_authority orelse return error.InvalidUri);
         return Uri{
             .scheme = scheme,
-            .host = rel_authority,
+            .userinfo = authority.userinfo,
+            .host = authority.host,
+            .port = authority.port,
             .path = try normalizePath(rel_path, allocator),
             .query = rel_query,
             .fragment = rel_fragment,
@@ -190,9 +345,12 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
     }
 
     if (rel_authority) |auth| {
+        const authority = try parseAuthority(auth);
         return Uri{
             .scheme = base.scheme,
-            .host = auth,
+            .userinfo = authority.userinfo,
+            .host = authority.host,
+            .port = authority.port,
             .path = try normalizePath(rel_path, allocator),
             .query = rel_query,
             .fragment = rel_fragment,
@@ -205,6 +363,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         if (rel_query) |q| {
             return Uri{
                 .scheme = base.scheme,
+                .userinfo = base.userinfo,
                 .host = base.host,
                 .port = base.port,
                 .path = merged_path,
@@ -215,6 +374,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         }
         return Uri{
             .scheme = base.scheme,
+            .userinfo = base.userinfo,
             .host = base.host,
             .port = base.port,
             .path = merged_path,
@@ -253,6 +413,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
 
     return Uri{
         .scheme = base.scheme,
+        .userinfo = base.userinfo,
         .host = base.host,
         .port = base.port,
         .path = normalized,
@@ -345,6 +506,54 @@ test "URI TLS detection" {
     try std.testing.expect(!http.isTLS());
 }
 
+test "URI HTTP scheme handling is case insensitive and rejects unsupported schemes" {
+    const secure = try Uri.parse("HTTPS://example.test/resource");
+    try secure.validateHttpScheme();
+    try std.testing.expect(secure.isTLS());
+    try std.testing.expectEqual(@as(u16, 443), secure.effectivePort());
+
+    const unsupported = try Uri.parse("gopher://example.test/resource");
+    try std.testing.expectError(error.UnsupportedUriScheme, unsupported.validateHttpScheme());
+}
+
+test "URI request targets reject injection and proxy form strips secrets" {
+    const injected = try Uri.parse("http://example.test/path with-space");
+    try std.testing.expectError(
+        error.InvalidRequestTarget,
+        injected.requestPath(std.testing.allocator),
+    );
+    const crlf = try Uri.parse("http://example.test/path\r\nInjected:value");
+    try std.testing.expectError(
+        error.InvalidRequestTarget,
+        crlf.requestPath(std.testing.allocator),
+    );
+
+    const proxy_uri = try Uri.parse(
+        "HTTP://user:password@example.test:8080/path?query=value#secret",
+    );
+    const target = try proxy_uri.proxyRequestTarget(std.testing.allocator);
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings(
+        "http://example.test:8080/path?query=value",
+        target,
+    );
+
+    const ipv6 = try Uri.parse("http://[2001:db8::1]:8080/path");
+    const ipv6_target = try ipv6.proxyRequestTarget(std.testing.allocator);
+    defer std.testing.allocator.free(ipv6_target);
+    try std.testing.expectEqualStrings(
+        "http://[2001:db8::1]:8080/path",
+        ipv6_target,
+    );
+    const connect_authority = try formatAuthorityHost(
+        std.testing.allocator,
+        "2001:db8::1",
+        443,
+    );
+    defer std.testing.allocator.free(connect_authority);
+    try std.testing.expectEqualStrings("[2001:db8::1]:443", connect_authority);
+}
+
 test "URI resolve relative path" {
     const base = try Uri.parse("http://example.com/a/b/c");
     const resolved = try resolve(base, "d", std.testing.allocator);
@@ -365,6 +574,48 @@ test "URI resolve with scheme" {
     defer std.testing.allocator.free(resolved.path);
     try std.testing.expectEqualStrings("https", resolved.scheme.?);
     try std.testing.expectEqualStrings("other.com", resolved.host.?);
+
+    const ipv6 = try resolve(
+        base,
+        "https://user@[2001:db8::1]:8443/x",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(ipv6.path);
+    try std.testing.expectEqualStrings("user", ipv6.userinfo.?);
+    try std.testing.expectEqualStrings("2001:db8::1", ipv6.host.?);
+    try std.testing.expectEqual(@as(u16, 8443), ipv6.port.?);
+    const formatted = try ipv6.format(std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("https://user@[2001:db8::1]:8443/x", formatted);
+
+    const network_path = try resolve(
+        base,
+        "//[2001:db8::2]:8080/y",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(network_path.path);
+    try std.testing.expectEqualStrings("2001:db8::2", network_path.host.?);
+    try std.testing.expectEqual(@as(u16, 8080), network_path.port.?);
+}
+
+test "URI bracketed authority rejects invalid suffixes" {
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]garbage/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]:/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]:abc/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1/"));
+
+    const valid = try Uri.parse("http://[::1]:8080/");
+    try std.testing.expectEqualStrings("::1", valid.host.?);
+    try std.testing.expectEqual(@as(u16, 8080), valid.port.?);
+
+    const formatted = try valid.format(std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("http://[::1]:8080/", formatted);
+
+    const with_user = try Uri.parse("http://user@[::1]:8080/path");
+    const authority_value = try with_user.authority(std.testing.allocator);
+    defer std.testing.allocator.free(authority_value);
+    try std.testing.expectEqualStrings("user@[::1]:8080", authority_value);
 }
 
 test "normalizePath basic" {

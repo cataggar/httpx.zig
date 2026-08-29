@@ -22,9 +22,9 @@ pub fn main() !void {
         .tls_enabled = true,
         .tls_cert_path = "examples/certs/server_ec.crt",
         .tls_key_path = "examples/certs/server_ec.key",
-        .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
+        .tls_alpn_protocols = &.{ "h2", "http/1.1" },
         .http2_enabled = true,
-        .http3_enabled = true,
+        .http3_enabled = false,
         .keep_alive = false,
     });
     defer server.deinit();
@@ -47,7 +47,7 @@ pub fn main() !void {
         return;
     };
 
-    const tls_config = tls.TlsConfig.insecureWithH2(allocator);
+    const tls_config = tls.TlsConfig.insecure(allocator);
     var session = tls.TlsSession.init(tls_config);
     session.socket = &sock;
 

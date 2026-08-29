@@ -1,6 +1,6 @@
 # Client API
 
-The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3. HTTPS is supported via a fully custom TLS 1.2/1.3 implementation built on `std.crypto` primitives (AES-GCM, ChaCha20-Poly1305, X25519, HKDF, SHA-256/384/512) with ALPN negotiation for HTTP/2 and HTTP/3.
+The `httpx.zig` client provides high-level HTTP/1.0, HTTP/1.1, and HTTP/2 requests. HTTPS uses the library's TCP TLS implementation with HTTP/2 ALPN.
 
 ## Protocol Support
 
@@ -9,11 +9,9 @@ The `httpx.zig` client provides a high-level HTTP client for making requests ove
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
 | HTTP/2 | ✅ Client Runtime + Primitives | TCP/TLS | Keep-alive sessions are reused sequentially. Concurrent multiplexing is not exposed by `Client`; concurrent requests use separate pooled sessions. |
-| HTTP/3 | ✅ Client Runtime + Primitives | QUIC/UDP | High-level client runtime over UDP + QUIC/HTTP3/QPACK primitives (suitable for local/integration endpoints) |
+| HTTP/3 | ⚠️ Primitives only | none | Public requests return `error.UnsupportedHttpVersion`; authenticated QUIC is not implemented. |
 
-HTTP/3 runtime mode is available in the high-level client and uses QUIC packet/stream framing primitives directly. Interoperability with endpoints that require full TLS-in-QUIC handshake negotiation may vary depending on deployment expectations.
-
-The protocol module provides HTTP/2 and HTTP/3 building blocks (HPACK/QPACK, framing, and transport primitives). See [Protocol API](protocol.md) for details.
+The protocol module provides unauthenticated HTTP/3/QPACK/QUIC codec primitives for fixtures and protocol work. They are not a network transport.
 
 ## Proxy Modes
 
@@ -94,11 +92,11 @@ defer client.deinit();
 | `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
 | `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
-| `http3_enabled` | `bool` | `false` | Enable high-level HTTP/3 execution path over UDP/QUIC stream framing. |
+| `http3_enabled` | `bool` | `false` | Reserved. Setting it causes public requests to return `error.UnsupportedHttpVersion`. |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS values sent during connection setup (`header_table_size`, `max_frame_size`, etc.). |
-| `http3_settings` | `Http3Settings` | `{}` | HTTP/3/QPACK settings sent on the control stream (`max_field_section_size`, `qpack_max_table_capacity`, `qpack_blocked_streams`, etc.). |
+| `http3_settings` | `Http3Settings` | `{}` | Reserved settings for experimental protocol primitives; not sent by the public client. |
 | `keep_alive` | `bool` | `true` | Reuse TCP connections when possible. |
-| `allow_push` | `bool` | `true` | Accept HTTP/2 server push (PUSH_PROMISE) from the server. |
+| `allow_push` | `bool` | `false` | Deprecated and ignored. PUSH_PROMISE is rejected to preserve stream/HPACK synchronization. |
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
 | `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. Use `.kind = .socks5h` for SOCKS5h tunneling; the default kind is HTTP. |
@@ -210,7 +208,7 @@ defer res.deinit();
 | `withHttp3Settings(settings)` | Override HTTP/3 SETTINGS values. |
 | `withSslVerification(enabled)` | Toggle TLS certificate verification. |
 | `withKeepAlive(enabled)` | Toggle keep-alive connection reuse. |
-| `withAllowPush(enabled)` | Toggle HTTP/2 server push acceptance. |
+| `withAllowPush(enabled)` | Deprecated source-compatibility helper; push remains disabled. |
 | `withMaxResponseSize(bytes)` | Override maximum response body size. |
 | `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
 | `withProxy(proxy_or_null)` | Configure or clear a forward proxy. Set `.kind = .socks5h` for SOCKS5h tunneling. |
@@ -365,6 +363,7 @@ Per-request overrides for configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `custom_method` | `?[]const u8` | `null` | Required validated HTTP token when the method argument is `.CUSTOM`; the request stores its own copy. |
 | `headers` | `?[]const [2][]const u8` | `null` | Additional headers for this request. |
 | `query_params` | `?[]const [2][]const u8` | `null` | Percent-encoded query params appended to the request URL. |
 | `body` | `?[]const u8` | `null` | Raw request body. |
@@ -385,6 +384,14 @@ Per-request overrides for configuration.
 | `unix_socket_path` | `?[]const u8` | `null` | Per-request Unix Domain Socket path routing override. |
 
 Unset request-option fields stay `null`, meaning client-level defaults are used implicitly.
+
+Streaming `Client.open` uses `OpenOptions`, which additionally accepts
+`custom_method`, `body_mode`, `response_limit`, `expect_100_continue`,
+`tls_handshake_ms`, and `header_ms`. The custom method is validated and copied.
+The TLS and header values bound their complete phases rather than
+each individual read. `null` uses `Timeouts.tls_handshake_ms`/`header_ms`
+(zero there falls back to connect/read); an explicit `OpenOptions` value of
+zero disables that phase timeout.
 
 When multiple body-style fields are provided, precedence is:
 

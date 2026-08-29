@@ -192,8 +192,10 @@ pub const StreamManager = struct {
     /// Peer's connection settings for enforcement.
     peer_settings: http.HTTP2Connection.HTTP2ConnectionSettings = .{},
 
-    /// HPACK encoder/decoder context.
-    hpack_ctx: hpack.HPACKContext,
+    /// Directional HPACK state. Encoder and decoder dynamic tables are
+    /// independent per RFC 7541.
+    hpack_encoder: hpack.HPACKContext,
+    hpack_decoder: hpack.HPACKContext,
 
     const Self = @This();
 
@@ -201,7 +203,8 @@ pub const StreamManager = struct {
         return .{
             .allocator = allocator,
             .is_client = is_client,
-            .hpack_ctx = hpack.HPACKContext.init(allocator),
+            .hpack_encoder = hpack.HPACKContext.init(allocator),
+            .hpack_decoder = hpack.HPACKContext.init(allocator),
         };
     }
 
@@ -211,7 +214,8 @@ pub const StreamManager = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.streams.deinit(self.allocator);
-        self.hpack_ctx.deinit();
+        self.hpack_encoder.deinit();
+        self.hpack_decoder.deinit();
     }
 
     /// Creates a new stream with the next available ID.
@@ -290,6 +294,7 @@ pub const StreamManager = struct {
         const old_window = self.peer_settings.initial_window_size;
         self.peer_settings = new_settings;
         self.max_concurrent_streams = new_settings.max_concurrent_streams;
+        self.hpack_encoder.setEncoderTableSize(new_settings.header_table_size);
         if (new_settings.initial_window_size != old_window) {
             try self.applyInitialWindowSizeChange(old_window, new_settings.initial_window_size);
         }
@@ -348,7 +353,7 @@ pub fn buildHeadersFramePayload(
     }
 
     // HPACK-encoded headers
-    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_ctx, headers, allocator);
+    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_encoder, headers, allocator);
     defer allocator.free(encoded_headers);
     try out.appendSlice(allocator, encoded_headers);
 
@@ -392,7 +397,7 @@ pub fn buildHeadersAndContinuations(
     }
 
     // HPACK-encode the headers
-    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_ctx, headers, allocator);
+    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_encoder, headers, allocator);
     defer allocator.free(encoded_headers);
 
     // max_fragment_size accounts for potential priority block overhead in the first frame,
@@ -470,12 +475,27 @@ pub fn buildHeadersAndContinuations(
 }
 
 /// Parses a HEADERS frame payload.
+pub const ParsedHeadersFrame = struct {
+    headers: []hpack.DecodedHeader,
+    priority: ?StreamPriority,
+};
+
 pub fn parseHeadersFramePayload(
     stream_manager: *StreamManager,
     payload: []const u8,
     flags: u8,
     allocator: Allocator,
-) !struct { headers: []hpack.DecodedHeader, priority: ?StreamPriority } {
+) !ParsedHeadersFrame {
+    return parseHeadersFramePayloadWithLimit(stream_manager, payload, flags, allocator, 0);
+}
+
+pub fn parseHeadersFramePayloadWithLimit(
+    stream_manager: *StreamManager,
+    payload: []const u8,
+    flags: u8,
+    allocator: Allocator,
+    max_header_list_size: u64,
+) !ParsedHeadersFrame {
     var offset: usize = 0;
     var priority: ?StreamPriority = null;
 
@@ -506,10 +526,11 @@ pub fn parseHeadersFramePayload(
     if (pad_length > payload.len - offset) return error.InvalidFrame;
     const header_block_len = payload.len - offset - pad_length;
 
-    const headers = try hpack.decodeHeaders(
-        &stream_manager.hpack_ctx,
+    const headers = try hpack.decodeHeadersWithLimit(
+        &stream_manager.hpack_decoder,
         payload[offset .. offset + header_block_len],
         allocator,
+        max_header_list_size,
     );
 
     return .{ .headers = headers, .priority = priority };
@@ -878,4 +899,37 @@ test "parseGoawayPayload preserves known and unknown error codes" {
         defer if (parsed.debug_data) |debug_data| std.testing.allocator.free(debug_data);
         try std.testing.expectEqual(raw_code, @intFromEnum(parsed.error_code));
     }
+}
+
+test "StreamManager HPACK encoder and decoder tables are directional" {
+    var manager = StreamManager.init(std.testing.allocator, true);
+    defer manager.deinit();
+    const fields = [_]hpack.HeaderEntry{.{
+        .name = "x-directional",
+        .value = "encoder",
+        .representation = .incremental_indexing,
+    }};
+    const encoded = try hpack.encodeHeaders(
+        &manager.hpack_encoder,
+        &fields,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqual(@as(usize, 1), manager.hpack_encoder.dynamic_table.len());
+    try std.testing.expectEqual(@as(usize, 0), manager.hpack_decoder.dynamic_table.len());
+
+    const decoded = try hpack.decodeHeaders(
+        &manager.hpack_decoder,
+        encoded,
+        std.testing.allocator,
+    );
+    defer {
+        for (decoded) |header| {
+            std.testing.allocator.free(header.name);
+            std.testing.allocator.free(header.value);
+        }
+        std.testing.allocator.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), manager.hpack_decoder.dynamic_table.len());
+    try std.testing.expectEqual(@as(usize, 1), manager.hpack_encoder.dynamic_table.len());
 }

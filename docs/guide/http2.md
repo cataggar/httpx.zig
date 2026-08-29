@@ -16,7 +16,7 @@ resetting omitted fields. GOAWAY drains the session while an allowed active
 stream is read through END_STREAM. Known nonzero and unknown GOAWAY error codes
 are preserved without enum traps. Opportunistic ALPN selection of HTTP/1.1
 falls back to the pooled HTTP/1.1 path.
-- **ALPN** negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback
+- **ALPN** negotiation (RFC 7301) for automatic HTTP/2 selection with HTTP/1.1 fallback
 :::
 
 ## Platform Support

@@ -149,23 +149,27 @@ pub const DynamicTable = struct {
     /// Adds a new entry to the beginning of the dynamic table.
     /// Evicts old entries if necessary to fit within max_size.
     pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
-        const entry_size = name.len + value.len + 32;
+        const name_value_size = std.math.add(usize, name.len, value.len) catch
+            return error.HeaderSizeOverflow;
+        const entry_size = std.math.add(usize, name_value_size, 32) catch
+            return error.HeaderSizeOverflow;
 
-        // Evict entries until we have room
-        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
-            self.evictOne();
+        if (entry_size > self.max_size) {
+            while (self.entries.items.len > 0) self.evictOne();
+            return;
         }
 
-        // If single entry is larger than max_size, don't add it
-        if (entry_size > self.max_size) return;
-
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
         const value_copy = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(value_copy);
 
-        // Insert at the beginning (index 0)
-        try self.entries.insert(self.allocator, 0, .{
+        // Mutate only after every fallible allocation succeeds.
+        while (entry_size > self.max_size - self.current_size and self.entries.items.len > 0) {
+            self.evictOne();
+        }
+        self.entries.insertAssumeCapacity(0, .{
             .name = name_copy,
             .value = value_copy,
         });
@@ -205,6 +209,9 @@ pub const DynamicTable = struct {
 pub const HPACKContext = struct {
     allocator: Allocator,
     dynamic_table: DynamicTable,
+    max_allowed_table_size: usize = 4096,
+    pending_encoder_min_table_size: ?usize = null,
+    pending_encoder_table_size: ?usize = null,
 
     const Self = @This();
 
@@ -212,6 +219,7 @@ pub const HPACKContext = struct {
         return .{
             .allocator = allocator,
             .dynamic_table = DynamicTable.init(allocator),
+            .max_allowed_table_size = 4096,
         };
     }
 
@@ -219,11 +227,30 @@ pub const HPACKContext = struct {
         return .{
             .allocator = allocator,
             .dynamic_table = DynamicTable.initWithSize(allocator, max_table_size),
+            .max_allowed_table_size = max_table_size,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.dynamic_table.deinit();
+    }
+
+    pub fn setMaxAllowedTableSize(self: *Self, max_table_size: usize) void {
+        self.max_allowed_table_size = max_table_size;
+        if (self.dynamic_table.max_size > max_table_size) {
+            self.dynamic_table.setMaxSize(max_table_size);
+        }
+    }
+
+    /// Applies the peer's encoder limit immediately and queues the required
+    /// HPACK table-size update for the start of the next encoded block.
+    pub fn setEncoderTableSize(self: *Self, max_table_size: usize) void {
+        self.dynamic_table.setMaxSize(max_table_size);
+        self.pending_encoder_min_table_size = if (self.pending_encoder_min_table_size) |current|
+            @min(current, max_table_size)
+        else
+            max_table_size;
+        self.pending_encoder_table_size = max_table_size;
     }
 
     /// Looks up a header by combined index (static + dynamic).
@@ -240,6 +267,7 @@ pub const HPACKContext = struct {
 /// Encodes an integer with the given prefix bits.
 /// prefix_bits: number of bits available in the first byte (1-8)
 pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
+    if (prefix_bits == 0 or prefix_bits > 8) return error.InvalidPrefixBits;
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
 
     if (value < max_prefix) {
@@ -270,6 +298,7 @@ pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
 /// Returns the value and number of bytes consumed.
 pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, len: usize } {
     if (data.len == 0) return error.UnexpectedEof;
+    if (prefix_bits == 0 or prefix_bits > 8) return error.InvalidPrefixBits;
 
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
     const first_byte_mask: u8 = @intCast(max_prefix);
@@ -281,19 +310,30 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
     }
 
     var i: usize = 1;
-    var m: u6 = 0;
+    var shift: u8 = 0;
 
     while (i < data.len) {
         const b = data[i];
-        value += @as(u64, b & 0x7F) << m;
+        const payload = @as(u64, b & 0x7F);
+        if (shift >= 64) return error.IntegerOverflow;
+        const shift_amount: std.math.Log2Int(u64) = @intCast(shift);
+        if (payload > (@as(u64, std.math.maxInt(u64)) >> shift_amount)) {
+            return error.IntegerOverflow;
+        }
+        value = std.math.add(
+            u64,
+            value,
+            payload << shift_amount,
+        ) catch return error.IntegerOverflow;
         i += 1;
 
         if (b & 0x80 == 0) {
             return .{ .value = value, .len = i };
         }
 
-        m += 7;
-        if (m > 63) return error.IntegerOverflow;
+        if (shift > 56) return error.IntegerOverflow;
+        shift += 7;
+        if (i > 11) return error.IntegerOverflow;
     }
 
     return error.UnexpectedEof;
@@ -326,8 +366,10 @@ pub fn decodeString(data: []const u8, allocator: Allocator) !struct { value: []u
 
     const huffman = (data[0] & 0x80) != 0;
     const len_result = try decodeInteger(data, 7);
-    const str_len: usize = @intCast(len_result.value);
-    const total_len = len_result.len + str_len;
+    const str_len = std.math.cast(usize, len_result.value) orelse
+        return error.StringLengthOverflow;
+    const total_len = std.math.add(usize, len_result.len, str_len) catch
+        return error.StringLengthOverflow;
 
     if (data.len < total_len) return error.UnexpectedEof;
 
@@ -409,7 +451,7 @@ pub const HuffmanCodec = struct {
         errdefer result.deinit(allocator);
 
         var bit_buffer: u64 = 0;
-        var bit_count: u6 = 0;
+        var bit_count: u8 = 0;
 
         for (data) |byte| {
             const code = codes[byte];
@@ -420,13 +462,14 @@ pub const HuffmanCodec = struct {
 
             while (bit_count >= 8) {
                 bit_count -= 8;
-                try result.append(allocator, @intCast((bit_buffer >> bit_count) & 0xFF));
+                const shift: std.math.Log2Int(u64) = @intCast(bit_count);
+                try result.append(allocator, @intCast((bit_buffer >> shift) & 0xFF));
             }
         }
 
         // Pad with EOS prefix bits if needed
         if (bit_count > 0) {
-            const pad_bits: u6 = 8 - bit_count;
+            const pad_bits: std.math.Log2Int(u64) = @intCast(8 - bit_count);
             bit_buffer = (bit_buffer << pad_bits) | ((@as(u64, 1) << pad_bits) - 1);
             try result.append(allocator, @intCast(bit_buffer & 0xFF));
         }
@@ -440,9 +483,10 @@ pub const HuffmanCodec = struct {
         errdefer result.deinit(allocator);
 
         var bit_buffer: u64 = 0;
-        var bit_count: u6 = 0;
+        var bit_count: u8 = 0;
 
         for (data) |byte| {
+            if (bit_count > 56) return error.InvalidHuffmanEncoding;
             bit_buffer = (bit_buffer << 8) | byte;
             bit_count += 8;
 
@@ -454,8 +498,10 @@ pub const HuffmanCodec = struct {
                     const len = lengths[sym];
 
                     if (bit_count >= len) {
-                        const mask = (@as(u64, 1) << len) - 1;
-                        const candidate = (bit_buffer >> (bit_count - len)) & mask;
+                        const code_len: std.math.Log2Int(u64) = @intCast(len);
+                        const mask = (@as(u64, 1) << code_len) - 1;
+                        const candidate_shift: std.math.Log2Int(u64) = @intCast(bit_count - len);
+                        const candidate = (bit_buffer >> candidate_shift) & mask;
                         if (candidate == code) {
                             try result.append(allocator, @intCast(sym));
                             bit_count -= len;
@@ -464,14 +510,18 @@ pub const HuffmanCodec = struct {
                         }
                     }
                 }
-                if (!matched) break;
+                if (!matched) {
+                    if (bit_count >= 30) return error.InvalidHuffmanEncoding;
+                    break;
+                }
             }
         }
 
         // Remaining bits should be EOS padding (all 1s)
         if (bit_count > 7) return error.InvalidHuffmanPadding;
         if (bit_count > 0) {
-            const mask = (@as(u64, 1) << bit_count) - 1;
+            const remaining: std.math.Log2Int(u64) = @intCast(bit_count);
+            const mask = (@as(u64, 1) << remaining) - 1;
             if ((bit_buffer & mask) != mask) return error.InvalidHuffmanPadding;
         }
 
@@ -556,9 +606,24 @@ pub fn encodeHeaders(
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
+    if (ctx.pending_encoder_min_table_size) |minimum_size| {
+        var buf: [10]u8 = undefined;
+        const n = try encodeInteger(minimum_size, 5, &buf);
+        buf[0] |= 0x20;
+        try out.appendSlice(allocator, buf[0..n]);
+        if (ctx.pending_encoder_table_size.? != minimum_size) {
+            const final_n = try encodeInteger(ctx.pending_encoder_table_size.?, 5, &buf);
+            buf[0] |= 0x20;
+            try out.appendSlice(allocator, buf[0..final_n]);
+        }
+    }
+
     for (headers) |header| {
         // Try to find in static table first
-        if (StaticTable.findNameValue(header.name, header.value)) |index| {
+        if (header.representation == .incremental_indexing and
+            StaticTable.findNameValue(header.name, header.value) != null)
+        {
+            const index = StaticTable.findNameValue(header.name, header.value).?;
             // Indexed header field (fully matched)
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(index, 7, &buf);
@@ -594,6 +659,8 @@ pub fn encodeHeaders(
         }
     }
 
+    ctx.pending_encoder_min_table_size = null;
+    ctx.pending_encoder_table_size = null;
     return out.toOwnedSlice(allocator);
 }
 
@@ -609,6 +676,18 @@ pub fn decodeHeaders(
     data: []const u8,
     allocator: Allocator,
 ) ![]DecodedHeader {
+    return decodeHeadersWithLimit(ctx, data, allocator, 0);
+}
+
+/// Decodes HPACK while enforcing RFC header-list size accounting before
+/// committing entries to the result or dynamic table. A limit of zero is
+/// unlimited.
+pub fn decodeHeadersWithLimit(
+    ctx: *HPACKContext,
+    data: []const u8,
+    allocator: Allocator,
+    max_header_list_size: u64,
+) ![]DecodedHeader {
     var headers = std.ArrayList(DecodedHeader).empty;
     errdefer {
         for (headers.items) |h| {
@@ -619,28 +698,41 @@ pub fn decodeHeaders(
     }
 
     var offset: usize = 0;
+    var header_list_size: u64 = 0;
+    var saw_header_field = false;
 
     while (offset < data.len) {
         const first = data[offset];
 
         if (first & 0x80 != 0) {
+            saw_header_field = true;
             // Indexed header field
             const idx_result = try decodeInteger(data[offset..], 7);
             offset += idx_result.len;
 
-            const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
-            try headers.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
-                .value = try allocator.dupe(u8, entry.value),
-            });
+            const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+            const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
+            try accountHeaderListSize(
+                &header_list_size,
+                entry.name.len,
+                entry.value.len,
+                max_header_list_size,
+            );
+            const name = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, entry.value);
+            errdefer allocator.free(value);
+            try headers.append(allocator, .{ .name = name, .value = value });
         } else if (first & 0x40 != 0) {
+            saw_header_field = true;
             // Literal with incremental indexing
             const idx_result = try decodeInteger(data[offset..], 6);
             offset += idx_result.len;
 
             var name: []u8 = undefined;
             if (idx_result.value > 0) {
-                const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+                const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+                const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
                 name = try allocator.dupe(u8, entry.name);
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
@@ -650,16 +742,31 @@ pub fn decodeHeaders(
             errdefer allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
+            errdefer allocator.free(value_result.value);
             offset += value_result.len;
 
+            try accountHeaderListSize(
+                &header_list_size,
+                name.len,
+                value_result.value.len,
+                max_header_list_size,
+            );
+            try headers.ensureUnusedCapacity(allocator, 1);
             try ctx.dynamic_table.add(name, value_result.value);
-            try headers.append(allocator, .{ .name = name, .value = value_result.value });
+            headers.appendAssumeCapacity(.{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
             // Dynamic table size update
+            if (saw_header_field) return error.InvalidDynamicTableSize;
             const size_result = try decodeInteger(data[offset..], 5);
             offset += size_result.len;
+            if (size_result.value > @as(u64, ctx.max_allowed_table_size) or
+                size_result.value > std.math.maxInt(usize))
+            {
+                return error.InvalidDynamicTableSize;
+            }
             ctx.dynamic_table.setMaxSize(@intCast(size_result.value));
         } else {
+            saw_header_field = true;
             // Literal without indexing or never indexed
             const prefix_bits: u3 = if (first & 0x10 != 0) 4 else 4;
             const idx_result = try decodeInteger(data[offset..], prefix_bits);
@@ -667,7 +774,8 @@ pub fn decodeHeaders(
 
             var name: []u8 = undefined;
             if (idx_result.value > 0) {
-                const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+                const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+                const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
                 name = try allocator.dupe(u8, entry.name);
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
@@ -677,13 +785,36 @@ pub fn decodeHeaders(
             errdefer allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
+            errdefer allocator.free(value_result.value);
             offset += value_result.len;
 
+            try accountHeaderListSize(
+                &header_list_size,
+                name.len,
+                value_result.value.len,
+                max_header_list_size,
+            );
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         }
     }
 
     return headers.toOwnedSlice(allocator);
+}
+
+fn accountHeaderListSize(total: *u64, name_len: usize, value_len: usize, limit: u64) !void {
+    const field_size = std.math.add(
+        u64,
+        @as(u64, name_len),
+        @as(u64, value_len),
+    ) catch return error.HeaderListTooLarge;
+    const accounted = std.math.add(u64, field_size, 32) catch
+        return error.HeaderListTooLarge;
+    total.* = std.math.add(
+        u64,
+        total.*,
+        accounted,
+    ) catch return error.HeaderListTooLarge;
+    if (limit > 0 and total.* > limit) return error.HeaderListTooLarge;
 }
 
 test "HPACK integer encoding" {
@@ -711,6 +842,38 @@ test "HPACK integer decoding" {
     const result2 = try decodeInteger(&data2, 5);
     try std.testing.expectEqual(@as(u64, 1337), result2.value);
     try std.testing.expectEqual(@as(usize, 3), result2.len);
+}
+
+test "HPACK malformed arithmetic returns errors without panics" {
+    var output: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidPrefixBits, encodeInteger(1, 0, &output));
+    try std.testing.expectError(error.InvalidPrefixBits, decodeInteger(&.{0}, 9));
+
+    var continuation: [16]u8 = [_]u8{0xff} ** 16;
+    continuation[0] = 0x7f;
+    try std.testing.expectError(error.IntegerOverflow, decodeInteger(&continuation, 7));
+
+    var oversized: [12]u8 = undefined;
+    const length_bytes = try encodeInteger(std.math.maxInt(u64), 7, &oversized);
+    oversized[0] |= 0x80;
+    try std.testing.expectError(
+        error.StringLengthOverflow,
+        decodeString(oversized[0..length_bytes], std.testing.allocator),
+    );
+
+    var random_state: u64 = 0xe7037ed1a0b428db;
+    var data: [64]u8 = undefined;
+    for (0..200) |_| {
+        for (&data) |*byte| {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 7;
+            random_state ^= random_state << 17;
+            byte.* = @truncate(random_state);
+        }
+        if (HuffmanCodec.decode(&data, std.testing.allocator)) |decoded| {
+            std.testing.allocator.free(decoded);
+        } else |_| {}
+    }
 }
 
 test "HPACK static table lookup" {
@@ -750,6 +913,89 @@ test "HPACK context combined lookup" {
     // Dynamic table lookup (index 62 = first dynamic entry)
     const dynamic_entry = ctx.getByIndex(62).?;
     try std.testing.expectEqualStrings("x-custom", dynamic_entry.name);
+}
+
+test "HPACK decode enforces header list limit without leaking partial entries" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]HeaderEntry{
+        .{ .name = ":status", .value = "200", .representation = .without_indexing },
+        .{ .name = "x-large", .value = "0123456789", .representation = .without_indexing },
+    };
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    var limited_decoder = HPACKContext.init(std.testing.allocator);
+    defer limited_decoder.deinit();
+    try std.testing.expectError(
+        error.HeaderListTooLarge,
+        decodeHeadersWithLimit(&limited_decoder, encoded, std.testing.allocator, 40),
+    );
+
+    const Case = struct {
+        fn run(allocator: Allocator, wire: []const u8) !void {
+            var decoder = HPACKContext.init(allocator);
+            defer decoder.deinit();
+            const decoded = try decodeHeadersWithLimit(&decoder, wire, allocator, 0);
+            defer {
+                for (decoded) |header| {
+                    allocator.free(header.name);
+                    allocator.free(header.value);
+                }
+                allocator.free(decoded);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Case.run,
+        .{encoded},
+    );
+}
+
+test "HPACK decoder rejects table updates above local advertised maximum" {
+    var context = HPACKContext.initWithTableSize(std.testing.allocator, 4096);
+    defer context.deinit();
+    var bytes: [16]u8 = undefined;
+    const len = try encodeInteger(8192, 5, &bytes);
+    bytes[0] |= 0x20;
+    try std.testing.expectError(
+        error.InvalidDynamicTableSize,
+        decodeHeaders(&context, bytes[0..len], std.testing.allocator),
+    );
+    try std.testing.expectEqual(@as(usize, 4096), context.dynamic_table.max_size);
+}
+
+test "HPACK incremental decode allocation failure does not mutate decoder table" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]HeaderEntry{.{
+        .name = "x-transactional",
+        .value = "value",
+        .representation = .incremental_indexing,
+    }};
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+
+    const Case = struct {
+        fn run(allocator: Allocator, wire: []const u8) !void {
+            var decoder = HPACKContext.init(allocator);
+            defer decoder.deinit();
+            const decoded = try decodeHeaders(&decoder, wire, allocator);
+            defer {
+                for (decoded) |header| {
+                    allocator.free(header.name);
+                    allocator.free(header.value);
+                }
+                allocator.free(decoded);
+            }
+            try std.testing.expectEqual(@as(usize, 1), decoder.dynamic_table.len());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Case.run,
+        .{encoded},
+    );
 }
 
 test "Huffman encode/decode roundtrip" {
@@ -954,4 +1200,59 @@ test "mixed representations in header block" {
     try std.testing.expectEqualStrings("session=xyz", decoded[2].value);
     try std.testing.expectEqualStrings("content-type", decoded[3].name);
     try std.testing.expectEqualStrings("text/html", decoded[3].value);
+}
+
+test "HPACK table size update is only accepted at block start" {
+    var ctx = HPACKContext.init(std.testing.allocator);
+    defer ctx.deinit();
+    const encoded = [_]u8{ 0x82, 0x20 };
+    try std.testing.expectError(
+        error.InvalidDynamicTableSize,
+        decodeHeaders(&ctx, &encoded, std.testing.allocator),
+    );
+}
+
+test "HPACK encoder emits queued table update at next block start" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    var decoder = HPACKContext.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    encoder.setEncoderTableSize(128);
+    const fields = [_]HeaderEntry{.{ .name = ":method", .value = "GET" }};
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len >= 2);
+    try std.testing.expect((encoded[0] & 0xe0) == 0x20);
+
+    const decoded = try decodeHeaders(&decoder, encoded, std.testing.allocator);
+    defer {
+        for (decoded) |field| {
+            std.testing.allocator.free(field.name);
+            std.testing.allocator.free(field.value);
+        }
+        std.testing.allocator.free(decoded);
+    }
+    try std.testing.expectEqualStrings("GET", decoded[0].value);
+    try std.testing.expectEqual(@as(usize, 128), decoder.dynamic_table.max_size);
+}
+
+test "HPACK encoder emits minimum then final queued table sizes" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    var decoder = HPACKContext.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    encoder.setEncoderTableSize(128);
+    encoder.setEncoderTableSize(512);
+    const encoded = try encodeHeaders(&encoder, &.{}, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+
+    const first = try decodeInteger(encoded, 5);
+    try std.testing.expectEqual(@as(u64, 128), first.value);
+    const second = try decodeInteger(encoded[first.len..], 5);
+    try std.testing.expectEqual(@as(u64, 512), second.value);
+    const decoded = try decodeHeaders(&decoder, encoded, std.testing.allocator);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(@as(usize, 512), decoder.dynamic_table.max_size);
 }
