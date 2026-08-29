@@ -343,6 +343,12 @@ and drains before reuse; `abort` closes HTTP/1 and sends a bounded HTTP/2
 reset before closing that session. `cancel` is the only operation method that
 may race active I/O.
 
+`OpenOptions.tls_handshake_ms` and `OpenOptions.header_ms` bound the entire
+TLS-handshake and response-header phases, so trickled progress does not restart
+their deadlines. `null` uses the corresponding `Timeouts` value (whose zero
+falls back to connect/read); an explicit option value of zero disables that
+phase deadline while the overall request deadline still applies.
+
 Streaming counters and limits are `u64`; caller and transport body buffers are
 fixed at 16–64 KiB. gzip/deflate, Brotli, and Zstandard are decoded
 incrementally, and response limits apply to decoded bytes. Decoder history is

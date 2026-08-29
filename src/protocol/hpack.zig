@@ -210,6 +210,7 @@ pub const HPACKContext = struct {
     allocator: Allocator,
     dynamic_table: DynamicTable,
     max_allowed_table_size: usize = 4096,
+    pending_encoder_min_table_size: ?usize = null,
     pending_encoder_table_size: ?usize = null,
 
     const Self = @This();
@@ -245,6 +246,10 @@ pub const HPACKContext = struct {
     /// HPACK table-size update for the start of the next encoded block.
     pub fn setEncoderTableSize(self: *Self, max_table_size: usize) void {
         self.dynamic_table.setMaxSize(max_table_size);
+        self.pending_encoder_min_table_size = if (self.pending_encoder_min_table_size) |current|
+            @min(current, max_table_size)
+        else
+            max_table_size;
         self.pending_encoder_table_size = max_table_size;
     }
 
@@ -601,11 +606,16 @@ pub fn encodeHeaders(
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    if (ctx.pending_encoder_table_size) |table_size| {
+    if (ctx.pending_encoder_min_table_size) |minimum_size| {
         var buf: [10]u8 = undefined;
-        const n = try encodeInteger(table_size, 5, &buf);
+        const n = try encodeInteger(minimum_size, 5, &buf);
         buf[0] |= 0x20;
         try out.appendSlice(allocator, buf[0..n]);
+        if (ctx.pending_encoder_table_size.? != minimum_size) {
+            const final_n = try encodeInteger(ctx.pending_encoder_table_size.?, 5, &buf);
+            buf[0] |= 0x20;
+            try out.appendSlice(allocator, buf[0..final_n]);
+        }
     }
 
     for (headers) |header| {
@@ -649,6 +659,7 @@ pub fn encodeHeaders(
         }
     }
 
+    ctx.pending_encoder_min_table_size = null;
     ctx.pending_encoder_table_size = null;
     return out.toOwnedSlice(allocator);
 }
@@ -1224,4 +1235,24 @@ test "HPACK encoder emits queued table update at next block start" {
     }
     try std.testing.expectEqualStrings("GET", decoded[0].value);
     try std.testing.expectEqual(@as(usize, 128), decoder.dynamic_table.max_size);
+}
+
+test "HPACK encoder emits minimum then final queued table sizes" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    var decoder = HPACKContext.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    encoder.setEncoderTableSize(128);
+    encoder.setEncoderTableSize(512);
+    const encoded = try encodeHeaders(&encoder, &.{}, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+
+    const first = try decodeInteger(encoded, 5);
+    try std.testing.expectEqual(@as(u64, 128), first.value);
+    const second = try decodeInteger(encoded[first.len..], 5);
+    try std.testing.expectEqual(@as(u64, 512), second.value);
+    const decoded = try decodeHeaders(&decoder, encoded, std.testing.allocator);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(@as(usize, 512), decoder.dynamic_table.max_size);
 }

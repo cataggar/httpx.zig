@@ -73,6 +73,8 @@ const RequestTimeouts = struct {
     read_ms: u64,
     write_ms: u64,
     request_ms: u64,
+    tls_handshake_ms: u64,
+    header_ms: u64,
 };
 
 fn validateClientConfig(config: ClientConfig) !void {
@@ -766,6 +768,18 @@ pub const Client = struct {
         return self.allocator.dupe(Interceptor, self.shared.interceptors.items);
     }
 
+    fn notifyInterceptorErrors(
+        interceptors: []const Interceptor,
+        err: anyerror,
+        attempt_context: *const AttemptContext,
+    ) void {
+        for (interceptors) |interceptor| {
+            if (interceptor.error_fn) |callback| {
+                callback(err, attempt_context, interceptor.context);
+            }
+        }
+    }
+
     fn isRequestSingletonHeader(name: []const u8) bool {
         return std.ascii.eqlIgnoreCase(name, HeaderName.HOST) or
             std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH) or
@@ -828,6 +842,33 @@ pub const Client = struct {
         }
     }
 
+    fn scrubRedirectRequest(
+        req: *Request,
+        strip_credentials: bool,
+        strip_entity_headers: bool,
+        api_key_header: ?[]const u8,
+    ) void {
+        if (strip_credentials) {
+            req.headers.removeAll(HeaderName.AUTHORIZATION);
+            req.headers.removeAll(HeaderName.PROXY_AUTHORIZATION);
+            req.headers.removeAll(HeaderName.COOKIE);
+            if (api_key_header) |name| req.headers.removeAll(name);
+        }
+        if (strip_entity_headers) {
+            req.headers.removeAll(HeaderName.CONTENT_LENGTH);
+            req.headers.removeAll(HeaderName.CONTENT_TYPE);
+            req.headers.removeAll(HeaderName.TRANSFER_ENCODING);
+            req.headers.removeAll("Content-Encoding");
+            req.headers.removeAll(HeaderName.EXPECT);
+            req.headers.removeAll("Trailer");
+            if (req.body_owned) {
+                if (req.body) |body| req.allocator.free(body);
+            }
+            req.body = null;
+            req.body_owned = false;
+        }
+    }
+
     fn validateRequestHeaders(req: *const Request) !void {
         try validateRequestLine(req);
         var host_count: usize = 0;
@@ -869,6 +910,63 @@ pub const Client = struct {
             if (declared != body_len) return error.InvalidContentLength;
         } else if (body_len > 0) {
             return error.MissingContentLength;
+        }
+    }
+
+    fn validateStreamingRequestHeaders(req: *const Request, body_mode: BodyMode) !void {
+        try validateRequestLine(req);
+        var host_count: usize = 0;
+        var content_length: ?u64 = null;
+        var transfer_encoding: ?[]const u8 = null;
+        for (req.headers.iterator()) |header| {
+            if (isRequestSingletonHeader(header.name)) {
+                var duplicate_count: usize = 0;
+                for (req.headers.iterator()) |candidate| {
+                    if (std.ascii.eqlIgnoreCase(candidate.name, header.name)) duplicate_count += 1;
+                }
+                if (duplicate_count > 1) return error.DuplicateSingletonHeader;
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.HOST)) {
+                host_count += 1;
+                if (mem.trim(u8, header.value, " \t").len == 0) return error.InvalidHostHeader;
+            } else if (std.ascii.eqlIgnoreCase(header.name, HeaderName.CONTENT_LENGTH)) {
+                content_length = std.fmt.parseInt(
+                    u64,
+                    mem.trim(u8, header.value, " \t"),
+                    10,
+                ) catch return error.InvalidContentLength;
+            } else if (std.ascii.eqlIgnoreCase(header.name, HeaderName.TRANSFER_ENCODING)) {
+                transfer_encoding = mem.trim(u8, header.value, " \t");
+            }
+        }
+        if (host_count != 1) return error.InvalidHostHeader;
+        if (content_length != null and transfer_encoding != null) {
+            return error.ConflictingFramingHeaders;
+        }
+        switch (body_mode) {
+            .none => {
+                if (content_length != null or transfer_encoding != null) {
+                    return error.InvalidRequestFraming;
+                }
+            },
+            .content_length => |expected| {
+                const actual = content_length orelse return error.InvalidContentLength;
+                if (actual != expected or transfer_encoding != null) {
+                    return error.InvalidContentLength;
+                }
+            },
+            .chunked => {
+                if (req.version == .HTTP_2) {
+                    if (content_length != null or transfer_encoding != null) {
+                        return error.InvalidRequestFraming;
+                    }
+                } else if (content_length != null or
+                    transfer_encoding == null or
+                    !std.ascii.eqlIgnoreCase(transfer_encoding.?, "chunked"))
+                {
+                    return error.UnsupportedTransferEncoding;
+                }
+            },
         }
     }
 
@@ -968,11 +1066,38 @@ pub const Client = struct {
 
         const effective_policy = self.shared.config.policy.resolve(open_options.policy);
         try self.prepareOpenRequest(req, open_options, &effective_policy);
-        try validateRequestLine(req);
+        const attempt_context = AttemptContext{
+            .logical_request_id = logical_request_id,
+            .attempt = 1,
+            .redirect_count = 0,
+            .policy = effective_policy,
+            .url = full_url,
+        };
+        const interceptors = try self.snapshotInterceptors();
+        defer self.allocator.free(interceptors);
+        for (interceptors) |interceptor| {
+            if (interceptor.request_fn) |callback| {
+                callback(req, &attempt_context, interceptor.context) catch |err| {
+                    notifyInterceptorErrors(interceptors, err, &attempt_context);
+                    return err;
+                };
+            }
+        }
+        applyOpenFraming(req, open_options.body_mode) catch |err| {
+            notifyInterceptorErrors(interceptors, err, &attempt_context);
+            return err;
+        };
+        validateStreamingRequestHeaders(req, open_options.body_mode) catch |err| {
+            notifyInterceptorErrors(interceptors, err, &attempt_context);
+            return err;
+        };
         if (self.shared.config.max_request_size > 0) {
             switch (open_options.body_mode) {
                 .content_length => |length| {
-                    if (length > self.shared.config.max_request_size) return error.RequestTooLarge;
+                    if (length > self.shared.config.max_request_size) {
+                        notifyInterceptorErrors(interceptors, error.RequestTooLarge, &attempt_context);
+                        return error.RequestTooLarge;
+                    }
                 },
                 else => {},
             }
@@ -993,17 +1118,23 @@ pub const Client = struct {
             context,
             effective_policy.decompression,
             logical_request_id,
-        );
+        ) catch |err| {
+            notifyInterceptorErrors(interceptors, err, &attempt_context);
+            return err;
+        };
     }
 
     fn resolveOpenTimeouts(self: *const Self, open_options: OpenOptions) RequestTimeouts {
-        return self.resolveRequestTimeouts(.{
+        var resolved = self.resolveRequestTimeouts(.{
             .timeout_ms = open_options.timeout_ms,
             .connect_timeout_ms = open_options.connect_timeout_ms,
             .read_timeout_ms = open_options.read_timeout_ms,
             .write_timeout_ms = open_options.write_timeout_ms,
             .timeouts = open_options.timeouts,
         });
+        if (open_options.tls_handshake_ms) |timeout| resolved.tls_handshake_ms = timeout;
+        if (open_options.header_ms) |timeout| resolved.header_ms = timeout;
+        return resolved;
     }
 
     fn prepareOpenRequest(
@@ -1037,9 +1168,13 @@ pub const Client = struct {
         if (open_options.bearer_token) |token| try req.setBearerAuth(token);
         if (effective_policy.cookies.sends()) try self.attachCookies(req);
 
+        try applyOpenFraming(req, open_options.body_mode);
+    }
+
+    fn applyOpenFraming(req: *Request, body_mode: BodyMode) !void {
         req.headers.removeAll(HeaderName.CONTENT_LENGTH);
         req.headers.removeAll(HeaderName.TRANSFER_ENCODING);
-        switch (open_options.body_mode) {
+        switch (body_mode) {
             .none => {},
             .content_length => |length| {
                 var length_buf: [32]u8 = undefined;
@@ -1291,6 +1426,9 @@ pub const Client = struct {
             logical_request_id,
             depth,
             full_url,
+            strip_credentials,
+            strip_entity_headers,
+            reqOpts.api_key_header,
         );
         var response = execution.response;
 
@@ -1412,6 +1550,9 @@ pub const Client = struct {
         logical_request_id: u64,
         redirect_count: u32,
         url: []const u8,
+        strip_credentials: bool,
+        strip_entity_headers: bool,
+        api_key_header: ?[]const u8,
     ) !RequestExecution {
         if (self.shared.config.metrics) |m| m.recordRequest();
         const start_time_ms: u64 = @intCast(@max(common.nowMillis(), 0));
@@ -1443,6 +1584,12 @@ pub const Client = struct {
                     try callback(req, &attempt_context, interceptor.context);
                 }
             }
+            scrubRedirectRequest(
+                req,
+                strip_credentials,
+                strip_entity_headers,
+                api_key_header,
+            );
             try validateRequestHeaders(req);
 
             var res = self.executeRequestOnce(req, reqOpts, effective_policy, context) catch |raw_err| {
@@ -1702,29 +1849,45 @@ pub const Client = struct {
         var read_ms = self.shared.config.timeouts.read_ms;
         var write_ms = self.shared.config.timeouts.write_ms;
         var request_ms = self.shared.config.timeouts.request_ms;
+        var tls_handshake_ms = self.shared.config.timeouts.effectiveTlsHandshakeMs();
+        var header_ms = self.shared.config.timeouts.effectiveHeaderMs();
+        var tls_handshake_explicit = self.shared.config.timeouts.tls_handshake_ms > 0;
+        var header_explicit = self.shared.config.timeouts.header_ms > 0;
 
         if (req_opts.timeouts) |t| {
             connect_ms = t.connect_ms;
             read_ms = t.read_ms;
             write_ms = t.write_ms;
             request_ms = t.request_ms;
+            tls_handshake_ms = t.effectiveTlsHandshakeMs();
+            header_ms = t.effectiveHeaderMs();
+            tls_handshake_explicit = t.tls_handshake_ms > 0;
+            header_explicit = t.header_ms > 0;
         }
 
         if (req_opts.timeout_ms) |ms| {
             connect_ms = ms;
             read_ms = ms;
             write_ms = ms;
+            tls_handshake_ms = ms;
+            header_ms = ms;
+            tls_handshake_explicit = true;
+            header_explicit = true;
         }
 
         if (req_opts.connect_timeout_ms) |c_ms| connect_ms = c_ms;
         if (req_opts.read_timeout_ms) |r_ms| read_ms = r_ms;
         if (req_opts.write_timeout_ms) |w_ms| write_ms = w_ms;
+        if (!tls_handshake_explicit) tls_handshake_ms = connect_ms;
+        if (!header_explicit) header_ms = read_ms;
 
         return .{
             .connect_ms = connect_ms,
             .read_ms = read_ms,
             .write_ms = write_ms,
             .request_ms = request_ms,
+            .tls_handshake_ms = tls_handshake_ms,
+            .header_ms = header_ms,
         };
     }
 
@@ -2493,6 +2656,16 @@ pub const Client = struct {
         return true;
     }
 
+    fn requireInitialServerSettings(
+        session_state: *const pool_mod.H2SessionState,
+        header: http.HTTP2FrameHeader,
+    ) !void {
+        if (session_state.received_initial_settings) return;
+        if (header.frame_type != .settings or (header.flags & 0x01) != 0) {
+            return error.ProtocolError;
+        }
+    }
+
     fn parseHTTP2GoAway(self: *Client, header: http.HTTP2FrameHeader, payload: []const u8) !u31 {
         if (header.stream_id != 0) return error.ProtocolError;
         const goaway = h2stream.parseGoawayPayload(payload, self.allocator) catch
@@ -2531,6 +2704,7 @@ pub const Client = struct {
             var hdr_bytes: [9]u8 = undefined;
             try transport.readNoEof(&hdr_bytes);
             const fhdr = http.HTTP2FrameHeader.parse(hdr_bytes);
+            try requireInitialServerSettings(session_state, fhdr);
 
             const payload_len: usize = @intCast(fhdr.length);
             try validateHttp2FrameHeader(
@@ -2824,6 +2998,7 @@ pub const Client = struct {
             };
             // Only free payload for frames we allocated ourselves (not early buf replays).
             defer if (!frame.from_early_buf) self.allocator.free(frame.payload);
+            try requireInitialServerSettings(session_state, frame.header);
 
             switch (frame.header.frame_type) {
                 .settings => {
@@ -3416,16 +3591,22 @@ pub const Client = struct {
         const scheme = base.scheme orelse "http";
         const host = base.host orelse return error.InvalidUri;
         const port = base.effectivePort();
+        const authority = try @import("../core/uri.zig").formatAuthorityHost(
+            self.allocator,
+            host,
+            port,
+        );
+        defer self.allocator.free(authority);
 
         if (location.len > 0 and location[0] == '/') {
-            return std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}", .{ scheme, host, port, location });
+            return std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, location });
         }
 
         // Relative to current path.
         const base_path = base.path;
         const slash = mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
         const prefix = base_path[0 .. slash + 1];
-        return std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}{s}", .{ scheme, host, port, prefix, location });
+        return std.fmt.allocPrint(self.allocator, "{s}://{s}{s}{s}", .{ scheme, authority, prefix, location });
     }
 
     /// Returns true if two URLs share the same origin (scheme + host + port).
@@ -3900,7 +4081,11 @@ const OperationEncodedReader = struct {
         const destinations = vectors[0..destination_count];
         if (destinations.len == 0 or destinations[0].len == 0) return 0;
         const self = parent(reader);
-        const n = self.operation.readEncodedProtocol(destinations[0]) catch |err| {
+        const n = if (self.operation.flate_pending_byte) |byte| blk: {
+            destinations[0][0] = byte;
+            self.operation.flate_pending_byte = null;
+            break :blk 1;
+        } else self.operation.readEncodedProtocol(destinations[0]) catch |err| {
             self.operation.decoder_io_error = err;
             return error.ReadFailed;
         };
@@ -4010,6 +4195,8 @@ const OperationImpl = struct {
     encoded_reader: OperationEncodedReader = undefined,
     flate_decoder: ?std.compress.flate.Decompress = null,
     flate_window: [std.compress.flate.max_window_len]u8 = undefined,
+    flate_pending_byte: ?u8 = null,
+    flate_members_completed: u64 = 0,
     brotli_decoder: ?brotli_pkg.Decoder = null,
     zstd_decoder: ?zstd_pkg.StreamingDecompressor = null,
     zstd_wire: std.ArrayList(u8) = .empty,
@@ -4226,19 +4413,23 @@ const OperationImpl = struct {
                     }
                 }
             }
+        }
 
-            if (self.req.uri.isTLS()) {
-                const existing_session = self.lease.?.tlsSession();
-                const session = existing_session orelse session: {
-                    const config = if (wants_h2)
-                        (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
-                    else if (self.verify_ssl)
-                        TLSConfig.init(self.allocator)
-                    else
-                        TLSConfig.insecure(self.allocator);
-                    break :session self.lease.?.initializeTls(config);
-                };
-                if (existing_session == null) {
+        if (self.req.uri.isTLS()) {
+            const existing_session = self.lease.?.tlsSession();
+            const session = existing_session orelse session: {
+                const config = if (wants_h2)
+                    (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
+                else if (self.verify_ssl)
+                    TLSConfig.init(self.allocator)
+                else
+                    TLSConfig.insecure(self.allocator);
+                break :session self.lease.?.initializeTls(config);
+            };
+            if (existing_session == null) {
+                const previous_phase = self.beginPhase(self.timeouts.tls_handshake_ms);
+                defer self.endPhase(previous_phase);
+                {
                     var client = self.clientHandle();
                     try client.handshakePooledTlsWithContext(
                         &self.lease.?,
@@ -4246,21 +4437,21 @@ const OperationImpl = struct {
                         host,
                         port,
                         effective_proxy == null,
-                        self.timeouts.connect_ms,
+                        self.timeouts.tls_handshake_ms,
                         &self.context,
                     );
                 }
-                self.tls_active = true;
-
-                const negotiated = http.negotiateVersion(session.negotiatedProtocol());
-                if (wants_h2 and negotiated == .http_2) {
-                    self.protocol = .http2;
-                } else if (self.req.version == .HTTP_2) {
-                    return error.UnsupportedHttpVersion;
-                }
-            } else if (wants_h2) {
-                self.protocol = .http2;
             }
+            self.tls_active = true;
+
+            const negotiated = http.negotiateVersion(session.negotiatedProtocol());
+            if (wants_h2 and negotiated == .http_2) {
+                self.protocol = .http2;
+            } else if (self.req.version == .HTTP_2) {
+                return error.UnsupportedHttpVersion;
+            }
+        } else if (wants_h2) {
+            self.protocol = .http2;
         }
 
         switch (self.protocol) {
@@ -4423,6 +4614,8 @@ const OperationImpl = struct {
             return if (self.response_head_ready) .final_response else .send_body;
         }
 
+        const previous_phase = self.beginPhase(self.timeouts.header_ms);
+        defer self.endPhase(previous_phase);
         while (true) {
             const code = switch (self.protocol) {
                 .http1 => try self.readHttp1Head(),
@@ -4498,6 +4691,8 @@ const OperationImpl = struct {
         }
         self.request_framing_complete = true;
 
+        const previous_phase = self.beginPhase(self.timeouts.header_ms);
+        defer self.endPhase(previous_phase);
         while (true) {
             const code = switch (self.protocol) {
                 .http1 => try self.readHttp1Head(),
@@ -4676,23 +4871,52 @@ const OperationImpl = struct {
     }
 
     fn readFlateDecoded(self: *Self, output: []u8) !usize {
-        const decoder = &(self.flate_decoder orelse return error.DecompressionFailed);
-        self.decoder_io_error = null;
-        const n = decoder.reader.readSliceShort(output) catch {
-            if (self.decoder_io_error) |io_error| return io_error;
-            return if (self.encoded_body_complete)
-                error.TruncatedCompressedBody
-            else
-                error.DecompressionFailed;
-        };
-        if (n == 0) {
-            if (self.encoded_reader.reader.buffered().len != 0) {
-                return error.TrailingCompressedData;
+        while (true) {
+            const decoder = &(self.flate_decoder orelse return error.DecompressionFailed);
+            self.decoder_io_error = null;
+            const n = decoder.reader.readSliceShort(output) catch {
+                if (self.decoder_io_error) |io_error| return io_error;
+                return if (self.encoded_body_complete)
+                    error.TruncatedCompressedBody
+                else
+                    error.DecompressionFailed;
+            };
+            if (n != 0) return n;
+
+            self.flate_members_completed += 1;
+            const buffered = self.encoded_reader.reader.buffered();
+            if (self.decoder_kind == .deflate) {
+                if (buffered.len != 0) return error.TrailingCompressedData;
+                try self.ensureEncodedBodyEnd();
+                self.decoded_body_complete = true;
+                return 0;
             }
-            try self.ensureEncodedBodyEnd();
-            self.decoded_body_complete = true;
+
+            if (buffered.len > 0) {
+                if (buffered[0] != 0x1f or (buffered.len > 1 and buffered[1] != 0x8b)) {
+                    return error.TrailingCompressedData;
+                }
+            } else if (!self.encoded_body_complete) {
+                var first: [1]u8 = undefined;
+                const amount = try self.readEncodedProtocol(&first);
+                if (amount == 0) {
+                    if (!self.encoded_body_complete) return error.TruncatedCompressedBody;
+                    self.decoded_body_complete = true;
+                    return 0;
+                }
+                if (first[0] != 0x1f) return error.TrailingCompressedData;
+                self.flate_pending_byte = first[0];
+            } else {
+                self.decoded_body_complete = true;
+                return 0;
+            }
+
+            self.flate_decoder = std.compress.flate.Decompress.init(
+                &self.encoded_reader.reader,
+                .gzip,
+                &self.flate_window,
+            );
         }
-        return n;
     }
 
     fn fillDecoderInput(self: *Self) !bool {
@@ -5897,6 +6121,7 @@ const OperationImpl = struct {
             const frame = &self.h2_early_frames.items[self.h2_early_frame_index];
             self.h2_early_frame_index += 1;
             try self.validateIncomingHttp2FrameHeader(frame.header, frame.payload.len);
+            try Client.requireInitialServerSettings(self.lease.?.h2Session(), frame.header);
             if (frame.payload.len > self.read_buffer.len) return error.FrameTooLarge;
             @memcpy(self.read_buffer[0..frame.payload.len], frame.payload);
             return .{
@@ -5911,6 +6136,7 @@ const OperationImpl = struct {
         const header = http.HTTP2FrameHeader.parse(raw_header);
         const payload_len: usize = @intCast(header.length);
         try self.validateIncomingHttp2FrameHeader(header, payload_len);
+        try Client.requireInitialServerSettings(self.lease.?.h2Session(), header);
         if (payload_len > self.read_buffer.len) return error.FrameTooLarge;
         try self.transportReadNoEof(self.read_buffer[0..payload_len]);
         return .{
@@ -7333,6 +7559,48 @@ test "transport adapter is exclusively leased per operation" {
     try std.testing.expectEqual(error.Cancelled, worker.result.?);
     try std.testing.expectEqual(@as(u32, 1), fixture.writes.load(.acquire));
     first.abort();
+}
+
+test "Client.open header timeout bounds the whole trickle phase" {
+    const Fixture = struct {
+        response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        offset: usize = 0,
+
+        fn write(_: *anyopaque, data: []const u8) !usize {
+            return data.len;
+        }
+
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            if (self.offset == self.response.len) return 0;
+            std.Io.sleep(
+                defaultIo(),
+                std.Io.Duration.fromMilliseconds(20),
+                .real,
+            ) catch {};
+            output[0] = self.response[self.offset];
+            self.offset += 1;
+            return 1;
+        }
+    };
+    var fixture = Fixture{};
+    var adapter = TransportAdapter{
+        .context = &fixture,
+        .writeFn = Fixture.write,
+        .readFn = Fixture.read,
+    };
+    var client = Client.initWithConfig(std.testing.allocator, .{
+        .transport_adapter = &adapter,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var operation_value = try client.open(.GET, "http://adapter.test/trickle", .{
+        .read_timeout_ms = 1_000,
+        .header_ms = 35,
+    });
+    defer operation_value.deinit();
+    try std.testing.expectError(error.Timeout, operation_value.finishRequest(null));
 }
 
 test "RequestOptions builder helpers" {
@@ -9953,6 +10221,74 @@ test "public streaming incrementally decodes gzip deflate brotli and zstd with d
     try std.testing.expect(server.failure == null);
 }
 
+test "operation gzip accepts concatenated members and rejects trailing garbage" {
+    const allocator = std.testing.allocator;
+    const first = try compression_util.compress(allocator, .gzip, "first");
+    defer allocator.free(first);
+    const second = try compression_util.compress(allocator, .gzip, "second");
+    defer allocator.free(second);
+    const concatenated = try std.mem.concat(allocator, u8, &.{ first, second });
+    defer allocator.free(concatenated);
+    const garbage = try std.mem.concat(allocator, u8, &.{ first, "garbage" });
+    defer allocator.free(garbage);
+    const headers = [_][2][]const u8{.{ HeaderName.CONTENT_ENCODING, "gzip" }};
+    const valid_response = try makePolicyTestResponse(allocator, "200 OK", &headers, concatenated);
+    defer allocator.free(valid_response);
+    const invalid_response = try makePolicyTestResponse(allocator, "200 OK", &headers, garbage);
+    defer allocator.free(invalid_response);
+
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ valid_response, invalid_response };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/gzip-members");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var decoded: [32]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try op.read(decoded[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        try std.testing.expectEqualStrings("firstsecond", decoded[0..total]);
+        try op.finish(.{});
+    }
+
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = .{ .decompression = .enabled },
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var decoded: [32]u8 = undefined;
+        _ = try op.read(&decoded);
+        try std.testing.expectError(error.TrailingCompressedData, op.read(&decoded));
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
 test "streaming operation decodes valid multi-block zstd incrementally" {
     const allocator = std.testing.allocator;
     const input = try allocator.alloc(u8, 1024 * 1024);
@@ -10580,7 +10916,14 @@ test "HTTP2 frame writes handle short writes and mark partial failures fatal" {
         null,
         false,
         null,
-        .{ .connect_ms = 0, .read_ms = 0, .write_ms = 1_000, .request_ms = 0 },
+        .{
+            .connect_ms = 0,
+            .read_ms = 0,
+            .write_ms = 1_000,
+            .request_ms = 0,
+            .tls_handshake_ms = 0,
+            .header_ms = 0,
+        },
         IoContext.init(.{}),
         .disabled,
         0,
@@ -11362,6 +11705,8 @@ test "RequestOptions explicit timeout resolution" {
     try std.testing.expectEqual(@as(u64, 5000), t_def.connect_ms);
     try std.testing.expectEqual(@as(u64, 10000), t_def.read_ms);
     try std.testing.expectEqual(@as(u64, 15000), t_def.write_ms);
+    try std.testing.expectEqual(@as(u64, 5000), t_def.tls_handshake_ms);
+    try std.testing.expectEqual(@as(u64, 10000), t_def.header_ms);
 
     // Uniform timeout_ms override
     const t_uni = client.resolveRequestTimeouts(RequestOptions.defaults().withTimeoutMs(2000));
@@ -11379,6 +11724,8 @@ test "RequestOptions explicit timeout resolution" {
     try std.testing.expectEqual(@as(u64, 100), t_exp.connect_ms);
     try std.testing.expectEqual(@as(u64, 200), t_exp.read_ms);
     try std.testing.expectEqual(@as(u64, 300), t_exp.write_ms);
+    try std.testing.expectEqual(@as(u64, 100), t_exp.tls_handshake_ms);
+    try std.testing.expectEqual(@as(u64, 200), t_exp.header_ms);
 
     // Explicit timeouts struct override
     const t_struct = client.resolveRequestTimeouts(
@@ -11386,16 +11733,29 @@ test "RequestOptions explicit timeout resolution" {
             .connect_ms = 111,
             .read_ms = 222,
             .write_ms = 333,
+            .tls_handshake_ms = 444,
+            .header_ms = 555,
         }),
     );
     try std.testing.expectEqual(@as(u64, 111), t_struct.connect_ms);
     try std.testing.expectEqual(@as(u64, 222), t_struct.read_ms);
     try std.testing.expectEqual(@as(u64, 333), t_struct.write_ms);
+    try std.testing.expectEqual(@as(u64, 444), t_struct.tls_handshake_ms);
+    try std.testing.expectEqual(@as(u64, 555), t_struct.header_ms);
 
     const none = client.resolveRequestTimeouts(
         RequestOptions.defaults().withTimeouts(types.Timeouts.none()),
     );
     try std.testing.expectEqual(@as(u64, 0), none.request_ms);
+
+    const open_none = client.resolveOpenTimeouts(.{
+        .connect_timeout_ms = 10,
+        .read_timeout_ms = 20,
+        .tls_handshake_ms = 0,
+        .header_ms = 0,
+    });
+    try std.testing.expectEqual(@as(u64, 0), open_none.tls_handshake_ms);
+    try std.testing.expectEqual(@as(u64, 0), open_none.header_ms);
 }
 
 test "Cookie path matching" {
@@ -11487,6 +11847,91 @@ test "Interceptor error_fn callback type" {
     interceptor.error_fn.?(error.ConnectionRefused, &attempt, null);
     try std.testing.expect(TestContext.called);
     try std.testing.expectEqualStrings("ConnectionRefused", @errorName(TestContext.last_err));
+}
+
+test "Client.open invokes request interceptors and reports interceptor errors" {
+    const allocator = std.testing.allocator;
+    const response = try makePolicyTestResponse(allocator, "200 OK", &.{}, "ok");
+    defer allocator.free(response);
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{response};
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    const Counts = struct {
+        requests: usize = 0,
+        errors: usize = 0,
+
+        fn request(
+            req: *Request,
+            attempt: *const AttemptContext,
+            context_ptr: ?*anyopaque,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr.?));
+            self.requests += 1;
+            try std.testing.expectEqual(@as(u32, 1), attempt.attempt);
+            try std.testing.expectEqual(@as(u32, 0), attempt.redirect_count);
+            try req.headers.set("X-Open-Interceptor", "called");
+        }
+
+        fn fail(_: *Request, _: *const AttemptContext, _: ?*anyopaque) anyerror!void {
+            return error.InterceptorFailure;
+        }
+
+        fn onError(_: anyerror, _: *const AttemptContext, context_ptr: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr.?));
+            self.errors += 1;
+        }
+    };
+
+    var counts = Counts{};
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    try client.addInterceptor(.{
+        .context = &counts,
+        .request_fn = Counts.request,
+        .error_fn = Counts.onError,
+    });
+    const url = try policyTestUrl(allocator, &listener, "/open-interceptor");
+    defer allocator.free(url);
+    var op = try client.open(.GET, url, .{});
+    defer op.deinit();
+    _ = try op.finishRequest(null);
+    try op.finish(.{});
+    server_thread.join();
+    joined = true;
+    if (server.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), counts.requests);
+    try std.testing.expectEqualStrings(
+        "called",
+        requestHeaderValue(server.request(0), "X-Open-Interceptor").?,
+    );
+
+    var failing_counts = Counts{};
+    var failing_client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+    });
+    defer failing_client.deinit();
+    try failing_client.addInterceptor(.{
+        .context = &failing_counts,
+        .request_fn = Counts.fail,
+        .error_fn = Counts.onError,
+    });
+    try std.testing.expectError(
+        error.InterceptorFailure,
+        failing_client.open(.GET, "http://127.0.0.1:1/fail", .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), failing_counts.errors);
 }
 
 test "Interceptor retry_fn callback type" {
@@ -11708,6 +12153,35 @@ test "HTTP2 client rejects response headers before initial server SETTINGS" {
     try std.testing.expect(server.failure == null);
 }
 
+test "HTTP2 upload pump requires initial server SETTINGS before controls" {
+    var session = pool_mod.H2SessionState.init(std.testing.allocator);
+    defer session.deinit();
+    try std.testing.expectError(
+        error.ProtocolError,
+        Client.requireInitialServerSettings(&session, .{
+            .length = 8,
+            .frame_type = .ping,
+            .flags = 0,
+            .stream_id = 0,
+        }),
+    );
+    try Client.requireInitialServerSettings(&session, .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    try std.testing.expectError(
+        error.ProtocolError,
+        Client.requireInitialServerSettings(&session, .{
+            .length = 0,
+            .frame_type = .settings,
+            .flags = 0x01,
+            .stream_id = 0,
+        }),
+    );
+}
+
 test "redirect origin and credential policy use full origin tuple" {
     const http_default = try Uri.parse("http://example.test/a");
     const http_explicit = try Uri.parse("http://EXAMPLE.test:80/b");
@@ -11716,6 +12190,13 @@ test "redirect origin and credential policy use full origin tuple" {
     try std.testing.expect(Client.isSameOrigin(http_default, http_explicit));
     try std.testing.expect(!Client.isSameOrigin(http_default, https_default));
     try std.testing.expect(!Client.isSameOrigin(http_default, alternate_port));
+
+    var redirect_client = Client.init(std.testing.allocator);
+    defer redirect_client.deinit();
+    const ipv6_base = try Uri.parse("http://[::1]:8080/base/path");
+    const ipv6_redirect = try redirect_client.resolveRedirectUrl(ipv6_base, "../next");
+    defer std.testing.allocator.free(ipv6_redirect);
+    try std.testing.expectEqualStrings("http://[::1]:8080/base/../next", ipv6_redirect);
 
     var request = try Request.init(std.testing.allocator, .GET, "https://other.test/");
     defer request.deinit();
@@ -11802,6 +12283,21 @@ test "cross-origin POST redirect drops body and all effective credentials" {
         },
     });
     defer client.deinit();
+    try client.addInterceptor(.{
+        .request_fn = &struct {
+            fn readdCredentials(
+                request: *Request,
+                _: *const AttemptContext,
+                _: ?*anyopaque,
+            ) anyerror!void {
+                if (request.uri.path.len == 0 or !mem.eql(u8, request.uri.path, "/final")) return;
+                try request.headers.set(HeaderName.AUTHORIZATION, "Bearer interceptor-secret");
+                try request.headers.set(HeaderName.COOKIE, "session=interceptor-secret");
+                try request.headers.set("X-API-Key", "interceptor-secret");
+                try request.setBody("interceptor-body");
+            }
+        }.readdCredentials,
+    });
     var response = try client.post(start_url, .{
         .headers = &request_headers,
         .body = "payload",

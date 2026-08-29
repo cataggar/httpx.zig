@@ -63,6 +63,12 @@ pub const OpenOptions = struct {
     connect_timeout_ms: ?u64 = null,
     read_timeout_ms: ?u64 = null,
     write_timeout_ms: ?u64 = null,
+    /// Null uses `timeouts.tls_handshake_ms`, falling back to connect timeout.
+    /// Explicit zero disables the TLS-handshake phase timeout.
+    tls_handshake_ms: ?u64 = null,
+    /// Null uses `timeouts.header_ms`, falling back to read timeout.
+    /// Explicit zero disables the whole response-header phase timeout.
+    header_ms: ?u64 = null,
     timeouts: ?types.Timeouts = null,
     cancel_token: ?*const types.CancellationToken = null,
     policy: types.RequestPolicyOverrides = .{},

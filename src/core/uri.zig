@@ -183,12 +183,16 @@ pub const Uri = struct {
     /// Reconstructs the full URI string.
     pub fn format(self: Self, allocator: Allocator) ![]u8 {
         var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
         const writer = list_writer.init(allocator, &buffer);
 
         if (self.scheme) |s| try writer.print("{s}://", .{s});
         if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
+        if (self.host) |host| {
+            const formatted_authority = try formatAuthorityHost(allocator, host, self.port);
+            defer allocator.free(formatted_authority);
+            try writer.writeAll(formatted_authority);
+        }
         try writer.print("{s}", .{self.path});
         if (self.query) |q| try writer.print("?{s}", .{q});
         if (self.fragment) |f| try writer.print("#{s}", .{f});
@@ -199,11 +203,15 @@ pub const Uri = struct {
     /// Returns the authority component (userinfo@host:port).
     pub fn authority(self: Self, allocator: Allocator) ![]u8 {
         var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
         const writer = list_writer.init(allocator, &buffer);
 
         if (self.userinfo) |u| try writer.print("{s}@", .{u});
-        if (self.host) |h| try writer.print("{s}", .{h});
-        if (self.port) |p| try writer.print(":{d}", .{p});
+        if (self.host) |host| {
+            const formatted_authority = try formatAuthorityHost(allocator, host, self.port);
+            defer allocator.free(formatted_authority);
+            try writer.writeAll(formatted_authority);
+        }
 
         return buffer.toOwnedSlice(allocator);
     }
@@ -518,6 +526,15 @@ test "URI bracketed authority rejects invalid suffixes" {
     const valid = try Uri.parse("http://[::1]:8080/");
     try std.testing.expectEqualStrings("::1", valid.host.?);
     try std.testing.expectEqual(@as(u16, 8080), valid.port.?);
+
+    const formatted = try valid.format(std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("http://[::1]:8080/", formatted);
+
+    const with_user = try Uri.parse("http://user@[::1]:8080/path");
+    const authority_value = try with_user.authority(std.testing.allocator);
+    defer std.testing.allocator.free(authority_value);
+    try std.testing.expectEqualStrings("user@[::1]:8080", authority_value);
 }
 
 test "normalizePath basic" {

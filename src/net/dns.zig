@@ -146,6 +146,10 @@ const DnsHeader = extern struct {
     pub fn isTruncated(self: Self) bool {
         return (self.flags & 0x0200) != 0;
     }
+
+    pub fn isAuthoritative(self: Self) bool {
+        return (self.flags & 0x0400) != 0;
+    }
 };
 
 const DnsQuestion = struct {
@@ -355,7 +359,6 @@ fn validateDnsResponse(
     if (message.header.id != expected_id) return error.DnsTransactionMismatch;
     if (!message.header.isResponse()) return error.DnsNotResponse;
     if ((message.header.flags & 0x7800) != 0) return error.DnsInvalidOpcode;
-    if (message.header.rcode() != 0) return error.DnsResponseError;
     if (message.questions.len != 1) return error.DnsQuestionMismatch;
     const question = message.questions[0];
     if (!std.ascii.eqlIgnoreCase(question.name, expected_name) or
@@ -364,6 +367,10 @@ fn validateDnsResponse(
     {
         return error.DnsQuestionMismatch;
     }
+    if (message.header.rcode() == 3 and message.header.isAuthoritative()) {
+        return error.AuthoritativeNameError;
+    }
+    if (message.header.rcode() != 0) return error.DnsResponseError;
     for (message.answers) |answer| {
         if (answer.record_class != .IN) return error.DnsAnswerClassMismatch;
         if (answer.record_type == .A or answer.record_type == .AAAA) {
@@ -609,21 +616,30 @@ fn queryDns(
     context: ?*const IoContext,
     stats_cache: ?*DNSCache,
 ) !DnsMessage {
+    var last_error: ?anyerror = null;
     for (servers) |server| {
         if (stats_cache) |cache| cache.recordUdpQuery();
         if (queryViaUdp(server, name, qtype, udp_timeout_ms, allocator, context)) |msg| {
             return msg;
         } else |udp_error| {
             if (udp_error == error.Cancelled or udp_error == error.Timeout) return udp_error;
+            if (udp_error == error.AuthoritativeNameError or udp_error == error.OutOfMemory) {
+                return udp_error;
+            }
+            last_error = udp_error;
             if (stats_cache) |cache| cache.recordTcpQuery();
             if (queryViaTcp(server, name, qtype, tcp_timeout_ms, allocator, context)) |msg| {
                 return msg;
             } else |tcp_error| {
                 if (tcp_error == error.Cancelled or tcp_error == error.Timeout) return tcp_error;
+                if (tcp_error == error.AuthoritativeNameError or tcp_error == error.OutOfMemory) {
+                    return tcp_error;
+                }
+                last_error = tcp_error;
             }
         }
     }
-    return error.DnsAllServersFailed;
+    return last_error orelse error.DnsAllServersFailed;
 }
 
 fn extractIpv4Addresses(msg: *DnsMessage, hostname: []const u8, allocator: Allocator) ![]net.Address {
@@ -677,7 +693,8 @@ const InFlight = struct {
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     addresses: []net.Address = &.{},
-    failed: bool = false,
+    failure: ?anyerror = null,
+    negative: bool = false,
     allocator: Allocator,
 
     fn incRef(self: *InFlight) void {
@@ -985,6 +1002,12 @@ pub const DNSCache = struct {
         defer self.lock.unlock(common.threadIo());
         self.stats.tcp_queries += 1;
     }
+
+    fn recordFailure(self: *Self) void {
+        self.lock.lock(common.threadIo()) catch {};
+        defer self.lock.unlock(common.threadIo());
+        self.stats.failures += 1;
+    }
 };
 
 pub const DNSResolver = struct {
@@ -1118,12 +1141,9 @@ pub const DNSResolver = struct {
                     try context.waitForMs(1);
                 }
                 try context.check();
-                const failed = inf.*.failed;
                 const addrs = inf.*.addresses;
-
-                if (failed) {
-                    return error.DNSLookupFailed;
-                }
+                if (inf.*.negative) return error.DNSLookupFailed;
+                if (inf.*.failure) |failure| return failure;
 
                 const result_addrs = try self.filterAddresses(addrs, family, order);
                 for (result_addrs) |*a| a.setPort(options.port);
@@ -1158,37 +1178,14 @@ pub const DNSResolver = struct {
             defer inf.decRef();
 
             const result = self.performResolution(hostname, family, context);
-            var publish_error: ?anyerror = null;
 
             self.cache.lock.lock(common.threadIo()) catch {};
             switch (result) {
                 .ok => |addrs| {
                     inf.addresses = addrs;
-                    inf.failed = false;
                 },
-                .err => |resolution_error| {
-                    inf.failed = true;
-                    if (resolution_error != error.Cancelled and resolution_error != error.Timeout) {
-                        self.cache.evictIfNeeded();
-                        self.cache.stats.failures += 1;
-                        if (self.cache.entries.fetchRemove(cache_key)) |kv| {
-                            self.cache.allocator.free(kv.key);
-                            self.cache.allocator.free(kv.value.addresses);
-                        }
-                        self.cache.removeNegative(cache_key);
-                        if (self.cache.allocator.dupe(u8, cache_key)) |neg_key| {
-                            self.cache.negative.put(self.cache.allocator, neg_key, .{
-                                .created_at_ms = common.nowMillis(),
-                                .ttl_ms = self.cache.config.negative_ttl_ms,
-                            }) catch |err| {
-                                self.cache.allocator.free(neg_key);
-                                publish_error = err;
-                            };
-                        } else |err| {
-                            publish_error = err;
-                        }
-                    }
-                },
+                .negative => inf.negative = true,
+                .err => |resolution_error| inf.failure = resolution_error,
             }
             inf.ready.store(true, .release);
             if (self.cache.in_flight.fetchRemove(cache_key)) |kv| {
@@ -1198,14 +1195,20 @@ pub const DNSResolver = struct {
             self.cache.lock.unlock(common.threadIo());
 
             try context.check();
-            if (publish_error) |err| return err;
-            const inf_failed = inf.failed;
-            if (!inf_failed) {
+            if (self.cache.config.cache_enabled and !inf.negative and inf.failure == null) {
                 self.cache.cacheStore(cache_key, inf.addresses, self.cache.config.positive_ttl_ms);
             }
-
-            if (inf_failed) {
+            if (inf.negative) {
+                if (self.cache.config.cache_enabled) {
+                    self.cache.cacheNegative(cache_key);
+                } else {
+                    self.cache.recordFailure();
+                }
                 return error.DNSLookupFailed;
+            }
+            if (inf.failure) |failure| {
+                self.cache.recordFailure();
+                return failure;
             }
 
             const addrs = try self.filterAddresses(inf.addresses, family, order);
@@ -1235,13 +1238,17 @@ pub const DNSResolver = struct {
                     .allocator = self.allocator,
                 };
             },
+            .negative => {
+                if (self.cache.config.cache_enabled) self.cache.cacheNegative(cache_key);
+                return error.DNSLookupFailed;
+            },
             .err => |resolution_error| {
                 if (resolution_error == error.Cancelled or resolution_error == error.Timeout) {
                     return resolution_error;
                 }
-                self.cache.cacheNegative(cache_key);
+                self.cache.recordFailure();
                 try context.check();
-                return error.DNSLookupFailed;
+                return resolution_error;
             },
         }
     }
@@ -1279,6 +1286,7 @@ pub const DNSResolver = struct {
 
     const ResolveResult = union(enum) {
         ok: []net.Address,
+        negative,
         err: anyerror,
     };
 
@@ -1293,8 +1301,12 @@ pub const DNSResolver = struct {
 
         const should_query_v4 = family == .any or family == .ipv4_only;
         const should_query_v6 = family == .any or family == .ipv6_only;
+        var query_count: u8 = 0;
+        var authoritative_no_data: u8 = 0;
+        var first_error: ?anyerror = null;
 
         if (should_query_v4) {
+            query_count += 1;
             if (queryDns(
                 self.cache.config.dns_servers,
                 hostname,
@@ -1309,14 +1321,21 @@ pub const DNSResolver = struct {
                 defer m.deinit();
                 if (extractIpv4Addresses(&m, hostname, self.allocator)) |v4_addrs| {
                     defer self.allocator.free(v4_addrs);
-                    all_addrs.appendSlice(self.allocator, v4_addrs) catch {};
-                } else |_| {}
+                    if (v4_addrs.len == 0) {
+                        if (m.header.isAuthoritative()) authoritative_no_data += 1 else first_error = error.DNSNoData;
+                    } else {
+                        all_addrs.appendSlice(self.allocator, v4_addrs) catch |err| return .{ .err = err };
+                    }
+                } else |err| return .{ .err = err };
             } else |err| {
                 if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+                if (err == error.AuthoritativeNameError) return .negative;
+                if (first_error == null) first_error = err;
             }
         }
 
         if (should_query_v6) {
+            query_count += 1;
             if (queryDns(
                 self.cache.config.dns_servers,
                 hostname,
@@ -1331,15 +1350,24 @@ pub const DNSResolver = struct {
                 defer m.deinit();
                 if (extractIpv6Addresses(&m, hostname, self.allocator)) |v6_addrs| {
                     defer self.allocator.free(v6_addrs);
-                    all_addrs.appendSlice(self.allocator, v6_addrs) catch {};
-                } else |_| {}
+                    if (v6_addrs.len == 0) {
+                        if (m.header.isAuthoritative()) authoritative_no_data += 1 else if (first_error == null) {
+                            first_error = error.DNSNoData;
+                        }
+                    } else {
+                        all_addrs.appendSlice(self.allocator, v6_addrs) catch |err| return .{ .err = err };
+                    }
+                } else |err| return .{ .err = err };
             } else |err| {
                 if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+                if (err == error.AuthoritativeNameError) return .negative;
+                if (first_error == null) first_error = err;
             }
         }
 
         if (all_addrs.items.len == 0) {
-            return .{ .err = error.DNSResolutionFailed };
+            if (query_count > 0 and authoritative_no_data == query_count) return .negative;
+            return .{ .err = first_error orelse error.DNSResolutionFailed };
         }
 
         const addrs = self.allocator.dupe(net.Address, all_addrs.items) catch {
@@ -1948,6 +1976,17 @@ test "DNS response validation checks transaction question and compressed answer 
         validateDnsResponse(&message, 0x1234, "example.com", .A),
     );
     message.answers[0].name = original_owner;
+
+    message.header.flags = 0x8403;
+    try std.testing.expectError(
+        error.AuthoritativeNameError,
+        validateDnsResponse(&message, 0x1234, "example.com", .A),
+    );
+    message.header.flags = 0x8182;
+    try std.testing.expectError(
+        error.DnsResponseError,
+        validateDnsResponse(&message, 0x1234, "example.com", .A),
+    );
 }
 
 test "DNS parsing is allocation safe for partial arrays" {
@@ -2079,4 +2118,19 @@ test "DNS negative cache hits are distinct bounded and replacement-safe" {
 
     cache.cacheNegative("two\x00\x00");
     try std.testing.expectEqual(@as(u32, 1), cache.count());
+}
+
+test "DNS transport failures are preserved and never negative cached" {
+    var resolver = DNSResolver.init(std.testing.allocator, .{
+        .dns_servers = &.{},
+        .cache_enabled = true,
+        .dedup_enabled = false,
+    });
+    defer resolver.deinit();
+    try std.testing.expectError(
+        error.DnsAllServersFailed,
+        resolver.resolve("transport-failure.test", .{}),
+    );
+    try std.testing.expectEqual(@as(u32, 0), resolver.cache.count());
+    try std.testing.expectEqual(@as(u64, 0), resolver.getStats().negative_hits);
 }
