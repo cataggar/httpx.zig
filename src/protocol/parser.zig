@@ -301,25 +301,52 @@ pub const Parser = struct {
         const result = try self.nextLine(data);
         const line = result.line orelse return result.consumed;
 
-        var parts = mem.splitScalar(u8, line, ' ');
-
-        const method_str = parts.next() orelse {
+        const first_space = mem.indexOfScalar(u8, line, ' ') orelse {
             self.state = .err;
             return result.consumed;
         };
+        if (first_space == 0) {
+            self.state = .err;
+            return result.consumed;
+        }
+        const remainder = line[first_space + 1 ..];
+        const second_relative = mem.indexOfScalar(u8, remainder, ' ') orelse {
+            self.state = .err;
+            return result.consumed;
+        };
+        if (second_relative == 0 or mem.indexOfScalar(u8, remainder[second_relative + 1 ..], ' ') != null) {
+            self.state = .err;
+            return result.consumed;
+        }
+
+        const method_str = line[0..first_space];
+        if (!validHeaderName(method_str)) {
+            self.state = .err;
+            return result.consumed;
+        }
         self.method = types.Method.fromString(method_str) orelse .CUSTOM;
 
-        const path = parts.next() orelse {
+        const path = remainder[0..second_relative];
+        if (path.len == 0) {
             self.state = .err;
             return result.consumed;
-        };
+        }
+        for (path) |byte| {
+            if (byte <= 0x20 or byte == 0x7f) {
+                self.state = .err;
+                return result.consumed;
+            }
+        }
         self.path = try self.allocator.dupe(u8, path);
 
-        const version_str = parts.next() orelse {
+        const version_str = remainder[second_relative + 1 ..];
+        if (!mem.eql(u8, version_str, "HTTP/1.0") and
+            !mem.eql(u8, version_str, "HTTP/1.1"))
+        {
             self.state = .err;
             return result.consumed;
-        };
-        self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
+        }
+        self.version = types.Version.fromString(version_str).?;
 
         try self.bumpHeaderBytes(line.len);
 
@@ -332,22 +359,49 @@ pub const Parser = struct {
         const result = try self.nextLine(data);
         const line = result.line orelse return result.consumed;
 
-        var parts = mem.splitScalar(u8, line, ' ');
-
-        const version_str = parts.next() orelse {
+        const first_space = mem.indexOfScalar(u8, line, ' ') orelse {
             self.state = .err;
             return result.consumed;
         };
-        self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
-
-        const status_str = parts.next() orelse {
+        const second_relative = mem.indexOfScalar(u8, line[first_space + 1 ..], ' ') orelse {
             self.state = .err;
             return result.consumed;
         };
+        const second_space = first_space + 1 + second_relative;
+        const version_str = line[0..first_space];
+        if (!mem.eql(u8, version_str, "HTTP/1.0") and
+            !mem.eql(u8, version_str, "HTTP/1.1"))
+        {
+            self.state = .err;
+            return result.consumed;
+        }
+        self.version = types.Version.fromString(version_str).?;
+
+        const status_str = line[first_space + 1 .. second_space];
+        if (status_str.len != 3) {
+            self.state = .err;
+            return result.consumed;
+        }
+        for (status_str) |byte| {
+            if (byte < '0' or byte > '9') {
+                self.state = .err;
+                return result.consumed;
+            }
+        }
         self.status_code = std.fmt.parseInt(u16, status_str, 10) catch {
             self.state = .err;
             return result.consumed;
         };
+        if (self.status_code.? < 100) {
+            self.state = .err;
+            return result.consumed;
+        }
+        for (line[second_space + 1 ..]) |byte| {
+            if ((byte < 0x20 and byte != '\t') or byte == 0x7f) {
+                self.state = .err;
+                return result.consumed;
+            }
+        }
 
         try self.bumpHeaderBytes(line.len);
 
@@ -1163,4 +1217,33 @@ test "parser headers trailers and buffering clean up on every allocation failure
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "Parser rejects malformed HTTP1 start lines" {
+    const bad_requests = [_][]const u8{
+        " GET / HTTP/1.1\r\n\r\n",
+        "GET  / HTTP/1.1\r\n\r\n",
+        "GE(T / HTTP/1.1\r\n\r\n",
+        "GET / HTTP/2\r\n\r\n",
+        "GET / extra HTTP/1.1\r\n\r\n",
+    };
+    for (bad_requests) |wire| {
+        var parser = Parser.init(std.testing.allocator);
+        defer parser.deinit();
+        _ = parser.feed(wire) catch {};
+        try std.testing.expect(parser.state == .err);
+    }
+
+    const bad_responses = [_][]const u8{
+        "HTTP/1.1 20 OK\r\n\r\n",
+        "HTTP/1.1 200OK\r\n\r\n",
+        "HTTP/2 200 OK\r\n\r\n",
+        "HTTP/1.1 099 Nope\r\n\r\n",
+    };
+    for (bad_responses) |wire| {
+        var parser = Parser.initResponse(std.testing.allocator);
+        defer parser.deinit();
+        _ = parser.feed(wire) catch {};
+        try std.testing.expect(parser.state == .err);
+    }
 }

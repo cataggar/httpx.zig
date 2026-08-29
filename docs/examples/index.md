@@ -44,10 +44,10 @@ zig build run-all-http3_example -Dtarget=aarch64-macos
 - [HTTP/2 Client Runtime](/examples/http2-client-runtime): End-to-end high-level HTTP/2 client request against a local loopback server.
 - [HTTP/2 Server Runtime](/examples/http2-server-runtime): End-to-end high-level HTTP/2 server route consumed by a local HTTP/2 client.
 - [HTTP/3 Example](/examples/http3-example): HTTP/3, QPACK, and QUIC primitives.
-- [HTTP/3 Client Runtime](/examples/http3-client-runtime): End-to-end high-level HTTP/3 client request against a local UDP loopback server.
-- [HTTP/3 Server Runtime](/examples/http3-server-runtime): End-to-end high-level HTTP/3 server route consumed by a local HTTP/3 client over UDP.
+- [HTTP/3 Client Runtime](/examples/http3-client-runtime): Demonstrates explicit safe rejection by the public client.
+- [HTTP/3 Server Runtime](/examples/http3-server-runtime): Demonstrates explicit safe rejection by the public server.
 - [HTTP/2 Advanced](/examples/http2-advanced): HTTP/2 production features (SETTINGS enforcement, GOAWAY/RST_STREAM, HPACK security, trailers).
-- [HTTP/3 Advanced](/examples/http3-advanced): HTTP/3 production features (QPACK stream instructions, QUIC stream cancellation, transport parameters).
+- [HTTP/3 Advanced](/examples/http3-advanced): Experimental QPACK/QUIC codec features (stream instructions, cancellation frames, transport parameters).
 - [TCP Local](/examples/tcp-local): Local TCP listener/client round trip.
 - [UDP Local](/examples/udp-local): Local UDP transport demo.
 - [WebSocket Example](/examples/websocket-example): Read upgrade headers, handshake keys, and process frame inputs.
@@ -62,7 +62,7 @@ zig build run-all-http3_example -Dtarget=aarch64-macos
 - [Cloud HTTPS Server](/examples/cloud-https-server): Production cloud deployment with TLS, middleware, and health checks.
 - [TLS Server](/examples/tls-server): Custom TLS server with ALPN negotiation.
 - [HTTPS Client](/examples/https-client): HTTPS client with custom TLS configuration.
-- [TLS HTTPS GET](/examples/tls-https-get): Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3).
+- [TLS HTTPS GET](/examples/tls-https-get): Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2).
 - [TLS Configuration Options](/examples/tls-config-options): TLS configuration constructors and ALPN negotiation.
 - [TLS Handshake Details](/examples/tls-handshake-details): TLS handshake info and cipher suites.
 - [TLS Custom CA](/examples/tls-custom-ca): Custom CA certificate verification with self-signed certs.

@@ -607,12 +607,15 @@ fn queryDns(
     tcp_timeout_ms: u64,
     allocator: Allocator,
     context: ?*const IoContext,
+    stats_cache: ?*DNSCache,
 ) !DnsMessage {
     for (servers) |server| {
+        if (stats_cache) |cache| cache.recordUdpQuery();
         if (queryViaUdp(server, name, qtype, udp_timeout_ms, allocator, context)) |msg| {
             return msg;
         } else |udp_error| {
             if (udp_error == error.Cancelled or udp_error == error.Timeout) return udp_error;
+            if (stats_cache) |cache| cache.recordTcpQuery();
             if (queryViaTcp(server, name, qtype, tcp_timeout_ms, allocator, context)) |msg| {
                 return msg;
             } else |tcp_error| {
@@ -662,6 +665,12 @@ const CacheEntry = struct {
 const NegativeEntry = struct {
     created_at_ms: i64,
     ttl_ms: i64,
+};
+
+const CacheLookupResult = union(enum) {
+    miss,
+    negative,
+    positive: []net.Address,
 };
 
 const InFlight = struct {
@@ -735,43 +744,43 @@ pub const DNSCache = struct {
         }
     }
 
-    /// Must be called with `lock` held. Returns a caller-owned address copy.
-    fn cacheLookupOwned(self: *Self, hostname: []const u8) !?[]net.Address {
+    /// Must be called with `lock` held. Positive results are caller-owned.
+    fn cacheLookupOwned(self: *Self, key: []const u8) !CacheLookupResult {
         const now_ms = common.nowMillis();
 
-        if (self.entries.getPtr(hostname)) |entry| {
+        if (self.entries.getPtr(key)) |entry| {
             if (now_ms < entry.created_at_ms + entry.ttl_ms) {
-                self.touchLRU(hostname);
-                return try self.allocator.dupe(net.Address, entry.addresses);
+                self.touchLRU(key);
+                return .{ .positive = try self.allocator.dupe(net.Address, entry.addresses) };
             }
-            self.removeEntry(hostname);
-            return null;
+            self.removeEntry(key);
+            return .miss;
         }
 
-        if (self.negative.getPtr(hostname)) |neg| {
+        if (self.negative.getPtr(key)) |neg| {
             if (now_ms < neg.created_at_ms + neg.ttl_ms) {
                 self.stats.negative_hits += 1;
-                return null;
+                return .negative;
             }
-            self.removeNegative(hostname);
+            self.removeNegative(key);
         }
 
-        return null;
+        return .miss;
     }
 
-    fn cacheStore(self: *Self, hostname: []const u8, addresses: []const net.Address, ttl_ms: i64) void {
+    fn cacheStore(self: *Self, key_value: []const u8, addresses: []const net.Address, ttl_ms: i64) void {
         self.lock.lock(common.threadIo()) catch {};
         defer self.lock.unlock(common.threadIo());
 
         self.evictIfNeeded();
 
-        if (self.entries.fetchRemove(hostname)) |kv| {
+        if (self.entries.fetchRemove(key_value)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.addresses);
         }
-        self.removeNegative(hostname);
+        self.removeNegative(key_value);
 
-        const key = self.allocator.dupe(u8, hostname) catch return;
+        const key = self.allocator.dupe(u8, key_value) catch return;
         const addrs = self.allocator.dupe(net.Address, addresses) catch {
             self.allocator.free(key);
             return;
@@ -787,25 +796,26 @@ pub const DNSCache = struct {
             return;
         };
 
-        const lru_key = self.allocator.dupe(u8, hostname) catch return;
+        const lru_key = self.allocator.dupe(u8, key_value) catch return;
         self.lru_order.append(self.allocator, lru_key) catch {
             self.allocator.free(lru_key);
         };
     }
 
-    fn cacheNegative(self: *Self, hostname: []const u8) void {
+    fn cacheNegative(self: *Self, key_value: []const u8) void {
         self.lock.lock(common.threadIo()) catch {};
         defer self.lock.unlock(common.threadIo());
 
         self.evictIfNeeded();
         self.stats.failures += 1;
 
-        if (self.entries.fetchRemove(hostname)) |kv| {
+        if (self.entries.fetchRemove(key_value)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.addresses);
         }
+        self.removeNegative(key_value);
 
-        const key = self.allocator.dupe(u8, hostname) catch return;
+        const key = self.allocator.dupe(u8, key_value) catch return;
         self.negative.put(self.allocator, key, .{
             .created_at_ms = common.nowMillis(),
             .ttl_ms = self.config.negative_ttl_ms,
@@ -816,14 +826,22 @@ pub const DNSCache = struct {
 
     fn evictIfNeeded(self: *Self) void {
         if (self.config.max_cache_entries == 0) return;
-        while (self.entries.count() >= self.config.max_cache_entries) {
-            if (self.lru_order.items.len == 0) break;
-            const oldest = self.lru_order.orderedRemove(0);
-            if (self.entries.fetchRemove(oldest)) |kv| {
-                self.allocator.free(kv.key);
-                self.allocator.free(kv.value.addresses);
+        while (self.entries.count() + self.negative.count() >= self.config.max_cache_entries) {
+            if (self.lru_order.items.len > 0) {
+                const oldest = self.lru_order.orderedRemove(0);
+                if (self.entries.fetchRemove(oldest)) |kv| {
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value.addresses);
+                }
+                self.allocator.free(oldest);
+            } else {
+                var negative_it = self.negative.iterator();
+                const entry = negative_it.next() orelse break;
+                const negative_key = entry.key_ptr.*;
+                if (self.negative.fetchRemove(negative_key)) |kv| {
+                    self.allocator.free(kv.key);
+                }
             }
-            self.allocator.free(oldest);
             self.stats.evictions += 1;
         }
     }
@@ -932,6 +950,16 @@ pub const DNSCache = struct {
         defer self.lock.unlock(common.threadIo());
         self.removeEntry(hostname);
         self.removeNegative(hostname);
+        var family_value: u8 = 0;
+        while (family_value <= @intFromEnum(AddressFamily.ipv6_only)) : (family_value += 1) {
+            var key_buf = std.ArrayList(u8).empty;
+            defer key_buf.deinit(self.allocator);
+            key_buf.appendSlice(self.allocator, hostname) catch continue;
+            key_buf.append(self.allocator, 0) catch continue;
+            key_buf.append(self.allocator, family_value) catch continue;
+            self.removeEntry(key_buf.items);
+            self.removeNegative(key_buf.items);
+        }
     }
 
     pub fn getStats(self: *Self) DNSStats {
@@ -981,6 +1009,14 @@ pub const DNSResolver = struct {
         address_family: ?AddressFamily = null,
         address_order: ?AddressOrder = null,
     };
+
+    fn makeCacheKey(self: *Self, hostname: []const u8, family: AddressFamily) ![]u8 {
+        const key = try self.allocator.alloc(u8, hostname.len + 2);
+        @memcpy(key[0..hostname.len], hostname);
+        key[hostname.len] = 0;
+        key[hostname.len + 1] = @intFromEnum(family);
+        return key;
+    }
 
     pub fn resolve(self: *Self, hostname: []const u8, options: ResolveOptions) !DNSResolution {
         const context = IoContext.init(.{});
@@ -1037,35 +1073,42 @@ pub const DNSResolver = struct {
             };
         }
 
+        const cache_key = try self.makeCacheKey(hostname, family);
+        defer self.allocator.free(cache_key);
+
         if (self.cache.config.cache_enabled) {
             self.cache.lock.lock(common.threadIo()) catch {};
-            const cached = self.cache.cacheLookupOwned(hostname) catch |err| {
+            const cached = self.cache.cacheLookupOwned(cache_key) catch |err| {
                 self.cache.lock.unlock(common.threadIo());
                 return err;
             };
-            if (cached != null) {
-                self.cache.stats.hits += 1;
-            } else {
-                self.cache.stats.misses += 1;
+            switch (cached) {
+                .positive => self.cache.stats.hits += 1,
+                .negative => {},
+                .miss => self.cache.stats.misses += 1,
             }
             self.cache.lock.unlock(common.threadIo());
 
-            defer if (cached) |cached_addresses| self.allocator.free(cached_addresses);
             try context.check();
-            if (cached) |cached_addresses| {
-                const addrs = try self.filterAddresses(cached_addresses, family, order);
-                for (addrs) |*a| a.setPort(options.port);
-                return .{
-                    .hostname = hostname,
-                    .addresses = addrs,
-                    .allocator = self.allocator,
-                };
+            switch (cached) {
+                .positive => |cached_addresses| {
+                    defer self.allocator.free(cached_addresses);
+                    const addrs = try self.filterAddresses(cached_addresses, family, order);
+                    for (addrs) |*a| a.setPort(options.port);
+                    return .{
+                        .hostname = hostname,
+                        .addresses = addrs,
+                        .allocator = self.allocator,
+                    };
+                },
+                .negative => return error.DNSLookupFailed,
+                .miss => {},
             }
         }
 
         if (allow_dedup and self.cache.config.dedup_enabled) {
             self.cache.lock.lock(common.threadIo()) catch {};
-            if (self.cache.in_flight.getPtr(hostname)) |inf| {
+            if (self.cache.in_flight.getPtr(cache_key)) |inf| {
                 inf.*.incRef();
                 self.cache.stats.dedup_hits += 1;
                 self.cache.lock.unlock(common.threadIo());
@@ -1098,7 +1141,7 @@ pub const DNSResolver = struct {
             inf.* = .{ .allocator = self.cache.allocator };
             inf.incRef(); // Resolver owner.
             inf.incRef(); // In-flight map.
-            const in_flight_key = self.cache.allocator.dupe(u8, hostname) catch {
+            const in_flight_key = self.cache.allocator.dupe(u8, cache_key) catch {
                 inf.decRef();
                 inf.decRef();
                 self.cache.lock.unlock(common.threadIo());
@@ -1128,11 +1171,12 @@ pub const DNSResolver = struct {
                     if (resolution_error != error.Cancelled and resolution_error != error.Timeout) {
                         self.cache.evictIfNeeded();
                         self.cache.stats.failures += 1;
-                        if (self.cache.entries.fetchRemove(hostname)) |kv| {
+                        if (self.cache.entries.fetchRemove(cache_key)) |kv| {
                             self.cache.allocator.free(kv.key);
                             self.cache.allocator.free(kv.value.addresses);
                         }
-                        if (self.cache.allocator.dupe(u8, hostname)) |neg_key| {
+                        self.cache.removeNegative(cache_key);
+                        if (self.cache.allocator.dupe(u8, cache_key)) |neg_key| {
                             self.cache.negative.put(self.cache.allocator, neg_key, .{
                                 .created_at_ms = common.nowMillis(),
                                 .ttl_ms = self.cache.config.negative_ttl_ms,
@@ -1147,7 +1191,7 @@ pub const DNSResolver = struct {
                 },
             }
             inf.ready.store(true, .release);
-            if (self.cache.in_flight.fetchRemove(hostname)) |kv| {
+            if (self.cache.in_flight.fetchRemove(cache_key)) |kv| {
                 self.cache.allocator.free(kv.key);
                 kv.value.decRef();
             }
@@ -1157,7 +1201,7 @@ pub const DNSResolver = struct {
             if (publish_error) |err| return err;
             const inf_failed = inf.failed;
             if (!inf_failed) {
-                self.cache.cacheStore(hostname, inf.addresses, self.cache.config.positive_ttl_ms);
+                self.cache.cacheStore(cache_key, inf.addresses, self.cache.config.positive_ttl_ms);
             }
 
             if (inf_failed) {
@@ -1181,7 +1225,7 @@ pub const DNSResolver = struct {
                 defer self.allocator.free(addrs);
                 try context.check();
                 if (self.cache.config.cache_enabled) {
-                    self.cache.cacheStore(hostname, addrs, self.cache.config.positive_ttl_ms);
+                    self.cache.cacheStore(cache_key, addrs, self.cache.config.positive_ttl_ms);
                 }
                 const out = try self.filterAddresses(addrs, family, order);
                 for (out) |*a| a.setPort(options.port);
@@ -1195,7 +1239,7 @@ pub const DNSResolver = struct {
                 if (resolution_error == error.Cancelled or resolution_error == error.Timeout) {
                     return resolution_error;
                 }
-                self.cache.cacheNegative(hostname);
+                self.cache.cacheNegative(cache_key);
                 try context.check();
                 return error.DNSLookupFailed;
             },
@@ -1214,88 +1258,7 @@ pub const DNSResolver = struct {
         options: ResolveOptions,
         context: *const IoContext,
     ) !DNSResolution {
-        try context.check();
-        const family = options.address_family orelse self.cache.config.address_family;
-        const order = options.address_order orelse self.cache.config.address_order;
-
-        if (address_mod.isIp4Address(hostname)) {
-            try context.check();
-            self.cache.recordLiteralHit();
-            const parsed = try net.Address.parseIp(hostname, options.port);
-            const addrs = try self.allocator.alloc(net.Address, 1);
-            addrs[0] = parsed;
-            return .{
-                .hostname = hostname,
-                .addresses = addrs,
-                .allocator = self.allocator,
-            };
-        }
-        if (address_mod.isIp6Address(hostname)) {
-            try context.check();
-            self.cache.recordLiteralHit();
-            const parsed = try net.Address.parseIp(hostname, options.port);
-            const addrs = try self.allocator.alloc(net.Address, 1);
-            addrs[0] = parsed;
-            return .{
-                .hostname = hostname,
-                .addresses = addrs,
-                .allocator = self.allocator,
-            };
-        }
-
-        if (self.cache.config.cache_enabled) {
-            self.cache.lock.lock(common.threadIo()) catch {};
-            const cached = self.cache.cacheLookupOwned(hostname) catch |err| {
-                self.cache.lock.unlock(common.threadIo());
-                return err;
-            };
-            if (cached != null) {
-                self.cache.stats.hits += 1;
-            } else {
-                self.cache.stats.misses += 1;
-            }
-            self.cache.lock.unlock(common.threadIo());
-
-            defer if (cached) |cached_addresses| self.allocator.free(cached_addresses);
-            try context.check();
-            if (cached) |cached_addresses| {
-                const addrs = try self.filterAddresses(cached_addresses, family, order);
-                for (addrs) |*a| a.setPort(options.port);
-                return .{
-                    .hostname = hostname,
-                    .addresses = addrs,
-                    .allocator = self.allocator,
-                };
-            }
-        }
-
-        try context.check();
-        const result = self.performResolution(hostname, family, context);
-
-        switch (result) {
-            .ok => |addrs| {
-                defer self.allocator.free(addrs);
-                try context.check();
-                if (self.cache.config.cache_enabled) {
-                    self.cache.cacheStore(hostname, addrs, self.cache.config.positive_ttl_ms);
-                }
-                const out = try self.filterAddresses(addrs, family, order);
-                for (out) |*a| a.setPort(options.port);
-                return .{
-                    .hostname = hostname,
-                    .addresses = out,
-                    .allocator = self.allocator,
-                };
-            },
-            .err => |resolution_error| {
-                if (resolution_error == error.Cancelled or resolution_error == error.Timeout) {
-                    return resolution_error;
-                }
-                self.cache.cacheNegative(hostname);
-                try context.check();
-                return error.DNSLookupFailed;
-            },
-        }
+        return self.resolveInternal(hostname, options, context, false);
     }
 
     pub fn invalidate(self: *Self, hostname: []const u8) void {
@@ -1340,10 +1303,10 @@ pub const DNSResolver = struct {
                 self.cache.config.tcp_timeout_ms,
                 self.allocator,
                 context,
+                &self.cache,
             )) |msg| {
                 var m = msg;
                 defer m.deinit();
-                self.cache.recordUdpQuery();
                 if (extractIpv4Addresses(&m, hostname, self.allocator)) |v4_addrs| {
                     defer self.allocator.free(v4_addrs);
                     all_addrs.appendSlice(self.allocator, v4_addrs) catch {};
@@ -1362,10 +1325,10 @@ pub const DNSResolver = struct {
                 self.cache.config.tcp_timeout_ms,
                 self.allocator,
                 context,
+                &self.cache,
             )) |msg| {
                 var m = msg;
                 defer m.deinit();
-                self.cache.recordTcpQuery();
                 if (extractIpv6Addresses(&m, hostname, self.allocator)) |v6_addrs| {
                     defer self.allocator.free(v6_addrs);
                     all_addrs.appendSlice(self.allocator, v6_addrs) catch {};
@@ -2043,9 +2006,12 @@ test "DNS cache lookup clones addresses before concurrent invalidation" {
                     return;
                 };
                 self.cache.lock.unlock(common.threadIo());
-                if (copy) |owned| {
-                    if (owned.len != 1) self.failure = error.TestUnexpectedResult;
-                    self.cache.allocator.free(owned);
+                switch (copy) {
+                    .positive => |owned| {
+                        if (owned.len != 1) self.failure = error.TestUnexpectedResult;
+                        self.cache.allocator.free(owned);
+                    },
+                    .miss, .negative => {},
                 }
             }
         }
@@ -2066,4 +2032,51 @@ test "DNS cache lookup clones addresses before concurrent invalidation" {
     reader.join();
     writer.join();
     try std.testing.expect(shared.failure == null);
+}
+
+test "DNS cache and dedup keys include address family" {
+    var resolver = DNSResolver.init(std.testing.allocator, .{});
+    defer resolver.deinit();
+    const any_key = try resolver.makeCacheKey("family.test", .any);
+    defer std.testing.allocator.free(any_key);
+    const v4_key = try resolver.makeCacheKey("family.test", .ipv4_only);
+    defer std.testing.allocator.free(v4_key);
+    const v6_key = try resolver.makeCacheKey("family.test", .ipv6_only);
+    defer std.testing.allocator.free(v6_key);
+    try std.testing.expect(!std.mem.eql(u8, any_key, v4_key));
+    try std.testing.expect(!std.mem.eql(u8, v4_key, v6_key));
+
+    const addresses = [_]net.Address{net.Address.initIp4(.{ 127, 0, 0, 1 }, 0)};
+    resolver.cache.cacheStore(v4_key, &addresses, 60_000);
+    resolver.cache.lock.lock(common.threadIo()) catch unreachable;
+    const v4_lookup = try resolver.cache.cacheLookupOwned(v4_key);
+    const v6_lookup = try resolver.cache.cacheLookupOwned(v6_key);
+    resolver.cache.lock.unlock(common.threadIo());
+    defer switch (v4_lookup) {
+        .positive => |owned| std.testing.allocator.free(owned),
+        else => {},
+    };
+    try std.testing.expect(v4_lookup == .positive);
+    try std.testing.expect(v6_lookup == .miss);
+}
+
+test "DNS negative cache hits are distinct bounded and replacement-safe" {
+    var cache = DNSCache.init(std.testing.allocator, .{
+        .max_cache_entries = 1,
+        .negative_ttl_ms = 60_000,
+    });
+    defer cache.deinit();
+
+    cache.cacheNegative("one\x00\x00");
+    cache.cacheNegative("one\x00\x00");
+    try std.testing.expectEqual(@as(u32, 1), cache.count());
+
+    cache.lock.lock(common.threadIo()) catch unreachable;
+    const lookup = try cache.cacheLookupOwned("one\x00\x00");
+    cache.lock.unlock(common.threadIo());
+    try std.testing.expect(lookup == .negative);
+    try std.testing.expectEqual(@as(u64, 1), cache.getStats().negative_hits);
+
+    cache.cacheNegative("two\x00\x00");
+    try std.testing.expectEqual(@as(u32, 1), cache.count());
 }

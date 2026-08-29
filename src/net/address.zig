@@ -67,15 +67,16 @@ const ResolveJob = struct {
         self.result = self.adapter.resolveFn(self.adapter.context, self.hostname, self.port) catch |err| {
             self.failure = err;
             self.done.store(true, .release);
+            self.finishWorker();
             return;
         };
         self.done.store(true, .release);
+        self.finishWorker();
     }
 
-    fn reap(worker: std.Thread, self: *@This()) void {
-        worker.join();
-        if (self.adapter.cleanupFn) |cleanup| cleanup(self.adapter.context);
+    fn finishWorker(self: *@This()) void {
         while (!self.waiter_done.load(.acquire)) std.Thread.yield() catch {};
+        if (self.adapter.cleanupFn) |cleanup| cleanup(self.adapter.context);
         self.destroy();
     }
 };
@@ -108,6 +109,7 @@ pub fn resolveWithAdapter(
     };
     var transferred = false;
     errdefer if (!transferred) {
+        if (adapter.cleanupFn) |cleanup| cleanup(adapter.context);
         std.heap.page_allocator.free(owned_hostname);
         std.heap.page_allocator.destroy(job);
     };
@@ -118,14 +120,8 @@ pub fn resolveWithAdapter(
     };
 
     const worker = try std.Thread.spawn(.{}, ResolveJob.run, .{job});
-    const reaper = std.Thread.spawn(.{}, ResolveJob.reap, .{ worker, job }) catch |err| {
-        job.waiter_done.store(true, .release);
-        worker.join();
-        if (job.adapter.cleanupFn) |cleanup| cleanup(job.adapter.context);
-        return err;
-    };
     transferred = true;
-    reaper.detach();
+    worker.detach();
     defer job.waiter_done.store(true, .release);
 
     while (!job.done.load(.acquire)) {

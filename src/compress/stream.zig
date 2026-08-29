@@ -141,6 +141,28 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
                 reader.end = buffered.len;
             }
 
+            fn hasMoreInput(self: *@This()) !bool {
+                if (self.reader.seek < self.reader.end) return true;
+                const n = self.source.readSliceShort(&self.reader_buffer) catch |err| {
+                    self.source_error = err;
+                    return error.IoFailed;
+                };
+                if (n == 0) {
+                    self.source_eof = true;
+                    return false;
+                }
+                self.compressed_bytes = std.math.add(u64, self.compressed_bytes, n) catch
+                    return error.DecompressionBombDetected;
+                if (self.max_compressed_input > 0 and
+                    self.compressed_bytes > self.max_compressed_input)
+                {
+                    return error.DecompressionBombDetected;
+                }
+                self.reader.seek = 0;
+                self.reader.end = n;
+                return true;
+            }
+
             const reader_vtable: std.Io.Reader.VTable = .{
                 .stream = stream,
                 .discard = discard,
@@ -164,6 +186,8 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         zstd_output_len: usize = 0,
         brotli_finalized: bool = false,
         zstd_finalized: bool = false,
+        flate_finished: bool = false,
+        flate_members_completed: u64 = 0,
         total_decompressed: u64 = 0,
         total_compressed: u64 = 0,
         limits: StreamingLimits,
@@ -228,14 +252,35 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         fn readFlateChunk(self: *Self) !?[]const u8 {
             try self.ensureFlateInit();
             const pipeline = self.flate_state.?;
-            const n = pipeline.decompressor.reader.readSliceShort(&self.output_buf) catch {
-                if (pipeline.source_error) |err| return err;
-                return if (pipeline.source_eof) error.TruncatedStream else error.DecompressionFailed;
-            };
-            self.total_compressed = pipeline.compressed_bytes;
-            if (n == 0) return null;
-            try self.recordOutput(n);
-            return self.output_buf[0..n];
+            if (self.flate_finished) return null;
+            while (true) {
+                const n = pipeline.decompressor.reader.readSliceShort(&self.output_buf) catch {
+                    if (pipeline.source_error) |err| return err;
+                    return if (pipeline.source_eof and self.flate_members_completed == 0)
+                        error.TruncatedStream
+                    else
+                        error.DecompressionFailed;
+                };
+                self.total_compressed = pipeline.compressed_bytes;
+                if (n > 0) {
+                    try self.recordOutput(n);
+                    return self.output_buf[0..n];
+                }
+
+                self.flate_members_completed += 1;
+                const has_more = try pipeline.hasMoreInput();
+                self.total_compressed = pipeline.compressed_bytes;
+                if (!has_more) {
+                    self.flate_finished = true;
+                    return null;
+                }
+                if (self.encoding == .deflate) return error.TrailingData;
+                pipeline.decompressor = std.compress.flate.Decompress.init(
+                    &pipeline.reader,
+                    .gzip,
+                    &pipeline.window_buffer,
+                );
+            }
         }
 
         fn refillDecoderInput(self: *Self) !bool {
@@ -249,7 +294,9 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
             const amount = self.reader.readSliceShort(output) catch return error.IoFailed;
             if (amount == 0) return 0;
             self.total_compressed +|= amount;
-            if (self.total_compressed > self.limits.max_compressed_input) {
+            if (self.limits.max_compressed_input > 0 and
+                self.total_compressed > self.limits.max_compressed_input)
+            {
                 return error.DecompressionBombDetected;
             }
             return amount;
@@ -550,6 +597,46 @@ test "streaming decompressor gzip round trip" {
     }
 
     try testing.expectEqualStrings(sample, result.items);
+}
+
+test "streaming flate accepts concatenated gzip and rejects zlib trailing data" {
+    const allocator = std.testing.allocator;
+    const first = try compression.compress(allocator, .gzip, "first");
+    defer allocator.free(first);
+    const second = try compression.compress(allocator, .gzip, "second");
+    defer allocator.free(second);
+    const concatenated = try std.mem.concat(allocator, u8, &.{ first, second });
+    defer allocator.free(concatenated);
+
+    var gzip = StreamingDecompressor(std.Io.Reader).init(
+        allocator,
+        .gzip,
+        .fixed(concatenated),
+    );
+    defer gzip.deinit();
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    while (try gzip.readChunk()) |chunk| try output.appendSlice(allocator, chunk);
+    try std.testing.expectEqualStrings("firstsecond", output.items);
+
+    const zlib = try compression.compress(allocator, .deflate, "payload");
+    defer allocator.free(zlib);
+    const with_trailing = try std.mem.concat(allocator, u8, &.{ zlib, "garbage" });
+    defer allocator.free(with_trailing);
+    var deflate = StreamingDecompressor(std.Io.Reader).init(
+        allocator,
+        .deflate,
+        .fixed(with_trailing),
+    );
+    defer deflate.deinit();
+    while (true) {
+        if (deflate.readChunk()) |chunk| {
+            if (chunk == null) return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.TrailingData, err);
+            break;
+        }
+    }
 }
 
 test "streaming flate decoder preserves incremental state and propagates failures" {

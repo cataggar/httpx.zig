@@ -165,7 +165,7 @@ The root module re-exports core types and convenience helpers so most apps can i
 
 - HTTP/1.0 and HTTP/1.1 are production runtime paths in the high-level client/server API.
 - HTTP/2 has high-level client and server runtime paths plus full protocol primitives (HPACK/framing/streams).
-- HTTP/3 has high-level client and server runtime paths over UDP/QUIC stream framing, plus full protocol primitives (QPACK/HTTP3/QUIC framing).
+- HTTP/3 exposes experimental QPACK/HTTP3/QUIC codec primitives only; public client and server runtimes reject it.
 - Cross-platform validation is maintained for Linux/Windows (x86, x86_64, aarch64) and macOS (x86_64, aarch64) build matrices.
 
 ## Customization and Callbacks

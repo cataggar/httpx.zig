@@ -135,6 +135,7 @@ pub const EntryState = enum {
 pub const H2SessionState = struct {
     stream_manager: h2stream.StreamManager,
     initialized: bool = false,
+    received_initial_settings: bool = false,
     peer_max_frame_size: u32 = 16_384,
     draining: bool = false,
     poisoned: bool = false,
@@ -482,8 +483,7 @@ pub const ConnectionPool = struct {
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
-        const timeout = if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms;
-        try socket.connectWithContext(addr, timeout, context);
+        try socket.connectWithContext(addr, connect_timeout_ms, context);
         try socket.setNoDelay(true);
 
         if (key.proxy) |proxy| {

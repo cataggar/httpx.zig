@@ -7,7 +7,7 @@ Zig's standard library does not provide TLS/ALPN support. **httpx.zig implements
 - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446)
 - **Key exchange:** X25519 (TLS 1.2/1.3)
 - **AEAD cipher suites:** ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM
-- **ALPN negotiation** (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback
+- **ALPN negotiation** (RFC 7301) for automatic HTTP/2 selection with HTTP/1.1 fallback
 - **Handshake message encryption** (TLS 1.3)
 - **X.509 certificate parsing and verification** (client-side)
 - **Custom record-layer encryption/decryption**
@@ -151,8 +151,8 @@ pub const TlsConfig = struct {
 | `insecure(allocator)` | Skip server verification |
 | `withH2(allocator)` | Advertise h2 + http/1.1 ALPN |
 | `insecureWithH2(allocator)` | Insecure + h2 ALPN |
-| `withH3(allocator)` | Advertise h3 + h2 + http/1.1 ALPN |
-| `insecureWithH3(allocator)` | Insecure + h3 ALPN |
+| `withH3(allocator)` | Low-level experimental h3 ALPN configuration; no public QUIC runtime |
+| `insecureWithH3(allocator)` | Low-level experimental h3 ALPN configuration without verification |
 
 ## ServerTlsConfig
 
@@ -188,17 +188,17 @@ var server = httpx.Server.initWithConfig(allocator, .{
     .tls_enabled = true,
     .tls_cert_path = "examples/certs/server_ec.crt",
     .tls_key_path = "examples/certs/server_ec.key",
-    .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
+    .tls_alpn_protocols = &.{ "h2", "http/1.1" },
     .http2_enabled = true,
-    .http3_enabled = true,
+    .http3_enabled = false,
 });
 ```
 
 ::: tip ALPN Default
-The default `tls_alpn_protocols` is `&.{ "h3", "h2", "http/1.1" }`, so clients can negotiate HTTP/3, HTTP/2, or HTTP/1.1 automatically.
+The default `tls_alpn_protocols` is `&.{ "h2", "http/1.1" }`.
 :::
 
-The server automatically loads the certificate chain and private key on the first TLS connection. ALPN negotiation selects between HTTP/1.1, HTTP/2, and HTTP/3 based on the client's offer.
+The server automatically loads the certificate chain and private key on the first TLS connection. ALPN negotiation selects HTTP/1.1 or HTTP/2.
 
 ALPN uses the RFC 7301 network format: ClientHello carries a u16-length
 `ProtocolNameList`; TLS 1.2 returns the selected one-element list in

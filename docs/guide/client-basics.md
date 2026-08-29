@@ -41,7 +41,7 @@ defer api.deinit();
 ## Protocol Selection
 
 - Set `.http2_enabled = true` to use the high-level HTTP/2 request path.
-- Set `.http3_enabled = true` to use the high-level HTTP/3 request path over UDP + QUIC/HTTP3/QPACK primitives.
+- `.http3_enabled = true` is rejected with `error.UnsupportedHttpVersion`; HTTP/3 modules are unauthenticated codec primitives only.
 
 ## Making Requests
 

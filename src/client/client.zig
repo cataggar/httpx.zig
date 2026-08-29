@@ -110,6 +110,8 @@ pub const ClientConfig = struct {
     verify_ssl: bool = true,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
+    /// Deprecated and ignored. Server push is not implemented and
+    /// PUSH_PROMISE is rejected to preserve HPACK synchronization.
     allow_push: bool = false,
     http2_settings: types.HTTP2Settings = .{},
     http3_settings: types.HTTP3Settings = .{},
@@ -242,6 +244,7 @@ pub const ClientConfig = struct {
     /// dispatcher can decode promised-stream header blocks in wire order.
     pub fn withAllowPush(self: ClientConfig, allow_push: bool) ClientConfig {
         var out = self;
+        // Retained for source compatibility. Runtime push remains disabled.
         out.allow_push = allow_push;
         return out;
     }
@@ -785,6 +788,46 @@ pub const Client = struct {
         }
     }
 
+    fn isCredentialHeader(name: []const u8, api_key_header: ?[]const u8) bool {
+        if (std.ascii.eqlIgnoreCase(name, HeaderName.AUTHORIZATION) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.PROXY_AUTHORIZATION) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.COOKIE))
+        {
+            return true;
+        }
+        return if (api_key_header) |api_name|
+            std.ascii.eqlIgnoreCase(name, api_name)
+        else
+            false;
+    }
+
+    fn isEntityHeader(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_TYPE) or
+            std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING) or
+            std.ascii.eqlIgnoreCase(name, "Content-Encoding") or
+            std.ascii.eqlIgnoreCase(name, HeaderName.EXPECT) or
+            std.ascii.eqlIgnoreCase(name, "Trailer");
+    }
+
+    fn applyConfiguredHeadersFiltered(
+        req: *Request,
+        configured: []const [2][]const u8,
+        strip_credentials: bool,
+        strip_entity_headers: bool,
+        api_key_header: ?[]const u8,
+    ) !void {
+        for (configured) |header| {
+            if (strip_credentials and isCredentialHeader(header[0], api_key_header)) continue;
+            if (strip_entity_headers and isEntityHeader(header[0])) continue;
+            if (isRequestSingletonHeader(header[0])) {
+                try req.headers.set(header[0], header[1]);
+            } else {
+                try req.headers.append(header[0], header[1]);
+            }
+        }
+    }
+
     fn validateRequestHeaders(req: *const Request) !void {
         try validateRequestLine(req);
         var host_count: usize = 0;
@@ -1079,7 +1122,7 @@ pub const Client = struct {
             .external_cancel = reqOpts.cancel_token,
             .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
         });
-        return self.requestWithPolicy(method, url, reqOpts, &effective_policy, &context, logical_request_id, 0);
+        return self.requestWithPolicy(method, url, reqOpts, &effective_policy, &context, logical_request_id, 0, false, false);
     }
 
     fn requestWithPolicy(
@@ -1091,6 +1134,8 @@ pub const Client = struct {
         context: *const IoContext,
         logical_request_id: u64,
         depth: u32,
+        strip_credentials: bool,
+        strip_entity_headers: bool,
     ) !Response {
         try checkRequestContext(context);
 
@@ -1108,11 +1153,23 @@ pub const Client = struct {
         }
 
         if (self.shared.config.default_headers) |hdrs| {
-            try applyConfiguredHeaders(&req, hdrs);
+            try applyConfiguredHeadersFiltered(
+                &req,
+                hdrs,
+                strip_credentials,
+                strip_entity_headers,
+                reqOpts.api_key_header,
+            );
         }
 
         if (reqOpts.headers) |hdrs| {
-            try applyConfiguredHeaders(&req, hdrs);
+            try applyConfiguredHeadersFiltered(
+                &req,
+                hdrs,
+                strip_credentials,
+                strip_entity_headers,
+                reqOpts.api_key_header,
+            );
         }
 
         if (effective_policy.user_agent == .enabled and
@@ -1222,7 +1279,7 @@ pub const Client = struct {
             try req.setBearerAuth(token);
         }
 
-        if (effective_policy.cookies.sends()) {
+        if (effective_policy.cookies.sends() and !strip_credentials) {
             try self.attachCookies(&req);
         }
 
@@ -1252,6 +1309,10 @@ pub const Client = struct {
 
             const next_url = try self.resolveRedirectUrl(req.uri, location);
             defer self.allocator.free(next_url);
+            const next_uri = try Uri.parse(next_url);
+            try next_uri.validateHttpScheme();
+            const cross_origin = !isSameOrigin(req.uri, next_uri);
+            if (cross_origin and !redirect_policy.allow_cross_origin) return response;
 
             const attempt_context = AttemptContext{
                 .logical_request_id = logical_request_id,
@@ -1270,25 +1331,37 @@ pub const Client = struct {
 
             const next_method = redirect_policy.getRedirectMethod(response.status.code, req.method);
 
-            // Security: strip credentials on cross-origin redirects (RFC 6454).
             var next_opts = reqOpts;
             var safe_headers = std.ArrayList([2][]const u8).empty;
-            if (!isSameOrigin(req.uri.host orelse "", next_url)) {
-                // Strip Authorization header to prevent credential leakage.
-                if (next_opts.headers) |hdrs| {
+            const drops_body = next_method != req.method and next_method == .GET;
+            if (next_opts.headers) |hdrs| {
+                if (redirect_policy.preserve_headers) {
                     for (hdrs) |h| {
-                        if (!std.ascii.eqlIgnoreCase(h[0], "Authorization") and
-                            !std.ascii.eqlIgnoreCase(h[0], "Proxy-Authorization"))
-                        {
-                            safe_headers.append(self.allocator, h) catch break;
-                        }
+                        if (cross_origin and isCredentialHeader(h[0], next_opts.api_key_header)) continue;
+                        if (cross_origin and std.ascii.eqlIgnoreCase(h[0], HeaderName.HOST)) continue;
+                        if (drops_body and isEntityHeader(h[0])) continue;
+                        try safe_headers.append(self.allocator, h);
                     }
                     next_opts.headers = safe_headers.items;
+                } else {
+                    next_opts.headers = null;
                 }
-                // Clear auth fields.
+            }
+            if (cross_origin) {
                 next_opts.bearer_token = null;
                 next_opts.basic_auth = null;
+                next_opts.api_key_value = null;
             }
+            if (drops_body) {
+                next_opts.body = null;
+                next_opts.json = null;
+                next_opts.form_fields = null;
+                next_opts.multipart_fields = null;
+                next_opts.multipart_files = null;
+                next_opts.multipart_boundary = null;
+                next_opts.expect_100_continue = false;
+            }
+            next_opts.query_params = null;
 
             response.deinit();
             defer safe_headers.deinit(self.allocator);
@@ -1301,6 +1374,8 @@ pub const Client = struct {
                 context,
                 logical_request_id,
                 depth + 1,
+                strip_credentials or cross_origin,
+                strip_entity_headers or drops_body,
             );
         }
 
@@ -2402,19 +2477,20 @@ pub const Client = struct {
         header: http.HTTP2FrameHeader,
         payload: []const u8,
         peer_max_frame_size: *u32,
-    ) !void {
+    ) !bool {
         if (header.stream_id != 0) return error.ProtocolError;
         const is_ack = (header.flags & 0x01) != 0;
         if (is_ack) {
             if (payload.len != 0) return error.ProtocolError;
-            return;
+            return false;
         }
 
         var updated_settings = stream_manager.peer_settings;
-        try http.applySettingsPayload(&updated_settings, payload);
+        try http.applySettingsPayloadForPeer(&updated_settings, payload, .server);
         try stream_manager.applyPeerSettings(updated_settings);
         peer_max_frame_size.* = updated_settings.max_frame_size;
         try writeHTTP2Frame(transport, .settings, 0x01, 0, &.{});
+        return true;
     }
 
     fn parseHTTP2GoAway(self: *Client, header: http.HTTP2FrameHeader, payload: []const u8) !u31 {
@@ -2480,7 +2556,7 @@ pub const Client = struct {
                     self.allocator.free(payload);
                 },
                 .settings => {
-                    applyHTTP2SettingsUpdate(
+                    const received_initial = applyHTTP2SettingsUpdate(
                         transport,
                         stream_manager,
                         fhdr,
@@ -2490,6 +2566,7 @@ pub const Client = struct {
                         self.allocator.free(payload);
                         return err;
                     };
+                    if (received_initial) session_state.received_initial_settings = true;
                     session_state.peer_max_frame_size = peer_max_frame_size.*;
                     self.allocator.free(payload);
                 },
@@ -2750,13 +2827,13 @@ pub const Client = struct {
 
             switch (frame.header.frame_type) {
                 .settings => {
-                    try applyHTTP2SettingsUpdate(
+                    if (try applyHTTP2SettingsUpdate(
                         transport,
                         stream_manager,
                         frame.header,
                         frame.payload,
                         &peer_max_frame_size,
-                    );
+                    )) session_state.received_initial_settings = true;
                     session_state.peer_max_frame_size = peer_max_frame_size;
                 },
                 .ping => {
@@ -2780,15 +2857,7 @@ pub const Client = struct {
                 ),
                 .priority => {},
                 .push_promise => {
-                    if (frame.header.stream_id == 0) return error.ProtocolError;
-                    if (!self.shared.config.allow_push) {
-                        const promised_stream_id = (@as(u31, frame.payload[0] & 0x7F) << 24) |
-                            (@as(u31, frame.payload[1]) << 16) |
-                            (@as(u31, frame.payload[2]) << 8) |
-                            frame.payload[3];
-                        const rst_frame = h2stream.buildRstStreamFrame(promised_stream_id, .refused_stream);
-                        try transport.writeAll(&rst_frame);
-                    }
+                    return error.ProtocolError;
                 },
                 .rst_stream => {
                     if (frame.header.stream_id == request_stream.id) {
@@ -2801,6 +2870,7 @@ pub const Client = struct {
                     }
                 },
                 .headers => {
+                    if (!session_state.received_initial_settings) return error.ProtocolError;
                     if (frame.header.stream_id != request_stream.id) continue;
 
                     if (got_end_stream) {
@@ -3359,23 +3429,14 @@ pub const Client = struct {
     }
 
     /// Returns true if two URLs share the same origin (scheme + host + port).
-    fn isSameOrigin(base_url: []const u8, target_url: []const u8) bool {
-        const base_host = extractOriginHost(base_url) orelse return false;
-        const target_host = extractOriginHost(target_url) orelse return false;
-        return std.ascii.eqlIgnoreCase(base_host, target_host);
-    }
-
-    fn extractOriginHost(url: []const u8) ?[]const u8 {
-        var rest = url;
-        if (mem.startsWith(u8, rest, "https://")) {
-            rest = rest[8..];
-        } else if (mem.startsWith(u8, rest, "http://")) {
-            rest = rest[7..];
-        } else {
-            return null;
-        }
-        const host_end = mem.indexOfAny(u8, rest, "/:?#@") orelse rest.len;
-        return if (host_end > 0) rest[0..host_end] else null;
+    fn isSameOrigin(base: Uri, target: Uri) bool {
+        const base_scheme = base.scheme orelse return false;
+        const target_scheme = target.scheme orelse return false;
+        const base_host = base.host orelse return false;
+        const target_host = target.host orelse return false;
+        return std.ascii.eqlIgnoreCase(base_scheme, target_scheme) and
+            std.ascii.eqlIgnoreCase(base_host, target_host) and
+            base.effectivePort() == target.effectivePort();
     }
 
     fn attachCookies(self: *Self, req: *Request) !void {
@@ -4120,14 +4181,16 @@ const OperationImpl = struct {
         if (self.unix_socket_path) |path| {
             if (wants_h2 or self.req.uri.isTLS()) return error.UnsupportedStreamingTransport;
             const unix_mod = @import("../net/unix.zig");
-            const previous_phase = self.beginPhase(self.timeouts.connect_ms);
-            defer self.endPhase(previous_phase);
-            const unix_sock = try unix_mod.UnixClient.connectWithContext(
-                path,
-                self.timeouts.connect_ms,
-                &self.context,
-            );
-            self.owned_socket = Socket.fromHandle(unix_sock.fd);
+            {
+                const previous_phase = self.beginPhase(self.timeouts.connect_ms);
+                defer self.endPhase(previous_phase);
+                const unix_sock = try unix_mod.UnixClient.connectWithContext(
+                    path,
+                    self.timeouts.connect_ms,
+                    &self.context,
+                );
+                self.owned_socket = Socket.fromHandle(unix_sock.fd);
+            }
             try self.writeHttp1Head();
             return;
         }
@@ -4136,66 +4199,68 @@ const OperationImpl = struct {
         const port = self.req.uri.effectivePort();
         const effective_proxy = self.proxy;
 
-        const previous_phase = self.beginPhase(self.timeouts.connect_ms);
-        defer self.endPhase(previous_phase);
-        self.lease = try self.shared.pool.getLeaseWithContext(.{
-            .scheme = if (self.req.uri.isTLS()) .tls else .plain,
-            .host = host,
-            .port = port,
-            .proxy = effective_proxy,
-            .verify_tls = self.verify_ssl,
-            .protocol = if (wants_h2) .http2 else .http1,
-        }, self.timeouts.connect_ms, &self.context);
+        {
+            const previous_phase = self.beginPhase(self.timeouts.connect_ms);
+            defer self.endPhase(previous_phase);
+            self.lease = try self.shared.pool.getLeaseWithContext(.{
+                .scheme = if (self.req.uri.isTLS()) .tls else .plain,
+                .host = host,
+                .port = port,
+                .proxy = effective_proxy,
+                .verify_tls = self.verify_ssl,
+                .protocol = if (wants_h2) .http2 else .http1,
+            }, self.timeouts.connect_ms, &self.context);
 
-        const fresh = self.lease.?.isFresh();
-        if (fresh) {
-            if (effective_proxy) |configured| {
-                if (configured.kind == .http and self.req.uri.isTLS()) {
+            const fresh = self.lease.?.isFresh();
+            if (fresh) {
+                if (effective_proxy) |configured| {
+                    if (configured.kind == .http and self.req.uri.isTLS()) {
+                        var client = self.clientHandle();
+                        try client.establishProxyTLSTunnelWithContext(
+                            self.lease.?.socket(),
+                            host,
+                            port,
+                            configured,
+                            &self.context,
+                        );
+                    }
+                }
+            }
+
+            if (self.req.uri.isTLS()) {
+                const existing_session = self.lease.?.tlsSession();
+                const session = existing_session orelse session: {
+                    const config = if (wants_h2)
+                        (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
+                    else if (self.verify_ssl)
+                        TLSConfig.init(self.allocator)
+                    else
+                        TLSConfig.insecure(self.allocator);
+                    break :session self.lease.?.initializeTls(config);
+                };
+                if (existing_session == null) {
                     var client = self.clientHandle();
-                    try client.establishProxyTLSTunnelWithContext(
-                        self.lease.?.socket(),
+                    try client.handshakePooledTlsWithContext(
+                        &self.lease.?,
+                        session,
                         host,
                         port,
-                        configured,
+                        effective_proxy == null,
+                        self.timeouts.connect_ms,
                         &self.context,
                     );
                 }
-            }
-        }
+                self.tls_active = true;
 
-        if (self.req.uri.isTLS()) {
-            const existing_session = self.lease.?.tlsSession();
-            const session = existing_session orelse session: {
-                const config = if (wants_h2)
-                    (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
-                else if (self.verify_ssl)
-                    TLSConfig.init(self.allocator)
-                else
-                    TLSConfig.insecure(self.allocator);
-                break :session self.lease.?.initializeTls(config);
-            };
-            if (existing_session == null) {
-                var client = self.clientHandle();
-                try client.handshakePooledTlsWithContext(
-                    &self.lease.?,
-                    session,
-                    host,
-                    port,
-                    effective_proxy == null,
-                    self.timeouts.connect_ms,
-                    &self.context,
-                );
-            }
-            self.tls_active = true;
-
-            const negotiated = http.negotiateVersion(session.negotiatedProtocol());
-            if (wants_h2 and negotiated == .http_2) {
+                const negotiated = http.negotiateVersion(session.negotiatedProtocol());
+                if (wants_h2 and negotiated == .http_2) {
+                    self.protocol = .http2;
+                } else if (self.req.version == .HTTP_2) {
+                    return error.UnsupportedHttpVersion;
+                }
+            } else if (wants_h2) {
                 self.protocol = .http2;
-            } else if (self.req.version == .HTTP_2) {
-                return error.UnsupportedHttpVersion;
             }
-        } else if (wants_h2) {
-            self.protocol = .http2;
         }
 
         switch (self.protocol) {
@@ -5706,6 +5771,9 @@ const OperationImpl = struct {
             const frame = try self.nextHttp2Frame();
             switch (frame.header.frame_type) {
                 .headers => {
+                    if (!self.lease.?.h2Session().received_initial_settings) {
+                        return error.ProtocolError;
+                    }
                     if (frame.header.stream_id != self.h2_stream_id.?) return error.ProtocolError;
                     try self.appendH2InitialHeaderBlock(frame.payload, frame.header.flags);
                     if ((frame.header.flags & 0x04) == 0) {
@@ -5957,11 +6025,11 @@ const OperationImpl = struct {
                 {
                     return error.ProtocolError;
                 }
-                status_code = std.fmt.parseInt(u16, header.value, 10) catch
-                    return error.InvalidResponse;
+                status_code = try parseHttp2StatusCode(header.value);
                 continue;
             }
             saw_regular_header = true;
+            if (!isValidHttp2HeaderName(header.name)) return error.ProtocolError;
             if (common.isConnectionSpecificHeader(header.name)) return error.ProtocolError;
             try destination.append(header.name, header.value);
         }
@@ -6051,13 +6119,13 @@ const OperationImpl = struct {
         var transport = OperationHTTP2Transport{ .operation = self };
         switch (frame.header.frame_type) {
             .settings => {
-                try Client.applyHTTP2SettingsUpdate(
+                if (try Client.applyHTTP2SettingsUpdate(
                     &transport,
                     &session.stream_manager,
                     frame.header,
                     frame.payload,
                     &self.h2_peer_max_frame_size,
-                );
+                )) session.received_initial_settings = true;
                 session.peer_max_frame_size = self.h2_peer_max_frame_size;
             },
             .window_update => try Client.applyHTTP2WindowUpdate(
@@ -6088,6 +6156,31 @@ const OperationImpl = struct {
         }
     }
 };
+
+fn isValidHttp2HeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (c >= 'A' and c <= 'Z') return false;
+        if (!std.ascii.isAlphanumeric(c) and
+            c != '!' and c != '#' and c != '$' and c != '%' and c != '&' and
+            c != '\'' and c != '*' and c != '+' and c != '-' and c != '.' and
+            c != '^' and c != '_' and c != '`' and c != '|' and c != '~')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseHttp2StatusCode(value: []const u8) !u16 {
+    if (value.len != 3) return error.InvalidResponse;
+    for (value) |c| {
+        if (c < '0' or c > '9') return error.InvalidResponse;
+    }
+    const status = std.fmt.parseInt(u16, value, 10) catch return error.InvalidResponse;
+    if (status < 100) return error.InvalidResponse;
+    return status;
+}
 
 const OperationHTTP2Transport = struct {
     operation: *OperationImpl,
@@ -8761,7 +8854,7 @@ test "HTTP2 partial SETTINGS update retained peer settings" {
         .stream_id = 0,
     };
     var peer_max_frame_size: u32 = manager.peer_settings.max_frame_size;
-    try Client.applyHTTP2SettingsUpdate(
+    _ = try Client.applyHTTP2SettingsUpdate(
         &capture,
         &manager,
         header,
@@ -10325,6 +10418,7 @@ test "HTTP2 operation decodes padded HEADERS followed by CONTINUATION" {
             try readExact(&accepted.socket, &preface);
             var payload: [64 * 1024]u8 = undefined;
             _ = try readFrame(&accepted.socket, &payload);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &.{});
             try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
 
             var stream_id: u31 = 0;
@@ -10726,6 +10820,7 @@ test "HTTP2 failed stream reset poisons and closes the session" {
             try readExact(&accepted.socket, &preface);
             var payload: [64 * 1024]u8 = undefined;
             _ = try readFrame(&accepted.socket, &payload);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &.{});
             try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
 
             var stream_id: u31 = 0;
@@ -11506,4 +11601,231 @@ test "Client log_level filters messages below threshold" {
 
     client.log(.warn, "warn message", .{});
     try std.testing.expect(TestLogger.logged);
+}
+
+test "HTTP2 response fields require lowercase names and strict status" {
+    try std.testing.expectEqual(@as(u16, 200), try parseHttp2StatusCode("200"));
+    for ([_][]const u8{ "20", "020", "2000", "2O0", "9999" }) |status| {
+        try std.testing.expectError(error.InvalidResponse, parseHttp2StatusCode(status));
+    }
+    try std.testing.expect(isValidHttp2HeaderName("content-type"));
+    try std.testing.expect(!isValidHttp2HeaderName("Content-Type"));
+    try std.testing.expect(!isValidHttp2HeaderName(""));
+    try std.testing.expect(!isValidHttp2HeaderName("bad:name"));
+}
+
+test "HTTP2 client rejects response headers before initial server SETTINGS" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            var payload: [64 * 1024]u8 = undefined;
+            _ = try readFrame(&accepted.socket, &payload);
+
+            var stream_id: u31 = 0;
+            while (true) {
+                const header = try readFrame(&accepted.socket, &payload);
+                if (header.stream_id != 0) stream_id = header.stream_id;
+                if (stream_id != 0 and (header.flags & 0x01) != 0) break;
+            }
+
+            var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+            defer manager.deinit();
+            const fields = [_]hpack.HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+            };
+            const frames = try h2stream.buildHeadersAndContinuations(
+                &manager,
+                stream_id,
+                &fields,
+                null,
+                16_384,
+                true,
+                std.heap.page_allocator,
+            );
+            defer std.heap.page_allocator.free(frames);
+            try accepted.socket.sendAll(frames);
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/settings-first");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_2,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    try std.testing.expectError(error.ProtocolError, op.finishRequest(null));
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+}
+
+test "redirect origin and credential policy use full origin tuple" {
+    const http_default = try Uri.parse("http://example.test/a");
+    const http_explicit = try Uri.parse("http://EXAMPLE.test:80/b");
+    const https_default = try Uri.parse("https://example.test/b");
+    const alternate_port = try Uri.parse("http://example.test:8080/b");
+    try std.testing.expect(Client.isSameOrigin(http_default, http_explicit));
+    try std.testing.expect(!Client.isSameOrigin(http_default, https_default));
+    try std.testing.expect(!Client.isSameOrigin(http_default, alternate_port));
+
+    var request = try Request.init(std.testing.allocator, .GET, "https://other.test/");
+    defer request.deinit();
+    const headers = [_][2][]const u8{
+        .{ "Authorization", "secret" },
+        .{ "Cookie", "session=secret" },
+        .{ "X-API-Key", "secret" },
+        .{ "X-Safe", "value" },
+    };
+    try Client.applyConfiguredHeadersFiltered(&request, &headers, true, false, "X-API-Key");
+    try std.testing.expect(request.headers.get("Authorization") == null);
+    try std.testing.expect(request.headers.get("Cookie") == null);
+    try std.testing.expect(request.headers.get("X-API-Key") == null);
+    try std.testing.expectEqualStrings("value", request.headers.get("X-Safe").?);
+    try std.testing.expect(Client.isEntityHeader("Content-Length"));
+    try std.testing.expect(Client.isEntityHeader("Content-Encoding"));
+
+    var redirected_get = try Request.init(std.testing.allocator, .GET, "https://other.test/");
+    defer redirected_get.deinit();
+    const entity_headers = [_][2][]const u8{
+        .{ "Content-Length", "7" },
+        .{ "Content-Type", "application/json" },
+        .{ "X-Safe", "value" },
+    };
+    try Client.applyConfiguredHeadersFiltered(&redirected_get, &entity_headers, false, true, null);
+    try std.testing.expect(redirected_get.headers.get("Content-Length") == null);
+    try std.testing.expect(redirected_get.headers.get("Content-Type") == null);
+    try std.testing.expectEqualStrings("value", redirected_get.headers.get("X-Safe").?);
+}
+
+test "cross-origin POST redirect drops body and all effective credentials" {
+    const allocator = std.testing.allocator;
+    var redirect_listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer redirect_listener.deinit();
+    var target_listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer target_listener.deinit();
+
+    const target_url = try policyTestUrl(allocator, &target_listener, "/final");
+    defer allocator.free(target_url);
+    const location_headers = [_][2][]const u8{.{ HeaderName.LOCATION, target_url }};
+    const redirect_wire = try makePolicyTestResponse(allocator, "302 Found", &location_headers, "");
+    defer allocator.free(redirect_wire);
+    const success_wire = try makePolicyTestResponse(allocator, "200 OK", &.{}, "done");
+    defer allocator.free(success_wire);
+
+    const redirect_responses = [_][]const u8{redirect_wire};
+    const target_responses = [_][]const u8{success_wire};
+    var redirect_server = PolicyTestServer{
+        .listener = &redirect_listener,
+        .responses = &redirect_responses,
+    };
+    var target_server = PolicyTestServer{
+        .listener = &target_listener,
+        .responses = &target_responses,
+    };
+    const redirect_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&redirect_server});
+    const target_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&target_server});
+    var joined = false;
+    defer if (!joined) {
+        redirect_listener.deinit();
+        target_listener.deinit();
+        redirect_thread.join();
+        target_thread.join();
+    };
+
+    const start_url = try policyTestUrl(allocator, &redirect_listener, "/start");
+    defer allocator.free(start_url);
+    const defaults = [_][2][]const u8{
+        .{ HeaderName.AUTHORIZATION, "Bearer default-secret" },
+        .{ HeaderName.COOKIE, "session=default-secret" },
+        .{ "Content-Encoding", "identity" },
+    };
+    const request_headers = [_][2][]const u8{.{ "X-Safe", "preserved" }};
+    var client = Client.initWithConfig(allocator, .{
+        .default_headers = &defaults,
+        .keep_alive = false,
+        .policy = .{
+            .redirect = .{ .policy = .{
+                .max_redirects = 1,
+                .preserve_headers = true,
+                .allow_cross_origin = true,
+            } },
+            .cookies = .disabled,
+        },
+    });
+    defer client.deinit();
+    var response = try client.post(start_url, .{
+        .headers = &request_headers,
+        .body = "payload",
+        .bearer_token = "request-secret",
+        .api_key_header = "X-API-Key",
+        .api_key_value = "api-secret",
+    });
+    defer response.deinit();
+    try std.testing.expectEqualStrings("done", response.text().?);
+
+    redirect_thread.join();
+    target_thread.join();
+    joined = true;
+    if (redirect_server.failure) |err| return err;
+    if (target_server.failure) |err| return err;
+
+    const redirected = target_server.request(0);
+    try std.testing.expect(mem.startsWith(u8, redirected, "GET /final HTTP/1.1\r\n"));
+    try std.testing.expect(requestHeaderValue(redirected, HeaderName.AUTHORIZATION) == null);
+    try std.testing.expect(requestHeaderValue(redirected, HeaderName.PROXY_AUTHORIZATION) == null);
+    try std.testing.expect(requestHeaderValue(redirected, HeaderName.COOKIE) == null);
+    try std.testing.expect(requestHeaderValue(redirected, "X-API-Key") == null);
+    try std.testing.expect(requestHeaderValue(redirected, HeaderName.CONTENT_LENGTH) == null);
+    try std.testing.expect(requestHeaderValue(redirected, HeaderName.CONTENT_TYPE) == null);
+    try std.testing.expect(requestHeaderValue(redirected, "Content-Encoding") == null);
+    try std.testing.expectEqualStrings("preserved", requestHeaderValue(redirected, "X-Safe").?);
 }

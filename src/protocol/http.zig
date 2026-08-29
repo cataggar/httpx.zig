@@ -405,6 +405,20 @@ pub const HTTP2Connection = struct {
 };
 
 pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, allocator: Allocator, out: *std.ArrayList(u8)) !void {
+    return encodeSettingsPayloadForRole(settings, allocator, out, .client);
+}
+
+pub const SettingsSenderRole = enum {
+    client,
+    server,
+};
+
+pub fn encodeSettingsPayloadForRole(
+    settings: HTTP2Connection.HTTP2ConnectionSettings,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    sender_role: SettingsSenderRole,
+) !void {
     // Each setting is 6 bytes: 16-bit ID + 32-bit value.
     var buf: [6]u8 = undefined;
 
@@ -413,10 +427,12 @@ pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, 
     writeU32BE(buf[2..6], settings.header_table_size);
     try out.appendSlice(allocator, &buf);
 
-    // ENABLE_PUSH (0x2)
-    writeU16BE(&buf, @intFromEnum(HTTP2Settings.enable_push));
-    writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
-    try out.appendSlice(allocator, &buf);
+    // ENABLE_PUSH (0x2) is sent only by clients.
+    if (sender_role == .client) {
+        writeU16BE(&buf, @intFromEnum(HTTP2Settings.enable_push));
+        writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
+        try out.appendSlice(allocator, &buf);
+    }
 
     // MAX_CONCURRENT_STREAMS (0x3)
     writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_concurrent_streams));
@@ -444,6 +460,20 @@ pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, 
 }
 
 pub fn applySettingsPayload(settings: *HTTP2Connection.HTTP2ConnectionSettings, payload: []const u8) !void {
+    return applySettingsPayloadForPeer(settings, payload, .client);
+}
+
+pub const SettingsPeerRole = enum {
+    client,
+    server,
+};
+
+/// Applies peer settings while enforcing settings that are endpoint-specific.
+pub fn applySettingsPayloadForPeer(
+    settings: *HTTP2Connection.HTTP2ConnectionSettings,
+    payload: []const u8,
+    peer_role: SettingsPeerRole,
+) !void {
     if (payload.len % 6 != 0) return error.InvalidSettingsPayload;
 
     var i: usize = 0;
@@ -455,7 +485,12 @@ pub fn applySettingsPayload(settings: *HTTP2Connection.HTTP2ConnectionSettings, 
         // parameter with an identifier it does not understand.
         switch (@as(HTTP2Settings, @enumFromInt(id))) {
             .header_table_size => settings.header_table_size = value,
-            .enable_push => settings.enable_push = (value != 0),
+            .enable_push => {
+                // SETTINGS_ENABLE_PUSH is sent only by clients. A server that
+                // sends it commits a connection error.
+                if (peer_role == .server or value > 1) return error.ProtocolError;
+                settings.enable_push = value == 1;
+            },
             .max_concurrent_streams => settings.max_concurrent_streams = value,
             .initial_window_size => {
                 // RFC 7540 6.9.2: INITIAL_WINDOW_SIZE must not exceed 2^31-1.
@@ -1159,4 +1194,24 @@ test "writeChunkToWriter empty data is no-op" {
 
     try writeChunkToWriter(writer, "");
     try std.testing.expectEqualStrings("", buf.items);
+}
+
+test "SETTINGS_ENABLE_PUSH is endpoint-role constrained" {
+    var payload: [6]u8 = undefined;
+    writeU16BE(&payload, @intFromEnum(HTTP2Settings.enable_push));
+    writeU32BE(payload[2..], 0);
+
+    var settings = HTTP2Connection.HTTP2ConnectionSettings{};
+    try applySettingsPayloadForPeer(&settings, &payload, .client);
+    try std.testing.expect(!settings.enable_push);
+    try std.testing.expectError(
+        error.ProtocolError,
+        applySettingsPayloadForPeer(&settings, &payload, .server),
+    );
+
+    writeU32BE(payload[2..], 2);
+    try std.testing.expectError(
+        error.ProtocolError,
+        applySettingsPayloadForPeer(&settings, &payload, .client),
+    );
 }

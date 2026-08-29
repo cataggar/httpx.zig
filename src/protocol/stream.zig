@@ -294,7 +294,7 @@ pub const StreamManager = struct {
         const old_window = self.peer_settings.initial_window_size;
         self.peer_settings = new_settings;
         self.max_concurrent_streams = new_settings.max_concurrent_streams;
-        self.hpack_encoder.dynamic_table.setMaxSize(new_settings.header_table_size);
+        self.hpack_encoder.setEncoderTableSize(new_settings.header_table_size);
         if (new_settings.initial_window_size != old_window) {
             try self.applyInitialWindowSizeChange(old_window, new_settings.initial_window_size);
         }
@@ -475,12 +475,27 @@ pub fn buildHeadersAndContinuations(
 }
 
 /// Parses a HEADERS frame payload.
+pub const ParsedHeadersFrame = struct {
+    headers: []hpack.DecodedHeader,
+    priority: ?StreamPriority,
+};
+
 pub fn parseHeadersFramePayload(
     stream_manager: *StreamManager,
     payload: []const u8,
     flags: u8,
     allocator: Allocator,
-) !struct { headers: []hpack.DecodedHeader, priority: ?StreamPriority } {
+) !ParsedHeadersFrame {
+    return parseHeadersFramePayloadWithLimit(stream_manager, payload, flags, allocator, 0);
+}
+
+pub fn parseHeadersFramePayloadWithLimit(
+    stream_manager: *StreamManager,
+    payload: []const u8,
+    flags: u8,
+    allocator: Allocator,
+    max_header_list_size: u64,
+) !ParsedHeadersFrame {
     var offset: usize = 0;
     var priority: ?StreamPriority = null;
 
@@ -511,10 +526,11 @@ pub fn parseHeadersFramePayload(
     if (pad_length > payload.len - offset) return error.InvalidFrame;
     const header_block_len = payload.len - offset - pad_length;
 
-    const headers = try hpack.decodeHeaders(
+    const headers = try hpack.decodeHeadersWithLimit(
         &stream_manager.hpack_decoder,
         payload[offset .. offset + header_block_len],
         allocator,
+        max_header_list_size,
     );
 
     return .{ .headers = headers, .priority = priority };

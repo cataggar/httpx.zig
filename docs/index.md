@@ -141,7 +141,7 @@ Zig's standard library does not provide HTTP/2, QUIC, HTTP/3, or TLS/ALPN suppor
 - **HTTP/2** stream/multiplexing primitives, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and sequential high-level client session reuse (RFC 7540)
 - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
 - **QUIC** transport frame encoding/decoding (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation, version negotiation, and transport parameters
-- **Experimental HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE codecs. Public HTTP/3 requests are rejected until authenticated QUIC TLS 1.3, packet/header protection, loss recovery, and mandatory control streams exist.
+- **Experimental HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE codecs. Public clients and servers reject HTTP/3 until authenticated QUIC TLS 1.3, packet/header protection, loss recovery, and mandatory control streams exist.
 - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 :::
 
@@ -152,7 +152,7 @@ Zig's standard library does not provide HTTP/2, QUIC, HTTP/3, or TLS/ALPN suppor
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
 | HTTP/2 | ✅ Client + Server Runtime + Primitives | TCP/TLS | High-level client/server execution paths plus full framing/HPACK/stream primitives |
-| HTTP/3 | ⚠️ Experimental Primitives Only | none | Public client requests return `error.UnsupportedHttpVersion`; framing/QPACK fixtures are unauthenticated and non-production |
+| HTTP/3 | ⚠️ Experimental Primitives Only | none | Public clients and servers return `error.UnsupportedHttpVersion`; framing/QPACK fixtures are unauthenticated and non-production |
 
 ## Platform Support
 
@@ -197,7 +197,7 @@ Available examples (see the `/examples` folder):
 - `http3_client_runtime.zig`: explicit public HTTP/3 rejection demo
 - `http3_server_runtime.zig`: experimental unauthenticated protocol fixture
 - `http2_advanced.zig`: HTTP/2 production features (SETTINGS enforcement, GOAWAY/RST_STREAM, HPACK security, trailers)
-- `http3_advanced.zig`: HTTP/3 production features (QPACK stream instructions, QUIC stream cancellation, transport parameters)
+- `http3_advanced.zig`: experimental QPACK/QUIC codec features (stream instructions, cancellation frames, transport parameters)
 - `tls_https_get.zig`: Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2)
 - `tls_config_options.zig`: TLS configuration constructors and ALPN negotiation
 - `tls_handshake_details.zig`: TLS handshake info and cipher suites
@@ -275,7 +275,7 @@ try op.finish(.{ .drain_timeout_ms = 5_000 });
 ```
 
 The same lifecycle drives HTTP/1, HTTP/2, and buffered convenience requests.
-Public HTTP/3 requests are rejected until authenticated QUIC is implemented.
+Public HTTP/3 clients and servers are rejected until authenticated QUIC is implemented.
 Cancellation is checked during DNS UDP/TCP, connect and pool waits,
 proxy negotiation, TLS records/handshake/reconnect, upload, response reads,
 flow-control waits, and drains. System `getaddrinfo` runs in a heap-owned

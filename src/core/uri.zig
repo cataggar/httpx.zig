@@ -60,10 +60,17 @@ pub const Uri = struct {
         }
 
         if (remaining.len > 0 and remaining[0] == '[') {
-            if (mem.indexOf(u8, remaining, "]")) |bracket_end| {
-                uri.host = remaining[1..bracket_end];
-                remaining = remaining[bracket_end + 1 ..];
+            const bracket_end = mem.indexOf(u8, remaining, "]") orelse
+                return error.InvalidUri;
+            if (bracket_end == 1) return error.InvalidUri;
+            uri.host = remaining[1..bracket_end];
+            const suffix = remaining[bracket_end + 1 ..];
+            if (suffix.len > 0) {
+                if (suffix[0] != ':' or suffix.len == 1) return error.InvalidUri;
+                uri.port = std.fmt.parseInt(u16, suffix[1..], 10) catch
+                    return error.InvalidUri;
             }
+            remaining = "";
         }
 
         if (mem.lastIndexOf(u8, remaining, ":")) |port_sep| {
@@ -500,6 +507,17 @@ test "URI resolve with scheme" {
     defer std.testing.allocator.free(resolved.path);
     try std.testing.expectEqualStrings("https", resolved.scheme.?);
     try std.testing.expectEqualStrings("other.com", resolved.host.?);
+}
+
+test "URI bracketed authority rejects invalid suffixes" {
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]garbage/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]:/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1]:abc/"));
+    try std.testing.expectError(error.InvalidUri, Uri.parse("http://[::1/"));
+
+    const valid = try Uri.parse("http://[::1]:8080/");
+    try std.testing.expectEqualStrings("::1", valid.host.?);
+    try std.testing.expectEqual(@as(u16, 8080), valid.port.?);
 }
 
 test "normalizePath basic" {

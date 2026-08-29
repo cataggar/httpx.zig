@@ -41,7 +41,7 @@ pub fn main() !void {
         .threads = 4,
         .http2_enabled = true,
         .http3_enabled = false,
-        .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
+        .tls_alpn_protocols = &.{ "h2", "http/1.1" },
         .keep_alive = true,
         .request_timeout_ms = 30_000,
         .keep_alive_timeout_ms = 60_000,

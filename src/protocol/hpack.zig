@@ -210,6 +210,7 @@ pub const HPACKContext = struct {
     allocator: Allocator,
     dynamic_table: DynamicTable,
     max_allowed_table_size: usize = 4096,
+    pending_encoder_table_size: ?usize = null,
 
     const Self = @This();
 
@@ -238,6 +239,13 @@ pub const HPACKContext = struct {
         if (self.dynamic_table.max_size > max_table_size) {
             self.dynamic_table.setMaxSize(max_table_size);
         }
+    }
+
+    /// Applies the peer's encoder limit immediately and queues the required
+    /// HPACK table-size update for the start of the next encoded block.
+    pub fn setEncoderTableSize(self: *Self, max_table_size: usize) void {
+        self.dynamic_table.setMaxSize(max_table_size);
+        self.pending_encoder_table_size = max_table_size;
     }
 
     /// Looks up a header by combined index (static + dynamic).
@@ -593,6 +601,13 @@ pub fn encodeHeaders(
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
+    if (ctx.pending_encoder_table_size) |table_size| {
+        var buf: [10]u8 = undefined;
+        const n = try encodeInteger(table_size, 5, &buf);
+        buf[0] |= 0x20;
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+
     for (headers) |header| {
         // Try to find in static table first
         if (header.representation == .incremental_indexing and
@@ -634,6 +649,7 @@ pub fn encodeHeaders(
         }
     }
 
+    ctx.pending_encoder_table_size = null;
     return out.toOwnedSlice(allocator);
 }
 
@@ -672,11 +688,13 @@ pub fn decodeHeadersWithLimit(
 
     var offset: usize = 0;
     var header_list_size: u64 = 0;
+    var saw_header_field = false;
 
     while (offset < data.len) {
         const first = data[offset];
 
         if (first & 0x80 != 0) {
+            saw_header_field = true;
             // Indexed header field
             const idx_result = try decodeInteger(data[offset..], 7);
             offset += idx_result.len;
@@ -695,6 +713,7 @@ pub fn decodeHeadersWithLimit(
             errdefer allocator.free(value);
             try headers.append(allocator, .{ .name = name, .value = value });
         } else if (first & 0x40 != 0) {
+            saw_header_field = true;
             // Literal with incremental indexing
             const idx_result = try decodeInteger(data[offset..], 6);
             offset += idx_result.len;
@@ -726,6 +745,7 @@ pub fn decodeHeadersWithLimit(
             headers.appendAssumeCapacity(.{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
             // Dynamic table size update
+            if (saw_header_field) return error.InvalidDynamicTableSize;
             const size_result = try decodeInteger(data[offset..], 5);
             offset += size_result.len;
             if (size_result.value > @as(u64, ctx.max_allowed_table_size) or
@@ -735,6 +755,7 @@ pub fn decodeHeadersWithLimit(
             }
             ctx.dynamic_table.setMaxSize(@intCast(size_result.value));
         } else {
+            saw_header_field = true;
             // Literal without indexing or never indexed
             const prefix_bits: u3 = if (first & 0x10 != 0) 4 else 4;
             const idx_result = try decodeInteger(data[offset..], prefix_bits);
@@ -1168,4 +1189,39 @@ test "mixed representations in header block" {
     try std.testing.expectEqualStrings("session=xyz", decoded[2].value);
     try std.testing.expectEqualStrings("content-type", decoded[3].name);
     try std.testing.expectEqualStrings("text/html", decoded[3].value);
+}
+
+test "HPACK table size update is only accepted at block start" {
+    var ctx = HPACKContext.init(std.testing.allocator);
+    defer ctx.deinit();
+    const encoded = [_]u8{ 0x82, 0x20 };
+    try std.testing.expectError(
+        error.InvalidDynamicTableSize,
+        decodeHeaders(&ctx, &encoded, std.testing.allocator),
+    );
+}
+
+test "HPACK encoder emits queued table update at next block start" {
+    var encoder = HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    var decoder = HPACKContext.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    encoder.setEncoderTableSize(128);
+    const fields = [_]HeaderEntry{.{ .name = ":method", .value = "GET" }};
+    const encoded = try encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len >= 2);
+    try std.testing.expect((encoded[0] & 0xe0) == 0x20);
+
+    const decoded = try decodeHeaders(&decoder, encoded, std.testing.allocator);
+    defer {
+        for (decoded) |field| {
+            std.testing.allocator.free(field.name);
+            std.testing.allocator.free(field.value);
+        }
+        std.testing.allocator.free(decoded);
+    }
+    try std.testing.expectEqualStrings("GET", decoded[0].value);
+    try std.testing.expectEqual(@as(usize, 128), decoder.dynamic_table.max_size);
 }

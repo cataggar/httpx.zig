@@ -1,9 +1,9 @@
 # Protocol API
 
-Low-level protocol framing, parsing, and header compression. This module provides complete implementations of HTTP/1.1 parsing, HTTP/2 framing with HPACK, and HTTP/3 framing with QPACK over QUIC transport.
+Low-level protocol framing, parsing, and header compression. HTTP/3/QPACK/QUIC APIs are experimental codec primitives, not an authenticated transport.
 
 ::: warning Custom Implementation
-Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx.zig implements these protocols entirely from scratch**. This includes complete implementations of HPACK, QPACK, HTTP/2 framing, HTTP/3 framing, and QUIC transport as specified in the relevant RFCs:
+Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. httpx.zig implements its HTTP/2 runtime and exposes selected QPACK, HTTP/3 framing, and unauthenticated QUIC codec primitives:
 - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
 - **HTTP/2** stream multiplexing, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and connection pooling (RFC 7540)
 - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
@@ -18,8 +18,8 @@ Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx
 | HTTP/1.0 | 1.0 | ✅ Full | RFC 1945 | High-level runtime support |
 | HTTP/1.1 | 1.1 | ✅ Full | RFC 7230-7235 | High-level runtime support |
 | HTTP/2 | h2 | ✅ Full | RFC 7540, RFC 7541 | Full protocol-module implementation (framing/stream state/flow control/HPACK), integrated with high-level client/server runtimes |
-| HTTP/3 | h3 | ✅ Full | RFC 9114, RFC 9204 | Full protocol-module implementation (framing/QPACK/QUIC helpers), integrated with high-level client/server runtimes |
-| QUIC | v1 | ✅ Full | RFC 9000 | QUIC transport/frame primitives implemented in protocol module |
+| HTTP/3 | h3 | ⚠️ Primitives | RFC 9114, RFC 9204 | Framing/QPACK helpers; public runtimes reject H3 |
+| QUIC | v1 | ⚠️ Primitives | RFC 9000 | Selected unauthenticated packet/frame codecs |
 
 ## HTTP/1.1 Parser
 
@@ -269,9 +269,9 @@ const payload = try httpx.encodeSettingsPayload(&settings, allocator);
 try httpx.applySettingsPayload(&settings, received_payload);
 ```
 
-## HTTP/3 Support
+## Experimental HTTP/3 Primitives
 
-httpx.zig provides HTTP/3 protocol support including:
+httpx.zig provides unauthenticated HTTP/3 codec primitives including:
 - QPACK header compression (RFC 9204) 
 - QUIC transport framing (RFC 9000)
 - Variable-length integer encoding
