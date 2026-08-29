@@ -47,11 +47,12 @@ pub const Parser = struct {
     version: types.Version = .HTTP_1_1,
     status_code: ?u16 = null,
     headers: Headers,
+    trailers: Headers,
     body_buffer: std.ArrayList(u8) = .empty,
     content_length: ?u64 = null,
     chunked: bool = false,
-    current_chunk_size: usize = 0,
-    bytes_read: usize = 0,
+    current_chunk_size: u64 = 0,
+    bytes_read: u64 = 0,
     chunk_crlf_read: u2 = 0,
     line_buffer: std.ArrayList(u8) = .empty,
     max_header_size: usize = 8192,
@@ -62,7 +63,7 @@ pub const Parser = struct {
     /// Used for HEAD responses which have no body.
     expect_body: bool = true,
     /// Maximum body size in bytes. 0 means unlimited. Prevents memory exhaustion.
-    max_body_size: usize = 100 * 1024 * 1024,
+    max_body_size: u64 = 0,
     /// Whether Connection: close was seen.
     connection_close: bool = false,
     /// Whether Connection: keep-alive was seen.
@@ -77,6 +78,7 @@ pub const Parser = struct {
         return .{
             .allocator = allocator,
             .headers = Headers.init(allocator),
+            .trailers = Headers.init(allocator),
         };
     }
 
@@ -91,6 +93,7 @@ pub const Parser = struct {
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        self.trailers.deinit();
         self.body_buffer.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
         if (self.path) |p| self.allocator.free(p);
@@ -104,6 +107,8 @@ pub const Parser = struct {
     pub fn finishEof(self: *Self) void {
         if (self.state == .body and self.mode == .response and self.content_length == null and !self.chunked) {
             self.state = .complete;
+        } else if (self.state != .complete) {
+            self.state = .err;
         }
     }
 
@@ -165,6 +170,7 @@ pub const Parser = struct {
         }
         self.status_code = null;
         self.headers.clear();
+        self.trailers.clear();
         self.body_buffer.clearRetainingCapacity();
         self.line_buffer.clearRetainingCapacity();
         self.content_length = null;
@@ -324,10 +330,9 @@ pub const Parser = struct {
             self.header_count += 1;
 
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                // RFC 7230 3.3.3: If Transfer-Encoding is present, Content-Length
-                // must be silently ignored.
                 if (self.transfer_encoding_seen) {
-                    // Skip parsing this header entirely.
+                    self.state = .err;
+                    return error.ConflictingFramingHeaders;
                 } else {
                     // Content-Length may be a comma-separated list of integers,
                     // all of which must be identical.
@@ -387,9 +392,8 @@ pub const Parser = struct {
                 }
                 self.transfer_encoding_seen = true;
                 if (self.content_length != null) {
-                    // RFC 7230: Content-Length must be ignored when Transfer-Encoding
-                    // is present. We clear it to avoid confusion.
-                    self.content_length = null;
+                    self.state = .err;
+                    return error.ConflictingFramingHeaders;
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
                 if (std.ascii.indexOfIgnoreCase(value, "close") != null) {
@@ -399,6 +403,9 @@ pub const Parser = struct {
                     self.connection_keep_alive = true;
                 }
             }
+        } else {
+            self.state = .err;
+            return error.InvalidHeader;
         }
 
         self.line_buffer.clearRetainingCapacity();
@@ -435,9 +442,9 @@ pub const Parser = struct {
     fn parseBody(self: *Self, data: []const u8) !usize {
         if (self.content_length) |len| {
             const remaining = len - self.bytes_read;
-            const to_read = @min(data.len, @as(usize, @intCast(remaining)));
+            const to_read: usize = @intCast(@min(@as(u64, data.len), remaining));
             // Enforce body size limit
-            if (self.max_body_size > 0 and self.body_buffer.items.len + to_read > self.max_body_size) {
+            if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + to_read > self.max_body_size) {
                 self.state = .err;
                 return error.BodyTooLarge;
             }
@@ -451,7 +458,7 @@ pub const Parser = struct {
         }
 
         // EOF-delimited body: enforce body size limit
-        if (self.max_body_size > 0 and self.body_buffer.items.len + data.len > self.max_body_size) {
+        if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + data.len > self.max_body_size) {
             self.state = .err;
             return error.BodyTooLarge;
         }
@@ -476,9 +483,13 @@ pub const Parser = struct {
         else
             mem.trim(u8, line, " \t");
 
-        self.current_chunk_size = std.fmt.parseInt(usize, size_part, 16) catch {
+        if (size_part.len == 0) {
             self.state = .err;
-            return line_end + 2;
+            return error.InvalidChunkEncoding;
+        }
+        self.current_chunk_size = std.fmt.parseInt(u64, size_part, 16) catch {
+            self.state = .err;
+            return error.InvalidChunkEncoding;
         };
 
         self.line_buffer.clearRetainingCapacity();
@@ -496,10 +507,10 @@ pub const Parser = struct {
 
     fn parseChunkData(self: *Self, data: []const u8) !usize {
         const remaining = self.current_chunk_size - self.bytes_read;
-        const to_read = @min(data.len, remaining);
+        const to_read: usize = @intCast(@min(@as(u64, data.len), remaining));
 
         // Enforce body size limit
-        if (self.max_body_size > 0 and self.body_buffer.items.len + to_read > self.max_body_size) {
+        if (self.max_body_size > 0 and @as(u64, self.body_buffer.items.len) + to_read > self.max_body_size) {
             self.state = .err;
             return error.BodyTooLarge;
         }
@@ -555,12 +566,32 @@ pub const Parser = struct {
             break :blk self.line_buffer.items;
         } else data[0..line_end];
 
-        // Ignore trailer fields but consume them until the terminating empty line.
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             self.state = .complete;
             return line_end + 2;
         }
+
+        try self.bumpHeaderBytes(line.len);
+        const sep = mem.indexOfScalar(u8, line, ':') orelse {
+            self.state = .err;
+            return error.InvalidHeader;
+        };
+        const name = mem.trim(u8, line[0..sep], " \t");
+        const value = mem.trim(u8, line[sep + 1 ..], " \t");
+        if (name.len == 0 or
+            std.ascii.eqlIgnoreCase(name, "content-length") or
+            std.ascii.eqlIgnoreCase(name, "transfer-encoding"))
+        {
+            self.state = .err;
+            return error.InvalidHeader;
+        }
+        if (self.header_count >= self.max_headers) {
+            self.state = .err;
+            return error.TooManyHeaders;
+        }
+        try self.trailers.append(name, value);
+        self.header_count += 1;
 
         self.line_buffer.clearRetainingCapacity();
         return line_end + 2;
@@ -769,19 +800,13 @@ test "Parser Transfer-Encoding not last coding is rejected" {
     try std.testing.expectError(error.InvalidChunkEncoding, result);
 }
 
-test "Parser Content-Length ignored when Transfer-Encoding present" {
+test "Parser rejects Content-Length with Transfer-Encoding" {
     const allocator = std.testing.allocator;
     var parser = Parser.initResponse(allocator);
     defer parser.deinit();
 
-    // When Transfer-Encoding is present, Content-Length must be ignored per RFC 7230.
     const data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 999\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
-    _ = try parser.feed(data);
-
-    try std.testing.expect(parser.isComplete());
-    // Content-Length should be cleared
-    try std.testing.expect(parser.content_length == null);
-    try std.testing.expectEqualStrings("Hello", parser.getBody());
+    try std.testing.expectError(error.ConflictingFramingHeaders, parser.feed(data));
 }
 
 test "Parser Connection header tracking" {

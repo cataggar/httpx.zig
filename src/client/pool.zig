@@ -483,15 +483,18 @@ pub const ConnectionPool = struct {
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
         const timeout = if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms;
-        try context.unwrapAfterBlocking(void, socket.connectWithTimeout(addr, timeout));
+        try socket.connectWithContext(addr, timeout, context);
         try socket.setNoDelay(true);
 
         if (key.proxy) |proxy| {
             if (proxy.kind == .socks5h) {
                 try context.check();
-                try context.unwrapAfterBlocking(
-                    void,
-                    proxy_mod.establishSocks5hTunnel(&socket, key.host, key.port, proxy),
+                try proxy_mod.establishSocks5hTunnelWithContext(
+                    &socket,
+                    key.host,
+                    key.port,
+                    proxy,
+                    context,
                 );
             }
         }

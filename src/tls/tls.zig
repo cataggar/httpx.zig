@@ -12,6 +12,7 @@ const alpn = @import("alpn.zig");
 const errors = @import("errors.zig");
 const TlsClient = @import("client.zig");
 const any_io = @import("../io/any_io.zig");
+const IoContext = @import("../io/context.zig").IoContext;
 
 pub const trust = @import("trust.zig");
 pub const cert_signature = @import("cert_signature.zig");
@@ -429,6 +430,7 @@ const ApplicationRecord = struct {
 
 const ApplicationReadState = struct {
     socket: *Socket,
+    context: ?*const IoContext = null,
     version: tls.ProtocolVersion,
     is_server: bool,
     cipher_suite: tls.CipherSuite,
@@ -685,8 +687,12 @@ fn readEncryptedBytes(state: *ApplicationReadState, output: []u8) !usize {
         return to_copy;
     }
 
-    return state.socket.recv(output) catch |err| switch (err) {
+    return (if (state.context) |context|
+        state.socket.recvWithContext(output, context)
+    else
+        state.socket.recv(output)) catch |err| switch (err) {
         error.ConnectionResetByPeer => error.TlsConnectionTruncated,
+        error.Cancelled, error.Timeout => |context_err| context_err,
         else => error.ReadFailed,
     };
 }
@@ -1574,17 +1580,46 @@ pub const Connection = struct {
         return self.writeRecord(data, .application_data);
     }
 
+    pub fn writeWithContext(self: *Connection, data: []const u8, context: *const IoContext) !usize {
+        const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
+        const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
+        const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
+        var sender = ContextSocketSender{ .socket = self.socket, .context = context };
+        return writeBoundedEncryptedRecord(&sender, self.tls_version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+            try context.check();
+            return err;
+        };
+    }
+
     /// Sends the complete application buffer as independently framed records.
     pub fn writeAll(self: *Connection, data: []const u8) !void {
         return writeAllBoundedRecords(self, data);
     }
 
+    pub fn writeAllWithContext(self: *Connection, data: []const u8, context: *const IoContext) !void {
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = try self.writeWithContext(data[written..], context);
+            if (n == 0 or n > data.len - written) return error.WriteFailed;
+            written += n;
+        }
+    }
+
     pub fn flush(_: *Connection) !void {}
 
     pub fn read(self: *Connection, buf: []u8) !usize {
+        return self.readInternal(buf, null);
+    }
+
+    pub fn readWithContext(self: *Connection, buf: []u8, context: *const IoContext) !usize {
+        return self.readInternal(buf, context);
+    }
+
+    fn readInternal(self: *Connection, buf: []u8, context: ?*const IoContext) !usize {
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var state = ApplicationReadState{
             .socket = self.socket,
+            .context = context,
             .version = self.tls_version,
             .is_server = self.is_server,
             .cipher_suite = cs,
@@ -1606,6 +1641,15 @@ pub const Connection = struct {
             .post_handshake_len = &self.post_handshake_len,
         };
         return readApplicationData(&state, buf);
+    }
+};
+
+const ContextSocketSender = struct {
+    socket: *Socket,
+    context: *const IoContext,
+
+    fn sendAll(self: *@This(), data: []const u8) !void {
+        return self.socket.sendAllWithContext(data, self.context);
     }
 };
 
@@ -1709,24 +1753,43 @@ pub const TLSSession = struct {
     }
 
     pub fn handshake(self: *TLSSession, host: []const u8) !void {
+        return self.handshakeInternal(host, null);
+    }
+
+    pub fn handshakeWithContext(self: *TLSSession, host: []const u8, context: *const IoContext) !void {
+        self.handshakeInternal(host, context) catch |err| {
+            try context.check();
+            return err;
+        };
+        try context.check();
+    }
+
+    fn handshakeInternal(self: *TLSSession, host: []const u8, context: ?*const IoContext) !void {
         const socket = self.socket orelse return error.TlsMissingTransport;
-        self.handshakeDo(socket, host) catch {
+        self.handshakeDo(socket, host, context) catch {
+            if (context) |io_context| try io_context.check();
             if (self.reconnect_fn) |reconnect| {
                 if (reconnect(self.reconnect_ctx)) |new_socket| {
                     self.socket = new_socket;
-                    try self.handshakeRetry(new_socket, host);
+                    try self.handshakeRetry(new_socket, host, context);
                     return;
                 }
             }
-            try self.handshakeRetry(socket, host);
+            try self.handshakeRetry(socket, host, context);
         };
     }
 
-    fn handshakeDo(self: *TLSSession, socket: *Socket, host: []const u8) !void {
+    fn handshakeDo(self: *TLSSession, socket: *Socket, host: []const u8, context: ?*const IoContext) !void {
         self.encrypted_buf_len = 0;
         self.encrypted_buf_pos = 0;
-        var io_reader = SocketIoReader.init(socket, &self.hs_read_buf);
-        var io_writer = SocketIoWriter.init(socket, &self.hs_write_buf);
+        var io_reader = if (context) |io_context|
+            SocketIoReader.initWithContext(socket, &self.hs_read_buf, io_context)
+        else
+            SocketIoReader.init(socket, &self.hs_read_buf);
+        var io_writer = if (context) |io_context|
+            SocketIoWriter.initWithContext(socket, &self.hs_write_buf, io_context)
+        else
+            SocketIoWriter.init(socket, &self.hs_write_buf);
 
         var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
         std.Io.Threaded.global_single_threaded.io().random(&entropy);
@@ -1841,8 +1904,8 @@ pub const TLSSession = struct {
         self.encrypted_buf_len = buffered_encrypted.len;
     }
 
-    fn handshakeRetry(self: *TLSSession, socket: *Socket, host: []const u8) !void {
-        try self.handshakeDo(socket, host);
+    fn handshakeRetry(self: *TLSSession, socket: *Socket, host: []const u8, context: ?*const IoContext) !void {
+        try self.handshakeDo(socket, host, context);
     }
 
     pub fn isHTTP2(self: *const TLSSession) bool {
@@ -1863,6 +1926,19 @@ pub const TLSSession = struct {
         return writeBoundedEncryptedRecord(socket, version, key, iv, cs, &self.write_seq, data, .application_data);
     }
 
+    pub fn writeWithContext(self: *TLSSession, data: []const u8, context: *const IoContext) !usize {
+        const socket = self.socket orelse return 0;
+        const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
+        const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
+        const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
+        const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
+        var sender = ContextSocketSender{ .socket = socket, .context = context };
+        return writeBoundedEncryptedRecord(&sender, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+            try context.check();
+            return err;
+        };
+    }
+
     pub fn flush(_: *TLSSession) !void {}
 
     /// Sends the complete application buffer as independently framed records.
@@ -1870,12 +1946,30 @@ pub const TLSSession = struct {
         return writeAllBoundedRecords(self, data);
     }
 
+    pub fn writeAllWithContext(self: *TLSSession, data: []const u8, context: *const IoContext) !void {
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = try self.writeWithContext(data[written..], context);
+            if (n == 0 or n > data.len - written) return error.WriteFailed;
+            written += n;
+        }
+    }
+
     pub fn read(self: *TLSSession, buf: []u8) !usize {
+        return self.readInternal(buf, null);
+    }
+
+    pub fn readWithContext(self: *TLSSession, buf: []u8, context: *const IoContext) !usize {
+        return self.readInternal(buf, context);
+    }
+
+    fn readInternal(self: *TLSSession, buf: []u8, context: ?*const IoContext) !usize {
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var state = ApplicationReadState{
             .socket = socket,
+            .context = context,
             .version = version,
             .is_server = false,
             .cipher_suite = cs,

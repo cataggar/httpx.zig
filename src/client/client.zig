@@ -51,8 +51,17 @@ const Metrics = @import("../io/metrics.zig").Metrics;
 const dns_mod = @import("../net/dns.zig");
 const server_mod = @import("../server/server.zig");
 const LogFn = server_mod.LogFn;
+const operation = @import("operation.zig");
 
 const defaultIo = io_util.defaultIo;
+
+pub const BodyMode = operation.BodyMode;
+pub const ResponseLimit = operation.ResponseLimit;
+pub const OpenOptions = operation.OpenOptions;
+pub const ResponseHead = operation.ResponseHead;
+pub const ContinueResult = operation.ContinueResult;
+pub const FinishOptions = operation.FinishOptions;
+pub const ClientOperation = operation.ClientOperation;
 
 const RequestTimeouts = struct {
     connect_ms: u64,
@@ -68,8 +77,8 @@ pub const ClientConfig = struct {
     policy: types.ClientPolicy = .{},
     default_headers: ?[]const [2][]const u8 = null,
     user_agent: []const u8 = meta.default_user_agent,
-    max_response_size: usize = 100 * 1024 * 1024,
-    max_request_size: usize = 10 * 1024 * 1024,
+    max_response_size: u64 = 100 * 1024 * 1024,
+    max_request_size: u64 = 10 * 1024 * 1024,
     verify_ssl: bool = true,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
@@ -233,7 +242,7 @@ pub const ClientConfig = struct {
     }
 
     /// Returns a copy with maximum response-size limit.
-    pub fn withMaxResponseSize(self: ClientConfig, max_response_size: usize) ClientConfig {
+    pub fn withMaxResponseSize(self: ClientConfig, max_response_size: u64) ClientConfig {
         var out = self;
         out.max_response_size = max_response_size;
         return out;
@@ -249,10 +258,7 @@ pub const ClientConfig = struct {
 };
 
 /// Basic authentication credentials used by per-request options.
-pub const BasicAuth = struct {
-    username: []const u8,
-    password: []const u8,
-};
+pub const BasicAuth = operation.BasicAuth;
 
 /// Representation of a multipart form field.
 pub const MultipartField = struct {
@@ -839,6 +845,154 @@ pub const Client = struct {
         return self.shared.pool.hostConnectionCount(host, port);
     }
 
+    /// Opens a single-owner streaming operation. The request head is sent
+    /// before this function returns; request and response bodies remain
+    /// incremental and are never materialized by the operation.
+    pub fn open(self: *Self, method: types.Method, url: []const u8, open_options: OpenOptions) !ClientOperation {
+        const logical_request_id = try self.beginRequest();
+        errdefer self.endRequest();
+
+        const timeouts = self.resolveOpenTimeouts(open_options);
+        const context = IoContext.init(.{
+            .external_cancel = open_options.cancel_token,
+            .request_deadline = if (timeouts.request_ms > 0) Deadline.afterMs(timeouts.request_ms) else null,
+        });
+        try checkRequestContext(&context);
+
+        const full_url = if (self.shared.config.base_url) |base| blk: {
+            if (mem.indexOf(u8, url, "://") != null) break :blk try self.allocator.dupe(u8, url);
+            break :blk try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url });
+        } else try self.allocator.dupe(u8, url);
+        errdefer self.allocator.free(full_url);
+
+        const req = try self.allocator.create(Request);
+        errdefer self.allocator.destroy(req);
+        req.* = try Request.init(self.allocator, method, full_url);
+        errdefer req.deinit();
+
+        const effective_policy = self.shared.config.policy.resolve(open_options.policy);
+        try self.prepareOpenRequest(req, open_options, &effective_policy);
+
+        return self.openPrepared(
+            req,
+            true,
+            full_url,
+            open_options.body_mode,
+            open_options.response_limit,
+            open_options.expect_100_continue,
+            open_options.keep_alive orelse self.shared.config.keep_alive,
+            open_options.proxy orelse self.shared.config.proxy,
+            open_options.verify_ssl orelse self.shared.config.verify_ssl,
+            open_options.unix_socket_path orelse self.shared.config.unix_socket_path,
+            timeouts,
+            context,
+            effective_policy.decompression,
+            logical_request_id,
+        );
+    }
+
+    fn resolveOpenTimeouts(self: *const Self, open_options: OpenOptions) RequestTimeouts {
+        return self.resolveRequestTimeouts(.{
+            .timeout_ms = open_options.timeout_ms,
+            .connect_timeout_ms = open_options.connect_timeout_ms,
+            .read_timeout_ms = open_options.read_timeout_ms,
+            .write_timeout_ms = open_options.write_timeout_ms,
+            .timeouts = open_options.timeouts,
+        });
+    }
+
+    fn prepareOpenRequest(
+        self: *Self,
+        req: *Request,
+        open_options: OpenOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
+    ) !void {
+        if (open_options.version) |version| req.version = version;
+        if (self.shared.config.default_headers) |configured| try applyConfiguredHeaders(req, configured);
+        if (open_options.headers) |configured| try applyConfiguredHeaders(req, configured);
+
+        if (effective_policy.user_agent == .enabled and
+            !req.headers.contains(HeaderName.USER_AGENT) and
+            self.shared.config.user_agent.len > 0)
+        {
+            try req.headers.append(HeaderName.USER_AGENT, self.shared.config.user_agent);
+        }
+        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
+            if (effective_policy.accept_encoding.value()) |value| {
+                try req.headers.append(HeaderName.ACCEPT_ENCODING, value);
+            }
+        }
+        if (open_options.query_params) |params| try req.addQueryParams(params);
+        if (open_options.range_header) |range| try req.headers.set(HeaderName.RANGE, range);
+        if (open_options.api_key_header) |header_name| {
+            if (open_options.api_key_value) |value| try req.headers.set(header_name, value);
+        }
+        if (open_options.expect_100_continue) try req.headers.set(HeaderName.EXPECT, "100-continue");
+        if (open_options.basic_auth) |basic| try req.setBasicAuth(basic.username, basic.password);
+        if (open_options.bearer_token) |token| try req.setBearerAuth(token);
+        if (effective_policy.cookies.sends()) try self.attachCookies(req);
+
+        req.headers.removeAll(HeaderName.CONTENT_LENGTH);
+        req.headers.removeAll(HeaderName.TRANSFER_ENCODING);
+        switch (open_options.body_mode) {
+            .none => {},
+            .content_length => |length| {
+                var length_buf: [32]u8 = undefined;
+                const value = try std.fmt.bufPrint(&length_buf, "{d}", .{length});
+                try req.headers.set(HeaderName.CONTENT_LENGTH, value);
+            },
+            .chunked => {
+                if (req.version == .HTTP_1_0) return error.ChunkedHttp10Unsupported;
+                if (req.version != .HTTP_2 and req.version != .HTTP_3) {
+                    try req.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
+                }
+            },
+        }
+    }
+
+    fn openPrepared(
+        self: *Self,
+        req: *Request,
+        owns_request: bool,
+        owned_url: ?[]u8,
+        body_mode: BodyMode,
+        response_limit: ResponseLimit,
+        expect_continue: bool,
+        keep_alive: bool,
+        proxy: ?types.Proxy,
+        verify_ssl: bool,
+        unix_socket_path: ?[]const u8,
+        timeouts: RequestTimeouts,
+        context: IoContext,
+        decompression: types.DecompressionPolicy,
+        logical_request_id: u64,
+    ) !ClientOperation {
+        const impl = try self.allocator.create(OperationImpl);
+        errdefer self.allocator.destroy(impl);
+        impl.* = OperationImpl.init(
+            self,
+            req,
+            false,
+            null,
+            body_mode,
+            response_limit,
+            expect_continue,
+            keep_alive,
+            proxy,
+            verify_ssl,
+            unix_socket_path,
+            timeouts,
+            context,
+            decompression,
+            logical_request_id,
+        );
+        errdefer impl.deinitResources();
+        try impl.start();
+        impl.owns_request = owns_request;
+        impl.owned_url = owned_url;
+        return .{ .driver = impl, .vtable = &operation_vtable };
+    }
+
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
         return self.requestInternal(method, url, reqOpts);
@@ -966,7 +1120,7 @@ pub const Client = struct {
 
         // Enforce request size limit.
         if (req.body) |body| {
-            if (body.len > self.shared.config.max_request_size) {
+            if (@as(u64, body.len) > self.shared.config.max_request_size) {
                 return error.RequestTooLarge;
             }
         }
@@ -1350,6 +1504,51 @@ pub const Client = struct {
         }
     }
 
+    fn establishProxyTLSTunnelWithContext(
+        self: *Self,
+        socket: *Socket,
+        target_host: []const u8,
+        target_port: u16,
+        proxy: types.Proxy,
+        context: *const IoContext,
+    ) !void {
+        var request_bytes = std.ArrayList(u8).empty;
+        defer request_bytes.deinit(self.allocator);
+        const writer = list_writer.init(self.allocator, &request_bytes);
+        try writer.print(
+            "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n",
+            .{ target_host, target_port, target_host, target_port },
+        );
+        if (proxy.username) |username| {
+            const auth = try @import("../data/encoding.zig").Base64.formatBasicAuth(
+                self.allocator,
+                username,
+                proxy.password orelse "",
+            );
+            defer self.allocator.free(auth);
+            try writer.print("Proxy-Authorization: {s}\r\n", .{auth});
+        }
+        try writer.writeAll("\r\n");
+        try socket.sendAllWithContext(request_bytes.items, context);
+
+        var response_head: [8192]u8 = undefined;
+        var length: usize = 0;
+        while (mem.indexOf(u8, response_head[0..length], "\r\n\r\n") == null) {
+            if (length == response_head.len) return error.HeaderTooLarge;
+            const n = try socket.recvWithContext(response_head[length..], context);
+            if (n == 0) return error.ProxyConnectionFailed;
+            length += n;
+        }
+        const line_end = mem.indexOf(u8, response_head[0..length], "\r\n") orelse
+            return error.ProxyConnectionFailed;
+        var parts = mem.splitScalar(u8, response_head[0..line_end], ' ');
+        _ = parts.next() orelse return error.ProxyConnectionFailed;
+        const status_text = parts.next() orelse return error.ProxyConnectionFailed;
+        const status_code = std.fmt.parseInt(u16, status_text, 10) catch
+            return error.ProxyConnectionFailed;
+        if (status_code < 200 or status_code >= 300) return error.ProxyConnectionFailed;
+    }
+
     fn resolveRequestTimeouts(self: *const Self, req_opts: RequestOptions) RequestTimeouts {
         var connect_ms = self.shared.config.timeouts.connect_ms;
         var read_ms = self.shared.config.timeouts.read_ms;
@@ -1394,27 +1593,6 @@ pub const Client = struct {
         const verify_ssl = reqOpts.verify_ssl orelse self.shared.config.verify_ssl;
         const unix_socket_path = reqOpts.unix_socket_path orelse self.shared.config.unix_socket_path;
 
-        if (unix_socket_path) |path| {
-            const unix_mod = @import("../net/unix.zig");
-            const unix_sock = try unix_mod.UnixClient.connect(path);
-            var socket = Socket.fromHandle(unix_sock.fd);
-            defer socket.close();
-
-            if (timeouts.read_ms > 0) {
-                try socket.setRecvTimeout(timeouts.read_ms);
-            }
-            if (timeouts.write_ms > 0) {
-                try socket.setSendTimeout(timeouts.write_ms);
-            }
-
-            const request_data = try http.formatRequest(req, self.allocator);
-            defer self.allocator.free(request_data);
-
-            try socket.sendAll(request_data);
-            if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-            return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
-        }
-
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
 
@@ -1426,179 +1604,95 @@ pub const Client = struct {
         const wants_http2 = self.shared.config.http2_enabled or req.version == .HTTP_2;
         const wants_http3 = self.shared.config.http3_enabled or req.version == .HTTP_3;
 
-        // HTTP/3 takes priority, but falls back to HTTP/2 when a proxy is
-        // configured (QUIC does not support standard HTTP proxies).
-        if (wants_http3) {
-            if (effective_proxy != null) {
-                // Fall back to HTTP/2 if also enabled; otherwise return error.
-                if (wants_http2) {
-                    return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, effective_policy, context);
-                }
-                return error.ProxyNotSupported;
-            }
-            return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, effective_policy, context);
+        if (!wants_http3 or (effective_proxy != null and wants_http2)) {
+            return self.executeBufferedThroughOperation(
+                req,
+                reqOpts,
+                effective_policy,
+                context,
+                keep_alive,
+                effective_proxy,
+                verify_ssl,
+                unix_socket_path,
+                timeouts,
+            );
         }
 
-        if (wants_http2) {
-            return self.executeRequestHTTP2(req, host, port, timeouts, reqOpts, effective_policy, context);
+        if (effective_proxy != null) return error.ProxyNotSupported;
+        return self.executeRequestHTTP3(req, host, port, timeouts, reqOpts, effective_policy, context);
+    }
+
+    fn executeBufferedThroughOperation(
+        self: *Self,
+        req: *Request,
+        req_opts: RequestOptions,
+        effective_policy: *const types.EffectiveClientPolicy,
+        context: *const IoContext,
+        keep_alive: bool,
+        effective_proxy: ?types.Proxy,
+        verify_ssl: bool,
+        unix_socket_path: ?[]const u8,
+        timeouts: RequestTimeouts,
+    ) !Response {
+        const body = req.body orelse "";
+        var op = try self.openPrepared(
+            req,
+            false,
+            null,
+            if (body.len == 0) .none else .{ .content_length = @intCast(body.len) },
+            .inherit,
+            req_opts.expect_100_continue,
+            keep_alive,
+            effective_proxy,
+            verify_ssl,
+            unix_socket_path,
+            timeouts,
+            context.*,
+            .disabled,
+            0,
+        );
+        defer op.deinit();
+
+        if (body.len > 0) try op.writeAll(body);
+        const response_head = try op.finishRequest(null);
+
+        var collected = std.ArrayList(u8).empty;
+        defer collected.deinit(self.allocator);
+        var buffer: [32 * 1024]u8 = undefined;
+        while (true) {
+            const n = try op.read(&buffer);
+            if (n == 0) break;
+            try collected.appendSlice(self.allocator, buffer[0..n]);
         }
 
-        var request_data: []u8 = undefined;
-        if (effective_proxy) |p| {
-            if (p.kind == .http and !req.uri.isTLS()) {
-                request_data = try self.formatProxyRequest(req, p);
-            } else {
-                request_data = try http.formatRequest(req, self.allocator);
-            }
-        } else {
-            request_data = try http.formatRequest(req, self.allocator);
+        var response = Response.init(self.allocator, response_head.status.code);
+        errdefer response.deinit();
+        response.version = response_head.version;
+        response.headers.deinit();
+        response.headers = try response_head.headers.clone(self.allocator);
+        if (op.trailers()) |trailers| {
+            response.trailers = try trailers.clone(self.allocator);
         }
-        defer self.allocator.free(request_data);
 
-        if (req.uri.isTLS()) {
-            if (keep_alive) {
-                var lease = try self.shared.pool.getLeaseWithContext(.{
-                    .scheme = .tls,
-                    .host = host,
-                    .port = port,
-                    .proxy = effective_proxy,
-                    .verify_tls = verify_ssl,
-                    .protocol = .http1,
-                }, timeouts.connect_ms, context);
-                var disposition: pool_mod.LeaseDisposition = .broken;
-                defer lease.release(disposition) catch {};
-
-                const fresh = lease.isFresh();
-                const socket = lease.socket();
-                if (fresh) {
-                    if (effective_proxy) |proxy| {
-                        if (proxy.kind == .http) {
-                            try self.establishProxyTLSTunnel(socket, host, port, proxy);
+        if (collected.items.len > 0) {
+            if (effective_policy.decompression == .enabled) {
+                if (response.headers.get(HeaderName.CONTENT_ENCODING)) |encoding_text| {
+                    if (compression_util.ContentEncoding.fromString(encoding_text)) |encoding| {
+                        if (encoding != .identity) {
+                            response.body = try compression_util.decompress(self.allocator, encoding, collected.items);
+                            response.body_owned = true;
                         }
                     }
                 }
-
-                const session = lease.tlsSession() orelse blk: {
-                    const tls_config = if (verify_ssl)
-                        TLSConfig.init(self.allocator)
-                    else
-                        TLSConfig.insecure(self.allocator);
-                    const new_session = lease.initializeTls(tls_config);
-                    if (timeouts.connect_ms > 0) try socket.setRecvTimeout(timeouts.connect_ms);
-                    try self.handshakePooledTls(
-                        &lease,
-                        new_session,
-                        host,
-                        port,
-                        effective_proxy == null,
-                    );
-                    break :blk new_session;
-                };
-
-                try socket.setRecvTimeout(timeouts.read_ms);
-                try socket.setSendTimeout(timeouts.write_ms);
-                try session.writeAll(request_data);
-                try session.flush();
-                if (self.shared.config.metrics) |metrics| metrics.recordBytesSent(@intCast(request_data.len));
-
-                const response = try self.readResponseFromTLS(
-                    session,
-                    req.method.hasResponseBody(),
-                    effective_policy.decompression,
-                );
-                disposition = if (responseIsReusable(&response, req.method.hasResponseBody()))
-                    .reusable
-                else
-                    .draining;
-                return response;
             }
-
-            const connect_host = if (effective_proxy) |p| p.host else host;
-            const connect_port = if (effective_proxy) |p| p.port else port;
-            const addr = try self.resolveAddress(connect_host, connect_port, context);
-
-            var socket = try Socket.createForAddress(addr);
-            defer socket.close();
-
-            // Do not set SO_RCVTIMEO / SO_SNDTIMEO on TLS sockets.
-            // The TLS layer performs multi-step record I/O; a per-recv
-            // timeout fires mid-handshake and kills the TLS state
-            // machine.  The connect timeout is handled separately by
-            // connectWithTimeout (which uses poll).
-            try socket.setNoDelay(true);
-
-            try socket.connectWithTimeout(addr, timeouts.connect_ms);
-            try socket.setNoDelay(true);
-
-            if (effective_proxy) |p| {
-                if (p.kind == .socks5h) {
-                    try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
-                } else {
-                    try self.establishProxyTLSTunnel(&socket, host, port, p);
-                }
-            }
-
-            // Set a temporary SO_RCVTIMEO for the TLS handshake to prevent
-            // blocking indefinitely. Restored after handshake in executeTLSHttp.
-            if (timeouts.connect_ms > 0) {
-                try socket.setRecvTimeout(timeouts.connect_ms);
-            }
-
-            return self.executeTLSHttp(&socket, host, port, request_data, verify_ssl, effective_policy.decompression);
-        }
-
-        if (keep_alive) {
-            var lease = try self.shared.pool.getLeaseWithContext(.{
-                .scheme = .plain,
-                .host = host,
-                .port = port,
-                .proxy = effective_proxy,
-                .verify_tls = false,
-                .protocol = .http1,
-            }, timeouts.connect_ms, context);
-            var disposition: pool_mod.LeaseDisposition = .broken;
-            defer lease.release(disposition) catch {};
-            const socket = lease.socket();
-
-            try socket.setRecvTimeout(timeouts.read_ms);
-            try socket.setSendTimeout(timeouts.write_ms);
-            try socket.setKeepAlive(true);
-
-            try socket.sendAll(request_data);
-            if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-            const res = try self.readResponseFromTcp(socket, req.method.hasResponseBody(), effective_policy.decompression);
-            disposition = if (responseIsReusable(&res, req.method.hasResponseBody()))
-                .reusable
-            else
-                .draining;
-            return res;
-        }
-
-        const connect_host = if (effective_proxy) |p| p.host else host;
-        const connect_port = if (effective_proxy) |p| p.port else port;
-        const addr = try self.resolveAddress(connect_host, connect_port, context);
-
-        var socket = try Socket.createForAddress(addr);
-        defer socket.close();
-
-        if (timeouts.read_ms > 0) {
-            try socket.setRecvTimeout(timeouts.read_ms);
-        }
-        if (timeouts.write_ms > 0) {
-            try socket.setSendTimeout(timeouts.write_ms);
-        }
-
-        try socket.connectWithTimeout(addr, timeouts.connect_ms);
-
-        if (effective_proxy) |p| {
-            if (p.kind == .socks5h) {
-                try proxy_mod.establishSocks5hTunnel(&socket, host, port, p);
+            if (response.body == null) {
+                response.body = try collected.toOwnedSlice(self.allocator);
+                response.body_owned = true;
             }
         }
 
-        try socket.sendAll(request_data);
-        if (self.shared.config.metrics) |m| m.recordBytesSent(@intCast(request_data.len));
-        return self.readResponseFromTcp(&socket, req.method.hasResponseBody(), effective_policy.decompression);
+        try op.finish(.{});
+        return response;
     }
 
     fn executePooledTLSHTTP1(
@@ -1995,7 +2089,7 @@ pub const Client = struct {
             const incoming = try decodeHTTP3StreamDatagram(read_buf[0..n], &session);
 
             if (incoming.stream_id == 0) {
-                if (response_stream_payload.items.len + incoming.data.len > self.shared.config.max_response_size) {
+                if (@as(u64, response_stream_payload.items.len) + incoming.data.len > self.shared.config.max_response_size) {
                     return error.ResponseTooLarge;
                 }
                 try response_stream_payload.appendSlice(self.allocator, incoming.data);
@@ -2003,7 +2097,7 @@ pub const Client = struct {
                     got_response_fin = true;
                 }
             } else if (incoming.stream_id == 3) {
-                if (peer_control_payload.items.len + incoming.data.len > self.shared.config.max_response_size) {
+                if (@as(u64, peer_control_payload.items.len) + incoming.data.len > self.shared.config.max_response_size) {
                     return error.ResponseTooLarge;
                 }
                 try peer_control_payload.appendSlice(self.allocator, incoming.data);
@@ -2161,7 +2255,7 @@ pub const Client = struct {
                     }
                 },
                 @intFromEnum(http.HTTP3FrameType.data) => {
-                    if (response_body.items.len + frame_payload.len > self.shared.config.max_response_size) {
+                    if (@as(u64, response_body.items.len) + frame_payload.len > self.shared.config.max_response_size) {
                         return error.ResponseTooLarge;
                     }
                     try response_body.appendSlice(self.allocator, frame_payload);
@@ -2283,6 +2377,7 @@ pub const Client = struct {
         request_stream: *h2stream.Stream,
         peer_max_frame_size: *u32,
         early_frames: *std.ArrayList(EarlyH2Frame),
+        early_frame_bytes: *usize,
         session_state: *pool_mod.H2SessionState,
     ) !void {
         var pump_counter: usize = 0;
@@ -2295,7 +2390,7 @@ pub const Client = struct {
             const fhdr = http.HTTP2FrameHeader.parse(hdr_bytes);
 
             const payload_len: usize = @intCast(fhdr.length);
-            if (payload_len > self.shared.config.max_response_size) return error.FrameTooLarge;
+            if (@as(u64, payload_len) > self.shared.config.max_response_size) return error.FrameTooLarge;
 
             const payload = try self.allocator.alloc(u8, payload_len);
             if (payload_len > 0) {
@@ -2361,7 +2456,10 @@ pub const Client = struct {
                     self.allocator.free(payload);
                 },
                 .headers, .data, .continuation, .push_promise => {
-                    // Early response frame -- buffer for replay in the response loop.
+                    if (early_frame_bytes.* + payload.len > 64 * 1024) {
+                        self.allocator.free(payload);
+                        return error.EarlyResponseBufferExceeded;
+                    }
                     early_frames.append(self.allocator, .{
                         .header = fhdr,
                         .payload = payload,
@@ -2369,6 +2467,7 @@ pub const Client = struct {
                         self.allocator.free(payload);
                         return err;
                     };
+                    early_frame_bytes.* += payload.len;
                 },
                 // RFC 7540 4.1: Unknown frame types MUST be ignored.
                 _ => {
@@ -2438,6 +2537,7 @@ pub const Client = struct {
         // (when we pump for WINDOW_UPDATE). These are replayed at the start of
         // the response loop so no frames are dropped.
         var early_frames = std.ArrayList(EarlyH2Frame).empty;
+        var early_frame_bytes: usize = 0;
         defer {
             for (early_frames.items) |*ef| ef.deinit(self.allocator);
             early_frames.deinit(self.allocator);
@@ -2458,6 +2558,7 @@ pub const Client = struct {
                         request_stream,
                         &peer_max_frame_size,
                         &early_frames,
+                        &early_frame_bytes,
                         session_state,
                     );
                 }
@@ -2728,7 +2829,7 @@ pub const Client = struct {
                         data_slice = frame.payload[1 .. frame.payload.len - pad_len];
                     }
 
-                    if (body.items.len + data_slice.len > self.shared.config.max_response_size) return error.ResponseTooLarge;
+                    if (@as(u64, body.items.len) + data_slice.len > self.shared.config.max_response_size) return error.ResponseTooLarge;
                     try body.appendSlice(self.allocator, data_slice);
 
                     if (data_slice.len > 0) {
@@ -2798,7 +2899,7 @@ pub const Client = struct {
         const header = http.HTTP2FrameHeader.parse(header_bytes);
 
         const payload_len: usize = @intCast(header.length);
-        if (payload_len > self.shared.config.max_response_size) return error.FrameTooLarge;
+        if (@as(u64, payload_len) > self.shared.config.max_response_size) return error.FrameTooLarge;
 
         const payload = try self.allocator.alloc(u8, payload_len);
         errdefer self.allocator.free(payload);
@@ -2921,7 +3022,7 @@ pub const Client = struct {
             const n = try session.read(&buf);
             if (n == 0) break;
             total_read += n;
-            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
+            if (@as(u64, total_read) > self.shared.config.max_response_size) return error.ResponseTooLarge;
             _ = try parser.feed(buf[0..n]);
         }
 
@@ -2957,7 +3058,7 @@ pub const Client = struct {
             const n = try readFn(reader, &buf);
             if (n == 0) break;
             total_read += n;
-            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
+            if (@as(u64, total_read) > self.shared.config.max_response_size) return error.ResponseTooLarge;
             _ = try parser.feed(buf[0..n]);
         }
 
@@ -3000,7 +3101,7 @@ pub const Client = struct {
                 continue;
             }
             total_read += buffered.len;
-            if (total_read > self.shared.config.max_response_size) return error.ResponseTooLarge;
+            if (@as(u64, total_read) > self.shared.config.max_response_size) return error.ResponseTooLarge;
             const consumed = try parser.feed(buffered);
             r.toss(consumed);
         }
@@ -3021,6 +3122,10 @@ pub const Client = struct {
         res.headers.deinit();
         res.headers = parser.headers;
         parser.headers = Headers.init(parser.allocator);
+        if (parser.trailers.entries.items.len > 0) {
+            res.trailers = parser.trailers;
+            parser.trailers = Headers.init(parser.allocator);
+        }
 
         if (parser.getBody().len > 0) {
             const raw_body = parser.getBody();
@@ -3510,6 +3615,1338 @@ pub fn JsonBorrowedResult(comptime T: type) type {
         value: T,
     };
 }
+
+const OperationProtocol = enum {
+    http1,
+    http2,
+};
+
+const OperationState = enum {
+    request_body,
+    response_body,
+    response_complete,
+    terminal,
+};
+
+const Http1BodyKind = enum {
+    none,
+    content_length,
+    chunked,
+    close_delimited,
+    http2,
+};
+
+const OperationImpl = struct {
+    client: *Client,
+    allocator: Allocator,
+    req: *Request,
+    owns_request: bool,
+    owned_url: ?[]u8,
+    body_mode: BodyMode,
+    response_limit: ?u64,
+    expect_continue: bool,
+    continue_resolved: bool = false,
+    keep_alive: bool,
+    proxy: ?types.Proxy,
+    verify_ssl: bool,
+    unix_socket_path: ?[]const u8,
+    timeouts: RequestTimeouts,
+    context: IoContext,
+    decompression: types.DecompressionPolicy,
+    logical_request_id: u64,
+
+    lease: ?ConnectionLease = null,
+    owned_socket: ?Socket = null,
+    protocol: OperationProtocol = .http1,
+    tls_active: bool = false,
+    state: OperationState = .request_body,
+    terminal_disposition: ?pool_mod.LeaseDisposition = null,
+    owner_lock: std.atomic.Value(u32) = .init(0),
+
+    request_bytes: u64 = 0,
+    request_framing_complete: bool = false,
+    response_bytes: u64 = 0,
+    response_headers: Headers,
+    response_trailers: Headers,
+    response_head: ResponseHead = undefined,
+    response_head_ready: bool = false,
+    response_keep_alive: bool = false,
+    response_body_kind: Http1BodyKind = .none,
+    response_remaining: u64 = 0,
+    chunk_remaining: u64 = 0,
+    chunk_needs_crlf: bool = false,
+
+    h2_stream_id: ?u31 = null,
+    h2_peer_max_frame_size: u32 = 16_384,
+    h2_early_frames: std.ArrayList(Client.EarlyH2Frame) = .empty,
+    h2_early_frame_index: usize = 0,
+    h2_early_frame_bytes: usize = 0,
+    h2_pending_headers: std.ArrayList(u8) = .empty,
+    h2_pending_headers_flags: u8 = 0,
+    h2_data_start: usize = 0,
+    h2_data_end: usize = 0,
+    h2_data_end_stream: bool = false,
+    h2_expected_length: ?u64 = null,
+
+    read_buffer: [64 * 1024]u8 = undefined,
+    read_pos: usize = 0,
+    read_len: usize = 0,
+    line_buffer: [8192]u8 = undefined,
+
+    const Self = @This();
+    const H2FrameView = struct {
+        header: http.HTTP2FrameHeader,
+        payload: []const u8,
+    };
+
+    fn init(
+        client: *Client,
+        req: *Request,
+        owns_request: bool,
+        owned_url: ?[]u8,
+        body_mode: BodyMode,
+        response_limit: ResponseLimit,
+        expect_continue: bool,
+        keep_alive: bool,
+        proxy: ?types.Proxy,
+        verify_ssl: bool,
+        unix_socket_path: ?[]const u8,
+        timeouts: RequestTimeouts,
+        context: IoContext,
+        decompression: types.DecompressionPolicy,
+        logical_request_id: u64,
+    ) Self {
+        return .{
+            .client = client,
+            .allocator = client.allocator,
+            .req = req,
+            .owns_request = owns_request,
+            .owned_url = owned_url,
+            .body_mode = body_mode,
+            .response_limit = switch (response_limit) {
+                .inherit => client.shared.config.max_response_size,
+                .unlimited => null,
+                .bytes => |limit| limit,
+            },
+            .expect_continue = expect_continue,
+            .keep_alive = keep_alive,
+            .proxy = proxy,
+            .verify_ssl = verify_ssl,
+            .unix_socket_path = unix_socket_path,
+            .timeouts = timeouts,
+            .context = context,
+            .decompression = decompression,
+            .logical_request_id = logical_request_id,
+            .response_headers = Headers.init(client.allocator),
+            .response_trailers = Headers.init(client.allocator),
+        };
+    }
+
+    fn tryAcquireOwner(self: *Self) bool {
+        return self.owner_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
+    fn acquireOwner(self: *Self) !void {
+        if (!self.tryAcquireOwner()) return error.ConcurrentOperationUse;
+    }
+
+    fn releaseOwner(self: *Self) void {
+        self.owner_lock.store(0, .release);
+    }
+
+    fn setPhase(self: *Self, timeout_ms: u64) void {
+        self.context.setPhaseDeadline(if (timeout_ms > 0) Deadline.afterMs(timeout_ms) else null);
+    }
+
+    fn clearPhase(self: *Self) void {
+        self.context.setPhaseDeadline(null);
+    }
+
+    fn start(self: *Self) !void {
+        try self.context.check();
+        const wants_h2 = self.client.shared.config.http2_enabled or self.req.version == .HTTP_2;
+        if (self.req.version == .HTTP_3 or self.client.shared.config.http3_enabled) {
+            return error.StreamingHTTP3Unsupported;
+        }
+
+        if (self.unix_socket_path) |path| {
+            if (wants_h2 or self.req.uri.isTLS()) return error.UnsupportedStreamingTransport;
+            const unix_mod = @import("../net/unix.zig");
+            try self.context.check();
+            const unix_sock = try unix_mod.UnixClient.connect(path);
+            try self.context.check();
+            self.owned_socket = Socket.fromHandle(unix_sock.fd);
+            try self.writeHttp1Head();
+            return;
+        }
+
+        const host = self.req.uri.host orelse return error.InvalidUri;
+        const port = self.req.uri.effectivePort();
+        var effective_proxy = self.proxy;
+        if (effective_proxy) |configured| {
+            if (configured.shouldBypassProxy(host)) effective_proxy = null;
+        }
+        self.proxy = effective_proxy;
+
+        self.setPhase(self.timeouts.connect_ms);
+        defer self.clearPhase();
+        self.lease = try self.client.shared.pool.getLeaseWithContext(.{
+            .scheme = if (self.req.uri.isTLS()) .tls else .plain,
+            .host = host,
+            .port = port,
+            .proxy = effective_proxy,
+            .verify_tls = self.verify_ssl,
+            .protocol = if (wants_h2) .http2 else .http1,
+        }, self.timeouts.connect_ms, &self.context);
+
+        const fresh = self.lease.?.isFresh();
+        if (fresh) {
+            if (effective_proxy) |configured| {
+                if (configured.kind == .http and self.req.uri.isTLS()) {
+                    try self.client.establishProxyTLSTunnelWithContext(
+                        self.lease.?.socket(),
+                        host,
+                        port,
+                        configured,
+                        &self.context,
+                    );
+                }
+            }
+        }
+
+        if (self.req.uri.isTLS()) {
+            const existing_session = self.lease.?.tlsSession();
+            const session = existing_session orelse session: {
+                const config = if (wants_h2)
+                    (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
+                else if (self.verify_ssl)
+                    TLSConfig.init(self.allocator)
+                else
+                    TLSConfig.insecure(self.allocator);
+                break :session self.lease.?.initializeTls(config);
+            };
+            if (existing_session == null) try session.handshakeWithContext(host, &self.context);
+            self.tls_active = true;
+
+            const negotiated = http.negotiateVersion(session.negotiatedProtocol());
+            if (wants_h2 and negotiated == .http_2) {
+                self.protocol = .http2;
+            } else if (self.req.version == .HTTP_2) {
+                return error.UnsupportedHttpVersion;
+            }
+        } else if (wants_h2) {
+            self.protocol = .http2;
+        }
+
+        switch (self.protocol) {
+            .http1 => try self.writeHttp1Head(),
+            .http2 => try self.startHttp2(),
+        }
+    }
+
+    fn socket(self: *Self) *Socket {
+        if (self.lease) |*lease| return lease.socket();
+        return &self.owned_socket.?;
+    }
+
+    fn tlsSession(self: *Self) *TLSSession {
+        return self.lease.?.tlsSession().?;
+    }
+
+    fn transportWriteAll(self: *Self, data: []const u8) !void {
+        try self.context.check();
+        self.setPhase(self.timeouts.write_ms);
+        defer self.clearPhase();
+        if (self.tls_active) {
+            try self.tlsSession().writeAllWithContext(data, &self.context);
+            try self.tlsSession().flush();
+        } else {
+            try self.socket().sendAllWithContext(data, &self.context);
+        }
+        if (self.client.shared.config.metrics) |metrics| metrics.recordBytesSent(@intCast(data.len));
+    }
+
+    fn transportRead(self: *Self, output: []u8) !usize {
+        try self.context.check();
+        self.setPhase(self.timeouts.read_ms);
+        defer self.clearPhase();
+        const n = if (self.tls_active)
+            try self.tlsSession().readWithContext(output, &self.context)
+        else
+            try self.socket().recvWithContext(output, &self.context);
+        return n;
+    }
+
+    fn writeHttp1Head(self: *Self) !void {
+        var head = std.ArrayList(u8).empty;
+        defer head.deinit(self.allocator);
+        const writer = list_writer.init(self.allocator, &head);
+
+        const method = if (self.req.method == .CUSTOM)
+            (self.req.custom_method orelse "CUSTOM")
+        else
+            self.req.method.toString();
+        if (self.proxy) |configured| {
+            if (configured.kind == .http and !self.req.uri.isTLS()) {
+                const absolute = try self.req.uri.format(self.allocator);
+                defer self.allocator.free(absolute);
+                try writer.print("{s} {s} {s}\r\n", .{ method, absolute, self.req.version.toString() });
+            } else {
+                const path = try self.req.uri.requestPath(self.allocator);
+                defer self.allocator.free(path);
+                try writer.print("{s} {s} {s}\r\n", .{ method, path, self.req.version.toString() });
+            }
+        } else {
+            const path = try self.req.uri.requestPath(self.allocator);
+            defer self.allocator.free(path);
+            try writer.print("{s} {s} {s}\r\n", .{ method, path, self.req.version.toString() });
+        }
+
+        for (self.req.headers.iterator()) |header| {
+            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+        }
+        if (!self.keep_alive and !self.req.headers.contains(HeaderName.CONNECTION)) {
+            try writer.writeAll("Connection: close\r\n");
+        }
+        if (self.proxy) |configured| {
+            if (configured.kind == .http and !self.req.uri.isTLS() and configured.username != null) {
+                const auth = try @import("../data/encoding.zig").Base64.formatBasicAuth(
+                    self.allocator,
+                    configured.username.?,
+                    configured.password orelse "",
+                );
+                defer self.allocator.free(auth);
+                try writer.print("Proxy-Authorization: {s}\r\n", .{auth});
+            }
+        }
+        try writer.writeAll("\r\n");
+        if (head.items.len > self.line_buffer.len) return error.HeaderTooLarge;
+        try self.transportWriteAll(head.items);
+    }
+
+    fn writeRequest(self: *Self, data: []const u8) !usize {
+        try self.context.check();
+        if (self.state != .request_body) {
+            if (self.context.isCancelled()) return error.Cancelled;
+            return error.InvalidOperationState;
+        }
+        if (data.len == 0) return 0;
+        if (self.expect_continue and !self.continue_resolved) {
+            if (try self.waitForContinue() == .final_response) return error.EarlyResponse;
+        }
+
+        switch (self.body_mode) {
+            .none => return error.RequestBodyNotAllowed,
+            .content_length => |length| {
+                const next = std.math.add(u64, self.request_bytes, data.len) catch
+                    return error.RequestBodyOverrun;
+                if (next > length) return error.RequestBodyOverrun;
+                try self.writeProtocolData(data);
+                self.request_bytes = next;
+                return data.len;
+            },
+            .chunked => {
+                try self.writeProtocolData(data);
+                self.request_bytes = std.math.add(u64, self.request_bytes, data.len) catch
+                    return error.BodyLengthOverflow;
+                return data.len;
+            },
+        }
+    }
+
+    fn writeProtocolData(self: *Self, data: []const u8) !void {
+        switch (self.protocol) {
+            .http1 => switch (self.body_mode) {
+                .chunked => {
+                    var prefix_buf: [32]u8 = undefined;
+                    const prefix = try std.fmt.bufPrint(&prefix_buf, "{x}\r\n", .{data.len});
+                    try self.transportWriteAll(prefix);
+                    try self.transportWriteAll(data);
+                    try self.transportWriteAll("\r\n");
+                },
+                else => try self.transportWriteAll(data),
+            },
+            .http2 => try self.writeHttp2Data(data, false),
+        }
+    }
+
+    fn waitForContinue(self: *Self) !ContinueResult {
+        try self.context.check();
+        if (self.state != .request_body) {
+            return if (self.response_head_ready) .final_response else error.InvalidOperationState;
+        }
+        if (!self.expect_continue) return .send_body;
+        if (self.continue_resolved) {
+            return if (self.response_head_ready) .final_response else .send_body;
+        }
+
+        while (true) {
+            const code = switch (self.protocol) {
+                .http1 => try self.readHttp1Head(),
+                .http2 => try self.readHttp2Head(),
+            };
+            if (code == 100) {
+                self.continue_resolved = true;
+                return .send_body;
+            }
+            if (code >= 100 and code < 200) continue;
+            self.continue_resolved = true;
+            if (self.protocol == .http2) {
+                try self.writeHttp2Data(&.{}, true);
+                self.request_framing_complete = true;
+            } else {
+                self.response_keep_alive = false;
+            }
+            self.state = if (self.response_body_kind == .none) .response_complete else .response_body;
+            return .final_response;
+        }
+    }
+
+    fn finishRequest(self: *Self, trailers: ?[]const [2][]const u8) !*const ResponseHead {
+        try self.context.check();
+        if (self.response_head_ready) return &self.response_head;
+        if (self.state != .request_body) return error.InvalidOperationState;
+
+        if (self.expect_continue and !self.continue_resolved) {
+            if (try self.waitForContinue() == .final_response) return &self.response_head;
+        }
+
+        switch (self.body_mode) {
+            .none => {},
+            .content_length => |length| {
+                if (self.request_bytes != length) return error.RequestBodyUnderrun;
+            },
+            .chunked => {},
+        }
+
+        switch (self.protocol) {
+            .http1 => {
+                if (self.body_mode == .chunked) {
+                    var ending = std.ArrayList(u8).empty;
+                    defer ending.deinit(self.allocator);
+                    const writer = list_writer.init(self.allocator, &ending);
+                    try writer.writeAll("0\r\n");
+                    if (trailers) |fields| {
+                        for (fields) |field| {
+                            if (std.ascii.eqlIgnoreCase(field[0], HeaderName.CONTENT_LENGTH) or
+                                std.ascii.eqlIgnoreCase(field[0], HeaderName.TRANSFER_ENCODING) or
+                                mem.indexOfAny(u8, field[0], "\r\n") != null or
+                                mem.indexOfAny(u8, field[1], "\r\n") != null)
+                            {
+                                return error.InvalidTrailer;
+                            }
+                            try writer.print("{s}: {s}\r\n", .{ field[0], field[1] });
+                        }
+                    } else if (trailers != null) {
+                        return error.InvalidTrailer;
+                    }
+                    try writer.writeAll("\r\n");
+                    try self.transportWriteAll(ending.items);
+                } else if (trailers != null) {
+                    return error.TrailersRequireChunkedBody;
+                }
+            },
+            .http2 => {
+                if (trailers) |fields| {
+                    try self.writeHttp2Trailers(fields);
+                } else {
+                    try self.writeHttp2Data(&.{}, true);
+                }
+            },
+        }
+        self.request_framing_complete = true;
+
+        while (true) {
+            const code = switch (self.protocol) {
+                .http1 => try self.readHttp1Head(),
+                .http2 => try self.readHttp2Head(),
+            };
+            if (code >= 100 and code < 200) continue;
+            break;
+        }
+        self.state = if (self.response_body_kind == .none) .response_complete else .response_body;
+        return &self.response_head;
+    }
+
+    fn fillReadBuffer(self: *Self) !bool {
+        if (self.read_pos < self.read_len) return true;
+        self.read_pos = 0;
+        self.read_len = try self.transportRead(&self.read_buffer);
+        return self.read_len != 0;
+    }
+
+    fn readRaw(self: *Self, output: []u8) !usize {
+        if (output.len == 0) return 0;
+        if (!try self.fillReadBuffer()) return 0;
+        const n = @min(output.len, self.read_len - self.read_pos);
+        @memcpy(output[0..n], self.read_buffer[self.read_pos..][0..n]);
+        self.read_pos += n;
+        return n;
+    }
+
+    fn readByte(self: *Self) !?u8 {
+        if (!try self.fillReadBuffer()) return null;
+        const byte = self.read_buffer[self.read_pos];
+        self.read_pos += 1;
+        return byte;
+    }
+
+    fn readLine(self: *Self) ![]const u8 {
+        var len: usize = 0;
+        while (true) {
+            const byte = (try self.readByte()) orelse return error.UnexpectedEof;
+            if (len >= self.line_buffer.len) return error.HeaderTooLarge;
+            self.line_buffer[len] = byte;
+            len += 1;
+            if (len >= 2 and self.line_buffer[len - 2] == '\r' and self.line_buffer[len - 1] == '\n') {
+                return self.line_buffer[0 .. len - 2];
+            }
+        }
+    }
+
+    fn readHttp1Head(self: *Self) !u16 {
+        self.response_headers.clear();
+        self.response_trailers.clear();
+        self.response_head_ready = false;
+        self.response_body_kind = .none;
+        self.response_remaining = 0;
+
+        const status_line = try self.readLine();
+        var status_parts = mem.splitScalar(u8, status_line, ' ');
+        const version_text = status_parts.next() orelse return error.InvalidResponse;
+        const status_text = status_parts.next() orelse return error.InvalidResponse;
+        const version = types.Version.fromString(version_text) orelse return error.InvalidResponse;
+        const status_code = std.fmt.parseInt(u16, status_text, 10) catch return error.InvalidResponse;
+
+        var content_length: ?u64 = null;
+        var transfer_chunked = false;
+        var connection_close = false;
+        var connection_keep_alive = false;
+
+        while (true) {
+            const line = try self.readLine();
+            if (line.len == 0) break;
+            const separator = mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+            const name = mem.trim(u8, line[0..separator], " \t");
+            const value = mem.trim(u8, line[separator + 1 ..], " \t");
+            if (name.len == 0) return error.InvalidHeader;
+            try self.response_headers.append(name, value);
+
+            if (std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH)) {
+                var values = mem.splitScalar(u8, value, ',');
+                var saw_value = false;
+                while (values.next()) |part| {
+                    const trimmed = mem.trim(u8, part, " \t");
+                    if (trimmed.len == 0) return error.InvalidContentLength;
+                    const parsed = std.fmt.parseInt(u64, trimmed, 10) catch
+                        return error.InvalidContentLength;
+                    saw_value = true;
+                    if (content_length) |existing| {
+                        if (existing != parsed) return error.InvalidContentLength;
+                    } else {
+                        content_length = parsed;
+                    }
+                }
+                if (!saw_value) return error.InvalidContentLength;
+            } else if (std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING)) {
+                if (transfer_chunked) return error.InvalidChunkEncoding;
+                var codings = mem.splitScalar(u8, value, ',');
+                var count: usize = 0;
+                while (codings.next()) |coding| {
+                    const trimmed = mem.trim(u8, coding, " \t");
+                    count += 1;
+                    if (!std.ascii.eqlIgnoreCase(trimmed, "chunked")) return error.InvalidChunkEncoding;
+                }
+                if (count != 1) return error.InvalidChunkEncoding;
+                transfer_chunked = true;
+            } else if (std.ascii.eqlIgnoreCase(name, HeaderName.CONNECTION)) {
+                if (std.ascii.indexOfIgnoreCase(value, "close") != null) connection_close = true;
+                if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) connection_keep_alive = true;
+            }
+        }
+
+        if (transfer_chunked and content_length != null) return error.ConflictingFramingHeaders;
+        self.response_keep_alive = !connection_close and
+            (version == .HTTP_1_1 or connection_keep_alive);
+        self.response_head = .{
+            .version = version,
+            .status = Status.fromCode(status_code),
+            .headers = &self.response_headers,
+        };
+        self.response_head_ready = status_code < 100 or status_code >= 200;
+
+        const no_body = !self.req.method.hasResponseBody() or
+            (status_code >= 100 and status_code < 200) or
+            status_code == 204 or status_code == 304;
+        if (no_body) {
+            self.response_body_kind = .none;
+        } else if (transfer_chunked) {
+            self.response_body_kind = .chunked;
+        } else if (content_length) |length| {
+            if (self.response_limit) |limit| {
+                if (length > limit) return error.ResponseTooLarge;
+            }
+            self.response_body_kind = if (length == 0) .none else .content_length;
+            self.response_remaining = length;
+        } else {
+            self.response_body_kind = .close_delimited;
+            self.response_keep_alive = false;
+        }
+        return status_code;
+    }
+
+    fn countResponseBytes(self: *Self, amount: usize) !void {
+        const next = std.math.add(u64, self.response_bytes, amount) catch
+            return error.BodyLengthOverflow;
+        if (self.response_limit) |limit| {
+            if (next > limit) return error.ResponseTooLarge;
+        }
+        self.response_bytes = next;
+    }
+
+    fn readResponse(self: *Self, output: []u8) !usize {
+        try self.context.check();
+        if (self.state == .response_complete) return 0;
+        if (self.state != .response_body) return error.InvalidOperationState;
+        if (output.len == 0) return 0;
+        if (self.decompression == .enabled) {
+            if (self.response_headers.get(HeaderName.CONTENT_ENCODING)) |encoding| {
+                if (!std.ascii.eqlIgnoreCase(encoding, "identity")) {
+                    return error.StreamingDecompressionUnsupported;
+                }
+            }
+        }
+
+        return switch (self.protocol) {
+            .http1 => self.readHttp1Body(output),
+            .http2 => self.readHttp2Body(output),
+        };
+    }
+
+    fn readHttp1Body(self: *Self, output: []u8) !usize {
+        switch (self.response_body_kind) {
+            .none => {
+                self.state = .response_complete;
+                return 0;
+            },
+            .content_length => {
+                if (self.response_remaining == 0) {
+                    if (self.read_pos != self.read_len) return error.ResponseBodyOverrun;
+                    self.state = .response_complete;
+                    return 0;
+                }
+                const want: usize = @intCast(@min(@as(u64, output.len), self.response_remaining));
+                const n = try self.readRaw(output[0..want]);
+                if (n == 0) return error.ResponseBodyUnderrun;
+                try self.countResponseBytes(n);
+                self.response_remaining -= n;
+                if (self.response_remaining == 0 and self.read_pos != self.read_len) {
+                    return error.ResponseBodyOverrun;
+                }
+                return n;
+            },
+            .close_delimited => {
+                const n = try self.readRaw(output);
+                if (n == 0) {
+                    self.state = .response_complete;
+                    return 0;
+                }
+                try self.countResponseBytes(n);
+                return n;
+            },
+            .chunked => {
+                while (true) {
+                    if (self.chunk_needs_crlf) {
+                        const first = (try self.readByte()) orelse return error.MalformedChunk;
+                        const second = (try self.readByte()) orelse return error.MalformedChunk;
+                        if (first != '\r' or second != '\n') return error.MalformedChunk;
+                        self.chunk_needs_crlf = false;
+                    }
+                    if (self.chunk_remaining == 0) {
+                        const line = try self.readLine();
+                        const separator = mem.indexOfScalar(u8, line, ';') orelse line.len;
+                        const size_text = mem.trim(u8, line[0..separator], " \t");
+                        if (size_text.len == 0) return error.InvalidChunkSize;
+                        self.chunk_remaining = std.fmt.parseInt(u64, size_text, 16) catch
+                            return error.InvalidChunkSize;
+                        if (self.chunk_remaining == 0) {
+                            try self.readHttp1Trailers();
+                            self.state = .response_complete;
+                            return 0;
+                        }
+                    }
+
+                    const want: usize = @intCast(@min(@as(u64, output.len), self.chunk_remaining));
+                    const n = try self.readRaw(output[0..want]);
+                    if (n == 0) return error.ResponseBodyUnderrun;
+                    try self.countResponseBytes(n);
+                    self.chunk_remaining -= n;
+                    if (self.chunk_remaining == 0) self.chunk_needs_crlf = true;
+                    return n;
+                }
+            },
+            .http2 => return error.InvalidOperationState,
+        }
+    }
+
+    fn readHttp1Trailers(self: *Self) !void {
+        while (true) {
+            const line = try self.readLine();
+            if (line.len == 0) return;
+            const separator = mem.indexOfScalar(u8, line, ':') orelse return error.InvalidTrailer;
+            const name = mem.trim(u8, line[0..separator], " \t");
+            const value = mem.trim(u8, line[separator + 1 ..], " \t");
+            if (name.len == 0 or
+                std.ascii.eqlIgnoreCase(name, HeaderName.CONTENT_LENGTH) or
+                std.ascii.eqlIgnoreCase(name, HeaderName.TRANSFER_ENCODING))
+            {
+                return error.InvalidTrailer;
+            }
+            try self.response_trailers.append(name, value);
+        }
+    }
+
+    fn finish(self: *Self, options: FinishOptions) !void {
+        try self.context.check();
+        if (self.state == .terminal) return;
+        if (self.state == .request_body) return error.RequestNotFinished;
+        if (self.state == .response_body) {
+            if (!options.drain_response) {
+                self.terminalCleanup(.broken);
+                return;
+            }
+            var discard: [32 * 1024]u8 = undefined;
+            while (try self.readResponse(&discard) != 0) {}
+        }
+        if (self.state != .response_complete) return error.InvalidOperationState;
+
+        if (self.protocol == .http2) {
+            const draining = if (self.lease) |*lease| lease.h2Session().draining else true;
+            self.terminalCleanup(if (draining) .draining else if (self.keep_alive and self.request_framing_complete) .reusable else .broken);
+            return;
+        }
+
+        const reusable = self.request_framing_complete and
+            self.keep_alive and
+            self.response_keep_alive and
+            self.response_body_kind != .close_delimited and
+            self.read_pos == self.read_len;
+        self.terminalCleanup(if (reusable) .reusable else .broken);
+    }
+
+    fn terminalCleanup(self: *Self, disposition: pool_mod.LeaseDisposition) void {
+        if (self.state == .terminal) return;
+        if (self.h2_stream_id) |stream_id| {
+            if (self.lease) |*lease| {
+                lease.h2Session().stream_manager.removeStream(stream_id);
+            }
+            self.h2_stream_id = null;
+        }
+        self.state = .terminal;
+        self.terminal_disposition = disposition;
+        if (self.lease) |*lease| {
+            lease.release(disposition) catch {};
+            self.lease = null;
+        }
+        if (self.owned_socket) |*owned| {
+            owned.close();
+            self.owned_socket = null;
+        }
+    }
+
+    fn abort(self: *Self) void {
+        if (self.state == .terminal) return;
+        if (self.protocol == .http2 and self.lease != null) {
+            self.resetHttp2Stream();
+            self.terminalCleanup(if (self.lease.?.h2Session().draining) .draining else .reusable);
+        } else {
+            self.terminalCleanup(.broken);
+        }
+    }
+
+    fn cancel(self: *Self) void {
+        self.context.cancel();
+        if (self.tryAcquireOwner()) {
+            defer self.releaseOwner();
+            self.abort();
+        }
+    }
+
+    fn deinitResources(self: *Self) void {
+        if (self.state != .terminal) self.abort();
+        self.response_headers.deinit();
+        self.response_trailers.deinit();
+        for (self.h2_early_frames.items) |*frame| frame.deinit(self.allocator);
+        self.h2_early_frames.deinit(self.allocator);
+        self.h2_pending_headers.deinit(self.allocator);
+        if (self.owns_request) {
+            self.req.deinit();
+            self.allocator.destroy(self.req);
+        }
+        if (self.owned_url) |url| self.allocator.free(url);
+        if (self.owns_request) self.client.endRequest();
+    }
+
+    fn fail(self: *Self) void {
+        if (self.protocol == .http2 and self.lease != null) {
+            self.resetHttp2Stream();
+            self.terminalCleanup(if (self.lease.?.h2Session().draining) .draining else .reusable);
+        } else {
+            self.terminalCleanup(.broken);
+        }
+    }
+
+    fn startHttp2(self: *Self) !void {
+        const lease = &(self.lease orelse return error.InvalidConnectionState);
+        const session = lease.h2Session();
+        const local_settings = toConnectionSettings(
+            self.client.shared.config.http2_settings,
+            self.client.shared.config.allow_push,
+        );
+        var transport = OperationHTTP2Transport{ .operation = self };
+
+        if (!session.initialized) {
+            try transport.writeAll(http.HTTP2_PREFACE);
+            var settings_payload = std.ArrayList(u8).empty;
+            defer settings_payload.deinit(self.allocator);
+            try http.encodeSettingsPayload(local_settings, self.allocator, &settings_payload);
+            try writeHTTP2Frame(&transport, .settings, 0, 0, settings_payload.items);
+            session.initialized = true;
+        }
+
+        const request_stream = try session.stream_manager.createStream();
+        errdefer session.stream_manager.removeStream(request_stream.id);
+        self.h2_stream_id = request_stream.id;
+        request_stream.send_window = @intCast(session.stream_manager.peer_settings.initial_window_size);
+        try request_stream.open();
+        self.h2_peer_max_frame_size = session.peer_max_frame_size;
+
+        var path_buf: ?[]u8 = null;
+        defer if (path_buf) |buffer| self.allocator.free(buffer);
+        var authority_buf: ?[]u8 = null;
+        defer if (authority_buf) |buffer| self.allocator.free(buffer);
+        var header_entries = std.ArrayList(hpack.HeaderEntry).empty;
+        defer header_entries.deinit(self.allocator);
+        var owned_names = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_names.items) |name| self.allocator.free(name);
+            owned_names.deinit(self.allocator);
+        }
+        try buildPseudoHeaders(
+            self.allocator,
+            self.req,
+            &header_entries,
+            &owned_names,
+            &path_buf,
+            &authority_buf,
+        );
+
+        const frames = try h2stream.buildHeadersAndContinuations(
+            &session.stream_manager,
+            request_stream.id,
+            header_entries.items,
+            null,
+            local_settings.max_frame_size,
+            false,
+            self.allocator,
+        );
+        defer self.allocator.free(frames);
+        try transport.writeAll(frames);
+    }
+
+    fn writeHttp2Data(self: *Self, data: []const u8, end_stream: bool) !void {
+        const stream_id = self.h2_stream_id orelse return error.InvalidStreamState;
+        const session = self.lease.?.h2Session();
+        const request_stream = session.stream_manager.getStream(stream_id) orelse
+            return error.InvalidStreamState;
+        if (request_stream.end_stream_sent) return error.RequestAlreadyFinished;
+
+        var transport = OperationHTTP2Transport{ .operation = self };
+        if (data.len == 0) {
+            if (end_stream) {
+                try writeHTTP2Frame(&transport, .data, 0x01, stream_id, &.{});
+                request_stream.sendEndStream();
+            }
+            return;
+        }
+
+        var offset: usize = 0;
+        while (offset < data.len) {
+            if (request_stream.send_window <= 0 or session.stream_manager.connection_send_window <= 0) {
+                try self.client.pumpUntilSendWindow(
+                    &transport,
+                    &session.stream_manager,
+                    request_stream,
+                    &self.h2_peer_max_frame_size,
+                    &self.h2_early_frames,
+                    &self.h2_early_frame_bytes,
+                    session,
+                );
+            }
+            const stream_window = @as(i64, request_stream.send_window);
+            const connection_window = @as(i64, session.stream_manager.connection_send_window);
+            if (stream_window <= 0 or connection_window <= 0) return error.FlowControlError;
+            const max_window: usize = @intCast(@min(stream_window, connection_window));
+            const chunk_len = @min(
+                data.len - offset,
+                max_window,
+                @as(usize, @intCast(self.h2_peer_max_frame_size)),
+            );
+            const is_last = offset + chunk_len == data.len;
+            try writeHTTP2Frame(
+                &transport,
+                .data,
+                if (end_stream and is_last) 0x01 else 0,
+                stream_id,
+                data[offset..][0..chunk_len],
+            );
+            request_stream.send_window -= @intCast(chunk_len);
+            session.stream_manager.connection_send_window -= @intCast(chunk_len);
+            offset += chunk_len;
+        }
+        if (end_stream) request_stream.sendEndStream();
+    }
+
+    fn writeHttp2Trailers(self: *Self, fields: []const [2][]const u8) !void {
+        const stream_id = self.h2_stream_id orelse return error.InvalidStreamState;
+        const session = self.lease.?.h2Session();
+        const request_stream = session.stream_manager.getStream(stream_id) orelse
+            return error.InvalidStreamState;
+        var entries = std.ArrayList(hpack.HeaderEntry).empty;
+        defer entries.deinit(self.allocator);
+        var owned_names = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_names.items) |name| self.allocator.free(name);
+            owned_names.deinit(self.allocator);
+        }
+        for (fields) |field| {
+            if (field[0].len == 0 or field[0][0] == ':' or
+                common.isConnectionSpecificHeader(field[0]) or
+                std.ascii.eqlIgnoreCase(field[0], HeaderName.CONTENT_LENGTH))
+            {
+                return error.InvalidTrailer;
+            }
+            const name = try common.dupLowerAscii(self.allocator, field[0]);
+            try owned_names.append(self.allocator, name);
+            try entries.append(self.allocator, .{ .name = name, .value = field[1] });
+        }
+        const frames = try h2stream.buildHeadersAndContinuations(
+            &session.stream_manager,
+            stream_id,
+            entries.items,
+            null,
+            self.client.shared.config.http2_settings.max_frame_size,
+            true,
+            self.allocator,
+        );
+        defer self.allocator.free(frames);
+        var transport = OperationHTTP2Transport{ .operation = self };
+        try transport.writeAll(frames);
+        request_stream.sendEndStream();
+    }
+
+    fn readHttp2Head(self: *Self) !u16 {
+        self.response_headers.clear();
+        self.response_head_ready = false;
+        self.h2_pending_headers.clearRetainingCapacity();
+
+        while (true) {
+            const frame = try self.nextHttp2Frame();
+            switch (frame.header.frame_type) {
+                .headers => {
+                    if (frame.header.stream_id != self.h2_stream_id.?) continue;
+                    self.h2_pending_headers_flags = frame.header.flags;
+                    try self.appendH2HeaderBlock(frame.payload);
+                    if ((frame.header.flags & 0x04) == 0) {
+                        try self.readHttp2Continuations();
+                    }
+                    const status_code = try self.parseHttp2HeaderBlock(&self.response_headers, true);
+                    const end_stream = (frame.header.flags & 0x01) != 0;
+                    if (status_code >= 100 and status_code < 200) {
+                        if (end_stream) return error.ProtocolError;
+                        return status_code;
+                    }
+
+                    self.response_head = .{
+                        .version = .HTTP_2,
+                        .status = Status.fromCode(status_code),
+                        .headers = &self.response_headers,
+                    };
+                    self.response_head_ready = true;
+                    self.response_keep_alive = true;
+                    try self.configureHttp2ResponseBody(end_stream);
+                    return status_code;
+                },
+                .data => return error.ProtocolError,
+                else => try self.handleHttp2ControlFrame(frame),
+            }
+        }
+    }
+
+    fn readHttp2Body(self: *Self, output: []u8) !usize {
+        while (true) {
+            if (self.h2_data_start < self.h2_data_end) {
+                const amount = @min(output.len, self.h2_data_end - self.h2_data_start);
+                if (self.h2_expected_length) |remaining| {
+                    if (amount > remaining) return error.ResponseBodyOverrun;
+                    self.h2_expected_length = remaining - amount;
+                }
+                @memcpy(output[0..amount], self.read_buffer[self.h2_data_start..][0..amount]);
+                self.h2_data_start += amount;
+                try self.countResponseBytes(amount);
+                try self.sendHttp2WindowUpdate(amount);
+                if (self.h2_data_start == self.h2_data_end and self.h2_data_end_stream) {
+                    try self.completeHttp2Response();
+                }
+                return amount;
+            }
+            if (self.state == .response_complete) return 0;
+
+            const frame = try self.nextHttp2Frame();
+            switch (frame.header.frame_type) {
+                .data => {
+                    if (frame.header.stream_id != self.h2_stream_id.?) continue;
+                    var data_start: usize = 0;
+                    var end = frame.payload.len;
+                    if ((frame.header.flags & 0x08) != 0) {
+                        if (frame.payload.len == 0) return error.ProtocolError;
+                        const padding = frame.payload[0];
+                        if (frame.payload.len < @as(usize, padding) + 1) return error.ProtocolError;
+                        data_start = 1;
+                        end -= padding;
+                    }
+                    self.h2_data_start = data_start;
+                    self.h2_data_end = end;
+                    self.h2_data_end_stream = (frame.header.flags & 0x01) != 0;
+                    if (data_start == end) {
+                        if (self.h2_data_end_stream) try self.completeHttp2Response();
+                        continue;
+                    }
+                },
+                .headers => {
+                    if (frame.header.stream_id != self.h2_stream_id.?) continue;
+                    self.h2_pending_headers.clearRetainingCapacity();
+                    self.h2_pending_headers_flags = frame.header.flags;
+                    try self.appendH2HeaderBlock(frame.payload);
+                    if ((frame.header.flags & 0x04) == 0) try self.readHttp2Continuations();
+                    _ = try self.parseHttp2HeaderBlock(&self.response_trailers, false);
+                    if ((frame.header.flags & 0x01) == 0) return error.ProtocolError;
+                    try self.completeHttp2Response();
+                },
+                else => try self.handleHttp2ControlFrame(frame),
+            }
+        }
+    }
+
+    fn resetHttp2Stream(self: *Self) void {
+        const stream_id = self.h2_stream_id orelse return;
+        const frame = h2stream.buildRstStreamFrame(stream_id, .cancel);
+        if (self.tls_active) {
+            self.tlsSession().writeAll(&frame) catch {};
+            self.tlsSession().flush() catch {};
+        } else {
+            self.socket().sendAll(&frame) catch {};
+        }
+        if (self.lease) |*lease| {
+            if (lease.h2Session().stream_manager.getStream(stream_id)) |stream_value| {
+                stream_value.reset();
+            }
+        }
+    }
+
+    fn nextHttp2Frame(self: *Self) !H2FrameView {
+        if (self.h2_early_frame_index < self.h2_early_frames.items.len) {
+            const frame = &self.h2_early_frames.items[self.h2_early_frame_index];
+            self.h2_early_frame_index += 1;
+            if (frame.payload.len > self.read_buffer.len) return error.FrameTooLarge;
+            @memcpy(self.read_buffer[0..frame.payload.len], frame.payload);
+            return .{ .header = frame.header, .payload = self.read_buffer[0..frame.payload.len] };
+        }
+
+        var raw_header: [9]u8 = undefined;
+        try self.transportReadNoEof(&raw_header);
+        const header = http.HTTP2FrameHeader.parse(raw_header);
+        const payload_len: usize = @intCast(header.length);
+        if (payload_len > self.read_buffer.len) return error.FrameTooLarge;
+        try self.transportReadNoEof(self.read_buffer[0..payload_len]);
+        return .{ .header = header, .payload = self.read_buffer[0..payload_len] };
+    }
+
+    fn transportReadNoEof(self: *Self, output: []u8) !void {
+        var offset: usize = 0;
+        while (offset < output.len) {
+            const n = try self.transportRead(output[offset..]);
+            if (n == 0) return error.UnexpectedEof;
+            offset += n;
+        }
+    }
+
+    fn appendH2HeaderBlock(self: *Self, payload: []const u8) !void {
+        if (self.h2_pending_headers.items.len + payload.len > self.read_buffer.len) {
+            return error.HeaderTooLarge;
+        }
+        try self.h2_pending_headers.appendSlice(self.allocator, payload);
+    }
+
+    fn readHttp2Continuations(self: *Self) !void {
+        while (true) {
+            const continuation = try self.nextHttp2Frame();
+            if (continuation.header.frame_type != .continuation or
+                continuation.header.stream_id != self.h2_stream_id.?)
+            {
+                return error.ProtocolError;
+            }
+            try self.appendH2HeaderBlock(continuation.payload);
+            if ((continuation.header.flags & 0x04) != 0) return;
+        }
+    }
+
+    fn parseHttp2HeaderBlock(self: *Self, destination: *Headers, require_status: bool) !u16 {
+        const session = self.lease.?.h2Session();
+        const parsed = try h2stream.parseHeadersFramePayload(
+            &session.stream_manager,
+            self.h2_pending_headers.items,
+            self.h2_pending_headers_flags,
+            self.allocator,
+        );
+        defer {
+            for (parsed.headers) |header| {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            }
+            self.allocator.free(parsed.headers);
+        }
+
+        var status_code: ?u16 = null;
+        for (parsed.headers) |header| {
+            if (header.name.len > 0 and header.name[0] == ':') {
+                if (mem.eql(u8, header.name, ":status")) {
+                    if (status_code != null) return error.InvalidResponse;
+                    status_code = std.fmt.parseInt(u16, header.value, 10) catch
+                        return error.InvalidResponse;
+                }
+                continue;
+            }
+            if (common.isConnectionSpecificHeader(header.name)) return error.ProtocolError;
+            try destination.append(header.name, header.value);
+        }
+        if (require_status) return status_code orelse error.InvalidResponse;
+        if (status_code != null) return error.ProtocolError;
+        return 0;
+    }
+
+    fn configureHttp2ResponseBody(self: *Self, end_stream: bool) !void {
+        self.h2_expected_length = null;
+        for (self.response_headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.TRANSFER_ENCODING)) {
+                return error.ProtocolError;
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, HeaderName.CONTENT_LENGTH)) {
+                const parsed = std.fmt.parseInt(u64, mem.trim(u8, header.value, " \t"), 10) catch
+                    return error.InvalidContentLength;
+                if (self.h2_expected_length) |existing| {
+                    if (existing != parsed) return error.InvalidContentLength;
+                } else {
+                    self.h2_expected_length = parsed;
+                }
+            }
+        }
+        if (self.response_limit) |limit| {
+            if (self.h2_expected_length) |length| {
+                if (length > limit) return error.ResponseTooLarge;
+            }
+        }
+        const no_body = !self.req.method.hasResponseBody() or
+            self.response_head.status.code == 204 or
+            self.response_head.status.code == 304;
+        if (no_body) {
+            if (!end_stream) return error.ProtocolError;
+            self.response_body_kind = .none;
+            self.state = .response_complete;
+            return;
+        }
+        self.response_body_kind = if (end_stream) .none else .http2;
+        if (end_stream) try self.completeHttp2Response();
+    }
+
+    fn completeHttp2Response(self: *Self) !void {
+        if (self.h2_expected_length) |remaining| {
+            if (remaining != 0) return error.ResponseBodyUnderrun;
+        }
+        if (self.h2_stream_id) |stream_id| {
+            const session = self.lease.?.h2Session();
+            if (session.stream_manager.getStream(stream_id)) |stream_value| {
+                stream_value.receiveEndStream();
+            }
+        }
+        self.state = .response_complete;
+    }
+
+    fn sendHttp2WindowUpdate(self: *Self, amount: usize) !void {
+        if (amount == 0) return;
+        const increment: u31 = @intCast(amount);
+        const payload = h2stream.buildWindowUpdatePayload(increment);
+        var transport = OperationHTTP2Transport{ .operation = self };
+        try writeHTTP2Frame(&transport, .window_update, 0, self.h2_stream_id.?, &payload);
+        try writeHTTP2Frame(&transport, .window_update, 0, 0, &payload);
+    }
+
+    fn handleHttp2ControlFrame(self: *Self, frame: H2FrameView) !void {
+        const session = self.lease.?.h2Session();
+        const stream = session.stream_manager.getStream(self.h2_stream_id.?) orelse
+            return error.InvalidStreamState;
+        var transport = OperationHTTP2Transport{ .operation = self };
+        switch (frame.header.frame_type) {
+            .settings => {
+                try Client.applyHTTP2SettingsUpdate(
+                    &transport,
+                    &session.stream_manager,
+                    frame.header,
+                    frame.payload,
+                    &self.h2_peer_max_frame_size,
+                );
+                session.peer_max_frame_size = self.h2_peer_max_frame_size;
+            },
+            .window_update => try Client.applyHTTP2WindowUpdate(
+                &session.stream_manager,
+                stream,
+                frame.header,
+                frame.payload,
+            ),
+            .ping => {
+                if (frame.header.stream_id != 0 or frame.payload.len != 8) return error.ProtocolError;
+                if ((frame.header.flags & 0x01) == 0) {
+                    try writeHTTP2Frame(&transport, .ping, 0x01, 0, frame.payload);
+                }
+            },
+            .goaway => {
+                const last_stream_id = try self.client.parseHTTP2GoAway(frame.header, frame.payload);
+                session.draining = true;
+                if (self.h2_stream_id.? > last_stream_id) return error.GoAway;
+            },
+            .rst_stream => {
+                if (frame.header.stream_id == self.h2_stream_id.?) return error.StreamError;
+            },
+            .priority, .push_promise => {},
+            else => return error.ProtocolError,
+        }
+    }
+};
+
+const OperationHTTP2Transport = struct {
+    operation: *OperationImpl,
+
+    fn writeAll(self: *@This(), data: []const u8) !void {
+        try self.operation.context.check();
+        if (self.operation.tls_active) {
+            try self.operation.tlsSession().writeAllWithContext(data, &self.operation.context);
+            try self.operation.tlsSession().flush();
+        } else {
+            try self.operation.socket().sendAll(data);
+        }
+        try self.operation.context.check();
+    }
+
+    fn readNoEof(self: *@This(), output: []u8) !void {
+        return self.operation.transportReadNoEof(output);
+    }
+};
+
+fn operationImpl(context: *anyopaque) *OperationImpl {
+    return @ptrCast(@alignCast(context));
+}
+
+fn operationConstImpl(context: *const anyopaque) *const OperationImpl {
+    return @ptrCast(@alignCast(context));
+}
+
+fn operationWrite(context: *anyopaque, data: []const u8) anyerror!usize {
+    const impl = operationImpl(context);
+    try impl.acquireOwner();
+    defer impl.releaseOwner();
+    return impl.writeRequest(data) catch |err| {
+        impl.fail();
+        return err;
+    };
+}
+
+fn operationWaitForContinue(context: *anyopaque) anyerror!ContinueResult {
+    const impl = operationImpl(context);
+    try impl.acquireOwner();
+    defer impl.releaseOwner();
+    return impl.waitForContinue() catch |err| {
+        impl.fail();
+        return err;
+    };
+}
+
+fn operationFinishRequest(context: *anyopaque, trailers: ?[]const [2][]const u8) anyerror!*const ResponseHead {
+    const impl = operationImpl(context);
+    try impl.acquireOwner();
+    defer impl.releaseOwner();
+    return impl.finishRequest(trailers) catch |err| {
+        impl.fail();
+        return err;
+    };
+}
+
+fn operationRead(context: *anyopaque, output: []u8) anyerror!usize {
+    const impl = operationImpl(context);
+    try impl.acquireOwner();
+    defer impl.releaseOwner();
+    return impl.readResponse(output) catch |err| {
+        impl.fail();
+        return err;
+    };
+}
+
+fn operationTrailers(context: *const anyopaque) ?*const Headers {
+    const impl = operationConstImpl(context);
+    if (impl.response_trailers.entries.items.len == 0) return null;
+    return &impl.response_trailers;
+}
+
+fn operationFinish(context: *anyopaque, options: FinishOptions) anyerror!void {
+    const impl = operationImpl(context);
+    try impl.acquireOwner();
+    defer impl.releaseOwner();
+    return impl.finish(options) catch |err| {
+        impl.fail();
+        return err;
+    };
+}
+
+fn operationAbort(context: *anyopaque) void {
+    const impl = operationImpl(context);
+    impl.acquireOwner() catch return;
+    defer impl.releaseOwner();
+    impl.abort();
+}
+
+fn operationCancel(context: *anyopaque) void {
+    operationImpl(context).cancel();
+}
+
+fn operationDestroy(context: *anyopaque) void {
+    const impl = operationImpl(context);
+    impl.acquireOwner() catch @panic("httpx.ClientOperation.deinit raced active I/O");
+    impl.deinitResources();
+    impl.releaseOwner();
+    const allocator = impl.allocator;
+    allocator.destroy(impl);
+}
+
+const operation_vtable: operation.VTable = .{
+    .write = operationWrite,
+    .wait_for_continue = operationWaitForContinue,
+    .finish_request = operationFinishRequest,
+    .read = operationRead,
+    .trailers = operationTrailers,
+    .finish = operationFinish,
+    .abort = operationAbort,
+    .cancel = operationCancel,
+    .destroy = operationDestroy,
+};
 
 const SocketHTTP2Transport = struct {
     socket: *Socket,
@@ -4057,7 +5494,7 @@ test "ClientConfig builder helpers" {
     try std.testing.expect(cfg.http3_settings.enable_datagrams);
     try std.testing.expect(!cfg.verify_ssl);
     try std.testing.expect(!cfg.keep_alive);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.max_response_size);
+    try std.testing.expectEqual(@as(u64, 1024), cfg.max_response_size);
     try std.testing.expectEqual(@as(u32, 64), cfg.pool_max_connections);
     try std.testing.expectEqual(@as(u32, 16), cfg.pool_max_per_host);
     try std.testing.expect(cfg.proxy != null);
@@ -5395,6 +6832,597 @@ test "Client retry wait maps cancellation and request deadline" {
 
     const expired = IoContext.init(.{ .request_deadline = Deadline.at(0) });
     try std.testing.expectError(error.RequestTimeout, Client.waitForRetry(&expired, 1_000));
+}
+
+test "public streaming operation honors continue chunking trailers and partial reads" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        request: [8192]u8 = undefined,
+        request_len: usize = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+
+            while (mem.indexOf(u8, self.request[0..self.request_len], "\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(self.request[self.request_len..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                self.request_len += n;
+            }
+            try accepted.socket.sendAll("HTTP/1.1 100 Continue\r\n\r\n");
+
+            while (mem.indexOf(u8, self.request[0..self.request_len], "0\r\nX-Upload: done\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(self.request[self.request_len..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                self.request_len += n;
+            }
+            try accepted.socket.sendAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Transfer-Encoding: chunked\r\n" ++
+                    "X-Dupe: first\r\n" ++
+                    "X-Dupe: second\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "5\r\nhello\r\n" ++
+                    "6\r\n world\r\n" ++
+                    "0\r\nX-Response: done\r\n\r\n",
+            );
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/stream");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    var op = try client.open(.POST, url, .{
+        .body_mode = .chunked,
+        .expect_100_continue = true,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    try std.testing.expectEqual(ContinueResult.send_body, try op.waitForContinue());
+    try op.writeAll("hello");
+    try op.writeAll(" world");
+    const response_head = try op.finishRequest(&.{.{ "X-Upload", "done" }});
+    try std.testing.expectEqual(@as(u16, 200), response_head.status.code);
+    const duplicate_values = try response_head.headers.getAll("X-Dupe", allocator);
+    defer allocator.free(duplicate_values);
+    try std.testing.expectEqual(@as(usize, 2), duplicate_values.len);
+
+    var body: [11]u8 = undefined;
+    var offset: usize = 0;
+    var read_buffer: [3]u8 = undefined;
+    while (true) {
+        const n = try op.read(&read_buffer);
+        if (n == 0) break;
+        @memcpy(body[offset..][0..n], read_buffer[0..n]);
+        offset += n;
+    }
+    try std.testing.expectEqualStrings("hello world", body[0..offset]);
+    try std.testing.expectEqualStrings("done", op.trailers().?.get("X-Response").?);
+    try op.finish(.{});
+
+    thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    const request_bytes = server.request[0..server.request_len];
+    try std.testing.expect(requestHeaderValue(request_bytes, HeaderName.CONTENT_LENGTH) == null);
+    try std.testing.expectEqualStrings("chunked", requestHeaderValue(request_bytes, HeaderName.TRANSFER_ENCODING).?);
+    try std.testing.expect(mem.indexOf(u8, request_bytes, "5\r\nhello\r\n") != null);
+    try std.testing.expect(mem.indexOf(u8, request_bytes, "6\r\n world\r\n") != null);
+}
+
+test "public streaming cancellation interrupts response read and closes lease" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        response_sent: std.atomic.Value(bool) = .init(false),
+        saw_close: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var request_buffer: [4096]u8 = undefined;
+            var length: usize = 0;
+            while (mem.indexOf(u8, request_buffer[0..length], "\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(request_buffer[length..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                length += n;
+            }
+            try accepted.socket.sendAll("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n");
+            self.response_sent.store(true, .release);
+            var byte: [1]u8 = undefined;
+            self.saw_close = (accepted.socket.recv(&byte) catch 0) == 0;
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/cancel");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    var op = try client.open(.GET, url, .{
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    _ = try op.finishRequest(null);
+    while (!server.response_sent.load(.acquire)) std.Thread.yield() catch {};
+
+    const Reader = struct {
+        operation: *ClientOperation,
+        started: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            var byte: [1]u8 = undefined;
+            _ = self.operation.read(&byte) catch |err| {
+                self.result = err;
+                return;
+            };
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+    var reader = Reader{ .operation = &op };
+    const read_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    while (!reader.started.load(.acquire)) std.Thread.yield() catch {};
+    op.cancel();
+    read_thread.join();
+
+    try std.testing.expectEqual(error.Cancelled, reader.result.?);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().active);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+
+    server_thread.join();
+    server_joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expect(server.saw_close);
+}
+
+test "public streaming rejects short conflicting and malformed response framing" {
+    const allocator = std.testing.allocator;
+    const responses = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabcXX",
+    };
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+
+    const url = try policyTestUrl(allocator, &listener, "/invalid");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
+        try std.testing.expectError(error.ResponseBodyUnderrun, op.read(&buffer));
+    }
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        try std.testing.expectError(error.ConflictingFramingHeaders, op.finishRequest(null));
+    }
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
+        try std.testing.expectError(error.MalformedChunk, op.read(&buffer));
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+}
+
+test "public streaming finish drains framing and reuses one HTTP1 connection" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        accepts: usize = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readRequest(socket: *Socket, expected_body: []const u8) !void {
+            var request: [4096]u8 = undefined;
+            var length: usize = 0;
+            var header_end: ?usize = null;
+            while (header_end == null or length < header_end.? + expected_body.len) {
+                const n = try socket.recv(request[length..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                length += n;
+                if (header_end == null) {
+                    if (mem.indexOf(u8, request[0..length], "\r\n\r\n")) |index| {
+                        header_end = index + 4;
+                    }
+                }
+            }
+            try std.testing.expectEqualStrings(
+                expected_body,
+                request[header_end.?..][0..expected_body.len],
+            );
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            self.accepts += 1;
+            try readRequest(&accepted.socket, "data");
+            try accepted.socket.sendAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            try readRequest(&accepted.socket, "");
+            try accepted.socket.sendAll(
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
+            );
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/reuse");
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    {
+        var op = try client.open(.POST, url, .{
+            .body_mode = .{ .content_length = 4 },
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        const Reader = struct {
+            data: []const u8,
+            offset: usize = 0,
+
+            pub fn read(self: *@This(), output: []u8) !usize {
+                if (self.offset == self.data.len) return 0;
+                const amount = @min(@as(usize, 2), output.len, self.data.len - self.offset);
+                @memcpy(output[0..amount], self.data[self.offset..][0..amount]);
+                self.offset += amount;
+                return amount;
+            }
+        };
+        var source = Reader{ .data = "data" };
+        try std.testing.expectEqual(@as(u64, 4), try op.writeFromReader(&source));
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try op.read(&buffer));
+        try op.finish(.{});
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+
+    {
+        var op = try client.open(.GET, url, .{
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        _ = try op.finishRequest(null);
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
+        try op.finish(.{});
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), server.accepts);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+}
+
+test "public streaming request length errors close the connection" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        closes: usize = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            for (0..2) |_| {
+                var accepted = try self.listener.accept();
+                defer accepted.socket.close();
+                var buffer: [4096]u8 = undefined;
+                while (true) {
+                    const n = accepted.socket.recv(&buffer) catch |err| switch (err) {
+                        error.ConnectionResetByPeer => 0,
+                        else => return err,
+                    };
+                    if (n == 0) break;
+                }
+                self.closes += 1;
+            }
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/length");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    {
+        var op = try client.open(.POST, url, .{
+            .body_mode = .{ .content_length = 4 },
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        try std.testing.expectError(error.RequestBodyOverrun, op.writeAll("too long"));
+    }
+    {
+        var op = try client.open(.POST, url, .{
+            .body_mode = .{ .content_length = 4 },
+            .policy = types.RequestPolicyOverrides.embeddingOwned(),
+        });
+        defer op.deinit();
+        try op.writeAll("no");
+        try std.testing.expectError(error.RequestBodyUnderrun, op.finishRequest(null));
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(usize, 2), server.closes);
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
+}
+
+test "public HTTP2 streaming abort resets one stream and reuses session" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        reset_stream_id: u31 = 0,
+        completed_stream_id: u31 = 0,
+        failure: ?anyerror = null,
+
+        const Frame = struct {
+            header: http.HTTP2FrameHeader,
+            payload: []const u8,
+        };
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload_buffer: []u8) !Frame {
+            var raw_header: [9]u8 = undefined;
+            try readExact(socket, &raw_header);
+            const header = http.HTTP2FrameHeader.parse(raw_header);
+            const payload_len: usize = @intCast(header.length);
+            if (payload_len > payload_buffer.len) return error.FrameTooLarge;
+            try readExact(socket, payload_buffer[0..payload_len]);
+            return .{ .header = header, .payload = payload_buffer[0..payload_len] };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            var accepted = try self.listener.accept();
+            defer accepted.socket.close();
+            var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+            try readExact(&accepted.socket, &preface);
+            try std.testing.expectEqualStrings(http.HTTP2_PREFACE, &preface);
+
+            var payload_buffer: [64 * 1024]u8 = undefined;
+            const settings = try readFrame(&accepted.socket, &payload_buffer);
+            try std.testing.expectEqual(http.HTTP2FrameType.settings, settings.header.frame_type);
+            try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &.{});
+
+            while (self.reset_stream_id == 0) {
+                const frame = try readFrame(&accepted.socket, &payload_buffer);
+                if (frame.header.frame_type == .rst_stream) self.reset_stream_id = frame.header.stream_id;
+            }
+
+            var request_done = false;
+            while (!request_done) {
+                const frame = try readFrame(&accepted.socket, &payload_buffer);
+                if (frame.header.stream_id == 0) continue;
+                if (self.completed_stream_id == 0 and frame.header.frame_type == .headers) {
+                    self.completed_stream_id = frame.header.stream_id;
+                }
+                if (frame.header.stream_id == self.completed_stream_id and
+                    ((frame.header.frame_type == .headers or frame.header.frame_type == .data) and
+                        (frame.header.flags & 0x01) != 0))
+                {
+                    request_done = true;
+                }
+            }
+
+            var response_manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+            defer response_manager.deinit();
+            const response_headers = [_]hpack.HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                .{ .name = "content-length", .value = "8", .representation = .without_indexing },
+            };
+            const header_frames = try h2stream.buildHeadersAndContinuations(
+                &response_manager,
+                self.completed_stream_id,
+                &response_headers,
+                null,
+                16_384,
+                false,
+                std.heap.page_allocator,
+            );
+            defer std.heap.page_allocator.free(header_frames);
+            try accepted.socket.sendAll(header_frames);
+            try writeHTTP2Frame(&accepted.socket, .data, 0x01, self.completed_stream_id, "streamed");
+
+            var updates: usize = 0;
+            while (updates < 2) {
+                const frame = try readFrame(&accepted.socket, &payload_buffer);
+                if (frame.header.frame_type == .window_update) updates += 1;
+            }
+        }
+    };
+
+    var server = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&server});
+    var server_joined = false;
+    defer if (!server_joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const address = try listener.getLocalAddress();
+
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = true,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/h2-stream",
+        .{address.getPort()},
+    );
+    defer allocator.free(url);
+
+    var abandoned = try client.open(.POST, url, .{
+        .version = .HTTP_2,
+        .body_mode = .{ .content_length = 10 },
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    try abandoned.writeAll("part");
+    abandoned.abort();
+    abandoned.deinit();
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+
+    var op = try client.open(.GET, url, .{
+        .version = .HTTP_2,
+        .policy = types.RequestPolicyOverrides.embeddingOwned(),
+    });
+    defer op.deinit();
+    const response_head = try op.finishRequest(null);
+    try std.testing.expectEqual(types.Version.HTTP_2, response_head.version);
+    var response_body: [16]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) {
+        const n = try op.read(response_body[response_len..]);
+        if (n == 0) break;
+        response_len += n;
+    }
+    try std.testing.expectEqualStrings("streamed", response_body[0..response_len]);
+    try op.finish(.{});
+    try std.testing.expectEqual(@as(usize, 1), client.poolStats().idle);
+
+    server_thread.join();
+    server_joined = true;
+    try std.testing.expect(server.failure == null);
+    try std.testing.expectEqual(@as(u31, 1), server.reset_stream_id);
+    try std.testing.expectEqual(@as(u31, 3), server.completed_stream_id);
 }
 
 test "Client observes an already-cancelled borrowed token before request setup" {

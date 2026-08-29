@@ -371,7 +371,14 @@ fn buildDnsQuery(name: []const u8, qtype: DnsRecordType, use_edns: bool, buf: []
     return pos;
 }
 
-fn queryViaUdp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeout_ms: u64, allocator: Allocator) !DnsMessage {
+fn queryViaUdp(
+    server: DnsServer,
+    name: []const u8,
+    qtype: DnsRecordType,
+    timeout_ms: u64,
+    allocator: Allocator,
+    context: ?*const IoContext,
+) !DnsMessage {
     var buf: [4096]u8 = undefined;
     const query_len = try buildDnsQuery(name, qtype, true, &buf);
 
@@ -379,12 +386,25 @@ fn queryViaUdp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeou
     var sock = socket_mod.UdpSocket.createForAddress(server_addr) catch return error.DnsUdpSocketFailed;
     defer sock.close();
 
-    sock.setRecvTimeout(timeout_ms) catch {};
-
-    _ = sock.sendTo(server_addr, buf[0..query_len]) catch return error.DnsUdpSendFailed;
+    try sock.connect(server_addr);
+    if (context) |io_context| {
+        _ = sock.sendWithContext(buf[0..query_len], io_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.DnsUdpSendFailed,
+        };
+    } else {
+        sock.setRecvTimeout(timeout_ms) catch {};
+        _ = sock.send(buf[0..query_len]) catch return error.DnsUdpSendFailed;
+    }
 
     var resp_buf: [4096]u8 = undefined;
-    const n = sock.recv(&resp_buf) catch return error.DnsUdpRecvFailed;
+    const n = if (context) |io_context|
+        sock.recvWithContext(&resp_buf, io_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.DnsUdpRecvFailed,
+        }
+    else
+        sock.recv(&resp_buf) catch return error.DnsUdpRecvFailed;
 
     var msg = try parseDnsMessage(resp_buf[0..n], allocator);
 
@@ -396,7 +416,14 @@ fn queryViaUdp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeou
     return msg;
 }
 
-fn queryViaTcp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeout_ms: u64, allocator: Allocator) !DnsMessage {
+fn queryViaTcp(
+    server: DnsServer,
+    name: []const u8,
+    qtype: DnsRecordType,
+    timeout_ms: u64,
+    allocator: Allocator,
+    context: ?*const IoContext,
+) !DnsMessage {
     var buf: [4096]u8 = undefined;
     const query_len = try buildDnsQuery(name, qtype, false, &buf);
 
@@ -404,18 +431,38 @@ fn queryViaTcp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeou
     var sock = socket_mod.Socket.createForAddress(server_addr) catch return error.DnsTcpSocketFailed;
     defer sock.close();
 
-    sock.connectWithTimeout(server_addr, timeout_ms) catch return error.DnsTcpConnectFailed;
+    if (context) |io_context| {
+        sock.connectWithContext(server_addr, timeout_ms, io_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.DnsTcpConnectFailed,
+        };
+    } else {
+        sock.connectWithTimeout(server_addr, timeout_ms) catch return error.DnsTcpConnectFailed;
+    }
 
     var tcp_buf: [4098]u8 = undefined;
     putU16(tcp_buf[0..], @intCast(query_len));
     @memcpy(tcp_buf[2 .. 2 + query_len], buf[0..query_len]);
 
-    sock.sendAll(tcp_buf[0 .. 2 + query_len]) catch return error.DnsTcpSendFailed;
+    if (context) |io_context| {
+        sock.sendAllWithContext(tcp_buf[0 .. 2 + query_len], io_context) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.DnsTcpSendFailed,
+        };
+    } else {
+        sock.sendAll(tcp_buf[0 .. 2 + query_len]) catch return error.DnsTcpSendFailed;
+    }
 
     var len_buf: [2]u8 = undefined;
     var read: usize = 0;
     while (read < 2) {
-        const n = sock.recv(len_buf[read..]) catch return error.DnsTcpRecvFailed;
+        const n = if (context) |io_context|
+            sock.recvWithContext(len_buf[read..], io_context) catch |err| switch (err) {
+                error.Cancelled, error.Timeout => return err,
+                else => return error.DnsTcpRecvFailed,
+            }
+        else
+            sock.recv(len_buf[read..]) catch return error.DnsTcpRecvFailed;
         if (n == 0) return error.DnsTcpConnectionClosed;
         read += n;
     }
@@ -426,7 +473,13 @@ fn queryViaTcp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeou
     var resp_buf: [4096]u8 = undefined;
     read = 0;
     while (read < resp_len) {
-        const n = sock.recv(resp_buf[read..resp_len]) catch return error.DnsTcpRecvFailed;
+        const n = if (context) |io_context|
+            sock.recvWithContext(resp_buf[read..resp_len], io_context) catch |err| switch (err) {
+                error.Cancelled, error.Timeout => return err,
+                else => return error.DnsTcpRecvFailed,
+            }
+        else
+            sock.recv(resp_buf[read..resp_len]) catch return error.DnsTcpRecvFailed;
         if (n == 0) return error.DnsTcpConnectionClosed;
         read += n;
     }
@@ -434,14 +487,25 @@ fn queryViaTcp(server: DnsServer, name: []const u8, qtype: DnsRecordType, timeou
     return parseDnsMessage(resp_buf[0..resp_len], allocator);
 }
 
-fn queryDns(servers: []const DnsServer, name: []const u8, qtype: DnsRecordType, udp_timeout_ms: u64, tcp_timeout_ms: u64, allocator: Allocator) !DnsMessage {
+fn queryDns(
+    servers: []const DnsServer,
+    name: []const u8,
+    qtype: DnsRecordType,
+    udp_timeout_ms: u64,
+    tcp_timeout_ms: u64,
+    allocator: Allocator,
+    context: ?*const IoContext,
+) !DnsMessage {
     for (servers) |server| {
-        if (queryViaUdp(server, name, qtype, udp_timeout_ms, allocator)) |msg| {
+        if (queryViaUdp(server, name, qtype, udp_timeout_ms, allocator, context)) |msg| {
             return msg;
-        } else |_| {
-            if (queryViaTcp(server, name, qtype, tcp_timeout_ms, allocator)) |msg| {
+        } else |udp_error| {
+            if (udp_error == error.Cancelled or udp_error == error.Timeout) return udp_error;
+            if (queryViaTcp(server, name, qtype, tcp_timeout_ms, allocator, context)) |msg| {
                 return msg;
-            } else |_| {}
+            } else |tcp_error| {
+                if (tcp_error == error.Cancelled or tcp_error == error.Timeout) return tcp_error;
+            }
         }
     }
     return error.DnsAllServersFailed;
@@ -903,7 +967,7 @@ pub const DNSResolver = struct {
             self.cache.lock.unlock(common.threadIo());
             defer inf.decRef();
 
-            const result = self.performResolution(hostname, family);
+            const result = self.performResolution(hostname, family, context);
             var publish_error: ?anyerror = null;
 
             self.cache.lock.lock(common.threadIo()) catch {};
@@ -912,24 +976,26 @@ pub const DNSResolver = struct {
                     inf.addresses = addrs;
                     inf.failed = false;
                 },
-                .err => {
+                .err => |resolution_error| {
                     inf.failed = true;
-                    self.cache.evictIfNeeded();
-                    self.cache.stats.failures += 1;
-                    if (self.cache.entries.fetchRemove(hostname)) |kv| {
-                        self.cache.allocator.free(kv.key);
-                        self.cache.allocator.free(kv.value.addresses);
-                    }
-                    if (self.cache.allocator.dupe(u8, hostname)) |neg_key| {
-                        self.cache.negative.put(self.cache.allocator, neg_key, .{
-                            .created_at_ms = common.nowMillis(),
-                            .ttl_ms = self.cache.config.negative_ttl_ms,
-                        }) catch |err| {
-                            self.cache.allocator.free(neg_key);
+                    if (resolution_error != error.Cancelled and resolution_error != error.Timeout) {
+                        self.cache.evictIfNeeded();
+                        self.cache.stats.failures += 1;
+                        if (self.cache.entries.fetchRemove(hostname)) |kv| {
+                            self.cache.allocator.free(kv.key);
+                            self.cache.allocator.free(kv.value.addresses);
+                        }
+                        if (self.cache.allocator.dupe(u8, hostname)) |neg_key| {
+                            self.cache.negative.put(self.cache.allocator, neg_key, .{
+                                .created_at_ms = common.nowMillis(),
+                                .ttl_ms = self.cache.config.negative_ttl_ms,
+                            }) catch |err| {
+                                self.cache.allocator.free(neg_key);
+                                publish_error = err;
+                            };
+                        } else |err| {
                             publish_error = err;
-                        };
-                    } else |err| {
-                        publish_error = err;
+                        }
                     }
                 },
             }
@@ -962,7 +1028,7 @@ pub const DNSResolver = struct {
         }
 
         try context.check();
-        const result = self.performResolution(hostname, family);
+        const result = self.performResolution(hostname, family, context);
 
         switch (result) {
             .ok => |addrs| {
@@ -980,7 +1046,10 @@ pub const DNSResolver = struct {
                     .allocator = self.allocator,
                 };
             },
-            .err => {
+            .err => |resolution_error| {
+                if (resolution_error == error.Cancelled or resolution_error == error.Timeout) {
+                    return resolution_error;
+                }
                 self.cache.cacheNegative(hostname);
                 try context.check();
                 return error.DNSLookupFailed;
@@ -1050,7 +1119,7 @@ pub const DNSResolver = struct {
         }
 
         try context.check();
-        const result = self.performResolution(hostname, family);
+        const result = self.performResolution(hostname, family, context);
 
         switch (result) {
             .ok => |addrs| {
@@ -1068,7 +1137,10 @@ pub const DNSResolver = struct {
                     .allocator = self.allocator,
                 };
             },
-            .err => {
+            .err => |resolution_error| {
+                if (resolution_error == error.Cancelled or resolution_error == error.Timeout) {
+                    return resolution_error;
+                }
                 self.cache.cacheNegative(hostname);
                 try context.check();
                 return error.DNSLookupFailed;
@@ -1097,7 +1169,12 @@ pub const DNSResolver = struct {
         err: anyerror,
     };
 
-    fn performResolution(self: *Self, hostname: []const u8, family: AddressFamily) ResolveResult {
+    fn performResolution(
+        self: *Self,
+        hostname: []const u8,
+        family: AddressFamily,
+        context: ?*const IoContext,
+    ) ResolveResult {
         var all_addrs = std.ArrayList(net.Address).empty;
         defer all_addrs.deinit(self.allocator);
 
@@ -1112,6 +1189,7 @@ pub const DNSResolver = struct {
                 self.cache.config.udp_timeout_ms,
                 self.cache.config.tcp_timeout_ms,
                 self.allocator,
+                context,
             )) |msg| {
                 var m = msg;
                 defer m.deinit();
@@ -1120,7 +1198,9 @@ pub const DNSResolver = struct {
                     defer self.allocator.free(v4_addrs);
                     all_addrs.appendSlice(self.allocator, v4_addrs) catch {};
                 } else |_| {}
-            } else |_| {}
+            } else |err| {
+                if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+            }
         }
 
         if (should_query_v6) {
@@ -1131,6 +1211,7 @@ pub const DNSResolver = struct {
                 self.cache.config.udp_timeout_ms,
                 self.cache.config.tcp_timeout_ms,
                 self.allocator,
+                context,
             )) |msg| {
                 var m = msg;
                 defer m.deinit();
@@ -1139,7 +1220,9 @@ pub const DNSResolver = struct {
                     defer self.allocator.free(v6_addrs);
                     all_addrs.appendSlice(self.allocator, v6_addrs) catch {};
                 } else |_| {}
-            } else |_| {}
+            } else |err| {
+                if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+            }
         }
 
         if (all_addrs.items.len == 0) {
@@ -1423,6 +1506,56 @@ test "DNSResolver context checks cancellation before cache or lookup" {
         resolver.resolveWithContext("127.0.0.1", .{ .port = 80 }, &context),
     );
     try std.testing.expectEqual(@as(u64, 0), resolver.cache.stats.literal_hits);
+}
+
+test "DNSResolver cancellation interrupts an in-flight UDP query" {
+    var dns_socket = try socket_mod.UdpSocket.create();
+    defer dns_socket.close();
+    try dns_socket.bind(try net.Address.parseIp("127.0.0.1", 0));
+    try dns_socket.setRecvTimeout(5_000);
+    const dns_address = try dns_socket.getLocalAddress();
+    const servers = [_]DnsServer{.{ .ip = "127.0.0.1", .port = dns_address.getPort() }};
+
+    var resolver = DNSResolver.init(std.testing.allocator, .{
+        .cache_enabled = false,
+        .dedup_enabled = false,
+        .address_family = .ipv4_only,
+        .dns_servers = &servers,
+        .udp_timeout_ms = 30_000,
+        .tcp_timeout_ms = 30_000,
+    });
+    defer resolver.deinit();
+
+    var token = CancellationToken.init();
+    const context = IoContext.init(.{ .external_cancel = &token });
+    const Worker = struct {
+        resolver: *DNSResolver,
+        context: *const IoContext,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var resolution = self.resolver.resolveWithContext(
+                "cancel-during-udp.invalid",
+                .{ .port = 80 },
+                self.context,
+            ) catch |err| {
+                self.result = err;
+                return;
+            };
+            resolution.deinit();
+            self.result = error.TestUnexpectedResult;
+        }
+    };
+
+    var worker = Worker{ .resolver = &resolver, .context = &context };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var response_buffer: [4096]u8 = undefined;
+    _ = try dns_socket.recvFrom(&response_buffer);
+    token.cancel();
+    thread.join();
+
+    try std.testing.expectEqual(error.Cancelled, worker.result.?);
+    try std.testing.expectEqual(@as(u64, 0), resolver.getStats().failures);
 }
 
 test "DNSResolver context interrupts in-flight dedup wait" {

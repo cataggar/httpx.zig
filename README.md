@@ -309,6 +309,48 @@ pub fn main() !void {
 }
 ```
 
+### Streaming Client Operations
+
+`Client.open` sends only the request head. The caller then owns one operation
+until `finish`, `abort`, `cancel`, or `deinit`:
+
+```zig
+var token = httpx.CancellationToken.init();
+var op = try client.open(.PUT, url, .{
+    .body_mode = .{ .content_length = total_size },
+    .cancel_token = &token,
+    .response_limit = .unlimited,
+});
+defer op.deinit(); // aborts exactly once unless already terminal
+
+while (source.next()) |chunk| try op.writeAll(chunk);
+const response = try op.finishRequest(null);
+std.debug.print("status={d}\n", .{response.status.code});
+
+var buffer: [32 * 1024]u8 = undefined;
+while (try op.read(&buffer) != 0) {
+    // consume this chunk
+}
+try op.finish(.{});
+```
+
+Use `.chunked` for an HTTP/1.1 request of unknown length. HTTP/2 maps both
+known and unknown lengths to DATA frames and sends END_STREAM only from
+`finishRequest`. `waitForContinue` exposes the `Expect: 100-continue`
+boundary. `finish(.{ .drain_response = true })` validates and drains before
+reuse; `abort` closes HTTP/1 or resets HTTP/2; `cancel` is the only operation
+method that may race active I/O.
+
+Streaming counters and limits are `u64`; transport storage is fixed at 64 KiB.
+TCP connect/read/write, pool waits, configured DNS UDP/TCP queries, and TLS
+record I/O check cancellation in bounded readiness waits. The platform system
+resolver fallback (`getaddrinfo`) and Unix-domain connect are only cooperative:
+cancellation is checked immediately before and after those platform calls,
+which cannot be portably interrupted.
+Automatic gzip/brotli/zstd response decoding remains a buffered-only feature;
+streaming operations return `error.StreamingDecompressionUnsupported` rather
+than buffering the complete encoded body.
+
 ### Simplified API Aliases
 
 Every alias has a `*WithAllocator` variant for explicit allocator control.
