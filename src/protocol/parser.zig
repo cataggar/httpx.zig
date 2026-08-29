@@ -274,6 +274,18 @@ pub const Parser = struct {
         }
     }
 
+    fn validHeaderName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |byte| {
+            if (!(std.ascii.isAlphanumeric(byte) or
+                mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) != null))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn parseStart(self: *Self, data: []const u8) usize {
         if (data.len == 0) return 0;
 
@@ -362,8 +374,12 @@ pub const Parser = struct {
                 self.state = .err;
                 return error.TooManyHeaders;
             }
-            const name = mem.trim(u8, line[0..sep], " \t");
+            const name = line[0..sep];
             const value = mem.trim(u8, line[sep + 1 ..], " \t");
+            if (!validHeaderName(name)) {
+                self.state = .err;
+                return error.InvalidHeader;
+            }
             try self.headers.append(name, value);
             self.header_count += 1;
 
@@ -375,9 +391,13 @@ pub const Parser = struct {
                     // Content-Length may be a comma-separated list of integers,
                     // all of which must be identical.
                     var cl_iter = std.mem.splitScalar(u8, value, ',');
+                    var saw_content_length = false;
                     while (cl_iter.next()) |cl_part| {
                         const trimmed = std.mem.trim(u8, cl_part, " \t");
-                        if (trimmed.len == 0) continue;
+                        if (trimmed.len == 0) {
+                            self.state = .err;
+                            return error.InvalidContentLength;
+                        }
                         const cl = std.fmt.parseInt(u64, trimmed, 10) catch {
                             self.state = .err;
                             return error.InvalidContentLength;
@@ -391,6 +411,11 @@ pub const Parser = struct {
                         } else {
                             self.content_length = cl;
                         }
+                        saw_content_length = true;
+                    }
+                    if (!saw_content_length) {
+                        self.state = .err;
+                        return error.InvalidContentLength;
                     }
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
@@ -416,11 +441,14 @@ pub const Parser = struct {
                     return error.ConflictingFramingHeaders;
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                if (std.ascii.indexOfIgnoreCase(value, "close") != null) {
-                    self.connection_close = true;
-                }
-                if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) {
-                    self.connection_keep_alive = true;
+                var tokens = mem.splitScalar(u8, value, ',');
+                while (tokens.next()) |token| {
+                    const trimmed = mem.trim(u8, token, " \t");
+                    if (std.ascii.eqlIgnoreCase(trimmed, "close")) {
+                        self.connection_close = true;
+                    } else if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) {
+                        self.connection_keep_alive = true;
+                    }
                 }
             }
         } else {
@@ -596,9 +624,9 @@ pub const Parser = struct {
             self.state = .err;
             return error.InvalidHeader;
         };
-        const name = mem.trim(u8, line[0..sep], " \t");
+        const name = line[0..sep];
         const value = mem.trim(u8, line[sep + 1 ..], " \t");
-        if (name.len == 0 or
+        if (!validHeaderName(name) or
             std.ascii.eqlIgnoreCase(name, "content-length") or
             std.ascii.eqlIgnoreCase(name, "transfer-encoding"))
         {
@@ -839,6 +867,40 @@ test "Parser rejects gzip before chunked and long transfer encoding safely" {
         .{&value},
     );
     try std.testing.expectError(error.InvalidChunkEncoding, parser.feed(wire));
+}
+
+test "Parser enforces strict header names content length and connection tokens" {
+    var parser = Parser.initResponse(std.testing.allocator);
+    defer parser.deinit();
+    try std.testing.expectError(
+        error.InvalidHeader,
+        parser.feed("HTTP/1.1 200 OK\r\nContent-Length : 1\r\n\r\nx"),
+    );
+
+    parser.reset();
+    parser.mode = .response;
+    parser.state = .status_line;
+    try std.testing.expectError(
+        error.InvalidHeader,
+        parser.feed("HTTP/1.1 200 OK\r\nBad Header: value\r\n\r\n"),
+    );
+
+    parser.reset();
+    parser.mode = .response;
+    parser.state = .status_line;
+    try std.testing.expectError(
+        error.InvalidContentLength,
+        parser.feed("HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n"),
+    );
+
+    parser.reset();
+    parser.mode = .response;
+    parser.state = .status_line;
+    _ = try parser.feed(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: not-keep-alive, disclose\r\n\r\n",
+    );
+    try std.testing.expect(!parser.connection_keep_alive);
+    try std.testing.expect(!parser.connection_close);
 }
 
 test "Parser rejects Content-Length with Transfer-Encoding" {

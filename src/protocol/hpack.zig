@@ -149,7 +149,10 @@ pub const DynamicTable = struct {
     /// Adds a new entry to the beginning of the dynamic table.
     /// Evicts old entries if necessary to fit within max_size.
     pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
-        const entry_size = name.len + value.len + 32;
+        const name_value_size = std.math.add(usize, name.len, value.len) catch
+            return error.HeaderSizeOverflow;
+        const entry_size = std.math.add(usize, name_value_size, 32) catch
+            return error.HeaderSizeOverflow;
 
         if (entry_size > self.max_size) {
             while (self.entries.items.len > 0) self.evictOne();
@@ -163,7 +166,7 @@ pub const DynamicTable = struct {
         errdefer self.allocator.free(value_copy);
 
         // Mutate only after every fallible allocation succeeds.
-        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
+        while (entry_size > self.max_size - self.current_size and self.entries.items.len > 0) {
             self.evictOne();
         }
         self.entries.insertAssumeCapacity(0, .{
@@ -251,6 +254,7 @@ pub const HPACKContext = struct {
 /// Encodes an integer with the given prefix bits.
 /// prefix_bits: number of bits available in the first byte (1-8)
 pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
+    if (prefix_bits == 0 or prefix_bits > 8) return error.InvalidPrefixBits;
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
 
     if (value < max_prefix) {
@@ -281,6 +285,7 @@ pub fn encodeInteger(value: u64, prefix_bits: u4, out: []u8) !usize {
 /// Returns the value and number of bytes consumed.
 pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, len: usize } {
     if (data.len == 0) return error.UnexpectedEof;
+    if (prefix_bits == 0 or prefix_bits > 8) return error.InvalidPrefixBits;
 
     const max_prefix: u64 = (@as(u64, 1) << prefix_bits) - 1;
     const first_byte_mask: u8 = @intCast(max_prefix);
@@ -292,19 +297,30 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
     }
 
     var i: usize = 1;
-    var m: u6 = 0;
+    var shift: u8 = 0;
 
     while (i < data.len) {
         const b = data[i];
-        value += @as(u64, b & 0x7F) << m;
+        const payload = @as(u64, b & 0x7F);
+        if (shift >= 64) return error.IntegerOverflow;
+        const shift_amount: std.math.Log2Int(u64) = @intCast(shift);
+        if (payload > (@as(u64, std.math.maxInt(u64)) >> shift_amount)) {
+            return error.IntegerOverflow;
+        }
+        value = std.math.add(
+            u64,
+            value,
+            payload << shift_amount,
+        ) catch return error.IntegerOverflow;
         i += 1;
 
         if (b & 0x80 == 0) {
             return .{ .value = value, .len = i };
         }
 
-        m += 7;
-        if (m > 63) return error.IntegerOverflow;
+        if (shift > 56) return error.IntegerOverflow;
+        shift += 7;
+        if (i > 11) return error.IntegerOverflow;
     }
 
     return error.UnexpectedEof;
@@ -337,8 +353,10 @@ pub fn decodeString(data: []const u8, allocator: Allocator) !struct { value: []u
 
     const huffman = (data[0] & 0x80) != 0;
     const len_result = try decodeInteger(data, 7);
-    const str_len: usize = @intCast(len_result.value);
-    const total_len = len_result.len + str_len;
+    const str_len = std.math.cast(usize, len_result.value) orelse
+        return error.StringLengthOverflow;
+    const total_len = std.math.add(usize, len_result.len, str_len) catch
+        return error.StringLengthOverflow;
 
     if (data.len < total_len) return error.UnexpectedEof;
 
@@ -420,7 +438,7 @@ pub const HuffmanCodec = struct {
         errdefer result.deinit(allocator);
 
         var bit_buffer: u64 = 0;
-        var bit_count: u6 = 0;
+        var bit_count: u8 = 0;
 
         for (data) |byte| {
             const code = codes[byte];
@@ -431,13 +449,14 @@ pub const HuffmanCodec = struct {
 
             while (bit_count >= 8) {
                 bit_count -= 8;
-                try result.append(allocator, @intCast((bit_buffer >> bit_count) & 0xFF));
+                const shift: std.math.Log2Int(u64) = @intCast(bit_count);
+                try result.append(allocator, @intCast((bit_buffer >> shift) & 0xFF));
             }
         }
 
         // Pad with EOS prefix bits if needed
         if (bit_count > 0) {
-            const pad_bits: u6 = 8 - bit_count;
+            const pad_bits: std.math.Log2Int(u64) = @intCast(8 - bit_count);
             bit_buffer = (bit_buffer << pad_bits) | ((@as(u64, 1) << pad_bits) - 1);
             try result.append(allocator, @intCast(bit_buffer & 0xFF));
         }
@@ -451,9 +470,10 @@ pub const HuffmanCodec = struct {
         errdefer result.deinit(allocator);
 
         var bit_buffer: u64 = 0;
-        var bit_count: u6 = 0;
+        var bit_count: u8 = 0;
 
         for (data) |byte| {
+            if (bit_count > 56) return error.InvalidHuffmanEncoding;
             bit_buffer = (bit_buffer << 8) | byte;
             bit_count += 8;
 
@@ -465,8 +485,10 @@ pub const HuffmanCodec = struct {
                     const len = lengths[sym];
 
                     if (bit_count >= len) {
-                        const mask = (@as(u64, 1) << len) - 1;
-                        const candidate = (bit_buffer >> (bit_count - len)) & mask;
+                        const code_len: std.math.Log2Int(u64) = @intCast(len);
+                        const mask = (@as(u64, 1) << code_len) - 1;
+                        const candidate_shift: std.math.Log2Int(u64) = @intCast(bit_count - len);
+                        const candidate = (bit_buffer >> candidate_shift) & mask;
                         if (candidate == code) {
                             try result.append(allocator, @intCast(sym));
                             bit_count -= len;
@@ -475,14 +497,18 @@ pub const HuffmanCodec = struct {
                         }
                     }
                 }
-                if (!matched) break;
+                if (!matched) {
+                    if (bit_count >= 30) return error.InvalidHuffmanEncoding;
+                    break;
+                }
             }
         }
 
         // Remaining bits should be EOS padding (all 1s)
         if (bit_count > 7) return error.InvalidHuffmanPadding;
         if (bit_count > 0) {
-            const mask = (@as(u64, 1) << bit_count) - 1;
+            const remaining: std.math.Log2Int(u64) = @intCast(bit_count);
+            const mask = (@as(u64, 1) << remaining) - 1;
             if ((bit_buffer & mask) != mask) return error.InvalidHuffmanPadding;
         }
 
@@ -655,7 +681,8 @@ pub fn decodeHeadersWithLimit(
             const idx_result = try decodeInteger(data[offset..], 7);
             offset += idx_result.len;
 
-            const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+            const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+            const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
             try accountHeaderListSize(
                 &header_list_size,
                 entry.name.len,
@@ -674,7 +701,8 @@ pub fn decodeHeadersWithLimit(
 
             var name: []u8 = undefined;
             if (idx_result.value > 0) {
-                const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+                const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+                const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
                 name = try allocator.dupe(u8, entry.name);
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
@@ -714,7 +742,8 @@ pub fn decodeHeadersWithLimit(
 
             var name: []u8 = undefined;
             if (idx_result.value > 0) {
-                const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+                const index = std.math.cast(usize, idx_result.value) orelse return error.InvalidIndex;
+                const entry = ctx.getByIndex(index) orelse return error.InvalidIndex;
                 name = try allocator.dupe(u8, entry.name);
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
@@ -741,10 +770,17 @@ pub fn decodeHeadersWithLimit(
 }
 
 fn accountHeaderListSize(total: *u64, name_len: usize, value_len: usize, limit: u64) !void {
+    const field_size = std.math.add(
+        u64,
+        @as(u64, name_len),
+        @as(u64, value_len),
+    ) catch return error.HeaderListTooLarge;
+    const accounted = std.math.add(u64, field_size, 32) catch
+        return error.HeaderListTooLarge;
     total.* = std.math.add(
         u64,
         total.*,
-        @as(u64, name_len) + value_len + 32,
+        accounted,
     ) catch return error.HeaderListTooLarge;
     if (limit > 0 and total.* > limit) return error.HeaderListTooLarge;
 }
@@ -774,6 +810,38 @@ test "HPACK integer decoding" {
     const result2 = try decodeInteger(&data2, 5);
     try std.testing.expectEqual(@as(u64, 1337), result2.value);
     try std.testing.expectEqual(@as(usize, 3), result2.len);
+}
+
+test "HPACK malformed arithmetic returns errors without panics" {
+    var output: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidPrefixBits, encodeInteger(1, 0, &output));
+    try std.testing.expectError(error.InvalidPrefixBits, decodeInteger(&.{0}, 9));
+
+    var continuation: [16]u8 = [_]u8{0xff} ** 16;
+    continuation[0] = 0x7f;
+    try std.testing.expectError(error.IntegerOverflow, decodeInteger(&continuation, 7));
+
+    var oversized: [12]u8 = undefined;
+    const length_bytes = try encodeInteger(std.math.maxInt(u64), 7, &oversized);
+    oversized[0] |= 0x80;
+    try std.testing.expectError(
+        error.StringLengthOverflow,
+        decodeString(oversized[0..length_bytes], std.testing.allocator),
+    );
+
+    var random_state: u64 = 0xe7037ed1a0b428db;
+    var data: [64]u8 = undefined;
+    for (0..200) |_| {
+        for (&data) |*byte| {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 7;
+            random_state ^= random_state << 17;
+            byte.* = @truncate(random_state);
+        }
+        if (HuffmanCodec.decode(&data, std.testing.allocator)) |decoded| {
+            std.testing.allocator.free(decoded);
+        } else |_| {}
+    }
 }
 
 test "HPACK static table lookup" {

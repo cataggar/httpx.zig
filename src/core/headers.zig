@@ -137,12 +137,25 @@ pub const Headers = struct {
         return false;
     }
 
+    fn validHeaderName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |byte| {
+            if (!(std.ascii.isAlphanumeric(byte) or
+                mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) != null))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Appends a header, allowing multiple values for the same name.
     /// Validates that neither name nor value contains CRLF sequences
     /// to prevent HTTP header injection attacks (RFC 7230 Section 3.2).
     /// Header values are also checked for control characters per RFC 7230.
     pub fn append(self: *Self, name: []const u8, value: []const u8) !void {
         if (self.entries.items.len >= self.max_headers) return error.TooManyHeaders;
+        if (!validHeaderName(name)) return error.InvalidHeaderName;
         if (containsCRLF(name)) return error.InvalidHeaderName;
         if (containsCRLF(value)) return error.InvalidHeaderValue;
         if (containsControlChars(value)) return error.InvalidHeaderValue;

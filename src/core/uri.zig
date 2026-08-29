@@ -163,6 +163,16 @@ pub const Uri = struct {
         return buffer.toOwnedSlice(allocator);
     }
 
+    pub fn requestAuthority(self: Self, allocator: Allocator) ![]u8 {
+        const host = self.host orelse return error.InvalidUri;
+        const default_port: u16 = if (self.isTLS()) 443 else 80;
+        const port = if (self.port) |explicit|
+            if (explicit == default_port) null else explicit
+        else
+            null;
+        return formatAuthorityHost(allocator, host, port);
+    }
+
     /// Reconstructs the full URI string.
     pub fn format(self: Self, allocator: Allocator) ![]u8 {
         var buffer = std.ArrayList(u8).empty;
@@ -191,6 +201,23 @@ pub const Uri = struct {
         return buffer.toOwnedSlice(allocator);
     }
 };
+
+pub fn formatAuthorityHost(
+    allocator: Allocator,
+    host: []const u8,
+    port: ?u16,
+) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    const writer = list_writer.init(allocator, &buffer);
+    if (mem.indexOfScalar(u8, host, ':') != null) {
+        try writer.print("[{s}]", .{host});
+    } else {
+        try writer.writeAll(host);
+    }
+    if (port) |value| try writer.print(":{d}", .{value});
+    return buffer.toOwnedSlice(allocator);
+}
 
 fn validateRequestTargetComponent(value: []const u8) !void {
     for (value) |byte| {
@@ -436,6 +463,21 @@ test "URI request targets reject injection and proxy form strips secrets" {
         "http://example.test:8080/path?query=value",
         target,
     );
+
+    const ipv6 = try Uri.parse("http://[2001:db8::1]:8080/path");
+    const ipv6_target = try ipv6.proxyRequestTarget(std.testing.allocator);
+    defer std.testing.allocator.free(ipv6_target);
+    try std.testing.expectEqualStrings(
+        "http://[2001:db8::1]:8080/path",
+        ipv6_target,
+    );
+    const connect_authority = try formatAuthorityHost(
+        std.testing.allocator,
+        "2001:db8::1",
+        443,
+    );
+    defer std.testing.allocator.free(connect_authority);
+    try std.testing.expectEqualStrings("[2001:db8::1]:443", connect_authority);
 }
 
 test "URI resolve relative path" {

@@ -42,19 +42,10 @@ pub const Request = struct {
         try uri.validateHttpScheme();
         var headers = Headers.init(allocator);
 
-        if (uri.host) |host| {
-            const default_port: u16 = if (uri.isTLS()) 443 else 80;
-            if (uri.port) |port| {
-                if (port != default_port) {
-                    const host_with_port = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
-                    defer allocator.free(host_with_port);
-                    try headers.set(HeaderName.HOST, host_with_port);
-                } else {
-                    try headers.set(HeaderName.HOST, host);
-                }
-            } else {
-                try headers.set(HeaderName.HOST, host);
-            }
+        if (uri.host != null) {
+            const authority = try uri.requestAuthority(allocator);
+            defer allocator.free(authority);
+            try headers.set(HeaderName.HOST, authority);
         }
 
         return .{
@@ -454,6 +445,19 @@ test "request preparation is failure safe" {
             try std.testing.expectError(
                 error.UnsupportedUriScheme,
                 Request.init(std.testing.allocator, .GET, "gopher://example.test/resource"),
+            );
+        }
+
+        test "Request brackets IPv6 Host authority" {
+            var request = try Request.init(
+                std.testing.allocator,
+                .GET,
+                "https://[2001:db8::1]:8443/resource",
+            );
+            defer request.deinit();
+            try std.testing.expectEqualStrings(
+                "[2001:db8::1]:8443",
+                request.headers.get(HeaderName.HOST).?,
             );
         }
     };

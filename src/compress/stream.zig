@@ -37,23 +37,123 @@ pub const StreamingLimits = struct {
     max_compressed_input: u64 = 256 * 1024 * 1024,
 };
 
-const FlateDecompressorState = struct {
-    decompressor: std.compress.flate.Decompress,
-    window_buf: [std.compress.flate.max_window_len]u8,
-    input_buf: [16 * 1024]u8,
-    input_len: usize = 0,
-    finalized: bool = false,
-};
-
 pub fn StreamingDecompressor(comptime ReaderType: type) type {
     return struct {
         const Self = @This();
+
+        const FlatePipeline = struct {
+            source: ReaderType,
+            reader_buffer: [16 * 1024]u8 = undefined,
+            reader: std.Io.Reader = undefined,
+            window_buffer: [std.compress.flate.max_window_len]u8 = undefined,
+            decompressor: std.compress.flate.Decompress = undefined,
+            source_error: ?anyerror = null,
+            source_eof: bool = false,
+            compressed_bytes: u64 = 0,
+            max_compressed_input: u64,
+
+            fn init(self: *@This(), source: ReaderType, container: std.compress.flate.Container, max_input: u64) void {
+                self.* = .{ .source = source, .max_compressed_input = max_input };
+                self.reader = .{
+                    .vtable = &reader_vtable,
+                    .buffer = &self.reader_buffer,
+                    .seek = 0,
+                    .end = 0,
+                };
+                self.decompressor = std.compress.flate.Decompress.init(
+                    &self.reader,
+                    container,
+                    &self.window_buffer,
+                );
+            }
+
+            fn parent(reader: *std.Io.Reader) *@This() {
+                return @fieldParentPtr("reader", reader);
+            }
+
+            fn readVec(reader: *std.Io.Reader, buffers: [][]u8) std.Io.Reader.Error!usize {
+                var vectors: [4][]u8 = undefined;
+                const count, const data_size = try reader.writableVector(&vectors, buffers);
+                const destinations = vectors[0..count];
+                if (destinations.len == 0 or destinations[0].len == 0) return 0;
+                const self = parent(reader);
+                const n = self.source.readSliceShort(destinations[0]) catch |err| {
+                    self.source_error = err;
+                    return error.ReadFailed;
+                };
+                if (n == 0) {
+                    self.source_eof = true;
+                    return error.EndOfStream;
+                }
+                self.compressed_bytes = std.math.add(u64, self.compressed_bytes, n) catch {
+                    self.source_error = error.DecompressionBombDetected;
+                    return error.ReadFailed;
+                };
+                if (self.max_compressed_input > 0 and
+                    self.compressed_bytes > self.max_compressed_input)
+                {
+                    self.source_error = error.DecompressionBombDetected;
+                    return error.ReadFailed;
+                }
+                if (n > data_size) {
+                    reader.end += n - data_size;
+                    return data_size;
+                }
+                return n;
+            }
+
+            fn stream(
+                reader: *std.Io.Reader,
+                writer: *std.Io.Writer,
+                limit: std.Io.Limit,
+            ) std.Io.Reader.StreamError!usize {
+                var total: usize = 0;
+                const max = limit.toInt() orelse std.math.maxInt(usize);
+                while (total < max) {
+                    var output = [_][]u8{reader.buffer[0..@min(reader.buffer.len, max - total)]};
+                    const n = readVec(reader, &output) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
+                    if (n == 0) break;
+                    try writer.writeAll(reader.buffer[0..n]);
+                    total += n;
+                }
+                return total;
+            }
+
+            fn discard(reader: *std.Io.Reader, limit: std.Io.Limit) error{ EndOfStream, ReadFailed }!usize {
+                var total: usize = 0;
+                const max = limit.toInt() orelse std.math.maxInt(usize);
+                while (total < max) {
+                    var output = [_][]u8{reader.buffer[0..@min(reader.buffer.len, max - total)]};
+                    const n = try readVec(reader, &output);
+                    if (n == 0) break;
+                    total += n;
+                }
+                return total;
+            }
+
+            fn rebase(reader: *std.Io.Reader, _: usize) std.Io.Reader.RebaseError!void {
+                const buffered = reader.buffer[reader.seek..reader.end];
+                @memmove(reader.buffer[0..buffered.len], buffered);
+                reader.seek = 0;
+                reader.end = buffered.len;
+            }
+
+            const reader_vtable: std.Io.Reader.VTable = .{
+                .stream = stream,
+                .discard = discard,
+                .readVec = readVec,
+                .rebase = rebase,
+            };
+        };
 
         allocator: Allocator,
         encoding: ContentEncoding,
         reader: ReaderType,
         output_buf: [16 * 1024]u8,
-        flate_state: ?FlateDecompressorState = null,
+        flate_state: ?*FlatePipeline = null,
         brotli_decoder: ?brotli.Decoder = null,
         zstd_decoder: ?zstd_pkg.StreamingDecompressor = null,
         decoder_input: [16 * 1024]u8 = undefined,
@@ -89,6 +189,7 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.flate_state) |pipeline| self.allocator.destroy(pipeline);
             if (self.brotli_decoder) |*decoder| decoder.deinit();
             if (self.zstd_decoder) |*decoder| decoder.deinit();
         }
@@ -96,8 +197,14 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         pub fn readChunk(self: *Self) !?[]const u8 {
             switch (self.encoding) {
                 .identity => {
-                    const n = self.reader.readSliceShort(&self.output_buf) catch return null;
+                    const n = self.reader.readSliceShort(&self.output_buf) catch return error.IoFailed;
                     if (n == 0) return null;
+                    self.total_compressed +|= n;
+                    if (self.limits.max_compressed_input > 0 and
+                        self.total_compressed > self.limits.max_compressed_input)
+                    {
+                        return error.DecompressionBombDetected;
+                    }
                     self.total_decompressed +|= n;
                     if (self.total_decompressed > self.limits.max_decompressed_size) return error.DecompressionBombDetected;
                     return self.output_buf[0..n];
@@ -112,74 +219,23 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
 
         fn ensureFlateInit(self: *Self) !void {
             if (self.flate_state != null) return;
-
-            var state = FlateDecompressorState{
-                .decompressor = undefined,
-                .window_buf = undefined,
-                .input_buf = undefined,
-            };
-
-            const initial_read = self.reader.readSliceShort(&state.input_buf) catch return error.IoFailed;
-            if (initial_read == 0) return error.TruncatedStream;
-            state.input_len = initial_read;
-            self.total_compressed +|= initial_read;
-
-            var in_reader: std.Io.Reader = .fixed(state.input_buf[0..initial_read]);
             const container: std.compress.flate.Container = if (self.encoding == .gzip) .gzip else .zlib;
-            state.decompressor = std.compress.flate.Decompress.init(&in_reader, container, &state.window_buf);
-
-            self.flate_state = state;
+            const pipeline = try self.allocator.create(FlatePipeline);
+            pipeline.init(self.reader, container, self.limits.max_compressed_input);
+            self.flate_state = pipeline;
         }
 
         fn readFlateChunk(self: *Self) !?[]const u8 {
             try self.ensureFlateInit();
-            var state = &self.flate_state.?;
-            if (state.finalized) return null;
-
-            var w: std.Io.Writer = .fixed(&self.output_buf);
-            _ = state.decompressor.reader.streamRemaining(&w) catch |err| {
-                if (err == error.WriteFailed) {
-                    const written = w.buffered();
-                    self.total_decompressed +|= written.len;
-                    if (self.total_decompressed > self.limits.max_decompressed_size) return error.DecompressionBombDetected;
-                    return written;
-                }
-                return self.refillFlateAndRetry(state);
+            const pipeline = self.flate_state.?;
+            const n = pipeline.decompressor.reader.readSliceShort(&self.output_buf) catch {
+                if (pipeline.source_error) |err| return err;
+                return if (pipeline.source_eof) error.TruncatedStream else error.DecompressionFailed;
             };
-
-            state.finalized = true;
-            const written = w.buffered();
-            if (written.len == 0) return null;
-            self.total_decompressed +|= written.len;
-            if (self.total_decompressed > self.limits.max_decompressed_size) return error.DecompressionBombDetected;
-            return written;
-        }
-
-        fn refillFlateAndRetry(self: *Self, state: *FlateDecompressorState) !?[]const u8 {
-            const new_data = self.reader.readSliceShort(state.input_buf[state.input_len..]) catch return null;
-            if (new_data == 0) {
-                state.finalized = true;
-                return null;
-            }
-            state.input_len += new_data;
-            self.total_compressed +|= new_data;
-
-            var in_reader: std.Io.Reader = .fixed(state.input_buf[0..state.input_len]);
-            const container: std.compress.flate.Container = if (self.encoding == .gzip) .gzip else .zlib;
-            state.decompressor = std.compress.flate.Decompress.init(&in_reader, container, &state.window_buf);
-
-            var w: std.Io.Writer = .fixed(&self.output_buf);
-            _ = state.decompressor.reader.streamRemaining(&w) catch {
-                state.finalized = true;
-                return null;
-            };
-
-            state.finalized = true;
-            const written = w.buffered();
-            if (written.len == 0) return null;
-            self.total_decompressed +|= written.len;
-            if (self.total_decompressed > self.limits.max_decompressed_size) return error.DecompressionBombDetected;
-            return written;
+            self.total_compressed = pipeline.compressed_bytes;
+            if (n == 0) return null;
+            try self.recordOutput(n);
+            return self.output_buf[0..n];
         }
 
         fn refillDecoderInput(self: *Self) !bool {
@@ -309,6 +365,7 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
                     return self.output_buf[0..amount];
                 }
                 if (!has_input) {
+                    if (self.total_compressed == 0) return error.TruncatedStream;
                     if (result.needs_more) return error.TruncatedStream;
                     self.zstd_finalized = true;
                     return null;
@@ -493,6 +550,141 @@ test "streaming decompressor gzip round trip" {
     }
 
     try testing.expectEqualStrings(sample, result.items);
+}
+
+test "streaming flate decoder preserves incremental state and propagates failures" {
+    const allocator = std.testing.allocator;
+    const input = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(input);
+    var random_state: u64 = 0xa0761d6478bd642f;
+    for (input) |*byte| {
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 7;
+        random_state ^= random_state << 17;
+        byte.* = @truncate(random_state);
+    }
+    const compressed = try compression.compress(allocator, .gzip, input);
+    defer allocator.free(compressed);
+
+    const ChunkReader = struct {
+        data: []const u8,
+        offset: usize = 0,
+        max_chunk: usize,
+        fail_after: ?usize = null,
+
+        pub fn readSliceShort(self: *@This(), output: []u8) !usize {
+            if (self.fail_after) |limit| {
+                if (self.offset >= limit) return error.SourceReadFailure;
+            }
+            if (self.offset == self.data.len) return 0;
+            const amount = @min(output.len, self.max_chunk, self.data.len - self.offset);
+            @memcpy(output[0..amount], self.data[self.offset..][0..amount]);
+            self.offset += amount;
+            return amount;
+        }
+    };
+
+    var reader = ChunkReader{ .data = compressed, .max_chunk = 37 };
+    var decoder = StreamingDecompressor(*ChunkReader).initWithLimits(
+        allocator,
+        .gzip,
+        &reader,
+        .{
+            .max_decompressed_size = input.len,
+            .max_compressed_input = compressed.len,
+        },
+    );
+    defer decoder.deinit();
+    var offset: usize = 0;
+    while (try decoder.readChunk()) |chunk| {
+        try std.testing.expectEqualSlices(u8, input[offset..][0..chunk.len], chunk);
+        offset += chunk.len;
+    }
+    try std.testing.expectEqual(input.len, offset);
+
+    var truncated_reader = ChunkReader{
+        .data = compressed[0 .. compressed.len - 3],
+        .max_chunk = 29,
+    };
+    var truncated = StreamingDecompressor(*ChunkReader).init(
+        allocator,
+        .gzip,
+        &truncated_reader,
+    );
+    defer truncated.deinit();
+    while (true) {
+        if (truncated.readChunk()) |chunk| {
+            if (chunk == null) return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.TruncatedStream, err);
+            break;
+        }
+    }
+
+    var limited_reader = ChunkReader{ .data = compressed, .max_chunk = 31 };
+    var limited = StreamingDecompressor(*ChunkReader).initWithLimits(
+        allocator,
+        .gzip,
+        &limited_reader,
+        .{ .max_compressed_input = compressed.len - 1 },
+    );
+    defer limited.deinit();
+    while (true) {
+        if (limited.readChunk()) |chunk| {
+            if (chunk == null) return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.DecompressionBombDetected, err);
+            break;
+        }
+    }
+
+    var failing_reader = ChunkReader{
+        .data = compressed,
+        .max_chunk = 7,
+        .fail_after = 7,
+    };
+    var failing = StreamingDecompressor(*ChunkReader).init(
+        allocator,
+        .gzip,
+        &failing_reader,
+    );
+    defer failing.deinit();
+    while (true) {
+        if (failing.readChunk()) |chunk| {
+            if (chunk == null) return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.SourceReadFailure, err);
+            break;
+        }
+    }
+}
+
+test "streaming flate pipeline is allocation failure safe" {
+    const compressed = try compression.compress(
+        std.testing.allocator,
+        .gzip,
+        "allocation-safe incremental gzip",
+    );
+    defer std.testing.allocator.free(compressed);
+    const Case = struct {
+        fn run(allocator: Allocator, wire: []const u8) !void {
+            const reader: std.Io.Reader = .fixed(wire);
+            var decoder = StreamingDecompressor(std.Io.Reader).init(
+                allocator,
+                .gzip,
+                reader,
+            );
+            defer decoder.deinit();
+            var total: usize = 0;
+            while (try decoder.readChunk()) |chunk| total += chunk.len;
+            try std.testing.expect(total > 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Case.run,
+        .{compressed},
+    );
 }
 
 test "streaming decompressor deflate round trip" {
@@ -769,4 +961,13 @@ test "streaming decompressor empty input" {
 
     const result = decompressor.readChunk();
     try testing.expectError(error.TruncatedStream, result);
+
+    const zstd_reader: std.Io.Reader = .fixed("");
+    var zstd = StreamingDecompressor(std.Io.Reader).init(
+        allocator,
+        .zstd,
+        zstd_reader,
+    );
+    defer zstd.deinit();
+    try testing.expectError(error.TruncatedStream, zstd.readChunk());
 }
