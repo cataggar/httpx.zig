@@ -609,6 +609,18 @@ pub fn decodeHeaders(
     data: []const u8,
     allocator: Allocator,
 ) ![]DecodedHeader {
+    return decodeHeadersWithLimit(ctx, data, allocator, 0);
+}
+
+/// Decodes HPACK while enforcing RFC header-list size accounting before
+/// committing entries to the result or dynamic table. A limit of zero is
+/// unlimited.
+pub fn decodeHeadersWithLimit(
+    ctx: *HPACKContext,
+    data: []const u8,
+    allocator: Allocator,
+    max_header_list_size: u64,
+) ![]DecodedHeader {
     var headers = std.ArrayList(DecodedHeader).empty;
     errdefer {
         for (headers.items) |h| {
@@ -619,6 +631,7 @@ pub fn decodeHeaders(
     }
 
     var offset: usize = 0;
+    var header_list_size: u64 = 0;
 
     while (offset < data.len) {
         const first = data[offset];
@@ -629,6 +642,12 @@ pub fn decodeHeaders(
             offset += idx_result.len;
 
             const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+            try accountHeaderListSize(
+                &header_list_size,
+                entry.name.len,
+                entry.value.len,
+                max_header_list_size,
+            );
             try headers.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
@@ -652,6 +671,12 @@ pub fn decodeHeaders(
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
+            try accountHeaderListSize(
+                &header_list_size,
+                name.len,
+                value_result.value.len,
+                max_header_list_size,
+            );
             try ctx.dynamic_table.add(name, value_result.value);
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
@@ -679,11 +704,26 @@ pub fn decodeHeaders(
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
+            try accountHeaderListSize(
+                &header_list_size,
+                name.len,
+                value_result.value.len,
+                max_header_list_size,
+            );
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         }
     }
 
     return headers.toOwnedSlice(allocator);
+}
+
+fn accountHeaderListSize(total: *u64, name_len: usize, value_len: usize, limit: u64) !void {
+    total.* = std.math.add(
+        u64,
+        total.*,
+        @as(u64, name_len) + value_len + 32,
+    ) catch return error.HeaderListTooLarge;
+    if (limit > 0 and total.* > limit) return error.HeaderListTooLarge;
 }
 
 test "HPACK integer encoding" {
@@ -750,6 +790,29 @@ test "HPACK context combined lookup" {
     // Dynamic table lookup (index 62 = first dynamic entry)
     const dynamic_entry = ctx.getByIndex(62).?;
     try std.testing.expectEqualStrings("x-custom", dynamic_entry.name);
+}
+
+test "HPACK decode enforces header list limit without leaking partial entries" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var encoder = HPACKContext.init(allocator);
+            defer encoder.deinit();
+            const fields = [_]HeaderEntry{
+                .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                .{ .name = "x-large", .value = "0123456789", .representation = .without_indexing },
+            };
+            const encoded = try encodeHeaders(&encoder, &fields, allocator);
+            defer allocator.free(encoded);
+
+            var decoder = HPACKContext.init(allocator);
+            defer decoder.deinit();
+            try std.testing.expectError(
+                error.HeaderListTooLarge,
+                decodeHeadersWithLimit(&decoder, encoded, allocator, 40),
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "Huffman encode/decode roundtrip" {

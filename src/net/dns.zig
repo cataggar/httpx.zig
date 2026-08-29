@@ -879,18 +879,29 @@ pub const DNSResolver = struct {
 
     pub fn resolve(self: *Self, hostname: []const u8, options: ResolveOptions) !DNSResolution {
         const context = IoContext.init(.{});
-        return self.resolveWithContext(hostname, options, &context);
+        return self.resolveInternal(hostname, options, &context, true);
     }
 
-    /// Resolves a hostname while observing cancellation and monotonic
-    /// deadlines. The in-flight deduplication wait is interruptible. Individual
-    /// UDP/TCP DNS socket operations remain bounded by their existing timeouts
-    /// until context-aware socket I/O is implemented.
+    /// Resolves a hostname while observing cancellation and the earliest
+    /// caller/per-query monotonic deadline.
     pub fn resolveWithContext(
         self: *Self,
         hostname: []const u8,
         options: ResolveOptions,
         context: *const IoContext,
+    ) !DNSResolution {
+        // A caller-owned cancellation/deadline must not abort shared work and
+        // poison unrelated deduplicated waiters. Contextual lookups therefore
+        // run independently; the non-contextual resolve() path still dedups.
+        return self.resolveInternal(hostname, options, context, false);
+    }
+
+    fn resolveInternal(
+        self: *Self,
+        hostname: []const u8,
+        options: ResolveOptions,
+        context: *const IoContext,
+        allow_dedup: bool,
     ) !DNSResolution {
         try context.check();
         const family = options.address_family orelse self.cache.config.address_family;
@@ -941,7 +952,7 @@ pub const DNSResolver = struct {
             self.cache.stats.misses += 1;
         }
 
-        if (self.cache.config.dedup_enabled) {
+        if (allow_dedup and self.cache.config.dedup_enabled) {
             self.cache.lock.lock(common.threadIo()) catch {};
             if (self.cache.in_flight.getPtr(hostname)) |inf| {
                 inf.*.incRef();
@@ -1321,13 +1332,6 @@ fn dnsTestWorker(resolver: *DNSResolver, thread_id: u32) void {
     }
 }
 
-fn cancelWhenDedupWaitStarts(in_flight: *InFlight, token: *CancellationToken) void {
-    while (in_flight.ref_count.load(.acquire) < 2) {
-        std.Thread.yield() catch {};
-    }
-    token.cancel();
-}
-
 test "DNSConfig defaults" {
     const cfg = DNSConfig{};
     try std.testing.expectEqual(@as(i64, 60_000), cfg.positive_ttl_ms);
@@ -1653,7 +1657,7 @@ test "DNS TCP query enforces its per-query deadline" {
     try std.testing.expect(server_state.accepted.load(.acquire));
 }
 
-test "DNSResolver context interrupts in-flight dedup wait" {
+test "DNSResolver cancellable lookup does not join or poison shared dedup work" {
     const allocator = std.testing.allocator;
     var resolver = DNSResolver.init(allocator, .{
         .cache_enabled = false,
@@ -1668,15 +1672,13 @@ test "DNSResolver context interrupts in-flight dedup wait" {
     try resolver.cache.in_flight.put(allocator, key, in_flight);
 
     var token = CancellationToken.init();
+    token.cancel();
     const context = IoContext.init(.{ .external_cancel = &token });
-    const thread = try std.Thread.spawn(.{}, cancelWhenDedupWaitStarts, .{ in_flight, &token });
-
     const result = resolver.resolveWithContext("dedup.test", .{}, &context);
-    thread.join();
 
     try std.testing.expectError(error.Cancelled, result);
-    try std.testing.expect(token.isCancelled());
     try std.testing.expectEqual(@as(u32, 1), in_flight.ref_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), resolver.getStats().dedup_hits);
 }
 
 test "DNSResolver resolveAll IP literal" {

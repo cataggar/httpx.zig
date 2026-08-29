@@ -136,7 +136,14 @@ pub const ClientOperation = struct {
         var buffer: [32 * 1024]u8 = undefined;
         var total: u64 = 0;
         while (true) {
-            const n = try reader.read(&buffer);
+            const ReaderType = switch (@typeInfo(@TypeOf(reader))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(reader),
+            };
+            const n = if (@hasDecl(ReaderType, "readSliceShort"))
+                try reader.readSliceShort(&buffer)
+            else
+                try reader.read(&buffer);
             if (n == 0) return total;
             try self.writeAll(buffer[0..n]);
             total = std.math.add(u64, total, n) catch return error.BodyLengthOverflow;

@@ -185,14 +185,18 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
         fn refillDecoderInput(self: *Self) !bool {
             if (self.decoder_input_pos < self.decoder_input_len) return true;
             self.decoder_input_pos = 0;
-            self.decoder_input_len = self.reader.readSliceShort(&self.decoder_input) catch
-                return error.IoFailed;
-            if (self.decoder_input_len == 0) return false;
-            self.total_compressed +|= self.decoder_input_len;
+            self.decoder_input_len = try self.readDecoderBytes(&self.decoder_input);
+            return self.decoder_input_len != 0;
+        }
+
+        fn readDecoderBytes(self: *Self, output: []u8) !usize {
+            const amount = self.reader.readSliceShort(output) catch return error.IoFailed;
+            if (amount == 0) return 0;
+            self.total_compressed +|= amount;
             if (self.total_compressed > self.limits.max_compressed_input) {
                 return error.DecompressionBombDetected;
             }
-            return true;
+            return amount;
         }
 
         fn recordOutput(self: *Self, amount: usize) !void {
@@ -223,6 +227,14 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
                 const produced = self.output_buf.len - output.len;
                 switch (result) {
                     .success => {
+                        if (decoder.br.pos != decoder.br.input.len or decoder.buffer_length != 0) {
+                            return error.MalformedData;
+                        }
+                        self.decoder_input_pos = self.decoder_input_len;
+                        var trailing: [1]u8 = undefined;
+                        const trailing_len = self.reader.readSliceShort(&trailing) catch
+                            return error.IoFailed;
+                        if (trailing_len != 0) return error.MalformedData;
                         self.brotli_finalized = true;
                         try self.recordOutput(produced);
                         return if (produced == 0) null else self.output_buf[0..produced];

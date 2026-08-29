@@ -34,14 +34,14 @@
 > [!NOTE]
 > **Project maturity:** This project is production-ready and actively maintained. It provides a comprehensive HTTP client and server implementation with modern protocol, networking, security, and performance features. The project is actively evolving and welcomes production use and contributions.
 >
-> **Custom HTTP/2, HTTP/3, and TLS implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, QUIC, or TLS/ALPN support.
+> **Custom HTTP/2, QUIC/HTTP3 primitives, and TLS implementation:** Zig's standard library does not provide HTTP/2, QUIC, HTTP/3, or TLS/ALPN support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
-> - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — key exchange: X25519 (TLS 1.2/1.3); AEAD cipher suites: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback; handshake message encryption (TLS 1.3); X.509 certificate parsing and verification (client-side); custom record-layer encryption/decryption
+> - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) for TCP protocols, including HTTP/2 ALPN and HTTP/1.1 fallback
 > - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
 > - **HTTP/2** stream primitives, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and sequential high-level client session reuse (RFC 7540). The high-level `Client` does not currently multiplex concurrent requests on one session.
 > - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
 > - **QUIC** transport frame encoding/decoding (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation, version negotiation, and transport parameters
-> - **HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE handling
+> - **Experimental QUIC/HTTP3 protocol primitives** for framing and QPACK tests. The public client rejects HTTP/3 until authenticated QUIC TLS 1.3, AEAD/header protection, loss recovery, and mandatory control streams are implemented.
 > - **Interop note:** strict TLS-in-QUIC server negotiation expectations may vary by endpoint deployment
 
 **Related Zig projects:**
@@ -75,7 +75,7 @@
 
 | Feature | Description | Documentation |
 |---------|-------------|---------------|
-| **Protocol Support** | Full runtime support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2**, and **HTTP/3** in high-level client/server APIs, plus low-level protocol primitives. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
+| **Protocol Support** | High-level client support for **HTTP/1.0**, **HTTP/1.1**, and **HTTP/2**. QUIC/HTTP3 APIs are experimental protocol primitives only; public HTTP/3 requests return `error.UnsupportedHttpVersion`. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Header Compression** | HPACK (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2; QPACK (RFC 9204) with decoder/encoder stream instructions for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
 | **HTTP/2 ALPN** | Automatic protocol negotiation during TLS handshake with HTTP/1.1 fallback. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
 | **Stream Multiplexing Primitives** | HTTP/2 stream state machine with flow control, SETTINGS enforcement, GOAWAY/RST_STREAM, and trailer support. High-level client reuse is sequential. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
@@ -111,8 +111,7 @@
 | **FTP** | Full FTP/FTPS client with PASV/EPSV, directory listing, upload/download, resume. | https://muhammad-fiaz.github.io/httpx.zig/api/ftp |
 | **DNS Resolution** | `resolveAddress`, `resolveAllAddresses`, `parseHostAndPort`, `parseAndResolveAddress`, `isIpAddress`, `isIp4Address`, `isIp6Address` helpers with RFC 1035 wire protocol, UDP/TCP/DoH transports, and SSRF policy checks. | https://muhammad-fiaz.github.io/httpx.zig/api/dns |
 | **Server-Sent Events** | `SseEvent` type and `parseSSEStream` helper for SSE client parsing. | https://muhammad-fiaz.github.io/httpx.zig/api/sse |
-| **HTTP/3 Flow Control** | MAX_DATA and MAX_STREAM_DATA frame handling with connection-level and per-stream flow control windows. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
-| **Stream Cancellation** | RESET_STREAM and STOP_SENDING frames for graceful HTTP/3 stream teardown without connection disruption. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
+| **HTTP/3 Framing Primitives** | Experimental MAX_DATA, MAX_STREAM_DATA, RESET_STREAM, and STOP_SENDING codecs; not an authenticated public transport. | https://muhammad-fiaz.github.io/httpx.zig/examples/http3-advanced |
 | **Cookie APIs** | First-class request/response cookie helpers for both client and server contexts. | https://muhammad-fiaz.github.io/httpx.zig/api/server |
 | **Security** | Security headers (Helmet: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, HSTS), CSRF protection, SSRF protection in reverse proxy, and safe defaults. | https://muhammad-fiaz.github.io/httpx.zig/api/middleware |
 | **Minimal Dependencies** | Pure Zig core implementation for maximum portability. Compression uses bundled brotli and zstd packages. | https://muhammad-fiaz.github.io/httpx.zig/guide/installation |
@@ -336,12 +335,13 @@ try op.finish(.{});
 
 Use `.chunked` for an HTTP/1.1 request of unknown length. HTTP/2 maps both
 known and unknown lengths to DATA frames and sends END_STREAM only from
-`finishRequest`; HTTP/3 maps them to incremental DATA frames and stream FIN.
+`finishRequest`. HTTP/3 is explicitly rejected by the public client until a
+real authenticated QUIC transport is available.
 `waitForContinue` exposes the `Expect: 100-continue` boundary.
 `finish(.{ .drain_response = true, .drain_timeout_ms = 5_000 })` validates
-and drains before reuse; `abort` closes HTTP/1, resets HTTP/2, or sends
-HTTP/3 RESET_STREAM and STOP_SENDING. `cancel` is the only operation method
-that may race active I/O.
+and drains before reuse; `abort` closes HTTP/1 and sends a bounded HTTP/2
+reset before closing that session. `cancel` is the only operation method that
+may race active I/O.
 
 Streaming counters and limits are `u64`; caller and transport body buffers are
 fixed at 16–64 KiB. gzip/deflate, Brotli, and Zstandard are decoded
@@ -618,12 +618,12 @@ The `examples/` directory contains **67 comprehensive, runnable examples** demon
 - [`http2_server_runtime`](examples/http2_server_runtime.zig) - HTTP/2 server runtime
 - [`http2_advanced`](examples/http2_advanced.zig) - HTTP/2 SETTINGS enforcement, GOAWAY, HPACK security, trailers
 - [`http3_example`](examples/http3_example.zig) - HTTP/3 protocol primitives
-- [`http3_client_runtime`](examples/http3_client_runtime.zig) - HTTP/3 client runtime
-- [`http3_server_runtime`](examples/http3_server_runtime.zig) - HTTP/3 server runtime
+- [`http3_client_runtime`](examples/http3_client_runtime.zig) - demonstrates explicit public HTTP/3 rejection
+- [`http3_server_runtime`](examples/http3_server_runtime.zig) - experimental unauthenticated protocol fixture
 - [`http3_advanced`](examples/http3_advanced.zig) - QPACK stream instructions, QUIC cancellation, transport parameters
 
 **TLS:**
-- [`tls_https_get`](examples/tls_https_get.zig) - Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2 + HTTP/3)
+- [`tls_https_get`](examples/tls_https_get.zig) - Simple HTTPS GET via local TLS server (HTTP/1.1 + HTTP/2)
 - [`tls_config_options`](examples/tls_config_options.zig) - TLS configuration options and ALPN negotiation
 - [`tls_handshake_details`](examples/tls_handshake_details.zig) - TLS handshake info and cipher suites
 - [`tls_custom_ca`](examples/tls_custom_ca.zig) - Custom CA certificate verification with self-signed certs

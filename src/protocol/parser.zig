@@ -335,8 +335,6 @@ pub const Parser = struct {
     }
 
     fn parseHeaders(self: *Self, data: []const u8) !usize {
-        var lower_buf: [256]u8 = undefined; // For case-insensitive comparison buffers
-
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -394,40 +392,22 @@ pub const Parser = struct {
                     }
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                if (self.transfer_encoding_seen) {
+                    self.state = .err;
+                    return error.InvalidChunkEncoding;
+                }
                 // RFC 7230 3.3.1: Transfer-Encoding is not allowed in HTTP/1.0.
                 if (self.version == .HTTP_1_0) {
                     self.state = .err;
                     return error.InvalidChunkEncoding;
                 }
-                // RFC 7230 3.3.1: Only chunked is supported as the last transfer-coding.
-                // Reject if "chunked" is not the last coding in the list.
-                const lower_value = std.ascii.lowerString(&lower_buf, value);
-                if (std.mem.lastIndexOf(u8, lower_value, "chunked")) |pos| {
-                    // Check that nothing meaningful comes after "chunked"
-                    const after = std.mem.trim(u8, lower_value[pos + 7 ..], " \t");
-                    if (after.len > 0 and after[0] != ',') {
-                        self.state = .err;
-                        return error.InvalidChunkEncoding;
-                    }
-                    // Check that chunked is the LAST coding (no codings after the comma following chunked)
-                    var coding_iter = std.mem.splitScalar(u8, lower_value, ',');
-                    var last_was_chunked = false;
-                    while (coding_iter.next()) |coding| {
-                        const trimmed_coding = std.mem.trim(u8, coding, " \t");
-                        if (std.mem.eql(u8, trimmed_coding, "chunked")) {
-                            last_was_chunked = true;
-                        } else if (last_was_chunked) {
-                            // chunked is not the last coding
-                            self.state = .err;
-                            return error.InvalidChunkEncoding;
-                        }
-                    }
-                    self.chunked = true;
-                } else {
-                    // Non-chunked Transfer-Encoding is not supported.
+                var codings = std.mem.splitScalar(u8, value, ',');
+                const first = std.mem.trim(u8, codings.next() orelse "", " \t");
+                if (!std.ascii.eqlIgnoreCase(first, "chunked") or codings.next() != null) {
                     self.state = .err;
                     return error.InvalidChunkEncoding;
                 }
+                self.chunked = true;
                 self.transfer_encoding_seen = true;
                 if (self.content_length != null) {
                     self.state = .err;
@@ -851,6 +831,28 @@ test "Parser Transfer-Encoding not last coding is rejected" {
     const result = parser.feed(data);
 
     try std.testing.expectError(error.InvalidChunkEncoding, result);
+}
+
+test "Parser rejects gzip before chunked and long transfer encoding safely" {
+    var parser = Parser.initResponse(std.testing.allocator);
+    defer parser.deinit();
+    try std.testing.expectError(
+        error.InvalidChunkEncoding,
+        parser.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
+    );
+
+    parser.reset();
+    parser.mode = .response;
+    parser.state = .status_line;
+    var value: [300]u8 = undefined;
+    @memset(&value, 'a');
+    var message: [400]u8 = undefined;
+    const wire = try std.fmt.bufPrint(
+        &message,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: {s}\r\n\r\n",
+        .{&value},
+    );
+    try std.testing.expectError(error.InvalidChunkEncoding, parser.feed(wire));
 }
 
 test "Parser rejects Content-Length with Transfer-Encoding" {

@@ -200,6 +200,7 @@ pub const negotiateVersion = http.negotiateVersion;
 
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
+pub const TransportAdapter = client_mod.TransportAdapter;
 pub const RequestOptions = client_mod.RequestOptions;
 pub const BodyMode = client_mod.BodyMode;
 pub const ResponseLimit = client_mod.ResponseLimit;

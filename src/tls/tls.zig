@@ -577,16 +577,33 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
             1,
             @intFromEnum(tls.KeyUpdateRequest.update_not_requested),
         };
-        _ = try writeBoundedEncryptedRecord(
-            state.socket,
-            .tls_1_3,
-            write_key.?.*,
-            write_iv.?.*,
-            state.cipher_suite,
-            state.write_seq,
-            &response,
-            .handshake,
-        );
+        if (state.context) |context| {
+            var sender = ContextSocketSender{ .socket = state.socket, .context = context };
+            _ = writeBoundedEncryptedRecord(
+                &sender,
+                .tls_1_3,
+                write_key.?.*,
+                write_iv.?.*,
+                state.cipher_suite,
+                state.write_seq,
+                &response,
+                .handshake,
+            ) catch |err| {
+                try context.check();
+                return err;
+            };
+        } else {
+            _ = try writeBoundedEncryptedRecord(
+                state.socket,
+                .tls_1_3,
+                write_key.?.*,
+                write_iv.?.*,
+                state.cipher_suite,
+                state.write_seq,
+                &response,
+                .handshake,
+            );
+        }
         try updateTLS13TrafficKeys(state.cipher_suite, write_secret.?, write_key.?, write_iv.?);
         state.write_seq.* = 0;
     }
