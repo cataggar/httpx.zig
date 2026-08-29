@@ -240,6 +240,55 @@ fn validateRequestTargetComponent(value: []const u8) !void {
     }
 }
 
+const AuthorityParts = struct {
+    userinfo: ?[]const u8 = null,
+    host: []const u8,
+    port: ?u16 = null,
+};
+
+fn parseAuthority(authority: []const u8) !AuthorityParts {
+    var remaining = authority;
+    var userinfo: ?[]const u8 = null;
+    if (mem.lastIndexOfScalar(u8, remaining, '@')) |separator| {
+        userinfo = remaining[0..separator];
+        remaining = remaining[separator + 1 ..];
+    }
+    if (remaining.len == 0) return error.InvalidUri;
+
+    if (remaining[0] == '[') {
+        const bracket_end = mem.indexOfScalar(u8, remaining, ']') orelse
+            return error.InvalidUri;
+        if (bracket_end == 1) return error.InvalidUri;
+        const suffix = remaining[bracket_end + 1 ..];
+        const port = if (suffix.len == 0)
+            null
+        else blk: {
+            if (suffix[0] != ':' or suffix.len == 1) return error.InvalidUri;
+            break :blk std.fmt.parseInt(u16, suffix[1..], 10) catch
+                return error.InvalidUri;
+        };
+        return .{
+            .userinfo = userinfo,
+            .host = remaining[1..bracket_end],
+            .port = port,
+        };
+    }
+
+    const first_colon = mem.indexOfScalar(u8, remaining, ':');
+    const last_colon = mem.lastIndexOfScalar(u8, remaining, ':');
+    if (first_colon != last_colon) return error.InvalidUri;
+    if (last_colon) |separator| {
+        if (separator == 0 or separator + 1 == remaining.len) return error.InvalidUri;
+        return .{
+            .userinfo = userinfo,
+            .host = remaining[0..separator],
+            .port = std.fmt.parseInt(u16, remaining[separator + 1 ..], 10) catch
+                return error.InvalidUri,
+        };
+    }
+    return .{ .userinfo = userinfo, .host = remaining };
+}
+
 /// Resolves a relative URI against a base URI per RFC 3986 Section 5.
 pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
     var remaining = relative_str;
@@ -253,13 +302,14 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         rel_scheme = remaining[0..scheme_end];
         remaining = remaining[scheme_end + 3 ..];
 
-        if (mem.indexOf(u8, remaining, "/")) |path_start| {
-            rel_authority = remaining[0..path_start];
-            remaining = remaining[path_start..];
-        } else {
-            rel_authority = remaining;
-            remaining = "";
-        }
+        const authority_end = mem.indexOfAny(u8, remaining, "/?#") orelse remaining.len;
+        rel_authority = remaining[0..authority_end];
+        remaining = remaining[authority_end..];
+    } else if (mem.startsWith(u8, remaining, "//")) {
+        remaining = remaining[2..];
+        const authority_end = mem.indexOfAny(u8, remaining, "/?#") orelse remaining.len;
+        rel_authority = remaining[0..authority_end];
+        remaining = remaining[authority_end..];
     }
 
     if (mem.indexOf(u8, remaining, "#")) |frag_start| {
@@ -281,9 +331,12 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
     }
 
     if (rel_scheme) |scheme| {
+        const authority = try parseAuthority(rel_authority orelse return error.InvalidUri);
         return Uri{
             .scheme = scheme,
-            .host = rel_authority,
+            .userinfo = authority.userinfo,
+            .host = authority.host,
+            .port = authority.port,
             .path = try normalizePath(rel_path, allocator),
             .query = rel_query,
             .fragment = rel_fragment,
@@ -292,9 +345,12 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
     }
 
     if (rel_authority) |auth| {
+        const authority = try parseAuthority(auth);
         return Uri{
             .scheme = base.scheme,
-            .host = auth,
+            .userinfo = authority.userinfo,
+            .host = authority.host,
+            .port = authority.port,
             .path = try normalizePath(rel_path, allocator),
             .query = rel_query,
             .fragment = rel_fragment,
@@ -307,6 +363,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         if (rel_query) |q| {
             return Uri{
                 .scheme = base.scheme,
+                .userinfo = base.userinfo,
                 .host = base.host,
                 .port = base.port,
                 .path = merged_path,
@@ -317,6 +374,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
         }
         return Uri{
             .scheme = base.scheme,
+            .userinfo = base.userinfo,
             .host = base.host,
             .port = base.port,
             .path = merged_path,
@@ -355,6 +413,7 @@ pub fn resolve(base: Uri, relative_str: []const u8, allocator: Allocator) !Uri {
 
     return Uri{
         .scheme = base.scheme,
+        .userinfo = base.userinfo,
         .host = base.host,
         .port = base.port,
         .path = normalized,
@@ -515,6 +574,28 @@ test "URI resolve with scheme" {
     defer std.testing.allocator.free(resolved.path);
     try std.testing.expectEqualStrings("https", resolved.scheme.?);
     try std.testing.expectEqualStrings("other.com", resolved.host.?);
+
+    const ipv6 = try resolve(
+        base,
+        "https://user@[2001:db8::1]:8443/x",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(ipv6.path);
+    try std.testing.expectEqualStrings("user", ipv6.userinfo.?);
+    try std.testing.expectEqualStrings("2001:db8::1", ipv6.host.?);
+    try std.testing.expectEqual(@as(u16, 8443), ipv6.port.?);
+    const formatted = try ipv6.format(std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("https://user@[2001:db8::1]:8443/x", formatted);
+
+    const network_path = try resolve(
+        base,
+        "//[2001:db8::2]:8080/y",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(network_path.path);
+    try std.testing.expectEqualStrings("2001:db8::2", network_path.host.?);
+    try std.testing.expectEqual(@as(u16, 8080), network_path.port.?);
 }
 
 test "URI bracketed authority rejects invalid suffixes" {

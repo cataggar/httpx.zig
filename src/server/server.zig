@@ -40,6 +40,8 @@ const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../data/common.zig");
 const list_writer = @import("../io/list_writer.zig");
 const io_util = @import("../io/any_io.zig");
+const IoContext = @import("../io/context.zig").IoContext;
+const Deadline = @import("../io/context.zig").Deadline;
 const Executor = @import("../concurrency/executor.zig").Executor;
 
 const Metrics = @import("../io/metrics.zig").Metrics;
@@ -1176,6 +1178,8 @@ pub const Server = struct {
                         }
                     }
                     ctx.server.executor_conn_mutex.unlock(io);
+                    var owned_socket = ctx.socket;
+                    owned_socket.close();
                     _ = ctx.server.active_conn_count.fetchSub(1, .monotonic);
                     ctx.server.allocator.destroy(ctx);
                 }
@@ -1183,6 +1187,7 @@ pub const Server = struct {
             const job_ctx = self.allocator.create(ConnJob) catch {
                 var s = socket;
                 s.close();
+                _ = self.active_conn_count.fetchSub(1, .monotonic);
                 return;
             };
             job_ctx.* = .{
@@ -1215,6 +1220,7 @@ pub const Server = struct {
                 var s = socket;
                 s.close();
                 self.allocator.destroy(job_ctx);
+                _ = self.active_conn_count.fetchSub(1, .monotonic);
             };
         } else {
             {
@@ -1232,6 +1238,8 @@ pub const Server = struct {
                 }
             };
             self.removeFromActive(socket);
+            var owned_socket = socket;
+            owned_socket.close();
         }
     }
 
@@ -1364,21 +1372,19 @@ pub const Server = struct {
             const io = defaultIo();
             self.active_conn_mutex.lock(io) catch unreachable;
             for (self.active_connections.items) |*s| {
-                s.close();
+                s.shutdownBoth() catch {};
             }
-            self.active_connections.clearRetainingCapacity();
             self.active_conn_mutex.unlock(io);
         }
-        self.active_conn_count.store(0, .monotonic);
 
-        // Close executor-tracked sockets so worker threads unblock from recv().
+        // Interrupt executor-tracked sockets; each connection handler remains
+        // the sole close owner.
         {
             const io = defaultIo();
             self.executor_conn_mutex.lock(io) catch unreachable;
             for (self.executor_connections.items) |*s| {
-                s.close();
+                s.shutdownBoth() catch {};
             }
-            self.executor_connections.clearRetainingCapacity();
             self.executor_conn_mutex.unlock(io);
         }
 
@@ -1494,18 +1500,26 @@ pub const Server = struct {
             // otherwise those bytes are the start of an HTTP/1.1 request.
             var probe: [http.HTTP2_PREFACE.len]u8 = undefined;
             var total: usize = 0;
+            var preface_context = IoContext.init(.{
+                .phase_deadline = if (self.config.request_timeout_ms > 0)
+                    Deadline.afterMs(self.config.request_timeout_ms)
+                else
+                    null,
+            });
             while (total < probe.len) {
-                const n = sock.recv(probe[total..]) catch break;
+                const n = try sock.recvWithContext(probe[total..], &preface_context);
                 if (n == 0) return;
                 total += n;
+                if (!mem.eql(
+                    u8,
+                    probe[0..total],
+                    http.HTTP2_PREFACE[0..total],
+                )) {
+                    return self.handleHttp1WithPrefix(sock, probe[0..total]);
+                }
             }
 
-            if (total == probe.len and mem.eql(u8, &probe, http.HTTP2_PREFACE)) {
-                return self.handleHTTP2Connection(sock);
-            }
-
-            // Not HTTP/2 -- handle as HTTP/1.1 with the already-read prefix.
-            return self.handleHttp1WithPrefix(sock, probe[0..total]);
+            return self.handleHTTP2Connection(sock);
         }
 
         return self.handleHttp1Connection(sock);
@@ -1569,6 +1583,7 @@ pub const Server = struct {
             );
             defer req.deinit();
             req.version = parser.version;
+            if (parser.custom_method) |method| try req.setCustomMethod(method);
 
             for (parser.headers.entries.items) |h| {
                 try req.headers.append(h.name, h.value);
@@ -1657,6 +1672,7 @@ pub const Server = struct {
             );
             defer req.deinit();
             req.version = parser.version;
+            if (parser.custom_method) |method| try req.setCustomMethod(method);
 
             for (parser.headers.entries.items) |h| {
                 try req.headers.append(h.name, h.value);
@@ -1714,6 +1730,7 @@ pub const Server = struct {
         pending_headers_flags: u8,
         pending_is_trailers: bool,
         waiting_continuation: bool,
+        header_deadline: ?Deadline,
         initial_headers_parsed: bool,
         headers_complete: bool,
         expected_content_length: ?u64,
@@ -1737,6 +1754,7 @@ pub const Server = struct {
                 .pending_headers_flags = 0,
                 .pending_is_trailers = false,
                 .waiting_continuation = false,
+                .header_deadline = null,
                 .initial_headers_parsed = false,
                 .headers_complete = false,
                 .expected_content_length = null,
@@ -1756,6 +1774,28 @@ pub const Server = struct {
         }
     };
 
+    const H2ServerContextReader = struct {
+        const Source = union(enum) {
+            socket: *Socket,
+            tls: *tls_mod.Connection,
+        };
+
+        source: Source,
+        context: *const IoContext,
+
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            return switch (self.source) {
+                .socket => |socket| socket.recvWithContext(output, self.context),
+                .tls => |connection| connection.readWithContext(output, self.context),
+            };
+        }
+
+        fn anyReader(self: *@This()) io_util.AnyReader {
+            return .{ .context = self, .readFn = read };
+        }
+    };
+
     /// Handles an HTTP/2 connection over TLS.
     fn validateHTTP2Preface(preface: []const u8) !void {
         if (!mem.eql(u8, preface, http.HTTP2_PREFACE)) return error.ProtocolError;
@@ -1765,27 +1805,36 @@ pub const Server = struct {
         var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
         try tls_conn.reader().readNoEof(&preface);
         try validateHTTP2Preface(&preface);
+        var frame_context = IoContext.init(.{});
+        var contextual_reader = H2ServerContextReader{
+            .source = .{ .tls = tls_conn },
+            .context = &frame_context,
+        };
         var conn = http.HTTP2Connection.init(
             self.allocator,
-            tls_conn.reader(),
+            contextual_reader.anyReader(),
             tls_conn.writer(),
         );
-        try self.handleHTTP2Frames(&conn, true);
+        try self.handleHTTP2Frames(&conn, true, &frame_context);
     }
 
     /// Handles an HTTP/2 connection over plain TCP.
     fn handleHTTP2Connection(self: *Self, socket: Socket) !void {
         var sock = socket;
-        defer sock.close();
         if (self.config.request_timeout_ms > 0) {
             try sock.setRecvTimeout(self.config.request_timeout_ms);
         }
+        var frame_context = IoContext.init(.{});
+        var contextual_reader = H2ServerContextReader{
+            .source = .{ .socket = &sock },
+            .context = &frame_context,
+        };
         var conn = http.HTTP2Connection.init(
             self.allocator,
-            sock.reader(),
+            contextual_reader.anyReader(),
             sock.writer(),
         );
-        try self.handleHTTP2Frames(&conn, false);
+        try self.handleHTTP2Frames(&conn, false, &frame_context);
         sock.shutdownWrite() catch {};
         sleepMs(25);
     }
@@ -1839,9 +1888,30 @@ pub const Server = struct {
         conn: *http.HTTP2Connection,
         stream_manager: *h2stream.StreamManager,
         stream_id: u31,
+        frame_context: *IoContext,
+        send_wait_deadline: ?Deadline,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        queued_continuation_stream: *?u31,
     ) !void {
-        var frame = try conn.readFrame(self.allocator, conn.settings.max_frame_size);
-        defer frame.deinit(self.allocator);
+        const previous_deadline = frame_context.phase_deadline;
+        frame_context.setPhaseDeadline(send_wait_deadline);
+        var frame = conn.readFrame(self.allocator, conn.settings.max_frame_size) catch |err| {
+            frame_context.setPhaseDeadline(previous_deadline);
+            return err;
+        };
+        frame_context.setPhaseDeadline(previous_deadline);
+        var frame_owned = true;
+        defer if (frame_owned) frame.deinit(self.allocator);
+        if (queued_continuation_stream.*) |required_stream| {
+            if (frame.header.frame_type != .continuation or
+                frame.header.stream_id != required_stream)
+            {
+                return error.ProtocolError;
+            }
+        } else if (frame.header.frame_type == .continuation) {
+            return error.ProtocolError;
+        }
         switch (frame.header.frame_type) {
             .window_update => try applyHTTP2SendWindowUpdate(
                 stream_manager,
@@ -1882,13 +1952,65 @@ pub const Server = struct {
                 if (frame.header.stream_id == 0 or frame.payload.len != 4) {
                     return error.ProtocolError;
                 }
-                if (frame.header.stream_id != stream_id) return error.ProtocolError;
-                if (stream_manager.getStream(stream_id)) |stream| stream.reset();
-                return error.StreamReset;
+                if (frame.header.stream_id == stream_id) {
+                    if (stream_manager.getStream(stream_id)) |stream| stream.reset();
+                    return error.StreamReset;
+                }
+                try queueHTTP2Frame(
+                    self,
+                    pending_frames,
+                    pending_frame_bytes,
+                    frame,
+                );
+                frame_owned = false;
             },
             .goaway => return error.GoAway,
-            else => return error.ProtocolError,
+            .headers, .continuation, .data => {
+                if (frame.header.frame_type == .data) {
+                    const debit = std.math.cast(i32, frame.payload.len) orelse
+                        return error.FlowControlError;
+                    if (debit > stream_manager.connection_recv_window) {
+                        return error.FlowControlError;
+                    }
+                    stream_manager.connection_recv_window -= debit;
+                }
+                try queueHTTP2Frame(
+                    self,
+                    pending_frames,
+                    pending_frame_bytes,
+                    frame,
+                );
+                frame_owned = false;
+                if (frame.header.frame_type == .headers and
+                    (frame.header.flags & 0x04) == 0)
+                {
+                    queued_continuation_stream.* = frame.header.stream_id;
+                } else if (frame.header.frame_type == .continuation and
+                    (frame.header.flags & 0x04) != 0)
+                {
+                    queued_continuation_stream.* = null;
+                }
+            },
+            .push_promise => return error.ProtocolError,
+            // PRIORITY and unknown extension frames are connection-neutral.
+            else => {},
         }
+    }
+
+    fn queueHTTP2Frame(
+        self: *Self,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        frame: http.HTTP2Connection.Frame,
+    ) !void {
+        const max_pending_bytes = 256 * 1024;
+        if (pending_frames.items.len >= 1024 or
+            frame.payload.len > max_pending_bytes -| pending_frame_bytes.*)
+        {
+            return error.EnhanceYourCalm;
+        }
+        try pending_frames.append(self.allocator, frame);
+        pending_frame_bytes.* += frame.payload.len;
     }
 
     fn requestContentLength(headers: *const Headers) !?u64 {
@@ -1946,12 +2068,12 @@ pub const Server = struct {
     /// Common HTTP/2 frame processing loop for both TLS and plain TCP connections.
     /// Supports concurrent streams: processes each stream's request/response before
     /// moving to the next. Sends GOAWAY only after all streams complete.
-    fn handleHTTP2Frames(self: *Self, conn: *http.HTTP2Connection, is_tls: bool) !void {
-        const header_deadline_ms: u64 = if (self.config.request_timeout_ms > 0)
-            @intCast(@max(0, common.nowMillis() +| @as(i64, @intCast(@min(self.config.request_timeout_ms, @as(u64, std.math.maxInt(i64)))))))
-        else
-            0;
-
+    fn handleHTTP2Frames(
+        self: *Self,
+        conn: *http.HTTP2Connection,
+        is_tls: bool,
+        frame_context: *IoContext,
+    ) !void {
         const local_settings = http.HTTP2Connection.HTTP2ConnectionSettings{
             .header_table_size = self.config.http2_settings.header_table_size,
             .enable_push = false,
@@ -1989,6 +2111,13 @@ pub const Server = struct {
         }
         var context_map = std.AutoHashMap(u31, usize).init(self.allocator);
         defer context_map.deinit();
+        var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+        defer {
+            for (pending_frames.items) |*pending| pending.deinit(self.allocator);
+            pending_frames.deinit(self.allocator);
+        }
+        var pending_frame_bytes: usize = 0;
+        var queued_continuation_stream: ?u31 = null;
 
         var continuation_stream: ?u31 = null;
         var all_done = false;
@@ -2001,11 +2130,30 @@ pub const Server = struct {
         const default_scheme: []const u8 = if (is_tls) "https" else "http";
 
         while (!all_done) {
-            if (header_deadline_ms > 0) {
-                const now_ms: u64 = @intCast(@max(0, common.nowMillis()));
-                if (now_ms >= header_deadline_ms) return error.HeaderTimeout;
-            }
-            var frame = try conn.readFrame(self.allocator, max_frame_payload);
+            var incoming_frame_deadline: ?Deadline = null;
+            var frame_from_queue = false;
+            var frame = if (pending_frames.items.len > 0) blk: {
+                const queued = pending_frames.orderedRemove(0);
+                pending_frame_bytes -= queued.payload.len;
+                frame_from_queue = true;
+                break :blk queued;
+            } else blk: {
+                const frame_deadline = if (continuation_stream) |stream_id|
+                    contexts.items[context_map.get(stream_id) orelse return error.ProtocolError].header_deadline
+                else if (self.config.request_timeout_ms > 0)
+                    Deadline.afterMs(self.config.request_timeout_ms)
+                else
+                    null;
+                incoming_frame_deadline = frame_deadline;
+                const previous_deadline = frame_context.phase_deadline;
+                frame_context.setPhaseDeadline(frame_deadline);
+                const incoming = conn.readFrame(self.allocator, max_frame_payload) catch |err| {
+                    frame_context.setPhaseDeadline(previous_deadline);
+                    return err;
+                };
+                frame_context.setPhaseDeadline(previous_deadline);
+                break :blk incoming;
+            };
             defer frame.deinit(self.allocator);
 
             processed_this_iteration = false;
@@ -2079,6 +2227,13 @@ pub const Server = struct {
                         try context_map.put(stream_id, contexts.items.len - 1);
                         break :blk &contexts.items[contexts.items.len - 1];
                     };
+                    if (!ctx.initial_headers_parsed) {
+                        ctx.header_deadline = incoming_frame_deadline orelse
+                            if (self.config.request_timeout_ms > 0)
+                                Deadline.afterMs(self.config.request_timeout_ms)
+                            else
+                                null;
+                    }
 
                     if ((frame.header.flags & 0x04) != 0) {
                         const parsed = try h2stream.parseHeadersFramePayloadWithLimit(
@@ -2120,6 +2275,7 @@ pub const Server = struct {
                             ctx.headers_complete = true;
                             stream_manager.getStream(stream_id).?.receiveEndStream();
                         }
+                        ctx.header_deadline = null;
                     } else {
                         ctx.pending_headers_flags = frame.header.flags;
                         ctx.pending_is_trailers = ctx.initial_headers_parsed;
@@ -2184,6 +2340,7 @@ pub const Server = struct {
                         ctx.waiting_continuation = false;
                         ctx.pending_is_trailers = false;
                         continuation_stream = null;
+                        ctx.header_deadline = null;
 
                         if ((ctx.pending_headers_flags & 0x01) != 0) {
                             ctx.headers_complete = true;
@@ -2202,12 +2359,12 @@ pub const Server = struct {
                     const flow_amount = std.math.cast(i32, frame.payload.len) orelse
                         return error.FlowControlError;
                     if (flow_amount > remote_stream.recv_window or
-                        flow_amount > stream_manager.connection_recv_window)
+                        (!frame_from_queue and flow_amount > stream_manager.connection_recv_window))
                     {
                         return error.FlowControlError;
                     }
                     remote_stream.recv_window -= flow_amount;
-                    stream_manager.connection_recv_window -= flow_amount;
+                    if (!frame_from_queue) stream_manager.connection_recv_window -= flow_amount;
 
                     var data_slice = frame.payload;
                     if ((frame.header.flags & 0x08) != 0) {
@@ -2320,7 +2477,7 @@ pub const Server = struct {
                 var req = try Request.init(self.allocator, method, url);
                 defer req.deinit();
                 req.version = .HTTP_2;
-                if (method == .CUSTOM) req.custom_method = ctx.method_raw;
+                if (method == .CUSTOM) try req.setCustomMethod(ctx.method_raw);
 
                 req.headers.deinit();
                 req.headers = Headers.init(self.allocator);
@@ -2337,7 +2494,24 @@ pub const Server = struct {
                     var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
                     defer internal.deinit();
                     internal.version = .HTTP_2;
-                    try self.sendHTTP2Response(conn, &stream_manager, ctx.stream_id, &internal);
+                    self.sendHTTP2Response(
+                        conn,
+                        &stream_manager,
+                        ctx.stream_id,
+                        &internal,
+                        frame_context,
+                        &pending_frames,
+                        &pending_frame_bytes,
+                        &queued_continuation_stream,
+                    ) catch |err| switch (err) {
+                        error.StreamReset => {
+                            ctx.done = true;
+                            last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
+                            processed_this_iteration = true;
+                            continue;
+                        },
+                        else => return err,
+                    };
                     ctx.done = true;
                     last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
                     processed_this_iteration = true;
@@ -2346,7 +2520,24 @@ pub const Server = struct {
                 defer response.deinit();
                 response.version = .HTTP_2;
 
-                try self.sendHTTP2Response(conn, &stream_manager, ctx.stream_id, &response);
+                self.sendHTTP2Response(
+                    conn,
+                    &stream_manager,
+                    ctx.stream_id,
+                    &response,
+                    frame_context,
+                    &pending_frames,
+                    &pending_frame_bytes,
+                    &queued_continuation_stream,
+                ) catch |err| switch (err) {
+                    error.StreamReset => {
+                        ctx.done = true;
+                        last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
+                        processed_this_iteration = true;
+                        continue;
+                    },
+                    else => return err,
+                };
                 ctx.done = true;
                 last_processed_stream_id = @max(last_processed_stream_id, ctx.stream_id);
                 processed_this_iteration = true;
@@ -2418,6 +2609,10 @@ pub const Server = struct {
         stream_manager: *h2stream.StreamManager,
         stream_id: u31,
         response: *Response,
+        frame_context: *IoContext,
+        pending_frames: *std.ArrayList(http.HTTP2Connection.Frame),
+        pending_frame_bytes: *usize,
+        queued_continuation_stream: *?u31,
     ) !void {
         try self.ensureContentLengthHeader(response);
         const response_stream = stream_manager.getStream(stream_id) orelse
@@ -2471,12 +2666,25 @@ pub const Server = struct {
 
         const body = response.body.?;
         const data_max_frame_size: usize = @intCast(max_frame_size);
+        const send_wait_deadline = if (self.config.write_timeout_ms > 0)
+            Deadline.afterMs(self.config.write_timeout_ms)
+        else
+            null;
         var offset: usize = 0;
         while (offset < body.len) {
             while (response_stream.send_window <= 0 or
                 stream_manager.connection_send_window <= 0)
             {
-                try self.pumpHTTP2SendWindow(conn, stream_manager, stream_id);
+                try self.pumpHTTP2SendWindow(
+                    conn,
+                    stream_manager,
+                    stream_id,
+                    frame_context,
+                    send_wait_deadline,
+                    pending_frames,
+                    pending_frame_bytes,
+                    queued_continuation_stream,
+                );
                 if (!response_stream.canSend()) return error.StreamReset;
             }
             const stream_window: usize = @intCast(response_stream.send_window);
@@ -4584,9 +4792,257 @@ test "HTTP2 server send-window pump resets terminal stream state" {
     stream.receiveEndStream();
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
+    var frame_context = IoContext.init(.{});
+    var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+    defer {
+        for (pending_frames.items) |*pending| pending.deinit(std.testing.allocator);
+        pending_frames.deinit(std.testing.allocator);
+    }
+    var pending_bytes: usize = 0;
+    var queued_continuation: ?u31 = null;
     try std.testing.expectError(
         error.StreamReset,
-        server.pumpHTTP2SendWindow(&conn, &manager, 1),
+        server.pumpHTTP2SendWindow(
+            &conn,
+            &manager,
+            1,
+            &frame_context,
+            null,
+            &pending_frames,
+            &pending_bytes,
+            &queued_continuation,
+        ),
     );
     try std.testing.expectEqual(h2stream.StreamState.closed, stream.state);
+}
+
+test "HTTP2 server send-window pump queues multiplexed stream work" {
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const other_headers = (http.HTTP2FrameHeader{
+        .length = 0,
+        .frame_type = .headers,
+        .flags = 0x05,
+        .stream_id = 3,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &other_headers);
+    const update_payload = h2stream.buildWindowUpdatePayload(5);
+    const update_header = (http.HTTP2FrameHeader{
+        .length = update_payload.len,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = 1,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &update_header);
+    try wire.appendSlice(std.testing.allocator, &update_payload);
+
+    const Fixture = struct {
+        input: []const u8,
+        offset: usize = 0,
+        fn read(context_ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context_ptr));
+            if (self.offset == self.input.len) return 0;
+            const amount = @min(output.len, self.input.len - self.offset);
+            @memcpy(output[0..amount], self.input[self.offset..][0..amount]);
+            self.offset += amount;
+            return amount;
+        }
+        fn write(_: *anyopaque, data: []const u8) !usize {
+            return data.len;
+        }
+    };
+    var fixture = Fixture{ .input = wire.items };
+    var conn = http.HTTP2Connection.init(
+        std.testing.allocator,
+        .{ .context = &fixture, .readFn = Fixture.read },
+        .{ .context = &fixture, .writeFn = Fixture.write },
+    );
+    var manager = h2stream.StreamManager.init(std.testing.allocator, false);
+    defer manager.deinit();
+    const response_stream = try manager.getOrCreateStream(1);
+    try response_stream.open();
+    response_stream.receiveEndStream();
+    response_stream.send_window = 0;
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var frame_context = IoContext.init(.{});
+    var pending_frames = std.ArrayList(http.HTTP2Connection.Frame).empty;
+    defer {
+        for (pending_frames.items) |*pending| pending.deinit(std.testing.allocator);
+        pending_frames.deinit(std.testing.allocator);
+    }
+    var pending_bytes: usize = 0;
+    var queued_continuation: ?u31 = null;
+
+    try server.pumpHTTP2SendWindow(
+        &conn,
+        &manager,
+        1,
+        &frame_context,
+        null,
+        &pending_frames,
+        &pending_bytes,
+        &queued_continuation,
+    );
+    try std.testing.expectEqual(@as(usize, 1), pending_frames.items.len);
+    try std.testing.expectEqual(@as(i32, 0), response_stream.send_window);
+    try server.pumpHTTP2SendWindow(
+        &conn,
+        &manager,
+        1,
+        &frame_context,
+        null,
+        &pending_frames,
+        &pending_bytes,
+        &queued_continuation,
+    );
+    try std.testing.expectEqual(@as(i32, 5), response_stream.send_window);
+}
+
+test "Server connection owner closes accepted HTTP1 sockets" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .keep_alive = false,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    try server.get("/close", &struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            return ctx.text("ok");
+        }
+    }.handler);
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll(
+        "GET /close HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    try socket.setRecvTimeout(2_000);
+    var response: [1024]u8 = undefined;
+    var length: usize = 0;
+    while (mem.indexOf(u8, response[0..length], "\r\n\r\n") == null or
+        mem.indexOf(u8, response[0..length], "\r\n\r\n").? + 6 > length)
+    {
+        const n = try socket.recv(response[length..]);
+        if (n == 0) return error.UnexpectedEof;
+        length += n;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&response));
+}
+
+test "cleartext HTTP2 preface probe has one bounded deadline" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .request_timeout_ms = 50,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll("PRI");
+    try socket.setRecvTimeout(2_000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));
+}
+
+test "HTTP2 continuation read uses one header-block deadline" {
+    var server = Server.initWithConfig(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .http2_enabled = true,
+        .request_timeout_ms = 50,
+        .log_fn = &struct {
+            fn logFn(_: LogLevel, _: []const u8) void {}
+        }.logFn,
+    });
+    defer server.deinit();
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+    var socket = try Socket.create();
+    defer socket.close();
+    try socket.connect(net.Address.initIp4(.{ 127, 0, 0, 1 }, server.listeningPort()));
+    try socket.writeAll(http.HTTP2_PREFACE);
+
+    var settings_payload = std.ArrayList(u8).empty;
+    defer settings_payload.deinit(std.testing.allocator);
+    try http.encodeSettingsPayload(
+        .{},
+        std.testing.allocator,
+        &settings_payload,
+    );
+    const settings_header = (http.HTTP2FrameHeader{
+        .length = @intCast(settings_payload.items.len),
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try socket.writeAll(&settings_header);
+    try socket.writeAll(settings_payload.items);
+
+    const Helpers = struct {
+        fn readExact(sock: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try sock.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEof;
+                offset += n;
+            }
+        }
+        fn readFrame(sock: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(sock, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(sock, payload[0..header.length]);
+            return header;
+        }
+    };
+    var payload: [256]u8 = undefined;
+    _ = try Helpers.readFrame(&socket, &payload);
+    _ = try Helpers.readFrame(&socket, &payload);
+
+    var encoder = hpack.HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const fields = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "127.0.0.1" },
+    };
+    const block = try hpack.encodeHeaders(&encoder, &fields, std.testing.allocator);
+    defer std.testing.allocator.free(block);
+    const headers_frame = (http.HTTP2FrameHeader{
+        .length = @intCast(block.len),
+        .frame_type = .headers,
+        .flags = 0x01,
+        .stream_id = 1,
+    }).serialize();
+    try socket.writeAll(&headers_frame);
+    try socket.writeAll(block);
+    try socket.setRecvTimeout(2_000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try socket.recv(&byte));
 }

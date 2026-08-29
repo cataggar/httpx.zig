@@ -1290,6 +1290,98 @@ pub const DNSResolver = struct {
         err: anyerror,
     };
 
+    fn terminalCnameTarget(message: *const DnsMessage, start: []const u8) !?[]const u8 {
+        var current = start;
+        var changed = false;
+        var depth: usize = 0;
+        while (depth < 8) : (depth += 1) {
+            var next: ?[]const u8 = null;
+            for (message.answers) |answer| {
+                if (answer.record_type == .CNAME and
+                    std.ascii.eqlIgnoreCase(answer.name, current))
+                {
+                    if (next != null and !std.ascii.eqlIgnoreCase(next.?, answer.rdata)) {
+                        return error.DnsCnameConflict;
+                    }
+                    next = answer.rdata;
+                }
+            }
+            const target = next orelse break;
+            if (std.ascii.eqlIgnoreCase(target, start)) return error.DnsCnameLoop;
+            current = target;
+            changed = true;
+        }
+        if (depth == 8) return error.DnsCnameDepthExceeded;
+        return if (changed) current else null;
+    }
+
+    fn resolveRecordType(
+        self: *Self,
+        hostname: []const u8,
+        record_type: DnsRecordType,
+        context: ?*const IoContext,
+    ) ResolveResult {
+        var current = self.allocator.dupe(u8, hostname) catch |err| return .{ .err = err };
+        defer self.allocator.free(current);
+        var visited = std.ArrayList([]u8).empty;
+        defer {
+            for (visited.items) |name| self.allocator.free(name);
+            visited.deinit(self.allocator);
+        }
+
+        for (0..8) |_| {
+            for (visited.items) |name| {
+                if (std.ascii.eqlIgnoreCase(name, current)) {
+                    return .{ .err = error.DnsCnameLoop };
+                }
+            }
+            const visited_name = self.allocator.dupe(u8, current) catch |err|
+                return .{ .err = err };
+            visited.append(self.allocator, visited_name) catch |err| {
+                self.allocator.free(visited_name);
+                return .{ .err = err };
+            };
+
+            var message = queryDns(
+                self.cache.config.dns_servers,
+                current,
+                record_type,
+                self.cache.config.udp_timeout_ms,
+                self.cache.config.tcp_timeout_ms,
+                self.allocator,
+                context,
+                &self.cache,
+            ) catch |err| {
+                if (err == error.AuthoritativeNameError) return .negative;
+                return .{ .err = err };
+            };
+            defer message.deinit();
+
+            const addresses = if (record_type == .A)
+                extractIpv4Addresses(&message, current, self.allocator)
+            else
+                extractIpv6Addresses(&message, current, self.allocator);
+            const resolved = addresses catch |err| return .{ .err = err };
+            if (resolved.len > 0) return .{ .ok = resolved };
+            self.allocator.free(resolved);
+
+            const target = terminalCnameTarget(&message, current) catch |err|
+                return .{ .err = err };
+            if (target) |canonical| {
+                const next = self.allocator.dupe(u8, canonical) catch |err|
+                    return .{ .err = err };
+                self.allocator.free(current);
+                current = next;
+                continue;
+            }
+            return if (message.header.isAuthoritative())
+                .negative
+            else
+                .{ .err = error.DNSNoData };
+        }
+        return .{ .err = error.DnsCnameDepthExceeded };
+    }
+
     fn performResolution(
         self: *Self,
         hostname: []const u8,
@@ -1307,61 +1399,33 @@ pub const DNSResolver = struct {
 
         if (should_query_v4) {
             query_count += 1;
-            if (queryDns(
-                self.cache.config.dns_servers,
-                hostname,
-                .A,
-                self.cache.config.udp_timeout_ms,
-                self.cache.config.tcp_timeout_ms,
-                self.allocator,
-                context,
-                &self.cache,
-            )) |msg| {
-                var m = msg;
-                defer m.deinit();
-                if (extractIpv4Addresses(&m, hostname, self.allocator)) |v4_addrs| {
-                    defer self.allocator.free(v4_addrs);
-                    if (v4_addrs.len == 0) {
-                        if (m.header.isAuthoritative()) authoritative_no_data += 1 else first_error = error.DNSNoData;
-                    } else {
-                        all_addrs.appendSlice(self.allocator, v4_addrs) catch |err| return .{ .err = err };
-                    }
-                } else |err| return .{ .err = err };
-            } else |err| {
-                if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
-                if (err == error.AuthoritativeNameError) return .negative;
-                if (first_error == null) first_error = err;
+            switch (self.resolveRecordType(hostname, .A, context)) {
+                .ok => |addresses| {
+                    defer self.allocator.free(addresses);
+                    all_addrs.appendSlice(self.allocator, addresses) catch |err|
+                        return .{ .err = err };
+                },
+                .negative => authoritative_no_data += 1,
+                .err => |err| {
+                    if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+                    if (first_error == null) first_error = err;
+                },
             }
         }
 
         if (should_query_v6) {
             query_count += 1;
-            if (queryDns(
-                self.cache.config.dns_servers,
-                hostname,
-                .AAAA,
-                self.cache.config.udp_timeout_ms,
-                self.cache.config.tcp_timeout_ms,
-                self.allocator,
-                context,
-                &self.cache,
-            )) |msg| {
-                var m = msg;
-                defer m.deinit();
-                if (extractIpv6Addresses(&m, hostname, self.allocator)) |v6_addrs| {
-                    defer self.allocator.free(v6_addrs);
-                    if (v6_addrs.len == 0) {
-                        if (m.header.isAuthoritative()) authoritative_no_data += 1 else if (first_error == null) {
-                            first_error = error.DNSNoData;
-                        }
-                    } else {
-                        all_addrs.appendSlice(self.allocator, v6_addrs) catch |err| return .{ .err = err };
-                    }
-                } else |err| return .{ .err = err };
-            } else |err| {
-                if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
-                if (err == error.AuthoritativeNameError) return .negative;
-                if (first_error == null) first_error = err;
+            switch (self.resolveRecordType(hostname, .AAAA, context)) {
+                .ok => |addresses| {
+                    defer self.allocator.free(addresses);
+                    all_addrs.appendSlice(self.allocator, addresses) catch |err|
+                        return .{ .err = err };
+                },
+                .negative => authoritative_no_data += 1,
+                .err => |err| {
+                    if (err == error.Cancelled or err == error.Timeout) return .{ .err = err };
+                    if (first_error == null) first_error = err;
+                },
             }
         }
 
@@ -1986,6 +2050,51 @@ test "DNS response validation checks transaction question and compressed answer 
     try std.testing.expectError(
         error.DnsResponseError,
         validateDnsResponse(&message, 0x1234, "example.com", .A),
+    );
+}
+
+test "DNS CNAME-only responses follow a bounded validated terminal chain" {
+    const answers = [_]DnsRecord{
+        .{
+            .name = "alias.test",
+            .record_type = .CNAME,
+            .record_class = .IN,
+            .ttl = 60,
+            .rdata = "middle.test",
+        },
+        .{
+            .name = "middle.test",
+            .record_type = .CNAME,
+            .record_class = .IN,
+            .ttl = 60,
+            .rdata = "terminal.test",
+        },
+    };
+    const message = DnsMessage{
+        .header = .{
+            .id = 1,
+            .flags = 0x8400,
+            .qdcount = 1,
+            .ancount = 2,
+            .nscount = 0,
+            .arcount = 0,
+        },
+        .questions = &.{},
+        .answers = @constCast(&answers),
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings(
+        "terminal.test",
+        (try DNSResolver.terminalCnameTarget(&message, "alias.test")).?,
+    );
+
+    var loop_answers = answers;
+    loop_answers[1].rdata = "alias.test";
+    var loop_message = message;
+    loop_message.answers = &loop_answers;
+    try std.testing.expectError(
+        error.DnsCnameLoop,
+        DNSResolver.terminalCnameTarget(&loop_message, "alias.test"),
     );
 }
 

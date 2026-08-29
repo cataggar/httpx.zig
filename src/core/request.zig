@@ -31,6 +31,7 @@ pub const Request = struct {
     body: ?[]const u8 = null,
     body_owned: bool = false,
     custom_method: ?[]const u8 = null,
+    custom_method_owned: bool = false,
     query_owned: bool = false,
     context: ?*anyopaque = null,
 
@@ -69,6 +70,19 @@ pub const Request = struct {
                 self.allocator.free(q);
             }
         }
+        if (self.custom_method_owned) {
+            if (self.custom_method) |method| self.allocator.free(method);
+        }
+    }
+
+    pub fn setCustomMethod(self: *Self, method: []const u8) !void {
+        if (!isValidMethodToken(method)) return error.InvalidMethod;
+        if (self.custom_method_owned) {
+            if (self.custom_method) |existing| self.allocator.free(existing);
+        }
+        self.custom_method = try self.allocator.dupe(u8, method);
+        self.custom_method_owned = true;
+        self.method = .CUSTOM;
     }
 
     /// Sets the request body with ownership.
@@ -243,6 +257,18 @@ pub const Request = struct {
         return buffer.toOwnedSlice(allocator);
     }
 };
+
+fn isValidMethodToken(method: []const u8) bool {
+    if (method.len == 0) return false;
+    for (method) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 /// Fluent builder for constructing requests.
 pub const RequestBuilder = struct {

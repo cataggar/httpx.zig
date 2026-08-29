@@ -363,6 +363,7 @@ Per-request overrides for configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `custom_method` | `?[]const u8` | `null` | Required validated HTTP token when the method argument is `.CUSTOM`; the request stores its own copy. |
 | `headers` | `?[]const [2][]const u8` | `null` | Additional headers for this request. |
 | `query_params` | `?[]const [2][]const u8` | `null` | Percent-encoded query params appended to the request URL. |
 | `body` | `?[]const u8` | `null` | Raw request body. |
@@ -385,8 +386,9 @@ Per-request overrides for configuration.
 Unset request-option fields stay `null`, meaning client-level defaults are used implicitly.
 
 Streaming `Client.open` uses `OpenOptions`, which additionally accepts
-`body_mode`, `response_limit`, `expect_100_continue`, `tls_handshake_ms`, and
-`header_ms`. The TLS and header values bound their complete phases rather than
+`custom_method`, `body_mode`, `response_limit`, `expect_100_continue`,
+`tls_handshake_ms`, and `header_ms`. The custom method is validated and copied.
+The TLS and header values bound their complete phases rather than
 each individual read. `null` uses `Timeouts.tls_handshake_ms`/`header_ms`
 (zero there falls back to connect/read); an explicit `OpenOptions` value of
 zero disables that phase timeout.

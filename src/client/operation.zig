@@ -55,6 +55,9 @@ pub const BasicAuth = struct {
 };
 
 pub const OpenOptions = struct {
+    /// Required when `Client.open` receives `.CUSTOM`. Borrowed only for the
+    /// duration of `open`; the operation stores its own validated copy.
+    custom_method: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     query_params: ?[]const [2][]const u8 = null,
     bearer_token: ?[]const u8 = null,
@@ -132,7 +135,8 @@ pub const ClientOperation = struct {
         var offset: usize = 0;
         while (offset < data.len) {
             const n = try self.write(data[offset..]);
-            if (n == 0 or n > data.len - offset) return error.WriteFailed;
+            if (n == 0) return error.EarlyResponse;
+            if (n > data.len - offset) return error.WriteFailed;
             offset += n;
         }
     }
@@ -151,7 +155,15 @@ pub const ClientOperation = struct {
             else
                 try reader.read(&buffer);
             if (n == 0) return total;
-            try self.writeAll(buffer[0..n]);
+            var offset: usize = 0;
+            while (offset < n) {
+                const written = try self.write(buffer[offset..n]);
+                if (written == 0) {
+                    return std.math.add(u64, total, offset) catch
+                        return error.BodyLengthOverflow;
+                }
+                offset += written;
+            }
             total = std.math.add(u64, total, n) catch return error.BodyLengthOverflow;
         }
     }

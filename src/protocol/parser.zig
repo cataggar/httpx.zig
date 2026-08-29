@@ -53,6 +53,7 @@ pub const Parser = struct {
     state: ParserState = .start,
     mode: ParserMode = .request,
     method: ?types.Method = null,
+    custom_method: ?[]u8 = null,
     path: ?[]const u8 = null,
     version: types.Version = .HTTP_1_1,
     status_code: ?u16 = null,
@@ -108,6 +109,7 @@ pub const Parser = struct {
         self.body_buffer.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
         if (self.path) |p| self.allocator.free(p);
+        if (self.custom_method) |method| self.allocator.free(method);
     }
 
     /// Finalizes parsing when the underlying stream has reached EOF.
@@ -201,6 +203,10 @@ pub const Parser = struct {
     pub fn reset(self: *Self) void {
         self.state = .start;
         self.method = null;
+        if (self.custom_method) |method| {
+            self.allocator.free(method);
+            self.custom_method = null;
+        }
         if (self.path) |p| {
             self.allocator.free(p);
             self.path = null;
@@ -324,7 +330,10 @@ pub const Parser = struct {
             self.state = .err;
             return result.consumed;
         }
-        self.method = types.Method.fromString(method_str) orelse .CUSTOM;
+        self.method = types.Method.fromString(method_str) orelse blk: {
+            self.custom_method = try self.allocator.dupe(u8, method_str);
+            break :blk .CUSTOM;
+        };
 
         const path = remainder[0..second_relative];
         if (path.len == 0) {
@@ -1246,4 +1255,14 @@ test "Parser rejects malformed HTTP1 start lines" {
         _ = parser.feed(wire) catch {};
         try std.testing.expect(parser.state == .err);
     }
+}
+
+test "Parser preserves unknown valid request method tokens" {
+    var parser = Parser.init(std.testing.allocator);
+    defer parser.deinit();
+    _ = try parser.feed("PURGE /cache HTTP/1.1\r\nHost: example.test\r\n\r\n");
+    try std.testing.expectEqual(types.Method.CUSTOM, parser.method.?);
+    try std.testing.expectEqualStrings("PURGE", parser.custom_method.?);
+    parser.reset();
+    try std.testing.expect(parser.custom_method == null);
 }

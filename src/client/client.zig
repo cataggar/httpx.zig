@@ -314,6 +314,8 @@ pub const MultipartFile = struct {
 
 /// Per-request options.
 pub const RequestOptions = struct {
+    /// Required when the request method is `.CUSTOM`.
+    custom_method: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     query_params: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
@@ -352,6 +354,12 @@ pub const RequestOptions = struct {
     pub fn withHeaders(self: RequestOptions, headers: []const [2][]const u8) RequestOptions {
         var out = self;
         out.headers = headers;
+        return out;
+    }
+
+    pub fn withCustomMethod(self: RequestOptions, method: []const u8) RequestOptions {
+        var out = self;
+        out.custom_method = method;
         return out;
     }
 
@@ -1063,6 +1071,11 @@ pub const Client = struct {
         errdefer self.allocator.destroy(req);
         req.* = try Request.init(self.allocator, method, full_url);
         errdefer req.deinit();
+        if (method == .CUSTOM) {
+            try req.setCustomMethod(open_options.custom_method orelse return error.InvalidMethod);
+        } else if (open_options.custom_method != null) {
+            return error.InvalidMethod;
+        }
 
         const effective_policy = self.shared.config.policy.resolve(open_options.policy);
         try self.prepareOpenRequest(req, open_options, &effective_policy);
@@ -1282,6 +1295,11 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        if (method == .CUSTOM) {
+            try req.setCustomMethod(reqOpts.custom_method orelse return error.InvalidMethod);
+        } else if (reqOpts.custom_method != null) {
+            return error.InvalidMethod;
+        }
 
         if (reqOpts.version) |version| {
             req.version = version;
@@ -1470,6 +1488,7 @@ pub const Client = struct {
             const next_method = redirect_policy.getRedirectMethod(response.status.code, req.method);
 
             var next_opts = reqOpts;
+            if (next_method != .CUSTOM) next_opts.custom_method = null;
             var safe_headers = std.ArrayList([2][]const u8).empty;
             const drops_body = next_method != req.method and next_method == .GET;
             if (next_opts.headers) |hdrs| {
@@ -1955,7 +1974,12 @@ pub const Client = struct {
         );
         defer op.deinit();
 
-        if (body.len > 0) try op.writeAll(body);
+        var body_offset: usize = 0;
+        while (body_offset < body.len) {
+            const written = try op.write(body[body_offset..]);
+            if (written == 0) break;
+            body_offset += written;
+        }
         const response_head = try op.finishRequest(null);
 
         var collected = std.ArrayList(u8).empty;
@@ -2601,6 +2625,11 @@ pub const Client = struct {
         from_early_buf: bool,
     };
 
+    const H2PumpResult = enum {
+        window_available,
+        response_started,
+    };
+
     fn applyHTTP2WindowUpdate(
         stream_manager: *h2stream.StreamManager,
         request_stream: *h2stream.Stream,
@@ -2695,9 +2724,16 @@ pub const Client = struct {
         early_frames: *std.ArrayList(EarlyH2Frame),
         early_frame_bytes: *usize,
         session_state: *pool_mod.H2SessionState,
-    ) !void {
+    ) !H2PumpResult {
         var pump_counter: usize = 0;
-        while (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
+        var continuation_stream: ?u31 = null;
+        var response_headers_complete = false;
+        var response_end_stream = false;
+        while (request_stream.send_window <= 0 or
+            stream_manager.connection_send_window <= 0 or
+            continuation_stream != null or
+            response_headers_complete)
+        {
             pump_counter += 1;
             if (pump_counter > 10_000) return error.ProtocolError;
 
@@ -2705,6 +2741,13 @@ pub const Client = struct {
             try transport.readNoEof(&hdr_bytes);
             const fhdr = http.HTTP2FrameHeader.parse(hdr_bytes);
             try requireInitialServerSettings(session_state, fhdr);
+            if (continuation_stream) |required_stream| {
+                if (fhdr.frame_type != .continuation or fhdr.stream_id != required_stream) {
+                    return error.ProtocolError;
+                }
+            } else if (fhdr.frame_type == .continuation) {
+                return error.ProtocolError;
+            }
 
             const payload_len: usize = @intCast(fhdr.length);
             try validateHttp2FrameHeader(
@@ -2769,6 +2812,21 @@ pub const Client = struct {
                 },
                 .rst_stream => {
                     if (fhdr.stream_id == request_stream.id) {
+                        if (response_headers_complete) {
+                            if (early_frame_bytes.* + payload.len > 64 * 1024) {
+                                self.allocator.free(payload);
+                                return error.EarlyResponseBufferExceeded;
+                            }
+                            early_frames.append(self.allocator, .{
+                                .header = fhdr,
+                                .payload = payload,
+                            }) catch |err| {
+                                self.allocator.free(payload);
+                                return err;
+                            };
+                            early_frame_bytes.* += payload.len;
+                            return .response_started;
+                        }
                         self.allocator.free(payload);
                         return error.StreamError;
                     }
@@ -2793,12 +2851,24 @@ pub const Client = struct {
                     early_frames.append(self.allocator, .{
                         .header = fhdr,
                         .payload = payload,
-                        .flow_debited = true,
                     }) catch |err| {
                         self.allocator.free(payload);
                         return err;
                     };
                     early_frame_bytes.* += payload.len;
+                    if (fhdr.frame_type == .headers) {
+                        response_end_stream = (fhdr.flags & 0x01) != 0;
+                        if ((fhdr.flags & 0x04) == 0) {
+                            continuation_stream = fhdr.stream_id;
+                        } else {
+                            response_headers_complete = true;
+                            if ((fhdr.flags & 0x01) != 0) return .response_started;
+                        }
+                    } else if ((fhdr.flags & 0x04) != 0) {
+                        continuation_stream = null;
+                        response_headers_complete = true;
+                        if (response_end_stream) return .response_started;
+                    }
                 },
                 .data => {
                     if (fhdr.stream_id != request_stream.id) {
@@ -2813,11 +2883,14 @@ pub const Client = struct {
                     early_frames.append(self.allocator, .{
                         .header = fhdr,
                         .payload = payload,
+                        .flow_debited = true,
                     }) catch |err| {
                         self.allocator.free(payload);
                         return err;
                     };
                     early_frame_bytes.* += payload.len;
+                    if (!response_headers_complete) return error.ProtocolError;
+                    return .response_started;
                 },
                 // RFC 7540 4.1: Unknown frame types MUST be ignored.
                 _ => {
@@ -2825,6 +2898,7 @@ pub const Client = struct {
                 },
             }
         }
+        return .window_available;
     }
 
     fn executeHTTP2WithTransport(
@@ -2891,6 +2965,7 @@ pub const Client = struct {
         // the response loop so no frames are dropped.
         var early_frames = std.ArrayList(EarlyH2Frame).empty;
         var early_frame_bytes: usize = 0;
+        var early_response_started = false;
         defer {
             for (early_frames.items) |*ef| ef.deinit(self.allocator);
             early_frames.deinit(self.allocator);
@@ -2904,7 +2979,7 @@ pub const Client = struct {
                 // pump incoming frames until we get enough WINDOW_UPDATE credit
                 // rather than immediately failing with FlowControlError.
                 if (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
-                    try pumpUntilSendWindow(
+                    const pump_result = try pumpUntilSendWindow(
                         self,
                         transport,
                         stream_manager,
@@ -2914,6 +2989,11 @@ pub const Client = struct {
                         &early_frame_bytes,
                         session_state,
                     );
+                    if (pump_result == .response_started) {
+                        early_response_started = true;
+                        session_state.poisoned = true;
+                        break;
+                    }
                 }
                 const window_stream = @as(i64, request_stream.send_window);
                 const window_conn = @as(i64, stream_manager.connection_send_window);
@@ -2936,7 +3016,7 @@ pub const Client = struct {
                 stream_manager.connection_send_window -= @intCast(chunk_len);
                 offset += chunk_len;
             }
-            request_stream.sendEndStream();
+            if (!early_response_started) request_stream.sendEndStream();
         } else {
             request_stream.sendEndStream();
         }
@@ -4224,6 +4304,7 @@ const OperationImpl = struct {
     h2_data_flow_credit: usize = 0,
     h2_expected_length: ?u64 = null,
     h2_write_failed: bool = false,
+    h2_early_response_started: bool = false,
 
     udp_socket: ?UdpSocket = null,
     h3_session: HTTP3QUICSession = undefined,
@@ -4571,23 +4652,25 @@ const OperationImpl = struct {
                 if (self.request_limit) |limit| {
                     if (next > limit) return error.RequestTooLarge;
                 }
-                try self.writeProtocolData(data);
-                self.request_progress.commit(next);
-                return data.len;
+                const written = try self.writeProtocolData(data);
+                const committed = try self.request_progress.validateWrite(written);
+                self.request_progress.commit(committed);
+                return written;
             },
             .chunked => {
                 const next = try self.request_progress.validateWrite(data.len);
                 if (self.request_limit) |limit| {
                     if (next > limit) return error.RequestTooLarge;
                 }
-                try self.writeProtocolData(data);
-                self.request_progress.commit(next);
-                return data.len;
+                const written = try self.writeProtocolData(data);
+                const committed = try self.request_progress.validateWrite(written);
+                self.request_progress.commit(committed);
+                return written;
             },
         }
     }
 
-    fn writeProtocolData(self: *Self, data: []const u8) !void {
+    fn writeProtocolData(self: *Self, data: []const u8) !usize {
         switch (self.protocol) {
             .http1 => switch (self.body_mode) {
                 .chunked => {
@@ -4596,11 +4679,18 @@ const OperationImpl = struct {
                     try self.transportWriteAll(prefix);
                     try self.transportWriteAll(data);
                     try self.transportWriteAll("\r\n");
+                    return data.len;
                 },
-                else => try self.transportWriteAll(data),
+                else => {
+                    try self.transportWriteAll(data);
+                    return data.len;
+                },
             },
-            .http2 => try self.writeHttp2Data(data, false),
-            .http3 => try self.writeHttp3Data(data),
+            .http2 => return self.writeHttp2Data(data, false),
+            .http3 => {
+                try self.writeHttp3Data(data);
+                return data.len;
+            },
         }
     }
 
@@ -4629,7 +4719,7 @@ const OperationImpl = struct {
             if (code >= 100 and code < 200) continue;
             self.continue_resolved = true;
             switch (self.protocol) {
-                .http2 => try self.writeHttp2Data(&.{}, true),
+                .http2 => _ = try self.writeHttp2Data(&.{}, true),
                 .http3 => try self.finishHttp3Request(null),
                 .http1 => self.response_keep_alive = false,
             }
@@ -4651,7 +4741,7 @@ const OperationImpl = struct {
             if (try self.waitForContinue() == .final_response) return &self.response_head;
         }
 
-        try self.request_progress.finish();
+        if (!self.h2_early_response_started) try self.request_progress.finish();
 
         switch (self.protocol) {
             .http1 => {
@@ -4681,10 +4771,12 @@ const OperationImpl = struct {
                 }
             },
             .http2 => {
-                if (trailers) |fields| {
+                if (self.h2_early_response_started) {
+                    if (trailers != null) return error.InvalidTrailer;
+                } else if (trailers) |fields| {
                     try self.writeHttp2Trailers(fields);
                 } else {
-                    try self.writeHttp2Data(&.{}, true);
+                    _ = try self.writeHttp2Data(&.{}, true);
                 }
             },
             .http3 => try self.finishHttp3Request(trailers),
@@ -5892,7 +5984,7 @@ const OperationImpl = struct {
         try transport.writeAll(frames);
     }
 
-    fn writeHttp2Data(self: *Self, data: []const u8, end_stream: bool) !void {
+    fn writeHttp2Data(self: *Self, data: []const u8, end_stream: bool) !usize {
         const previous_phase = self.beginPhase(self.timeouts.write_ms);
         defer self.endPhase(previous_phase);
         const stream_id = self.h2_stream_id orelse return error.InvalidStreamState;
@@ -5907,14 +5999,14 @@ const OperationImpl = struct {
                 try writeHTTP2Frame(&transport, .data, 0x01, stream_id, &.{});
                 request_stream.sendEndStream();
             }
-            return;
+            return 0;
         }
 
         var offset: usize = 0;
         while (offset < data.len) {
             if (request_stream.send_window <= 0 or session.stream_manager.connection_send_window <= 0) {
                 var client = self.clientHandle();
-                try client.pumpUntilSendWindow(
+                const pump_result = try client.pumpUntilSendWindow(
                     &transport,
                     &session.stream_manager,
                     request_stream,
@@ -5923,6 +6015,12 @@ const OperationImpl = struct {
                     &self.h2_early_frame_bytes,
                     session,
                 );
+                if (pump_result == .response_started) {
+                    self.h2_early_response_started = true;
+                    session.poisoned = true;
+                    session.draining = true;
+                    return offset;
+                }
             }
             const stream_window = @as(i64, request_stream.send_window);
             const connection_window = @as(i64, session.stream_manager.connection_send_window);
@@ -5946,6 +6044,7 @@ const OperationImpl = struct {
             offset += chunk_len;
         }
         if (end_stream) request_stream.sendEndStream();
+        return offset;
     }
 
     fn writeHttp2Trailers(self: *Self, fields: []const [2][]const u8) !void {
@@ -7650,10 +7749,53 @@ test "RequestOptions builder helpers" {
 
     const h3 = RequestOptions.defaults().withHTTP3();
     try std.testing.expectEqual(types.Version.HTTP_3, h3.version.?);
+    const custom = RequestOptions.defaults().withCustomMethod("PURGE");
+    try std.testing.expectEqualStrings("PURGE", custom.custom_method.?);
 
     const embedding_owned = RequestOptions.defaults().withPolicy(types.RequestPolicyOverrides.embeddingOwned());
     try std.testing.expect(embedding_owned.policy.retry.? == .disabled);
     try std.testing.expect(embedding_owned.policy.redirect.? == .disabled);
+}
+
+test "custom methods are validated owned and serialized by buffered and streaming clients" {
+    const allocator = std.testing.allocator;
+    const response = try makePolicyTestResponse(allocator, "200 OK", &.{}, "");
+    defer allocator.free(response);
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+    const responses = [_][]const u8{ response, response };
+    var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
+    const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/custom");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+
+    var buffered = try client.request(.CUSTOM, url, .{ .custom_method = "PURGE" });
+    buffered.deinit();
+    var operation_value = try client.open(.CUSTOM, url, .{ .custom_method = "BAN" });
+    defer operation_value.deinit();
+    _ = try operation_value.finishRequest(null);
+    try operation_value.finish(.{});
+
+    server_thread.join();
+    joined = true;
+    if (server.failure) |err| return err;
+    try std.testing.expect(mem.startsWith(u8, server.request(0), "PURGE /custom HTTP/1.1\r\n"));
+    try std.testing.expect(mem.startsWith(u8, server.request(1), "BAN /custom HTTP/1.1\r\n"));
+    try std.testing.expectError(
+        error.InvalidMethod,
+        client.open(.CUSTOM, url, .{ .custom_method = "BAD METHOD" }),
+    );
 }
 
 test "embedding-owned request disables redirect cookies encoding and decompression" {
@@ -9135,6 +9277,66 @@ test "HTTP2 partial SETTINGS update retained peer settings" {
     try std.testing.expectEqual(@as(u32, 32_768), manager.peer_settings.max_frame_size);
     try std.testing.expectEqual(@as(u32, 32_768), peer_max_frame_size);
     try std.testing.expectEqual(@as(usize, 9), capture.bytes.items.len);
+}
+
+test "HTTP2 upload pump rejects interleaving before CONTINUATION" {
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const headers = (http.HTTP2FrameHeader{
+        .length = 1,
+        .frame_type = .headers,
+        .flags = 0,
+        .stream_id = 1,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &headers);
+    try wire.append(std.testing.allocator, 0x88);
+    const ping = (http.HTTP2FrameHeader{
+        .length = 8,
+        .frame_type = .ping,
+        .flags = 0,
+        .stream_id = 0,
+    }).serialize();
+    try wire.appendSlice(std.testing.allocator, &ping);
+    try wire.appendSlice(std.testing.allocator, "12345678");
+
+    const Capture = struct {
+        input: []const u8,
+        offset: usize = 0,
+        fn readNoEof(self: *@This(), output: []u8) !void {
+            if (self.offset + output.len > self.input.len) return error.UnexpectedEof;
+            @memcpy(output, self.input[self.offset..][0..output.len]);
+            self.offset += output.len;
+        }
+        fn writeAll(_: *@This(), _: []const u8) !void {}
+    };
+    var capture = Capture{ .input = wire.items };
+    var session = pool_mod.H2SessionState.init(std.testing.allocator);
+    defer session.deinit();
+    session.received_initial_settings = true;
+    const request_stream = try session.stream_manager.createStream();
+    try request_stream.open();
+    request_stream.send_window = 0;
+    var early_frames = std.ArrayList(Client.EarlyH2Frame).empty;
+    defer {
+        for (early_frames.items) |*frame| frame.deinit(std.testing.allocator);
+        early_frames.deinit(std.testing.allocator);
+    }
+    var early_bytes: usize = 0;
+    var peer_max_frame_size: u32 = 16_384;
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.pumpUntilSendWindow(
+            &capture,
+            &session.stream_manager,
+            request_stream,
+            &peer_max_frame_size,
+            &early_frames,
+            &early_bytes,
+            &session,
+        ),
+    );
 }
 
 fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
@@ -12180,6 +12382,160 @@ test "HTTP2 upload pump requires initial server SETTINGS before controls" {
             .stream_id = 0,
         }),
     );
+}
+
+test "blocked HTTP2 upload preserves early final headers data and reset" {
+    const allocator = std.testing.allocator;
+    var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
+    defer listener.deinit();
+
+    const Loopback = struct {
+        listener: *TcpListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(socket: *Socket, output: []u8) !void {
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = try socket.recv(output[offset..]);
+                if (n == 0) return error.UnexpectedEndOfStream;
+                offset += n;
+            }
+        }
+
+        fn readFrame(socket: *Socket, payload: []u8) !http.HTTP2FrameHeader {
+            var raw: [9]u8 = undefined;
+            try readExact(socket, &raw);
+            const header = http.HTTP2FrameHeader.parse(raw);
+            if (header.length > payload.len) return error.FrameTooLarge;
+            try readExact(socket, payload[0..header.length]);
+            return header;
+        }
+
+        fn runFallible(self: *@This()) !void {
+            for (0..2) |index| {
+                var accepted = try self.listener.accept();
+                defer accepted.socket.close();
+                var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
+                try readExact(&accepted.socket, &preface);
+                var payload: [64 * 1024]u8 = undefined;
+                _ = try readFrame(&accepted.socket, &payload);
+
+                var settings = http.HTTP2Connection.HTTP2ConnectionSettings{};
+                settings.initial_window_size = 0;
+                var settings_payload = std.ArrayList(u8).empty;
+                defer settings_payload.deinit(std.heap.page_allocator);
+                try http.encodeSettingsPayloadForRole(
+                    settings,
+                    std.heap.page_allocator,
+                    &settings_payload,
+                    .server,
+                );
+                try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, settings_payload.items);
+                try writeHTTP2Frame(&accepted.socket, .settings, 0x01, 0, &.{});
+                const request_headers = try readFrame(&accepted.socket, &payload);
+                const stream_id = request_headers.stream_id;
+
+                var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
+                defer manager.deinit();
+                if (index == 0) {
+                    const fields = [_]hpack.HeaderEntry{
+                        .{ .name = ":status", .value = "413", .representation = .without_indexing },
+                        .{ .name = "content-length", .value = "0", .representation = .without_indexing },
+                    };
+                    const frames = try h2stream.buildHeadersAndContinuations(
+                        &manager,
+                        stream_id,
+                        &fields,
+                        null,
+                        16_384,
+                        true,
+                        std.heap.page_allocator,
+                    );
+                    defer std.heap.page_allocator.free(frames);
+                    try accepted.socket.sendAll(frames);
+                    const rst = h2stream.buildRstStreamFrame(stream_id, .cancel);
+                    try accepted.socket.sendAll(&rst);
+                } else {
+                    const fields = [_]hpack.HeaderEntry{
+                        .{ .name = ":status", .value = "200", .representation = .without_indexing },
+                        .{ .name = "content-length", .value = "2", .representation = .without_indexing },
+                    };
+                    const frames = try h2stream.buildHeadersAndContinuations(
+                        &manager,
+                        stream_id,
+                        &fields,
+                        null,
+                        16_384,
+                        false,
+                        std.heap.page_allocator,
+                    );
+                    defer std.heap.page_allocator.free(frames);
+                    try accepted.socket.sendAll(frames);
+                    try writeHTTP2Frame(&accepted.socket, .data, 0x01, stream_id, "ok");
+                }
+                while (true) {
+                    const incoming = readFrame(&accepted.socket, &payload) catch break;
+                    if (incoming.frame_type == .rst_stream) break;
+                }
+            }
+        }
+    };
+
+    var loopback = Loopback{ .listener = &listener };
+    const server_thread = try std.Thread.spawn(.{}, Loopback.run, .{&loopback});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit();
+        server_thread.join();
+    };
+    const url = try policyTestUrl(allocator, &listener, "/early-final");
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, .{
+        .http2_enabled = true,
+        .keep_alive = false,
+        .policy = types.ClientPolicy.embeddingOwned(),
+        .timeouts = types.Timeouts.uniform(5_000),
+    });
+    defer client.deinit();
+    var upload: [70_000]u8 = undefined;
+    @memset(&upload, 'u');
+
+    {
+        var op = try client.open(.POST, url, .{
+            .version = .HTTP_2,
+            .body_mode = .{ .content_length = upload.len },
+        });
+        defer op.deinit();
+        try std.testing.expectEqual(@as(usize, 65_535), try op.write(&upload));
+        const head = try op.finishRequest(null);
+        try std.testing.expectEqual(@as(u16, 413), head.status.code);
+        try op.finish(.{});
+    }
+    {
+        var op = try client.open(.POST, url, .{
+            .version = .HTTP_2,
+            .body_mode = .{ .content_length = upload.len },
+        });
+        defer op.deinit();
+        try std.testing.expectEqual(@as(usize, 65_535), try op.write(&upload));
+        const head = try op.finishRequest(null);
+        try std.testing.expectEqual(@as(u16, 200), head.status.code);
+        var body: [2]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try op.read(&body));
+        try std.testing.expectEqualStrings("ok", &body);
+        try op.finish(.{});
+    }
+
+    server_thread.join();
+    joined = true;
+    if (loopback.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), client.poolStats().total);
 }
 
 test "redirect origin and credential policy use full origin tuple" {

@@ -349,6 +349,10 @@ their deadlines. `null` uses the corresponding `Timeouts` value (whose zero
 falls back to connect/read); an explicit option value of zero disables that
 phase deadline while the overall request deadline still applies.
 
+Pass `.CUSTOM` with `custom_method = "PURGE"` (or another valid HTTP token) in
+`RequestOptions`/`OpenOptions`; the request owns a validated copy for its full
+lifetime and both HTTP/1.x and HTTP/2 preserve it on the wire.
+
 Streaming counters and limits are `u64`; caller and transport body buffers are
 fixed at 16–64 KiB. gzip/deflate, Brotli, and Zstandard are decoded
 incrementally, and response limits apply to decoded bytes. Decoder history is
