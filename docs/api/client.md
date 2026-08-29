@@ -8,7 +8,7 @@ The `httpx.zig` client provides a high-level HTTP client for making requests ove
 |----------|--------|-----------|-------|
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
-| HTTP/2 | ✅ Client Runtime + Primitives | TCP/TLS | High-level client request execution path plus full framing/HPACK/stream primitives |
+| HTTP/2 | ✅ Client Runtime + Primitives | TCP/TLS | Keep-alive sessions are reused sequentially. Concurrent multiplexing is not exposed by `Client`; concurrent requests use separate pooled sessions. |
 | HTTP/3 | ✅ Client Runtime + Primitives | QUIC/UDP | High-level client runtime over UDP + QUIC/HTTP3/QPACK primitives (suitable for local/integration endpoints) |
 
 HTTP/3 runtime mode is available in the high-level client and uses QUIC packet/stream framing primitives directly. Interoperability with endpoints that require full TLS-in-QUIC handshake negotiation may vary depending on deployment expectations.
@@ -29,6 +29,13 @@ Use `socks5h` when you want to avoid local DNS lookups or when the proxy has acc
 ## Client
 
 The `Client` struct is the main entry point for making requests. It manages connection pooling, cookies, and interceptors.
+
+`Client` is safe to share across threads. Request methods, cookie operations,
+interceptor registration, pool statistics, and idle cleanup are synchronized.
+Callbacks may run concurrently and reentrantly. Configuration is captured at
+initialization and exposed read-only through `client.configuration()`.
+`deinit()` is exclusive and must run only after all requests and responses are
+finished.
 
 ### Initialization
 
@@ -80,7 +87,7 @@ defer client.deinit();
 |-------|------|---------|-------------|
 | `base_url` | `?[]const u8` | `null` | Base URL prepended to all requests. |
 | `timeouts` | `Timeouts` | `{}` | Connection and read/write timeouts. |
-| `policy` | `ClientPolicy` | managed | Retry, redirect, cookie send/store, automatic `Accept-Encoding`, and response decompression behavior. |
+| `policy` | `ClientPolicy` | managed | Retry, redirect, cookie send/store, automatic `Accept-Encoding`, response decompression, and synthesized `User-Agent` behavior. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
 | `user_agent` | `[]const u8` | `"httpx.zig/0.1.8"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
@@ -111,10 +118,13 @@ If you do not set a field, the implicit default value is used. Builder helpers o
 | `cookies` | `CookiePolicy` | `.send_and_store` |
 | `accept_encoding` | `AcceptEncodingPolicy` | `.library_default` |
 | `decompression` | `DecompressionPolicy` | `.enabled` |
+| `user_agent` | `UserAgentPolicy` | `.enabled` |
 
 Retry and redirect behavior can be `.disabled` or carry their detailed policy. Cookie behavior can be `.disabled`, `.send_only`, `.store_only`, or `.send_and_store`. Automatic encoding can be `.disabled`, `.library_default`, or `.explicit = "..."`.
 
-Use embedding-owned mode when a higher-level transport owns retries, redirects, cookies, encoding negotiation, and decoding:
+Use embedding-owned mode when a higher-level transport owns retries, redirects,
+cookies, encoding negotiation, decoding, and request identity. It does not
+synthesize `User-Agent`:
 
 ```zig
 var client = httpx.Client.initWithConfig(allocator, .{
@@ -129,6 +139,12 @@ defer response.deinit();
 ```
 
 Policy is resolved once per logical request. Disabling a feature never removes a caller-provided `Cookie` or `Accept-Encoding` header. With decompression disabled, the response retains its encoded bytes and `Content-Encoding` header.
+
+Caller-provided request headers are appended in order when duplicates are
+legal. This preserves duplicate `Cookie`, `Set-Cookie`, and `x-ms-*` fields.
+Singleton fields such as `Host`, `Content-Length`, `Transfer-Encoding`,
+`Authorization`, and `User-Agent` use replacement semantics and are validated
+before I/O. Conflicting or unsupported framing is rejected explicitly.
 
 Migration: direct `retry_policy`, `redirect_policy`, `follow_redirects`, `accept_encoding`, and `auto_decompress` fields were replaced by `ClientConfig.policy`; per-request `follow_redirects` was replaced by `RequestOptions.policy.redirect`. `RequestSpec.follow_redirects` similarly became `RequestSpec.policy`. The `withRetryPolicy`, `withRedirectPolicy`, and `withFollowRedirects` helpers remain as compatibility adapters and write only the new policy fields.
 
@@ -276,7 +292,8 @@ The client keeps an in-memory cookie jar and automatically:
 | Method | Description |
 |--------|-------------|
 | `setCookie(name, value)` | Add or replace a cookie in the jar |
-| `getCookie(name)` | Read a cookie value |
+| `getCookie(name)` | Return an owned cookie value |
+| `freeCookieValue(value)` | Free a value returned by `getCookie` |
 | `removeCookie(name)` | Remove one cookie |
 | `clearCookies()` | Remove all cookies |
 | `hasCookie(name)` | Check whether a cookie exists |
@@ -491,6 +508,7 @@ pub const Response = struct {
 | Method | Description |
 |--------|-------------|
 | `deinit()` | Free response resources |
+| `clone(allocator)` | Deep-copy body, ordered headers, and trailers to another allocator |
 | `header(name)` | Get header value by name |
 | `ok()` | Status 200-299 |
 | `isRedirect()` | Status 300-399 |
@@ -504,13 +522,28 @@ pub const Response = struct {
 
 ## Interceptors
 
-Interceptors allow you to modify requests before they are sent or responses before they are returned.
+Interceptors observe every transport attempt. Ordering is: automatic request
+mutations, request callback, validation, I/O and configured decompression,
+response/error callback, retry delay plus cancellation/deadline checks, then a
+retry notification immediately before the next attempt. Redirect notification
+similarly fires only when the redirect will be followed.
 
 ### Structure
 
 ```zig
-pub const RequestInterceptor = *const fn (*Request, ?*anyopaque) anyerror!void;
-pub const ResponseInterceptor = *const fn (*Response, ?*anyopaque) anyerror!void;
+pub const AttemptContext = struct {
+    logical_request_id: u64,
+    attempt: u32,          // one-based; resets after a redirect
+    redirect_count: u32,
+    policy: EffectiveClientPolicy,
+    url: []const u8,
+};
+
+pub const RequestInterceptor = *const fn (*Request, *const AttemptContext, ?*anyopaque) anyerror!void;
+pub const ResponseInterceptor = *const fn (*Response, *const AttemptContext, ?*anyopaque) anyerror!void;
+pub const ErrorInterceptor = *const fn (anyerror, *const AttemptContext, ?*anyopaque) void;
+pub const RetryInterceptor = *const fn (*const AttemptContext, ?*anyopaque) void;
+pub const RedirectInterceptor = *const fn ([]const u8, *const AttemptContext, ?*anyopaque) void;
 
 pub const Interceptor = struct {
     request_fn: ?RequestInterceptor = null,
@@ -519,18 +552,20 @@ pub const Interceptor = struct {
 };
 ```
 
-Both `request_fn` and `response_fn` are optional. You can register only one callback or both.
+All callbacks are optional. Callback context storage must outlive in-flight
+requests. The client snapshots registrations and invokes callbacks without any
+client, cookie, or pool lock held.
 
 ### Usage
 
 ```zig
 // Logging interceptor
-fn logRequest(request: *httpx.Request, _: ?*anyopaque) !void {
-    std.debug.print("Request: {s} {s}\n", .{@tagName(request.method), request.uri.path});
+fn logRequest(request: *httpx.Request, attempt: *const httpx.AttemptContext, _: ?*anyopaque) !void {
+    std.debug.print("Attempt {d}: {s} {s}\n", .{attempt.attempt, @tagName(request.method), request.uri.path});
 }
 
-fn logResponse(response: *httpx.Response, _: ?*anyopaque) !void {
-    std.debug.print("Response: {d}\n", .{response.status.code});
+fn logResponse(response: *httpx.Response, attempt: *const httpx.AttemptContext, _: ?*anyopaque) !void {
+    std.debug.print("Attempt {d} response: {d}\n", .{attempt.attempt, response.status.code});
 }
 
 // Add interceptor
@@ -544,7 +579,7 @@ const AuthContext = struct {
     token: []const u8,
 };
 
-fn addAuth(request: *httpx.Request, ctx: ?*anyopaque) !void {
+fn addAuth(request: *httpx.Request, _: *const httpx.AttemptContext, ctx: ?*anyopaque) !void {
     if (ctx) |c| {
         const auth: *AuthContext = @ptrCast(@alignCast(c));
         try request.setHeader("Authorization", auth.token);

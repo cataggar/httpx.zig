@@ -19,8 +19,9 @@ pub fn main() !void {
     try client.setCookie("session", "abc123");
     std.debug.print("has session: {}\n", .{client.hasCookie("session")});
 
-    const value = client.getCookie("session") orelse "";
-    std.debug.print("session={s}\n", .{value});
+    const value = try client.getCookie("session");
+    defer if (value) |owned| client.freeCookieValue(owned);
+    std.debug.print("session={s}\n", .{value orelse ""});
 
     client.removeCookie("session");
     std.debug.print("cookie count={d}\n", .{client.cookieCount()});

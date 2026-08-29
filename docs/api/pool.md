@@ -1,19 +1,12 @@
 # Connection Pool API
 
-The `ConnectionPool` manages reusable TCP connections to improve throughput and reduce latency. The `Client` uses it internally, but you can also use it directly for custom implementations.
+`ConnectionPool` owns heap-stable TCP/TLS/HTTP2 entries. The pointer array may
+grow or compact without moving a checked-out transport. Each caller receives an
+exclusive `ConnectionLease`.
 
-## ConnectionPool
-
-### Initialization
+## Initialization
 
 ```zig
-const httpx = @import("httpx");
-
-// Default configuration
-var pool = httpx.ConnectionPool.init(allocator);
-defer pool.deinit();
-
-// Custom configuration
 var pool = httpx.ConnectionPool.initWithConfig(allocator, .{
     .max_connections = 100,
     .max_per_host = 10,
@@ -23,161 +16,84 @@ var pool = httpx.ConnectionPool.initWithConfig(allocator, .{
 defer pool.deinit();
 ```
 
-### Methods
+## Acquisition
 
-#### `getConnection`
-
-Returns a healthy idle connection or opens a new one.
+The compatibility helpers acquire a plain HTTP/1.1 route:
 
 ```zig
-pub fn getConnection(
-    self: *Self,
-    host: []const u8,
-    port: u16,
-    proxy: ?Proxy,
-    connect_timeout_ms: u64,
-) !*Connection
+var lease = try pool.getConnection("api.example.com", 80, null, 5_000);
+defer lease.release(.broken) catch {};
 ```
 
-Pass `0` for `connect_timeout_ms` to fall back to `PoolConfig.connect_timeout_ms`.
-
-#### `releaseConnection`
-
-Returns a connection to the pool after a request completes.
+Embedding transports should provide the complete reuse identity:
 
 ```zig
-pub fn releaseConnection(self: *Self, conn: *Connection) void
+var lease = try pool.getLeaseWithContext(.{
+    .scheme = .tls,
+    .host = "api.example.com",
+    .port = 443,
+    .verify_tls = true,
+    .protocol = .http2,
+}, 5_000, &io_context);
 ```
 
-#### `cleanup`
+The key includes scheme, target host/port, proxy route, TLS verification mode,
+and requested HTTP protocol. Strings are deep-owned by the pool.
 
-Evicts idle connections that have exceeded `PoolConfig.idle_timeout_ms` or `PoolConfig.max_requests_per_connection`.
+## Lease lifecycle
 
 ```zig
-pub fn cleanup(self: *Self) void
+const socket = lease.socket();
+// Perform one complete request/response exchange.
+try lease.release(.reusable);
 ```
 
-#### Statistics
+`LeaseDisposition` is:
+
+- `.reusable` — the response was fully framed and the peer permits reuse.
+- `.draining` — retire after the current exchange (for example,
+  `Connection: close` or HTTP/2 GOAWAY).
+- `.broken` — protocol, parse, TLS, or I/O failure.
+
+A lease may be released exactly once. Duplicate releases return
+`error.LeaseAlreadyReleased`; stale generations return `error.StaleLease`.
+Cleanup removes only zero-lease entries.
+
+TLS is initialized in stable entry storage with `lease.initializeTls(config)`.
+Sequential HTTP/2 state is returned by `lease.h2Session()` and persists HPACK,
+SETTINGS, flow-control windows, and monotonically increasing client stream IDs.
+The high-level client does not concurrently multiplex a leased session.
+Partial SETTINGS and WINDOW_UPDATE frames modify retained state. GOAWAY drains
+the entry, but an active stream permitted by `last_stream_id` is read through
+END_STREAM.
+
+An opportunistic HTTP/2 TLS connection that negotiates HTTP/1.1 can be re-keyed
+to `.http1` while exclusively leased. Future opportunistic requests first
+reuse that published HTTP/1.1 entry.
+
+## Statistics
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `activeCount()` | `usize` | Connections currently in use |
-| `totalCount()` | `usize` | All connections tracked by the pool |
-| `idleCount()` | `usize` | Available (not in-use) connections |
-| `hostConnectionCount(host, port)` | `usize` | Connections for a specific host:port |
-| `stats()` | `PoolStats` | Snapshot of total/active/idle counters |
-| `closeConnection(conn)` | `void` | Close and remove a specific connection from the pool |
+| `activeCount()` | `usize` | Connecting or leased entries |
+| `totalCount()` | `usize` | All tracked entries |
+| `idleCount()` | `usize` | Entries available for reuse |
+| `hostConnectionCount(host, port)` | `usize` | Entries for one target |
+| `stats()` | `PoolStats` | Total/active/idle snapshot |
+| `cleanup()` | `void` | Evict idle, exhausted, broken, or draining entries |
 
-## PoolConfig
+`deinit()` is exclusive and requires every lease to have been released.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | `u32` | `20` | Maximum total connections in the pool |
-| `max_per_host` | `u32` | `5` | Maximum connections per host |
-| `idle_timeout_ms` | `i64` | `60_000` | Idle time before a connection is evicted |
-| `max_requests_per_connection` | `u32` | `1000` | Requests before a connection is retired |
-| `health_check_interval_ms` | `i64` | `30_000` | Interval for health checks |
-| `connect_timeout_ms` | `u64` | `30_000` | Default TCP connect timeout for new connections |
-
-## PoolStats
-
-Snapshot of pool counters returned by `pool.stats()`.
-
-```zig
-pub const PoolStats = struct {
-    total: usize,   // All connections tracked
-    active: usize,  // Currently in use
-    idle: usize,    // Available for reuse
-};
-```
-
-## Connection
-
-Represents a single pooled TCP connection.
-
-```zig
-pub const Connection = struct {
-    socket: Socket,
-    host: []const u8,
-    port: u16,
-    proxy_host: ?[]const u8 = null,
-    proxy_port: ?u16 = null,
-    in_use: bool,
-    created_at: i64,    // Unix timestamp (ms) when created
-    last_used: i64,     // Unix timestamp (ms) of last acquire/release
-    requests_made: u32, // Total requests served by this connection
-};
-```
-
-### Methods
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `acquire()` | `void` | Mark connection as in-use, update `last_used` |
-| `release()` | `void` | Return to pool, increment `requests_made`, update `last_used` |
-| `isHealthy(max_idle_ms)` | `bool` | True when socket is valid and idle time < `max_idle_ms` |
-| `shouldEvict(idle_timeout_ms, max_requests)` | `bool` | True when socket is invalid, idle time exceeded, or request limit reached |
-| `matches(host, port, proxy)` | `bool` | True when connection matches the given host/port/proxy tuple |
-| `close()` | `void` | Close the underlying socket |
-
-### Lifecycle
-
-```
-getConnection()
-    ↓ calls acquire() internally
-    ↓ returns *Connection
-  [request executes]
-releaseConnection(conn)
-    ↓ calls release() internally
-    ↓ returns conn to idle pool
-```
-
-## PoolError
+## Pool errors
 
 ```zig
 pub const PoolError = error{
-    PoolExhausted,        // Total connection limit reached
-    PoolExhaustedForHost, // Per-host connection limit reached
+    PoolExhausted,
+    PoolExhaustedForHost,
 };
-```
-
-## Direct Usage Example
-
-```zig
-const httpx = @import("httpx");
-
-var pool = httpx.ConnectionPool.initWithConfig(allocator, .{
-    .max_connections = 20,
-    .max_per_host = 5,
-    .idle_timeout_ms = 60_000,
-    .max_requests_per_connection = 1000,
-});
-defer pool.deinit();
-
-// Print configuration
-std.debug.print("Max connections: {d}\n", .{pool.config.max_connections});
-std.debug.print("Max per host:    {d}\n", .{pool.config.max_per_host});
-
-// Print statistics
-const s = pool.stats();
-std.debug.print("Total: {d}  Active: {d}  Idle: {d}\n", .{
-    s.total, s.active, s.idle,
-});
-
-// Manual connection lifecycle
-const conn = try pool.getConnection("api.example.com", 443, null, 5_000);
-// conn.acquire() was called internally
-defer pool.releaseConnection(conn);
-
-// Health check
-const healthy = conn.isHealthy(60_000);
-std.debug.print("Healthy: {}\n", .{healthy});
-
-// Cleanup stale connections
-pool.cleanup();
 ```
 
 ## See Also
 
-- [Client API](client.md) — High-level client with built-in pooling
-- [Pooling Guide](/guide/pooling) — Pooling configuration patterns
+- [Client API](client.md)
+- [Pooling Guide](/guide/pooling)

@@ -200,6 +200,11 @@ The default `tls_alpn_protocols` is `&.{ "h3", "h2", "http/1.1" }`, so clients c
 
 The server automatically loads the certificate chain and private key on the first TLS connection. ALPN negotiation selects between HTTP/1.1, HTTP/2, and HTTP/3 based on the client's offer.
 
+ALPN uses the RFC 7301 network format: ClientHello carries a u16-length
+`ProtocolNameList`; TLS 1.2 returns the selected one-element list in
+ServerHello, while TLS 1.3 returns it in EncryptedExtensions. Empty names,
+truncated lists, duplicate ALPN extensions, and trailing bytes are rejected.
+
 ## Connection
 
 The `Connection` struct represents an established TLS session over a TCP socket.

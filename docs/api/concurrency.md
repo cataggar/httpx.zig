@@ -2,6 +2,13 @@
 
 The concurrency module provides tools for parallel execution and task management.
 
+The same `httpx.Client` may be passed to multiple workers. Its allocator
+adapter, cookie jar, interceptor registry, and stable connection pool are
+synchronized. HTTP/1.1 and HTTPS connections are exclusively leased per
+request. HTTP/2 sessions are reused sequentially; one lease owns a session at a
+time, so the high-level client does not claim concurrent stream multiplexing.
+Call `Client.deinit()` only after every worker and response is finished.
+
 ## Functions
 
 These functions are available under `httpx.concurrency.*` and also as top-level helpers:

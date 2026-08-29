@@ -197,6 +197,51 @@ pub const InitError = error{
     WeakPublicKey,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
+fn buildAlpnExtension(protocols: []const []const u8, out: []u8) InitError![]const u8 {
+    if (protocols.len == 0) return out[0..0];
+
+    var list_len: usize = 0;
+    for (protocols) |protocol| {
+        if (protocol.len == 0 or protocol.len > std.math.maxInt(u8)) {
+            return error.TlsIllegalParameter;
+        }
+        list_len = std.math.add(usize, list_len, 1 + protocol.len) catch
+            return error.TlsRecordOverflow;
+    }
+    if (list_len > std.math.maxInt(u16) or 6 + list_len > out.len) {
+        return error.TlsRecordOverflow;
+    }
+
+    mem.writeInt(u16, out[0..2], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+    mem.writeInt(u16, out[2..4], @intCast(2 + list_len), .big);
+    mem.writeInt(u16, out[4..6], @intCast(list_len), .big);
+    var offset: usize = 6;
+    for (protocols) |protocol| {
+        out[offset] = @intCast(protocol.len);
+        offset += 1;
+        @memcpy(out[offset..][0..protocol.len], protocol);
+        offset += protocol.len;
+    }
+    return out[0..offset];
+}
+
+fn parseSelectedAlpnProtocol(data: []const u8) error{ TlsDecodeError, TlsIllegalParameter }![]const u8 {
+    if (data.len < 3) return error.TlsDecodeError;
+    const list_len: usize = mem.readInt(u16, data[0..2], .big);
+    if (list_len == 0 or list_len != data.len - 2) return error.TlsDecodeError;
+    const protocol_len: usize = data[2];
+    if (protocol_len == 0) return error.TlsIllegalParameter;
+    if (protocol_len + 1 != list_len) return error.TlsDecodeError;
+    return data[3..][0..protocol_len];
+}
+
+fn validateSelectedAlpnProtocol(selected: []const u8, offered: []const []const u8) error{TlsIllegalParameter}!void {
+    for (offered) |protocol| {
+        if (mem.eql(u8, selected, protocol)) return;
+    }
+    return error.TlsIllegalParameter;
+}
+
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
 ///
 /// `host` is only borrowed during this function call.
@@ -254,36 +299,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
         .{0x00} ++ // name_type
         int(u16, host_len);
-    // ALPN extension
-    const alpn_extension_len: usize = blk: {
-        var len: usize = 0;
-        for (options.alpn_protocols) |proto| len += 1 + proto.len; // u8 len + name bytes
-        break :blk if (len > 0) 4 + 1 + len else 0; // ext_type(2) + ext_len(2) + list_len(1) + protocols
-    };
-    var alpn_buf: [256]u8 = undefined;
-    const alpn_extension: []const u8 = if (alpn_extension_len > 0) blk: {
-        var off: usize = 0;
-        // extension type
-        alpn_buf[0] = 0x00;
-        alpn_buf[1] = 0x10; // application_layer_protocol_negotiation
-        off = 2;
-        // extension data length
-        var list_len: usize = 0;
-        for (options.alpn_protocols) |proto| list_len += 1 + proto.len;
-        alpn_buf[2] = @intCast((list_len + 1) >> 8);
-        alpn_buf[3] = @intCast(list_len + 1);
-        off = 4;
-        // protocol name list length
-        alpn_buf[4] = @intCast(list_len);
-        off = 5;
-        for (options.alpn_protocols) |proto| {
-            alpn_buf[off] = @intCast(proto.len);
-            off += 1;
-            @memcpy(alpn_buf[off..][0..proto.len], proto);
-            off += proto.len;
-        }
-        break :blk alpn_buf[0..off];
-    } else &.{};
+    var alpn_buf: [4096]u8 = undefined;
+    const alpn_extension = try buildAlpnExtension(options.alpn_protocols, &alpn_buf);
 
     var client_hello_buf: [4096]u8 = undefined;
     var ch_off: usize = 0;
@@ -314,7 +331,17 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .no_verification => 0,
         .explicit => server_name_extension.len,
     };
-    const ext_total: u16 = @intCast(ext_payload_len + sni_ext_len + alpn_extension.len);
+    const ext_total_usize = std.math.add(
+        usize,
+        std.math.add(usize, ext_payload_len, sni_ext_len) catch return error.TlsRecordOverflow,
+        alpn_extension.len,
+    ) catch return error.TlsRecordOverflow;
+    if (ext_total_usize > std.math.maxInt(u16) or
+        ch_off + 2 + ext_total_usize > client_hello_buf.len - 4)
+    {
+        return error.TlsRecordOverflow;
+    }
+    const ext_total: u16 = @intCast(ext_total_usize);
     mem.writeInt(u16, client_hello_buf[ch_off..][0..2], ext_total, .big);
     ch_off += 2;
     // extensions payload
@@ -401,6 +428,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     const now_sec = options.realtime_now.toSeconds();
     var negotiated_alpn: ?[256]u8 = null;
     var negotiated_alpn_len: usize = 0;
+    var server_hello_alpn_present = false;
 
     var cleartext_fragment_start: usize = 0;
     var cleartext_fragment_end: usize = 0;
@@ -554,6 +582,17 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try extd.ensure(key_size);
                                         try key_share.exchange(named_group, extd.slice(key_size));
                                     },
+                                    .application_layer_protocol_negotiation => {
+                                        if (negotiated_alpn != null) return error.TlsIllegalParameter;
+                                        try extd.ensure(ext_size);
+                                        const selected = try parseSelectedAlpnProtocol(extd.slice(ext_size));
+                                        try validateSelectedAlpnProtocol(selected, options.alpn_protocols);
+                                        var buf: [256]u8 = undefined;
+                                        @memcpy(buf[0..selected.len], selected);
+                                        negotiated_alpn = buf;
+                                        negotiated_alpn_len = selected.len;
+                                        server_hello_alpn_present = true;
+                                    },
                                     else => {},
                                 }
                             }
@@ -561,7 +600,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
 
                         tls_version = @enumFromInt(supported_version orelse legacy_version);
                         switch (tls_version) {
-                            .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter,
+                            .tls_1_3 => {
+                                if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter;
+                                if (server_hello_alpn_present) return error.TlsIllegalParameter;
+                            },
                             .tls_1_2 => if (mem.eql(u8, server_hello_rand[24..31], "DOWNGRD") and
                                 server_hello_rand[31] >> 1 == 0x00) return error.TlsIllegalParameter,
                             else => return error.TlsIllegalParameter,
@@ -659,17 +701,14 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             switch (et) {
                                 .server_name => {},
                                 .application_layer_protocol_negotiation => {
-                                    // Parse the negotiated ALPN protocol
-                                    try extd.ensure(1);
-                                    const selected_len = extd.decode(u8);
-                                    if (selected_len > 0) {
-                                        try extd.ensure(selected_len);
-                                        const selected = extd.slice(selected_len);
-                                        var buf: [256]u8 = undefined;
-                                        @memcpy(buf[0..selected_len], selected);
-                                        negotiated_alpn = buf;
-                                        negotiated_alpn_len = selected_len;
-                                    }
+                                    if (negotiated_alpn != null) return error.TlsIllegalParameter;
+                                    try extd.ensure(ext_size);
+                                    const selected = try parseSelectedAlpnProtocol(extd.slice(ext_size));
+                                    try validateSelectedAlpnProtocol(selected, options.alpn_protocols);
+                                    var buf: [256]u8 = undefined;
+                                    @memcpy(buf[0..selected.len], selected);
+                                    negotiated_alpn = buf;
+                                    negotiated_alpn_len = selected.len;
                                 },
                                 else => {},
                             }
@@ -1732,3 +1771,43 @@ else
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     });
+
+test "ALPN ClientHello extension uses RFC 7301 u16 ProtocolNameList length" {
+    var buffer: [64]u8 = undefined;
+    const encoded = try buildAlpnExtension(&.{ "h2", "http/1.1" }, &buffer);
+    const standard_vector = [_]u8{
+        0x00, 0x10, 0x00, 0x0e,
+        0x00, 0x0c, 0x02, 'h',
+        '2',  0x08, 'h',  't',
+        't',  'p',  '/',  '1',
+        '.',  '1',
+    };
+    try std.testing.expectEqualSlices(u8, &standard_vector, encoded);
+    try std.testing.expectError(
+        error.TlsIllegalParameter,
+        buildAlpnExtension(&.{""}, &buffer),
+    );
+}
+
+test "ALPN selected protocol parses standard ServerHello vectors" {
+    const h2 = [_]u8{ 0x00, 0x03, 0x02, 'h', '2' };
+    try std.testing.expectEqualStrings("h2", try parseSelectedAlpnProtocol(&h2));
+
+    const http1 = [_]u8{ 0x00, 0x09, 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    try std.testing.expectEqualStrings("http/1.1", try parseSelectedAlpnProtocol(&http1));
+
+    const malformed_one_byte_length = [_]u8{ 0x02, 'h', '2' };
+    try std.testing.expectError(
+        error.TlsDecodeError,
+        parseSelectedAlpnProtocol(&malformed_one_byte_length),
+    );
+    const empty_protocol = [_]u8{ 0x00, 0x01, 0x00 };
+    try std.testing.expectError(
+        error.TlsIllegalParameter,
+        parseSelectedAlpnProtocol(&empty_protocol),
+    );
+    try std.testing.expectError(
+        error.TlsIllegalParameter,
+        validateSelectedAlpnProtocol("h3", &.{ "h2", "http/1.1" }),
+    );
+}

@@ -38,7 +38,7 @@
 > httpx.zig implements these protocols **entirely from scratch**, including:
 > - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446) — key exchange: X25519 (TLS 1.2/1.3); AEAD cipher suites: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; ALPN negotiation (RFC 7301) for automatic HTTP/2 and HTTP/3 protocol selection with HTTP/1.1 fallback; handshake message encryption (TLS 1.3); X.509 certificate parsing and verification (client-side); custom record-layer encryption/decryption
 > - **HPACK** header compression (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2
-> - **HTTP/2** stream multiplexing, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and connection pooling (RFC 7540)
+> - **HTTP/2** stream primitives, flow control (WINDOW_UPDATE), SETTINGS enforcement, GOAWAY/RST_STREAM, PRIORITY, CONTINUATION frames, PING, and sequential high-level client session reuse (RFC 7540). The high-level `Client` does not currently multiplex concurrent requests on one session.
 > - **QPACK** header compression (RFC 9204) with static/dynamic tables and decoder/encoder stream instructions for HTTP/3
 > - **QUIC** transport frame encoding/decoding (RFC 9000) with RESET_STREAM/STOP_SENDING cancellation, version negotiation, and transport parameters
 > - **HTTP/3** frame types, SETTINGS, GOAWAY, and CONNECTION_CLOSE handling
@@ -78,8 +78,8 @@
 | **Protocol Support** | Full runtime support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2**, and **HTTP/3** in high-level client/server APIs, plus low-level protocol primitives. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Header Compression** | HPACK (RFC 7541) with `Without Indexing` / `Never Indexed` security for HTTP/2; QPACK (RFC 9204) with decoder/encoder stream instructions for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
 | **HTTP/2 ALPN** | Automatic protocol negotiation during TLS handshake with HTTP/1.1 fallback. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
-| **Stream Multiplexing** | HTTP/2 stream state machine with flow control, SETTINGS enforcement, GOAWAY/RST_STREAM, and trailer support. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
-| **Connection Pooling** | Automatic reuse of TCP connections (including HTTP/2 connections) with keep-alive and health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
+| **Stream Multiplexing Primitives** | HTTP/2 stream state machine with flow control, SETTINGS enforcement, GOAWAY/RST_STREAM, and trailer support. High-level client reuse is sequential. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
+| **Connection Pooling** | Stable exclusive leases for TCP, TLS, and sequential HTTP/2 keep-alive reuse with health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
 | **Pool Introspection** | Built-in connection pool stats and per-host connection counts. | https://muhammad-fiaz.github.io/httpx.zig/api/pool |
 | **Pattern-based Routing** | Intuitive server routing with dynamic path parameters and groups. | https://muhammad-fiaz.github.io/httpx.zig/guide/routing |
 | **Port Conflict Handling** | Explicit startup strategy to fail fast or auto-increment to the next free port. | https://muhammad-fiaz.github.io/httpx.zig/api/server |

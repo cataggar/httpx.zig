@@ -102,6 +102,10 @@ httpx.zig provides full HTTP/2 protocol support including:
 | PING | 0x6 | Connection liveness |
 | GOAWAY | 0x7 | Graceful shutdown |
 | WINDOW_UPDATE | 0x8 | Flow control |
+
+`HTTP2ErrorCode` is non-exhaustive. Parsers preserve unknown wire values rather
+than trapping, so GOAWAY/RST_STREAM extensions can be handled as connection or
+stream results.
 | CONTINUATION | 0x9 | Header continuation |
 
 ### `Http2FrameHeader`

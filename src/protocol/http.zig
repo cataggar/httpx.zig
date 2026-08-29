@@ -313,6 +313,7 @@ pub const HTTP2ErrorCode = enum(u32) {
     enhance_your_calm = 0xb,
     inadequate_security = 0xc,
     http_1_1_required = 0xd,
+    _,
 };
 
 /// Manages the state of an HTTP/2 connection, including HPack context and streams.

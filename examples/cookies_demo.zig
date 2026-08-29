@@ -12,8 +12,12 @@ pub fn main() !void {
     try client.setCookie("session", "abc123");
     try client.setCookie("theme", "dark");
 
-    std.debug.print("Cookie session: {s}\n", .{client.getCookie("session") orelse "<missing>"});
-    std.debug.print("Cookie theme: {s}\n", .{client.getCookie("theme") orelse "<missing>"});
+    const session_value = try client.getCookie("session");
+    defer if (session_value) |value| client.freeCookieValue(value);
+    const theme_value = try client.getCookie("theme");
+    defer if (theme_value) |value| client.freeCookieValue(value);
+    std.debug.print("Cookie session: {s}\n", .{session_value orelse "<missing>"});
+    std.debug.print("Cookie theme: {s}\n", .{theme_value orelse "<missing>"});
 
     const removed = client.removeCookie("theme");
     std.debug.print("Removed theme cookie: {}\n", .{removed});
@@ -21,7 +25,9 @@ pub fn main() !void {
     var req = try httpx.Request.init(allocator, .GET, "http://httpbun.com/account");
     defer req.deinit();
 
-    if (client.getCookie("session")) |session| {
+    const request_session = try client.getCookie("session");
+    defer if (request_session) |value| client.freeCookieValue(value);
+    if (request_session) |session| {
         var cookie_buf = std.ArrayList(u8).empty;
         defer cookie_buf.deinit(allocator);
         try cookie_buf.appendSlice(allocator, "session=");
@@ -35,8 +41,10 @@ pub fn main() !void {
     std.debug.print("\nSerialized request with Cookie header:\n{s}\n", .{wire});
 
     client.clearCookies();
+    const cleared_session = try client.getCookie("session");
+    defer if (cleared_session) |value| client.freeCookieValue(value);
     std.debug.print(
         "Cookies cleared (session present? {}):\n",
-        .{client.getCookie("session") != null},
+        .{cleared_session != null},
     );
 }

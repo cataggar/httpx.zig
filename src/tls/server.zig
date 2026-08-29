@@ -81,12 +81,14 @@ fn findClientKeyShare(ch_data: []const u8, comptime group_id: u16, comptime expe
         const ext_data_len = mem.readInt(u16, ch_data[off + 2 ..][0..2], .big);
         off += 4;
         if (ext_type == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (ext_data_len < 2 or off + ext_data_len > ext_end) return null;
             // Key share entry list: each entry is group(2) + length(2) + key
-            // ClientHello key_share data begins with the uint16
-            // client_shares LIST LENGTH (RFC 8446 �4.2.8).
-            var koff = off + 2;
-            const shares_len: usize = mem.readInt(u16, ch_data[off..][0..2], .big);
-            var shares_end = off + 2 + shares_len;
+            // RFC 8446 uses a uint16 list length. Zig 0.16's std TLS client
+            // emits the entries directly, so accept either representation.
+            const first_u16: usize = mem.readInt(u16, ch_data[off..][0..2], .big);
+            const has_list_length = first_u16 + 2 == ext_data_len;
+            var koff = off + @as(usize, if (has_list_length) 2 else 0);
+            var shares_end = if (has_list_length) off + 2 + first_u16 else off + ext_data_len;
             if (shares_end > off + ext_data_len) shares_end = off + ext_data_len;
             if (shares_end > ch_data.len) shares_end = ch_data.len;
             while (koff + 4 <= shares_end) {
@@ -145,7 +147,27 @@ fn computeHybridKeyShare(
     return 1120;
 }
 
-fn parseClientHelloExtensions(data: []const u8) ClientHelloParsed {
+fn parseClientAlpnProtocols(
+    data: []const u8,
+    protocols: *BoundedArray([]const u8, 8),
+) error{ TlsDecodeError, TlsIllegalParameter }!void {
+    if (data.len < 3) return error.TlsDecodeError;
+    const list_len: usize = mem.readInt(u16, data[0..2], .big);
+    if (list_len == 0 or list_len != data.len - 2) return error.TlsDecodeError;
+
+    var offset: usize = 2;
+    while (offset < data.len) {
+        const protocol_len: usize = data[offset];
+        offset += 1;
+        if (protocol_len == 0) return error.TlsIllegalParameter;
+        if (protocol_len > data.len - offset) return error.TlsDecodeError;
+        protocols.append(data[offset..][0..protocol_len]) catch
+            return error.TlsIllegalParameter;
+        offset += protocol_len;
+    }
+}
+
+fn parseClientHelloExtensions(data: []const u8) error{ TlsDecodeError, TlsIllegalParameter }!ClientHelloParsed {
     var result = BoundedArray([]const u8, 8){};
     var supports_tls13 = false;
     var cipher_suites_list = BoundedArray(tls.CipherSuite, 32){};
@@ -180,53 +202,49 @@ fn parseClientHelloExtensions(data: []const u8) ClientHelloParsed {
     if (off + 2 > data.len) return ClientHelloParsed{ .alpn_protocols = result, .supports_tls13 = supports_tls13, .cipher_suites = cipher_suites_list, .sni_hostname = sni_hostname };
     const ext_len = mem.readInt(u16, data[off..][0..2], .big);
     off += 2;
-    const ext_end = @min(off + ext_len, data.len);
+    if (ext_len > data.len - off) return error.TlsDecodeError;
+    const ext_end = off + ext_len;
+    var saw_alpn = false;
 
     while (off + 4 <= ext_end) {
         const ext_type = mem.readInt(u16, data[off..][0..2], .big);
         const ext_data_len = mem.readInt(u16, data[off + 2 ..][0..2], .big);
         off += 4;
+        if (ext_data_len > ext_end - off) return error.TlsDecodeError;
+        const ext_data = data[off..][0..ext_data_len];
 
         if (ext_type == @intFromEnum(tls.ExtensionType.supported_versions)) {
-            if (off + 1 <= ext_end) {
-                const vlen = data[off];
-                var voff = off + 1;
-                while (voff + 2 <= off + 1 + vlen and voff + 2 <= ext_end) {
-                    const ver = mem.readInt(u16, data[voff..][0..2], .big);
-                    if (ver == @intFromEnum(tls.ProtocolVersion.tls_1_3)) supports_tls13 = true;
-                    voff += 2;
-                }
+            if (ext_data.len < 1) return error.TlsDecodeError;
+            const versions_len: usize = ext_data[0];
+            if (versions_len == 0 or versions_len % 2 != 0 or versions_len != ext_data.len - 1) {
+                return error.TlsDecodeError;
             }
-        } else if (ext_type == 0x0010) {
-            // ALPN extension
-            if (off + 1 <= ext_end) {
-                const list_len = data[off];
-                var loff = off + 1;
-                while (loff + 1 <= off + 1 + list_len and loff + 1 <= ext_end) {
-                    const proto_len = data[loff];
-                    loff += 1;
-                    if (loff + proto_len <= ext_end) {
-                        result.append(data[loff..][0..proto_len]) catch {};
-                    }
-                    loff += proto_len;
-                }
+            var version_offset: usize = 1;
+            while (version_offset < ext_data.len) : (version_offset += 2) {
+                const version = mem.readInt(u16, ext_data[version_offset..][0..2], .big);
+                if (version == @intFromEnum(tls.ProtocolVersion.tls_1_3)) supports_tls13 = true;
             }
+        } else if (ext_type == @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation)) {
+            if (saw_alpn) return error.TlsIllegalParameter;
+            saw_alpn = true;
+            try parseClientAlpnProtocols(ext_data, &result);
         } else if (ext_type == @intFromEnum(tls.ExtensionType.server_name)) {
             // SNI extension: server_name_list(2) + name_type(1) + name_len(2) + name
-            if (off + 5 <= ext_end) {
-                const name_list_len = mem.readInt(u16, data[off..][0..2], .big);
+            if (ext_data.len >= 5) {
+                const name_list_len = mem.readInt(u16, ext_data[0..2], .big);
                 _ = name_list_len;
-                const name_type = data[off + 2];
+                const name_type = ext_data[2];
                 if (name_type == 0x00) { // host_name
-                    const name_len = mem.readInt(u16, data[off + 3 ..][0..2], .big);
-                    if (off + 5 + name_len <= ext_end) {
-                        sni_hostname = data[off + 5 ..][0..name_len];
+                    const name_len = mem.readInt(u16, ext_data[3..5], .big);
+                    if (name_len <= ext_data.len - 5) {
+                        sni_hostname = ext_data[5..][0..name_len];
                     }
                 }
             }
         }
         off += ext_data_len;
     }
+    if (off != ext_end) return error.TlsDecodeError;
 
     return ClientHelloParsed{ .alpn_protocols = result, .supports_tls13 = supports_tls13, .cipher_suites = cipher_suites_list, .sni_hostname = sni_hostname };
 }
@@ -301,7 +319,8 @@ fn buildServerHello12(
     cipher_suite: tls.CipherSuite,
     server_random: *const [32]u8,
     legacy_session_id: []const u8,
-) usize {
+    selected_alpn: ?[]const u8,
+) !usize {
     var off: usize = 0;
     out[0] = 2;
     off = 4;
@@ -346,6 +365,22 @@ fn buildServerHello12(
     off += 1;
     out[off] = 0; // uncompressed
     off += 1;
+
+    if (selected_alpn) |protocol| {
+        if (protocol.len == 0 or protocol.len > std.math.maxInt(u8)) {
+            return error.TlsIllegalParameter;
+        }
+        mem.writeInt(u16, out[off..][0..2], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+        off += 2;
+        mem.writeInt(u16, out[off..][0..2], @intCast(2 + 1 + protocol.len), .big);
+        off += 2;
+        mem.writeInt(u16, out[off..][0..2], @intCast(1 + protocol.len), .big);
+        off += 2;
+        out[off] = @intCast(protocol.len);
+        off += 1;
+        @memcpy(out[off..][0..protocol.len], protocol);
+        off += protocol.len;
+    }
 
     const ext_data_len: u16 = @intCast(off - ext_start);
     mem.writeInt(u16, out[ext_len_pos..][0..2], ext_data_len, .big);
@@ -457,7 +492,7 @@ pub fn acceptServer(
     var buf: [4096]u8 = undefined;
     const ch_data = try tls_mod.readTLSRecord(socket, &buf);
 
-    const parsed = parseClientHelloExtensions(ch_data);
+    const parsed = try parseClientHelloExtensions(ch_data);
 
     // TLS 1.3 requires a usable key share.  Modern clients (OpenSSL 3.x,
     // curl, browsers) offer the X25519MLKEM768 hybrid (0x4588) — often as
@@ -629,9 +664,26 @@ fn acceptServerTLS13Comptime(
     // Send EncryptedExtensions
     var ee_msg: [256]u8 = undefined;
     ee_msg[0] = 8; // encrypted_extensions handshake type
-    mem.writeInt(u24, ee_msg[1..][0..3], 2, .big); // body length = 2 (extensions length field)
-    mem.writeInt(u16, ee_msg[4..][0..2], 0, .big); // extensions length = 0
-    const ee_len: usize = 6;
+    var ee_len: usize = 6;
+    if (alpn.serverNegotiate(server_alpn, parsed.alpn_protocols.slice())) |negotiated| {
+        const extension_data_len: usize = 2 + 1 + negotiated.len;
+        if (negotiated.len > std.math.maxInt(u8) or ee_len + 4 + extension_data_len > ee_msg.len) {
+            return error.TlsRecordOverflow;
+        }
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+        ee_len += 2;
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intCast(extension_data_len), .big);
+        ee_len += 2;
+        mem.writeInt(u16, ee_msg[ee_len..][0..2], @intCast(1 + negotiated.len), .big);
+        ee_len += 2;
+        ee_msg[ee_len] = @intCast(negotiated.len);
+        ee_len += 1;
+        @memcpy(ee_msg[ee_len..][0..negotiated.len], negotiated);
+        ee_len += negotiated.len;
+    }
+    const extensions_len = ee_len - 6;
+    mem.writeInt(u16, ee_msg[4..][0..2], @intCast(extensions_len), .big);
+    mem.writeInt(u24, ee_msg[1..][0..3], @intCast(2 + extensions_len), .big);
     try tls_mod.sendTLS13EncryptedHandshake(socket, ee_msg[0..ee_len], tls_mod.trafficKeyFor(negotiated_cs, &hs_keys), &hs_keys.iv, &conn.hs_write_seq, negotiated_cs);
 
     @memcpy(transcript[transcript_len..][0..ee_len], ee_msg[0..ee_len]);
@@ -916,7 +968,8 @@ fn acceptServerTLS12(
     @memcpy(hs_transcript[0..ch_data.len], ch_data);
     hs_transcript_len = ch_data.len;
 
-    const sh_len = buildServerHello12(buf, negotiated_cs, &server_random, legacy_session_id);
+    const selected_alpn = alpn.serverNegotiate(server_alpn, parsed.alpn_protocols.slice());
+    const sh_len = try buildServerHello12(buf, negotiated_cs, &server_random, legacy_session_id, selected_alpn);
     try tls_mod.sendTLSHandshakeRecord(socket, buf[0..sh_len]);
 
     @memcpy(hs_transcript[hs_transcript_len..][0..sh_len], buf[0..sh_len]);
@@ -1088,7 +1141,7 @@ fn acceptServerTLS12(
     conn.cipher_suite = negotiated_cs;
     conn.sni_hostname = parsed.sni_hostname;
 
-    if (alpn.serverNegotiate(server_alpn, parsed.alpn_protocols.slice())) |negotiated| {
+    if (selected_alpn) |negotiated| {
         conn.negotiated_alpn.set(negotiated);
     }
 
@@ -1148,7 +1201,7 @@ test "parseClientHelloExtensions extracts SNI hostname" {
     const body_len = off - 4;
     mem.writeInt(u24, buf[1..][0..3], @intCast(body_len), .big);
 
-    const parsed = parseClientHelloExtensions(buf[0..off]);
+    const parsed = try parseClientHelloExtensions(buf[0..off]);
     try std.testing.expect(parsed.sni_hostname != null);
     try std.testing.expectEqualStrings("localhost", parsed.sni_hostname.?);
 }
@@ -1175,10 +1228,10 @@ test "parseClientHelloExtensions extracts ALPN protocols" {
     const ext_start = off;
     mem.writeInt(u16, buf[off..][0..2], 0x0010, .big);
     off += 2;
-    mem.writeInt(u16, buf[off..][0..2], 13, .big);
+    mem.writeInt(u16, buf[off..][0..2], 14, .big);
     off += 2;
-    buf[off] = 12;
-    off += 1;
+    mem.writeInt(u16, buf[off..][0..2], 12, .big);
+    off += 2;
     buf[off] = 2;
     off += 1;
     @memcpy(buf[off..][0..2], "h2");
@@ -1192,10 +1245,97 @@ test "parseClientHelloExtensions extracts ALPN protocols" {
     const body_len = off - 4;
     mem.writeInt(u24, buf[1..][0..3], @intCast(body_len), .big);
 
-    const parsed = parseClientHelloExtensions(buf[0..off]);
+    const parsed = try parseClientHelloExtensions(buf[0..off]);
     try std.testing.expectEqual(@as(usize, 2), parsed.alpn_protocols.len);
     try std.testing.expectEqualStrings("h2", parsed.alpn_protocols.slice()[0]);
     try std.testing.expectEqualStrings("http/1.1", parsed.alpn_protocols.slice()[1]);
+}
+
+test "parseClientHelloExtensions accepts standards-compliant ALPN vector" {
+    const standard_client_hello = [_]u8{
+        0x01, 0x00, 0x00, 0x44,
+        0x03, 0x03,
+    } ++ ([_]u8{0x42} ** 32) ++ [_]u8{
+        0x00,
+        0x00,
+        0x02,
+        0x13,
+        0x01,
+        0x01,
+        0x00,
+        0x00,
+        0x19,
+        0x00,
+        0x2b,
+        0x00,
+        0x03,
+        0x02,
+        0x03,
+        0x04,
+        0x00,
+        0x10,
+        0x00,
+        0x0e,
+        0x00,
+        0x0c,
+        0x02,
+        'h',
+        '2',
+        0x08,
+        'h',
+        't',
+        't',
+        'p',
+        '/',
+        '1',
+        '.',
+        '1',
+    };
+
+    const parsed = try parseClientHelloExtensions(&standard_client_hello);
+    try std.testing.expect(parsed.supports_tls13);
+    try std.testing.expectEqual(@as(usize, 2), parsed.alpn_protocols.len);
+    try std.testing.expectEqualStrings("h2", parsed.alpn_protocols.slice()[0]);
+    try std.testing.expectEqualStrings("http/1.1", parsed.alpn_protocols.slice()[1]);
+
+    var protocols = BoundedArray([]const u8, 8){};
+    const malformed_one_byte_length = [_]u8{
+        0x0c,
+        0x02,
+        'h',
+        '2',
+        0x08,
+        'h',
+        't',
+        't',
+        'p',
+        '/',
+        '1',
+        '.',
+        '1',
+    };
+    try std.testing.expectError(
+        error.TlsDecodeError,
+        parseClientAlpnProtocols(&malformed_one_byte_length, &protocols),
+    );
+}
+
+test "TLS 1.2 ServerHello emits selected RFC 7301 ALPN extension" {
+    var buffer: [512]u8 = undefined;
+    const random = [_]u8{0x33} ** 32;
+    const length = try buildServerHello12(
+        &buffer,
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        &random,
+        &.{},
+        "h2",
+    );
+    const standard_h2_extension = [_]u8{
+        0x00, 0x10, 0x00, 0x05,
+        0x00, 0x03, 0x02, 'h',
+        '2',
+    };
+    try std.testing.expect(mem.indexOf(u8, buffer[0..length], &standard_h2_extension) != null);
 }
 
 test "parseClientHelloExtensions detects TLS 1.3 support" {
@@ -1231,12 +1371,12 @@ test "parseClientHelloExtensions detects TLS 1.3 support" {
     const body_len = off - 4;
     mem.writeInt(u24, buf[1..][0..3], @intCast(body_len), .big);
 
-    const parsed = parseClientHelloExtensions(buf[0..off]);
+    const parsed = try parseClientHelloExtensions(buf[0..off]);
     try std.testing.expect(parsed.supports_tls13);
 }
 
 test "parseClientHelloExtensions returns empty for short data" {
-    const parsed = parseClientHelloExtensions(&[_]u8{0});
+    const parsed = try parseClientHelloExtensions(&[_]u8{0});
     try std.testing.expectEqual(@as(usize, 0), parsed.alpn_protocols.len);
     try std.testing.expect(!parsed.supports_tls13);
     try std.testing.expect(parsed.sni_hostname == null);
@@ -1507,7 +1647,7 @@ test "parseClientHelloExtensions with TLS 1.3 and key_share" {
     const body_len = off - 4;
     mem.writeInt(u24, buf[1..][0..3], @intCast(body_len), .big);
 
-    const parsed = parseClientHelloExtensions(buf[0..off]);
+    const parsed = try parseClientHelloExtensions(buf[0..off]);
     try std.testing.expect(parsed.supports_tls13);
     try std.testing.expect(parsed.cipher_suites.len >= 2);
     // findX25519ClientKey should also find the key
@@ -1560,7 +1700,7 @@ test "parseClientHelloExtensions with TLS 1.3 but no X25519 keyshare" {
     const body_len = off - 4;
     mem.writeInt(u24, buf[1..][0..3], @intCast(body_len), .big);
 
-    const parsed = parseClientHelloExtensions(buf[0..off]);
+    const parsed = try parseClientHelloExtensions(buf[0..off]);
     try std.testing.expect(parsed.supports_tls13);
     // But findX25519ClientKey should NOT find X25519
     const key = findX25519ClientKey(buf[0..off]);
