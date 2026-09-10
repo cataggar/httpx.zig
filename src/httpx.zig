@@ -382,6 +382,8 @@ pub const CryptoProviderVTable = tls.CryptoProviderVTable;
 pub const CryptoProviderCapabilities = tls.CryptoProviderCapabilities;
 pub const CryptoCapabilities = tls.CryptoCapabilities;
 pub const CryptoProviderError = tls.CryptoProviderError;
+pub const StandardCryptoProvider = tls.StandardCryptoProvider;
+pub const CryptoCertificateVerifier = tls.CryptoCertificateVerifier;
 
 // Transfer exports
 pub const Progress = transfer.Progress;

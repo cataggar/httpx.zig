@@ -36,6 +36,8 @@ pub const CryptoProviderVTable = crypto_provider.VTable;
 pub const CryptoProviderCapabilities = crypto_provider.Capabilities;
 pub const CryptoCapabilities = crypto_provider.Capabilities;
 pub const CryptoProviderError = crypto_provider.ProviderError;
+pub const StandardCryptoProvider = @import("crypto/standard.zig").StandardProvider;
+pub const CryptoCertificateVerifier = @import("cert_crypto.zig").CryptoCertificateVerifier;
 
 pub const server = @import("server.zig");
 pub const acceptServer = server.acceptServer;

@@ -1,15 +1,24 @@
 # TLS API
 
-The TLS module provides a fully custom TLS 1.2/1.3 implementation built entirely on `std.crypto` primitives. No dependency on `std.crypto.tls` — all handshake, record-layer encryption, certificate verification, and ALPN negotiation is implemented from scratch.
+The TLS module implements TLS 1.2/1.3 using Zig cryptographic primitives and
+standard-library TLS state and wire-format helpers.
 
-::: warning Custom Implementation
-Zig's standard library does not provide TLS/ALPN support. **httpx.zig implements TLS entirely from scratch**, including:
+::: warning Production trust is not implemented
+The current client handshake does not implement production public-CA trust.
+`TLSConfig.verify_server` still selects the legacy self-signed verification
+path, and `ca_bundle_path` is not wired into it. Do not use this path for
+authenticated public HTTPS, including Azure. The primitive implementation
+described below does not fix or bypass these pending trust/handshake changes.
+:::
+
+::: warning TLS implementation status
+The existing TLS engine includes:
 - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446)
 - **Key exchange:** X25519 (TLS 1.2/1.3)
 - **AEAD cipher suites:** ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM
 - **ALPN negotiation** (RFC 7301) for automatic HTTP/2 selection with HTTP/1.1 fallback
 - **Handshake message encryption** (TLS 1.3)
-- **X.509 certificate parsing and verification** (client-side)
+- **X.509 certificate parsing** (production chain policy remains pending)
 - **Custom record-layer encryption/decryption**
 :::
 
@@ -23,7 +32,7 @@ Zig's standard library does not provide TLS/ALPN support. **httpx.zig implements
 | ChaCha20-Poly1305 | ✅ | ✅ |
 | ECDSA P-256 certificate signing | -- | ✅ |
 | Certificate loading (PEM) | ✅ | ✅ |
-| Certificate chain verification (client-side) | ✅ | ✅ |
+| Production certificate chain verification (client-side) | Pending | Pending |
 | ALPN negotiation | ✅ | ✅ |
 | SNI extension | ✅ | ✅ |
 | Handshake message encryption | -- | ✅ |
@@ -38,8 +47,83 @@ tls.zig              -- High-level Connection, TlsConfig, TlsSession, record-lay
 ├── alpn.zig         -- ALPN protocol negotiation
 ├── trust.zig        -- Provider-neutral trust policy, sources, limits, and peer-verification contract
 ├── cert_signature.zig -- Narrow certificate-signature verifier bridge
+├── cert_crypto.zig  -- Certificate-signature adapter to the selected primitive provider
+├── crypto/standard.zig -- Pure-Zig CryptoProvider implementation (not yet a handshake backend)
 └── errors.zig       -- Unified TLS error set and alert conversion
 ```
+
+## Standard CryptoProvider Implementation
+
+`httpx.StandardCryptoProvider` implements the borrowed `CryptoProvider` contract
+using `std.crypto`. It is a working primitive backend, not yet selectable through
+`TLSConfig` or `ClientConfig`: handshakes and record protection still need their
+provider-neutral state conversion. No option silently selects this provider
+while continuing to use another implementation.
+
+```zig
+var standard = httpx.StandardCryptoProvider.init(io, thread_safe_allocator);
+const crypto = standard.provider();
+var transcript = try crypto.hashCreate(allocator, .sha256);
+defer transcript.deinit();
+try transcript.update(handshake_bytes);
+```
+
+Keep `standard` at a stable address and alive for all borrowed handles.
+Its `Io` implementation and scratch allocator must also outlive those handles.
+Shared use requires a concurrent `Io` and thread-safe scratch allocator.
+Hash/key handles are individually owned; use `clone` for transcript copies
+and `take` for ownership transfer, and destroy each handle exactly once.
+
+Implemented operations:
+
+- SHA-1/256/384/512 transcripts, snapshots, independent clones, multipart HMAC,
+  HKDF extract/expand, and TLS 1.2 PRF.
+- AES-128/256-GCM and ChaCha20-Poly1305 with detached tags, multipart AAD,
+  in-place operation, and output wiping on operational/authentication failure.
+- X25519, P-256 and P-384 key generation/agreement; ML-KEM-768 key generation,
+  encapsulation and decapsulation (including standard implicit rejection).
+- ECDSA P-256/SHA-256, P-384/SHA-384 and Ed25519 signing and verification.
+  Signing imports currently accept **raw scalars/seeds only**; DER private-key
+  imports return `UnsupportedOperation`.
+- RSA PKCS#1 v1.5 and PSS verification for 2048/3072/4096-bit keys, with bounded
+  canonical PKCS#1 public-key DER and modulus-sized signatures. PSS uses the
+  scheme hash for MGF1 and a digest-sized salt.
+- Constant-time comparison.
+
+Entropy comes exclusively from `Io.randomSecure`; entropy failure is returned
+and never falls back to `Io.random`. Owned private-key, shared-secret, transcript,
+and key-derivation scratch storage is wiped before destruction.
+**RSA signing is unsupported** because Zig 0.16 `std.crypto` provides RSA
+verification but not a private-key signing implementation. Capabilities report
+that limitation. SHA-1 primitive availability is not permission to accept SHA-1
+certificates or negotiate legacy signatures; that decision belongs to policy.
+
+### Certificate-signature adapter
+
+`httpx.CryptoCertificateVerifier.init(crypto)` creates an independently owned,
+stable-address adapter. Its `.verifier()` handle can populate
+`VerifyPeerRequest.signature_verifier`. It parses bounded SPKI/algorithm
+encodings and delegates every signature verification to the selected provider,
+without fallback or trust decisions. Supported certificate signatures are RSA
+PKCS#1 SHA-1/256/384/512, P-256/SHA-256, P-384/SHA-384, and Ed25519.
+RSA-PSS certificate AlgorithmIdentifiers, restricted PSS SPKIs, other
+curve/hash combinations and unsupported parameters fail explicitly.
+
+### Remaining integration
+
+No target currently has production default/custom-root verification through
+this implementation. Zig 0.16's `Certificate.Parsed.verify` checks issuer,
+validity and signature, but does not implement the required CA/basic
+constraints, key usage, path constraints and critical-extension policy.
+Simply wrapping `Certificate.Bundle.verify` would not supply production PKI.
+Root discovery, bounded path construction and policy, SAN/IP matching, trust
+context ownership, and handshake trust dispatch remain required for issue #4.
+Provider-neutral client/server transcripts, key shares and records, private-key
+loading, and an instrumented whole-handshake dispatch test remain for issue #7.
+
+The existing `zig build test-tls-provider` runner covers primitives and the
+certificate adapter; both also run under `zig build test`. Neither needs a
+live endpoint or native cryptographic library.
 
 ## Trust Provider Contract
 
@@ -88,8 +172,7 @@ and path-construction candidate attempts.
 
 `CertificateSignatureVerifier` receives borrowed signature
 `AlgorithmIdentifier` components, issuer SubjectPublicKeyInfo DER, exact TBS
-certificate DER, and signature bytes. This seam lets a later `CryptoProvider`
-adapter perform certificate-edge cryptography without moving hostname, time,
+certificate DER, and signature bytes. `CryptoCertificateVerifier` implements this seam without moving hostname, time,
 chain, or root policy into the crypto provider.
 
 ### Declarative sources and policy

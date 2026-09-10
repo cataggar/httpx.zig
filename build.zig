@@ -191,19 +191,35 @@ pub fn build(b: *std.Build) void {
     });
     linkPlatformLibs(provider_tests, target);
     const run_provider_tests = b.addRunArtifact(provider_tests);
-    const provider_test_step = b.step("test-tls-provider", "Run TLS CryptoProvider contract tests");
+    const provider_test_step = b.step("test-tls-provider", "Run TLS CryptoProvider and certificate-signature tests");
+
+    const cert_crypto_tests = b.addTest(.{
+        .name = "tls-certificate-crypto-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls/cert_crypto.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkPlatformLibs(cert_crypto_tests, target);
+    const run_cert_crypto_tests = b.addRunArtifact(cert_crypto_tests);
 
     // Only run tests when target matches host; otherwise build test artifact only.
     if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
         test_step.dependOn(&run_tests.step);
         test_step.dependOn(&run_provider_tests.step);
+        test_step.dependOn(&run_cert_crypto_tests.step);
         provider_test_step.dependOn(&run_provider_tests.step);
+        provider_test_step.dependOn(&run_cert_crypto_tests.step);
     } else {
         const install_tests = b.addInstallArtifact(tests, .{});
         const install_provider_tests = b.addInstallArtifact(provider_tests, .{});
+        const install_cert_crypto_tests = b.addInstallArtifact(cert_crypto_tests, .{});
         test_step.dependOn(&install_tests.step);
         test_step.dependOn(&install_provider_tests.step);
+        test_step.dependOn(&install_cert_crypto_tests.step);
         provider_test_step.dependOn(&install_provider_tests.step);
+        provider_test_step.dependOn(&install_cert_crypto_tests.step);
     }
 
     const bench_exe = b.addExecutable(.{

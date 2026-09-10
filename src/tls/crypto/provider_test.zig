@@ -1,6 +1,10 @@
 const std = @import("std");
 const p = @import("provider.zig");
 
+test {
+    _ = @import("standard_test.zig");
+}
+
 const operation_count = @typeInfo(p.Operation).@"enum".fields.len;
 
 const FakeHandle = struct {
