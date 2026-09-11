@@ -307,6 +307,13 @@ fn decryptTLS13ForSuite(
     };
 }
 
+fn transportIoError(err: anyerror, fallback: anyerror) anyerror {
+    return switch (err) {
+        error.Cancelled, error.Timeout => err,
+        else => fallback,
+    };
+}
+
 fn writeBoundedEncryptedRecord(
     sender: anytype,
     version: tls.ProtocolVersion,
@@ -362,7 +369,8 @@ fn writeBoundedEncryptedRecord(
                 else => return error.TlsUnsupportedCipherSuite,
             };
             seq.* +%= 1;
-            sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
+            sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch |err|
+                return transportIoError(err, error.WriteFailed);
         },
         .tls_1_2 => {
             const ciphertext_len = try tls12CiphertextLen(cipher_suite, plaintext.len);
@@ -388,7 +396,8 @@ fn writeBoundedEncryptedRecord(
             const enc_len = encrypted.len;
             std.debug.assert(enc_len == ciphertext_len);
             seq.* +%= 1;
-            sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
+            sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch |err|
+                return transportIoError(err, error.WriteFailed);
         },
         else => return error.TlsUnsupportedCipherSuite,
     }
@@ -718,8 +727,7 @@ fn readEncryptedBytes(state: *ApplicationReadState, output: []u8) !usize {
     else
         state.socket.recv(output)) catch |err| switch (err) {
         error.ConnectionResetByPeer => error.TlsConnectionTruncated,
-        error.Cancelled, error.Timeout => |context_err| context_err,
-        else => error.ReadFailed,
+        else => transportIoError(err, error.ReadFailed),
     };
 }
 
@@ -1732,6 +1740,9 @@ pub const TLSSession = struct {
     tls_version: ?tls.ProtocolVersion = null,
     socket: ?*Socket = null,
     cipher_suite: ?tls.CipherSuite = null,
+    /// Optional legacy transport retry. The callback must supply a fresh
+    /// connection and honor the caller's cancellation/deadline policy.
+    /// Request operations should normally own retries and leave this null.
     reconnect_fn: ?*const fn (ctx: ?*anyopaque) ?*Socket = null,
     reconnect_ctx: ?*anyopaque = null,
     stored_client: ?TlsClient = null,
@@ -1801,16 +1812,13 @@ pub const TLSSession = struct {
 
     fn handshakeInternal(self: *TLSSession, host: []const u8, context: ?*const IoContext) !void {
         const socket = self.socket orelse return error.TlsMissingTransport;
-        self.handshakeDo(socket, host, context) catch {
+        self.handshakeDo(socket, host, context) catch |err| {
             if (context) |io_context| try io_context.check();
-            if (self.reconnect_fn) |reconnect| {
-                if (reconnect(self.reconnect_ctx)) |new_socket| {
-                    self.socket = new_socket;
-                    try self.handshakeRetry(new_socket, host, context);
-                    return;
-                }
-            }
-            try self.handshakeRetry(socket, host, context);
+            if (!mayReconnectHandshake(err)) return err;
+            const reconnect = self.reconnect_fn orelse return err;
+            const new_socket = reconnect(self.reconnect_ctx) orelse return err;
+            self.socket = new_socket;
+            try self.handshakeDo(new_socket, host, context);
         };
     }
 
@@ -1940,10 +1948,6 @@ pub const TLSSession = struct {
         self.encrypted_buf_len = buffered_encrypted.len;
     }
 
-    fn handshakeRetry(self: *TLSSession, socket: *Socket, host: []const u8, context: ?*const IoContext) !void {
-        try self.handshakeDo(socket, host, context);
-    }
-
     pub fn isHTTP2(self: *const TLSSession) bool {
         return self.negotiated_alpn.isHTTP2Result();
     }
@@ -2037,6 +2041,65 @@ pub const TLSSession = struct {
     }
 };
 pub const TlsSession = TLSSession;
+
+fn mayReconnectHandshake(err: anyerror) bool {
+    return switch (err) {
+        error.ReadFailed, error.WriteFailed, error.TlsConnectionTruncated => true,
+        else => false,
+    };
+}
+
+test "TLS reconnect is restricted to transport failures" {
+    try std.testing.expect(mayReconnectHandshake(error.ReadFailed));
+    try std.testing.expect(mayReconnectHandshake(error.WriteFailed));
+    try std.testing.expect(mayReconnectHandshake(error.TlsConnectionTruncated));
+    for ([_]anyerror{
+        error.Cancelled,
+        error.Timeout,
+        error.CertificateExpired,
+        error.CertificateHostMismatch,
+        error.CertificateSignatureInvalid,
+        error.TlsCertificateNotVerified,
+        error.TlsUnknownCa,
+        error.TlsBadRecordMac,
+        error.TlsDecodeError,
+        error.TlsAlert,
+    }) |err| {
+        try std.testing.expect(!mayReconnectHandshake(err));
+    }
+}
+
+test "TLS handshake configuration failure never invokes reconnect" {
+    const Reconnect = struct {
+        calls: usize = 0,
+
+        fn call(context: ?*anyopaque) ?*Socket {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            return null;
+        }
+    };
+    var socket = try Socket.create();
+    defer socket.close();
+    var reconnect = Reconnect{};
+    var session = TLSSession.init(.{
+        .allocator = std.testing.allocator,
+        .alpn_protocols = &.{""},
+    });
+    defer session.deinit();
+    session.attachSocket(&socket);
+    session.reconnect_fn = Reconnect.call;
+    session.reconnect_ctx = &reconnect;
+    try std.testing.expectError(error.TlsIllegalParameter, session.handshake("example.invalid"));
+    try std.testing.expectEqual(@as(usize, 0), reconnect.calls);
+}
+
+test "TLS record transport error mapping preserves cancellation and deadline" {
+    try std.testing.expectEqual(error.Cancelled, transportIoError(error.Cancelled, error.ReadFailed));
+    try std.testing.expectEqual(error.Timeout, transportIoError(error.Timeout, error.WriteFailed));
+    try std.testing.expectEqual(error.ReadFailed, transportIoError(error.Unexpected, error.ReadFailed));
+    try std.testing.expectEqual(error.WriteFailed, transportIoError(error.Unexpected, error.WriteFailed));
+}
 
 pub fn connectClient(
     allocator: Allocator,
@@ -2974,6 +3037,7 @@ const ScriptedSender = struct {
     bytes: std.ArrayList(u8) = .empty,
     max_chunk: usize,
     fail_after: ?usize = null,
+    failure: anyerror = error.ScriptedWriteFailure,
     underlying_writes: usize = 0,
 
     fn deinit(self: *@This()) void {
@@ -2984,14 +3048,14 @@ const ScriptedSender = struct {
         var sent: usize = 0;
         while (sent < data.len) {
             if (self.fail_after) |limit| {
-                if (self.bytes.items.len >= limit) return error.ScriptedWriteFailure;
+                if (self.bytes.items.len >= limit) return self.failure;
             }
 
             var chunk_len = @min(self.max_chunk, data.len - sent);
             if (self.fail_after) |limit| {
                 chunk_len = @min(chunk_len, limit - self.bytes.items.len);
             }
-            if (chunk_len == 0) return error.ScriptedWriteFailure;
+            if (chunk_len == 0) return self.failure;
 
             try self.bytes.appendSlice(self.allocator, data[sent..][0..chunk_len]);
             self.underlying_writes += 1;
@@ -3070,6 +3134,25 @@ test "TLS record send-all handles partial writes and failed records" {
             plaintext[0..max_plaintext_len],
         );
         try std.testing.expectEqual(@as(usize, 1), completed_records);
+    }
+}
+
+test "TLS partial record writes preserve cancellation and deadline failures" {
+    for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
+        for ([_]anyerror{ error.Cancelled, error.Timeout }) |failure| {
+            var sender = ScriptedSender{
+                .allocator = std.testing.allocator,
+                .max_chunk = 16,
+                .fail_after = 7,
+                .failure = failure,
+            };
+            defer sender.deinit();
+            var writer = ScriptedRecordWriter{ .sender = &sender, .version = version };
+            try std.testing.expectError(failure, writer.write("application bytes"));
+            try std.testing.expectEqual(@as(usize, 7), sender.bytes.items.len);
+            try std.testing.expectEqual(@as(u64, 1), writer.sequence);
+            try std.testing.expectEqual(@as(usize, 1), sender.underlying_writes);
+        }
     }
 }
 

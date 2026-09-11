@@ -217,6 +217,26 @@ TLS alert without erasing the original local error.
 
 Configuration for TLS client connections.
 
+### Cancellation and retry boundary
+
+`TLSSession.handshake` never implicitly retries on the same TLS stream.
+Without a reconnect callback it makes exactly one attempt. The optional legacy
+reconnect callback is considered only for transport I/O failure or truncation.
+Other explicitly reported errors, including certificate, protocol,
+authentication, cancellation and timeout errors, do not trigger it.
+A reconnect callback must supply a fresh connection and honor the
+operation's cancellation and deadline policy. Request operations should own
+retries and leave the callback unset.
+
+Record I/O preserves underlying `Cancelled` and `Timeout` errors. The standard
+`Io.Reader`/`Writer` handshake interfaces have narrower error sets, however, so
+their socket adapters or the enclosing operation must retain the concrete
+transport error. A context-owning caller can use `IoContext.unwrapAfterBlocking`
+after handshake/read/write/flush to restore cancellation/deadline precedence.
+This does not itself interrupt blocked I/O: the underlying socket transport must
+provide that behavior. Discard a connection after a failed record operation;
+partially transferred records are not resumable by retrying the operation.
+
 ```zig
 pub const TlsConfig = struct {
     allocator: Allocator,
