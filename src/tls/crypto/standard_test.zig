@@ -213,7 +213,7 @@ test "standard provider rejects invalid private scalars and unsupported RSA sign
     try testing.expect(caps.supportsVerify(.rsa_pss_rsae_sha256));
     try testing.expect(!caps.supportsSign(.rsa_pss_rsae_sha256));
     try testing.expectError(error.UnsupportedAlgorithm, provider.signingKeyImport(testing.allocator, .{ .algorithm = .rsa, .encoding = .rsa_pkcs1_der, .bytes = "\x30\x00" }));
-    try testing.expectError(error.UnsupportedOperation, provider.signingKeyImport(testing.allocator, .{ .algorithm = .ecdsa_p256, .encoding = .sec1_der, .bytes = "\x30\x00" }));
+    try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{ .algorithm = .ecdsa_p256, .encoding = .sec1_der, .bytes = "\x30\x00" }));
     inline for (.{ p.SignatureKeyAlgorithm.ecdsa_p256, p.SignatureKeyAlgorithm.ecdsa_p384 }) |algorithm| {
         const length = if (algorithm == .ecdsa_p256) 32 else 48;
         try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{ .algorithm = algorithm, .encoding = .raw_secret, .bytes = &(@as([length]u8, @splat(0))) }));
@@ -361,4 +361,123 @@ test "standard provider RSA PSS SHA384 RFC 7520 section 4.2 known answer" {
     try provider.verify(.rsa_pss_rsae_sha384, key, &parts, &signed);
     try testing.expectError(error.SignatureInvalid, provider.verify(.rsa_pss_rsae_sha384, key, &.{"wrong message"}, &signed));
     try testing.expectError(error.SignatureInvalid, provider.verify(.rsa_pss_rsae_sha256, key, &parts, &signed));
+}
+
+fn derElement(comptime tag: u8, bytes: anytype) [bytes.len + (if (bytes.len < 128) @as(usize, 2) else 3)]u8 {
+    if (bytes.len > 255) @compileError("fixture element too large");
+    const header_len: usize = if (bytes.len < 128) 2 else 3;
+    var encoded: [header_len + bytes.len]u8 = undefined;
+    encoded[0] = tag;
+    if (header_len == 2) {
+        encoded[1] = @intCast(bytes.len);
+    } else {
+        encoded[1] = 0x81;
+        encoded[2] = @intCast(bytes.len);
+    }
+    @memcpy(encoded[header_len..], &bytes);
+    return encoded;
+}
+
+test "standard provider imports SEC1 and PKCS8 ECDSA keys with matching public points" {
+    var owner = StandardProvider.init(testing.io, testing.allocator);
+    const provider = owner.provider();
+    inline for (.{
+        .{ p.SignatureScheme.ecdsa_secp256r1_sha256, std.crypto.sign.ecdsa.EcdsaP256Sha256 },
+        .{ p.SignatureScheme.ecdsa_secp384r1_sha384, std.crypto.sign.ecdsa.EcdsaP384Sha384 },
+    }) |item| {
+        const scheme = item[0];
+        const Scheme = item[1];
+        const pair = try Scheme.KeyPair.generateDeterministic(@splat(0x39));
+        const secret = pair.secret_key.toBytes();
+        const public = pair.public_key.toUncompressedSec1();
+        const curve = if (scheme == .ecdsa_secp256r1_sha256)
+            derElement(6, "\x2a\x86\x48\xce\x3d\x03\x01\x07".*)
+        else
+            derElement(6, "\x2b\x81\x04\x00\x22".*);
+        const algorithm = derElement(0x30, derElement(6, "\x2a\x86\x48\xce\x3d\x02\x01".*) ++ curve);
+        const sec1 = derElement(0x30, "\x02\x01\x01".* ++ derElement(4, secret) ++
+            derElement(0xa0, curve) ++ derElement(0xa1, derElement(3, [_]u8{0} ++ public)));
+        const compressed_sec1 = derElement(0x30, "\x02\x01\x01".* ++ derElement(4, secret) ++
+            derElement(0xa1, derElement(3, [_]u8{0} ++ pair.public_key.toCompressedSec1())));
+        const pkcs8 = derElement(0x30, "\x02\x01\x00".* ++ algorithm ++ derElement(4, sec1));
+        inline for (.{
+            .{ p.PrivateKeyEncoding.sec1_der, sec1 },
+            .{ p.PrivateKeyEncoding.sec1_der, compressed_sec1 },
+            .{ p.PrivateKeyEncoding.pkcs8_der, pkcs8 },
+        }) |encoded| {
+            var container = encoded[1];
+            var key = try provider.signingKeyImport(testing.allocator, .{
+                .algorithm = scheme.keyAlgorithm(),
+                .encoding = encoded[0],
+                .bytes = &container,
+            });
+            defer key.deinit();
+            @memset(&container, 0);
+            var signature: [scheme.signatureCapacity().?]u8 = undefined;
+            const signed = try key.sign(scheme, &.{"imported key"}, &signature);
+            try provider.verify(scheme, .{
+                .algorithm = scheme.keyAlgorithm(),
+                .encoding = .sec1_uncompressed,
+                .bytes = &public,
+            }, &.{"imported key"}, signed);
+        }
+        var wrong_public = public;
+        wrong_public[wrong_public.len - 1] ^= 1;
+        const inconsistent = derElement(0x30, "\x02\x01\x01".* ++ derElement(4, secret) ++
+            derElement(0xa1, derElement(3, [_]u8{0} ++ wrong_public)));
+        try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{
+            .algorithm = scheme.keyAlgorithm(),
+            .encoding = .sec1_der,
+            .bytes = &inconsistent,
+        }));
+        for (0..pkcs8.len) |length| {
+            try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{
+                .algorithm = scheme.keyAlgorithm(),
+                .encoding = .pkcs8_der,
+                .bytes = pkcs8[0..length],
+            }));
+        }
+    }
+}
+
+test "standard provider imports RFC 8410 Ed25519 PKCS8 and RFC 5958 public keys" {
+    var owner = StandardProvider.init(testing.io, testing.allocator);
+    const provider = owner.provider();
+    const seed: [32]u8 = @splat(0x37);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const public = pair.public_key.toBytes();
+    const algorithm = derElement(0x30, derElement(6, "\x2b\x65\x70".*));
+    const private = derElement(4, derElement(4, seed));
+    const version0 = derElement(0x30, "\x02\x01\x00".* ++ algorithm ++ private);
+    const version1 = derElement(0x30, "\x02\x01\x01".* ++ algorithm ++ private ++
+        derElement(0x81, [_]u8{0} ++ public));
+    inline for (.{ version0, version1 }) |bytes| {
+        var key = try provider.signingKeyImport(testing.allocator, .{
+            .algorithm = .ed25519,
+            .encoding = .pkcs8_der,
+            .bytes = &bytes,
+        });
+        defer key.deinit();
+        var signature: [64]u8 = undefined;
+        const signed = try key.sign(.ed25519, &.{"PKCS8"}, &signature);
+        try provider.verify(.ed25519, .{ .algorithm = .ed25519, .encoding = .ed25519_raw, .bytes = &public }, &.{"PKCS8"}, signed);
+    }
+    var wrong_public = version1;
+    wrong_public[wrong_public.len - 1] ^= 1;
+    const missing_public = derElement(0x30, "\x02\x01\x01".* ++ algorithm ++ private);
+    const bad_parameters = derElement(0x30, "\x02\x01\x00".* ++
+        derElement(0x30, derElement(6, "\x2b\x65\x70".*) ++ "\x05\x00".*) ++ private);
+    inline for (.{ wrong_public, missing_public, bad_parameters }) |bytes| {
+        try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{
+            .algorithm = .ed25519,
+            .encoding = .pkcs8_der,
+            .bytes = &bytes,
+        }));
+    }
+    const attributes = derElement(0x30, "\x02\x01\x00".* ++ algorithm ++ private ++ "\xa0\x00".*);
+    try testing.expectError(error.UnsupportedOperation, provider.signingKeyImport(testing.allocator, .{
+        .algorithm = .ed25519,
+        .encoding = .pkcs8_der,
+        .bytes = &attributes,
+    }));
 }

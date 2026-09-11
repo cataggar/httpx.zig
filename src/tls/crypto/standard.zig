@@ -7,6 +7,7 @@
 const std = @import("std");
 const p = @import("provider.zig");
 const der = @import("der.zig");
+const key_encoding = @import("key_encoding.zig");
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 const Error = p.ProviderError;
@@ -340,14 +341,14 @@ const SigningState = union(enum) {
 };
 
 fn signingKeyImport(_: *anyopaque, allocator: Allocator, input: p.PrivateKey, out: *?*anyopaque) Error!void {
-    if (input.encoding != .raw_secret) return error.UnsupportedOperation;
+    const material = try key_encoding.decode(input);
     const key = try allocator.create(SigningState);
     errdefer destroy(SigningState, allocator, key);
     key.* = switch (input.algorithm) {
         inline .ecdsa_p256, .ecdsa_p384 => |a| blk: {
             const Curve = if (a == .ecdsa_p256) crypto.ecc.P256 else crypto.ecc.P384;
             const Ecdsa = if (a == .ecdsa_p256) Ecdsa256 else Ecdsa384;
-            var bytes = input.bytes[0..Ecdsa.SecretKey.encoded_length].*;
+            var bytes = material.secret[0..Ecdsa.SecretKey.encoded_length].*;
             defer p.secureWipe(&bytes);
             // fromSecretKey multiplies modulo the order; reject noncanonical
             // imported scalars rather than silently normalizing a private key.
@@ -356,9 +357,20 @@ fn signingKeyImport(_: *anyopaque, allocator: Allocator, input: p.PrivateKey, ou
             if (scalar.isZero()) return error.InvalidEncoding;
             break :blk @unionInit(SigningState, @tagName(a), Ecdsa.KeyPair.fromSecretKey(.{ .bytes = bytes }) catch return error.InvalidEncoding);
         },
-        .ed25519 => .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(input.bytes[0..32].*) catch return error.InvalidEncoding },
+        .ed25519 => .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(material.secret[0..32].*) catch return error.InvalidEncoding },
         .rsa, .rsa_pss => return error.UnsupportedAlgorithm,
     };
+    if (material.public_key) |encoded| {
+        const matches = switch (key.*) {
+            inline .ecdsa_p256, .ecdsa_p384 => |*pair, a| blk: {
+                const Ecdsa = if (a == .ecdsa_p256) Ecdsa256 else Ecdsa384;
+                const public = Ecdsa.PublicKey.fromSec1(encoded) catch return error.InvalidEncoding;
+                break :blk std.mem.eql(u8, &public.toUncompressedSec1(), &pair.public_key.toUncompressedSec1());
+            },
+            .ed25519 => |*pair| std.mem.eql(u8, encoded, &pair.public_key.toBytes()),
+        };
+        if (!matches) return error.InvalidEncoding;
+    }
     out.* = key;
 }
 

@@ -83,8 +83,12 @@ Implemented operations:
 - X25519, P-256 and P-384 key generation/agreement; ML-KEM-768 key generation,
   encapsulation and decapsulation (including standard implicit rejection).
 - ECDSA P-256/SHA-256, P-384/SHA-384 and Ed25519 signing and verification.
-  Signing imports currently accept **raw scalars/seeds only**; DER private-key
-  imports return `UnsupportedOperation`.
+  Signing imports accept raw scalars/seeds, unencrypted SEC1 EC private keys,
+  and unencrypted PKCS#8 EC/Ed25519 private keys. Optional embedded public keys
+  are checked against the derived public key, including compressed SEC1 points.
+  RFC 5958 version-one containers require their public key; PKCS#8 attributes
+  remain explicitly unsupported. Malformed containers and mismatched curves,
+  key lengths or public keys are rejected.
 - RSA PKCS#1 v1.5 and PSS verification for 2048/3072/4096-bit keys, with bounded
   canonical PKCS#1 public-key DER and modulus-sized signatures. PSS uses the
   scheme hash for MGF1 and a digest-sized salt.
@@ -93,9 +97,8 @@ Implemented operations:
 Entropy comes exclusively from `Io.randomSecure`; entropy failure is returned
 and never falls back to `Io.random`. Owned private-key, shared-secret, transcript,
 and key-derivation scratch storage is wiped before destruction.
-**RSA signing is unsupported** because Zig 0.16 `std.crypto` provides RSA
-verification but not a private-key signing implementation. Capabilities report
-that limitation. SHA-1 primitive availability is not permission to accept SHA-1
+**RSA signing remains pending** in this backend; capabilities report it as
+unsupported. SHA-1 primitive availability is not permission to accept SHA-1
 certificates or negotiate legacy signatures; that decision belongs to policy.
 
 ### Certificate-signature adapter
@@ -118,8 +121,9 @@ constraints, key usage, path constraints and critical-extension policy.
 Simply wrapping `Certificate.Bundle.verify` would not supply production PKI.
 Root discovery, bounded path construction and policy, SAN/IP matching, trust
 context ownership, and handshake trust dispatch remain required for issue #4.
-Provider-neutral client/server transcripts, key shares and records, private-key
-loading, and an instrumented whole-handshake dispatch test remain for issue #7.
+Provider-neutral client/server transcripts, key shares and records, RSA
+private-key loading/signing, and an instrumented whole-handshake dispatch test
+remain for issue #7.
 
 The existing `zig build test-tls-provider` runner covers primitives and the
 certificate adapter; both also run under `zig build test`. Neither needs a
