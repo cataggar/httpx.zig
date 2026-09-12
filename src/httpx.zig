@@ -824,6 +824,8 @@ test {
     _ = socket;
     _ = address;
     _ = dns;
+    _ = server_mod;
+    _ = compression_stream;
 }
 
 test "top-level alias compile checks" {

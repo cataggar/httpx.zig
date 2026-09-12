@@ -441,6 +441,11 @@ With decompression enabled, response limits count decoded bytes. HTTP/1 response
 metadata is bounded to 8 KiB and 100 fields by the shared parser; HTTP/2 uses
 `http2_settings.max_header_list_size` (8 KiB by default). Keep finite metadata
 and payload limits when accepting responses of unknown size.
+An explicit `.bytes = 0` also rejects payload from chunked and close-delimited
+HTTP/1 responses before accepting those bytes into the caller's buffer.
+For HTTP/2 HEAD, 204, and 304 responses, the response head can precede a separate
+empty DATA terminator or trailers. Continue reading or call `finish` to validate
+END_STREAM before reuse; actual representation bytes remain an error.
 
 Streaming `open` is a single attempt, without the buffered retry/redirect loop.
 It retains configured request interceptors and reports failures during `open`

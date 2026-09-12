@@ -56,6 +56,7 @@ const dns_mod = @import("../net/dns.zig");
 const server_mod = @import("../server/server.zig");
 const LogFn = server_mod.LogFn;
 const operation = @import("operation.zig");
+const zstd_units = @import("../compress/zstd_units.zig");
 
 const defaultIo = io_util.defaultIo;
 
@@ -2713,12 +2714,30 @@ pub const Client = struct {
         return goaway.last_stream_id;
     }
 
+    fn appendEarlyHeaderBytes(
+        self: *Client,
+        block: *std.ArrayList(u8),
+        bytes: []const u8,
+        queued_bytes: usize,
+    ) !void {
+        const header_limit = self.shared.config.http2_settings.max_header_list_size;
+        if (header_limit > 0 and bytes.len > header_limit -| block.items.len) {
+            return error.HeaderTooLarge;
+        }
+        const remaining = 64 * 1024 -| queued_bytes;
+        if (block.items.len > remaining or bytes.len > remaining - block.items.len) {
+            return error.EarlyResponseBufferExceeded;
+        }
+        try block.appendSlice(self.allocator, bytes);
+    }
+
     fn appendEarlyHeaderFragment(
         self: *Client,
         block: *std.ArrayList(u8),
         payload: []const u8,
         flags: u8,
         stream_id: u31,
+        queued_bytes: usize,
     ) !void {
         var offset: usize = 0;
         var padding: usize = 0;
@@ -2737,7 +2756,7 @@ pub const Client = struct {
             offset += 5;
         }
         if (padding > payload.len - offset) return error.ProtocolError;
-        try block.appendSlice(self.allocator, payload[offset .. payload.len - padding]);
+        try self.appendEarlyHeaderBytes(block, payload[offset .. payload.len - padding], queued_bytes);
     }
 
     fn queueDecodedEarlyHeaders(
@@ -2796,19 +2815,34 @@ pub const Client = struct {
             fields.items,
             self.allocator,
         );
-        errdefer self.allocator.free(encoded);
-        if (early_frame_bytes.* + encoded.len > 64 * 1024) {
+        defer self.allocator.free(encoded);
+        if (encoded.len > 64 * 1024 -| early_frame_bytes.*) {
             return error.EarlyResponseBufferExceeded;
         }
-        try early_frames.append(self.allocator, .{
-            .header = .{
-                .length = @intCast(encoded.len),
-                .frame_type = .headers,
-                .flags = 0x04 | if (end_stream) @as(u8, 0x01) else 0,
-                .stream_id = request_stream_id,
-            },
-            .payload = encoded,
-        });
+        const first_frame = early_frames.items.len;
+        errdefer {
+            for (early_frames.items[first_frame..]) |*frame| frame.deinit(self.allocator);
+            early_frames.shrinkRetainingCapacity(first_frame);
+        }
+        const max_frame_size: usize = self.shared.config.http2_settings.max_frame_size;
+        try early_frames.ensureUnusedCapacity(self.allocator, std.math.divCeil(usize, encoded.len, max_frame_size) catch unreachable);
+        var offset: usize = 0;
+        while (offset < encoded.len) {
+            const length = @min(max_frame_size, encoded.len - offset);
+            const last = offset + length == encoded.len;
+            const payload = try self.allocator.dupe(u8, encoded[offset..][0..length]);
+            early_frames.appendAssumeCapacity(.{
+                .header = .{
+                    .length = @intCast(length),
+                    .frame_type = if (offset == 0) .headers else .continuation,
+                    .flags = (if (last) @as(u8, 0x04) else 0) |
+                        (if (offset == 0 and end_stream) @as(u8, 0x01) else 0),
+                    .stream_id = request_stream_id,
+                },
+                .payload = payload,
+            });
+            offset += length;
+        }
         early_frame_bytes.* += encoded.len;
         return status_code;
     }
@@ -2947,12 +2981,13 @@ pub const Client = struct {
                             payload,
                             fhdr.flags,
                             request_stream.id,
+                            early_frame_bytes.*,
                         ) catch |err| {
                             self.allocator.free(payload);
                             return err;
                         };
                     } else {
-                        header_block.appendSlice(self.allocator, payload) catch |err| {
+                        self.appendEarlyHeaderBytes(&header_block, payload, early_frame_bytes.*) catch |err| {
                             self.allocator.free(payload);
                             return err;
                         };
@@ -4393,9 +4428,7 @@ const OperationImpl = struct {
     brotli_decoder: ?brotli_pkg.Decoder = null,
     zstd_decoder: ?zstd_pkg.StreamingDecompressor = null,
     zstd_wire: std.ArrayList(u8) = .empty,
-    zstd_stage: enum { frame_header, block, checksum } = .frame_header,
-    zstd_frame_checksum: bool = false,
-    zstd_frames_completed: u64 = 0,
+    zstd_framer: zstd_units.Framer = .{},
     decoder_input: [16 * 1024]u8 = undefined,
     decoder_input_pos: usize = 0,
     decoder_input_len: usize = 0,
@@ -5237,7 +5270,7 @@ const OperationImpl = struct {
         }
         while (true) {
             const unit = try self.nextZstdUnit() orelse {
-                if (self.zstd_frames_completed == 0) return error.TruncatedCompressedBody;
+                if (self.zstd_framer.frames_completed == 0) return error.TruncatedCompressedBody;
                 if (decoder.in_buffer.items.len != 0) return error.TruncatedCompressedBody;
                 self.decoded_body_complete = true;
                 return 0;
@@ -5290,69 +5323,17 @@ const OperationImpl = struct {
     }
 
     fn nextZstdUnit(self: *Self) !?[]const u8 {
-        while (true) switch (self.zstd_stage) {
-            .frame_header => {
-                if (!try self.ensureZstdWire(5)) {
-                    if (self.zstd_wire.items.len == 0 and self.encoded_body_complete) return null;
-                    return error.TruncatedCompressedBody;
-                }
-                const bytes = self.zstd_wire.items;
-                const magic = std.mem.readInt(u32, bytes[0..4], .little);
-                if (magic != zstd_pkg.MAGICNUMBER) return error.DecompressionFailed;
-                const descriptor = bytes[4];
-                const single_segment = ((descriptor >> 5) & 1) != 0;
-                const dictionary_sizes = [_]usize{ 0, 1, 2, 4 };
-                const content_sizes = [_]usize{ 0, 2, 4, 8 };
-                var header_size: usize = 5;
-                if (!single_segment) header_size += 1;
-                header_size += dictionary_sizes[descriptor & 0x03];
-                const content_code: u2 = @truncate(descriptor >> 6);
-                header_size += if (content_code == 0 and single_segment)
-                    1
-                else
-                    content_sizes[content_code];
-                if (!try self.ensureZstdWire(header_size)) return error.TruncatedCompressedBody;
-                const header = zstd_pkg.getFrameHeader(self.zstd_wire.items[0..header_size]) catch
-                    return error.DecompressionFailed;
-                const window_size = std.math.cast(usize, header.window_size) orelse
-                    return error.DecompressionWindowTooLarge;
-                if (window_size > 32 * 1024 * 1024) return error.DecompressionWindowTooLarge;
-                self.zstd_frame_checksum = header.checksum_flag;
-                self.zstd_stage = .block;
-                return self.zstd_wire.items[0..header_size];
-            },
-            .block => {
-                if (!try self.ensureZstdWire(3)) return error.TruncatedCompressedBody;
-                const raw = @as(u32, self.zstd_wire.items[0]) |
-                    (@as(u32, self.zstd_wire.items[1]) << 8) |
-                    (@as(u32, self.zstd_wire.items[2]) << 16);
-                const last = (raw & 1) != 0;
-                const block_type: zstd_pkg.BlockType = @enumFromInt((raw >> 1) & 0x03);
-                const encoded_size: usize = @intCast(raw >> 3);
-                const payload_size = switch (block_type) {
-                    .raw, .compressed => encoded_size,
-                    .rle => 1,
-                    .reserved => return error.DecompressionFailed,
-                };
-                const unit_size = 3 + payload_size;
-                if (!try self.ensureZstdWire(unit_size)) return error.TruncatedCompressedBody;
-                if (last) {
-                    if (self.zstd_frame_checksum) {
-                        self.zstd_stage = .checksum;
-                    } else {
-                        self.zstd_stage = .frame_header;
-                        self.zstd_frames_completed += 1;
+        while (true) {
+            switch (try self.zstd_framer.next(self.zstd_wire.items, 32 * 1024 * 1024)) {
+                .bytes => |size| return self.zstd_wire.items[0..size],
+                .need => |required| {
+                    if (!try self.ensureZstdWire(required)) {
+                        if (self.zstd_wire.items.len == 0 and self.encoded_body_complete and self.zstd_framer.stage == .frame_header) return null;
+                        return error.TruncatedCompressedBody;
                     }
-                }
-                return self.zstd_wire.items[0..unit_size];
-            },
-            .checksum => {
-                if (!try self.ensureZstdWire(4)) return error.TruncatedCompressedBody;
-                self.zstd_stage = .frame_header;
-                self.zstd_frames_completed += 1;
-                return self.zstd_wire.items[0..4];
-            },
-        };
+                },
+            }
+        }
     }
 
     fn readHttp1Body(self: *Self, output: []u8) !usize {
@@ -5363,6 +5344,7 @@ const OperationImpl = struct {
         }
 
         const SinkState = struct {
+            operation: *Self,
             output: []u8,
             written: usize = 0,
 
@@ -5370,12 +5352,15 @@ const OperationImpl = struct {
                 const sink_state: *@This() = @ptrCast(@alignCast(context));
                 const amount = @min(data.len, sink_state.output.len - sink_state.written);
                 if (amount == 0) return 0;
+                if (sink_state.operation.decoder_kind == .none) {
+                    try sink_state.operation.countResponseBytes(amount);
+                }
                 @memcpy(sink_state.output[sink_state.written..][0..amount], data[0..amount]);
                 sink_state.written += amount;
                 return amount;
             }
         };
-        var sink_state = SinkState{ .output = output };
+        var sink_state = SinkState{ .operation = self, .output = output };
         var sink = ParserBodySink{
             .context = &sink_state,
             .writeFn = SinkState.write,
@@ -5411,7 +5396,6 @@ const OperationImpl = struct {
             }
         }
 
-        if (self.decoder_kind == .none) self.response_bytes = self.http1_parser.body_bytes;
         if (self.http1_parser.isComplete()) {
             if (self.response_body_kind != .close_delimited and self.read_pos != self.read_len) {
                 return error.ResponseBodyOverrun;
@@ -6260,11 +6244,10 @@ const OperationImpl = struct {
                     self.response_head_ready = true;
                     self.response_keep_alive = true;
                     if (self.http2ResponseHasNoBody()) {
-                        if (!end_stream) return error.ProtocolError;
-                        self.response_body_kind = .none;
-                        self.encoded_body_complete = true;
+                        self.h2_expected_length = 0;
+                        self.response_body_kind = if (end_stream) .none else .http2;
                         self.decoded_body_complete = true;
-                        self.state = .response_complete;
+                        if (end_stream) try self.completeHttp2Response();
                         return status_code;
                     }
                     try self.initializeContentDecoder();
@@ -9538,6 +9521,81 @@ test "HTTP2 upload pump rejects interleaving before CONTINUATION" {
     );
 }
 
+test "streaming early HTTP2 headers enforce encoded limits before append" {
+    var client = try Client.tryInitWithConfig(std.testing.allocator, .{ .http2_settings = .{ .max_header_list_size = 32 } });
+    defer client.deinit();
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(std.testing.allocator);
+    try std.testing.expectError(error.HeaderTooLarge, client.appendEarlyHeaderFragment(&block, "x" ** 33, 0, 1, 0));
+    try std.testing.expectEqual(@as(usize, 0), block.items.len);
+    try client.appendEarlyHeaderFragment(&block, &.{0x88}, 0, 1, 0);
+    try client.appendEarlyHeaderBytes(&block, "x" ** 31, 0);
+    try std.testing.expectError(error.HeaderTooLarge, client.appendEarlyHeaderBytes(&block, "x", 0));
+    try std.testing.expectEqual(@as(usize, 32), block.items.len);
+
+    var unlimited = try Client.tryInitWithConfig(std.testing.allocator, .{ .http2_settings = .{ .max_header_list_size = 0 } });
+    defer unlimited.deinit();
+    block.clearRetainingCapacity();
+    try std.testing.expectError(error.EarlyResponseBufferExceeded, unlimited.appendEarlyHeaderFragment(&block, "xy", 0, 1, 64 * 1024 - 1));
+    try unlimited.appendEarlyHeaderBytes(&block, "x", 64 * 1024 - 1);
+    try std.testing.expectError(error.EarlyResponseBufferExceeded, unlimited.appendEarlyHeaderBytes(&block, "y", 64 * 1024 - 1));
+    try std.testing.expectEqualStrings("x", block.items);
+}
+
+test "streaming early HTTP2 replay fragments valid headers and rolls back allocation failures" {
+    var encoder = hpack.HPACKContext.init(std.testing.allocator);
+    defer encoder.deinit();
+    const encoded = try hpack.encodeHeaders(&encoder, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "x-retained", .value = "stable" },
+        .{ .name = "x-large", .value = "q" ** (24 * 1024), .representation = .without_indexing },
+    }, std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const Case = struct {
+        fn run(allocator: Allocator, input: []const u8) !void {
+            var client = try Client.tryInitWithConfig(allocator, .{ .http2_settings = .{ .max_header_list_size = 64 * 1024 } });
+            defer client.deinit();
+            var manager = h2stream.StreamManager.init(allocator, true);
+            defer manager.deinit();
+            var frames = std.ArrayList(Client.EarlyH2Frame).empty;
+            defer {
+                for (frames.items) |*frame| frame.deinit(allocator);
+                frames.deinit(allocator);
+            }
+            var bytes: usize = 0;
+            const status_code = client.queueDecodedEarlyHeaders(&manager, 1, input, true, &frames, &bytes) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), frames.items.len);
+                try std.testing.expectEqual(@as(usize, 0), bytes);
+                return err;
+            };
+            try std.testing.expectEqual(@as(u16, 200), status_code);
+            try std.testing.expect(frames.items.len > 1);
+            var replay = std.ArrayList(u8).empty;
+            defer replay.deinit(allocator);
+            for (frames.items, 0..) |frame, index| {
+                try validateHttp2FrameHeader(frame.header, frame.payload.len, 16_384);
+                try std.testing.expectEqual(if (index == 0) http.HTTP2FrameType.headers else .continuation, frame.header.frame_type);
+                try std.testing.expectEqual(index == 0, (frame.header.flags & 1) != 0);
+                try std.testing.expectEqual(index + 1 == frames.items.len, (frame.header.flags & 4) != 0);
+                try replay.appendSlice(allocator, frame.payload);
+            }
+            const table_count = manager.hpack_decoder.dynamic_table.entries.items.len;
+            const decoded = try hpack.decodeHeadersWithLimit(&manager.hpack_decoder, replay.items, allocator, 64 * 1024);
+            defer {
+                for (decoded) |field| {
+                    allocator.free(field.name);
+                    allocator.free(field.value);
+                }
+                allocator.free(decoded);
+            }
+            try std.testing.expectEqual(@as(usize, 3), decoded.len);
+            try std.testing.expectEqualStrings("q" ** (24 * 1024), decoded[2].value);
+            try std.testing.expectEqual(table_count, manager.hpack_decoder.dynamic_table.entries.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{encoded});
+}
+
 test "HTTP2 upload pump resumes informational and stops on final headers" {
     var encoder = hpack.HPACKContext.init(std.testing.allocator);
     defer encoder.deinit();
@@ -10603,6 +10661,78 @@ test "buffered Client.request preserves chunked response trailers" {
     server_thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
+}
+
+test "streaming explicit zero H1 limits reject payload before copying but config zero stays unlimited" {
+    const Fixture = struct {
+        input: []const u8,
+        fn read(ptr: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const n = @min(output.len, self.input.len);
+            @memcpy(output[0..n], self.input[0..n]);
+            self.input = self.input[n..];
+            return n;
+        }
+        fn write(_: *anyopaque, input: []const u8) !usize {
+            return input.len;
+        }
+    };
+    const cases = [_]struct { wire: []const u8, body: bool, fixed: bool = false }{
+        .{ .wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", .body = true },
+        .{ .wire = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc", .body = true },
+        .{ .wire = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", .body = true, .fixed = true },
+        .{ .wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", .body = false },
+        .{ .wire = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", .body = false },
+    };
+    for (cases) |case| {
+        for ([_]ResponseLimit{ .{ .bytes = 0 }, .{ .bytes = 3 }, .inherit }) |limit| {
+            var fixture = Fixture{ .input = case.wire };
+            var adapter = TransportAdapter{ .context = &fixture, .readFn = Fixture.read, .writeFn = Fixture.write };
+            var client = try Client.tryInitWithConfig(std.testing.allocator, .{
+                .transport_adapter = &adapter,
+                .policy = types.ClientPolicy.embeddingOwned(),
+                .max_response_size = 0,
+            });
+            defer client.deinit();
+            var op = try client.open(.GET, "http://fixture.test/limit", .{ .response_limit = limit });
+            defer op.deinit();
+            const rejected = case.body and limit == .bytes and limit.bytes == 0;
+            var output: [8]u8 = @splat(0xa5);
+            if (rejected and case.fixed) {
+                try std.testing.expectError(error.ResponseTooLarge, op.finishRequest(null));
+            } else {
+                _ = try op.finishRequest(null);
+                if (rejected) {
+                    try std.testing.expectError(error.ResponseTooLarge, op.read(&output));
+                    try std.testing.expectEqual(@as(u8, 0xa5), output[0]);
+                } else {
+                    var count: usize = 0;
+                    while (true) {
+                        const n = try op.read(&output);
+                        if (n == 0) break;
+                        count += n;
+                    }
+                    try std.testing.expectEqual(@as(usize, if (case.body) 3 else 0), count);
+                }
+            }
+            if (rejected) try std.testing.expectError(error.ResponseTooLarge, op.finish(.{})) else try op.finish(.{});
+        }
+    }
+    const compressed = try compression_util.compress(std.testing.allocator, .gzip, "abc");
+    defer std.testing.allocator.free(compressed);
+    const wire = try std.fmt.allocPrint(std.testing.allocator, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}", .{ compressed.len, compressed });
+    defer std.testing.allocator.free(wire);
+    var fixture = Fixture{ .input = wire };
+    var adapter = TransportAdapter{ .context = &fixture, .readFn = Fixture.read, .writeFn = Fixture.write };
+    var client = try Client.tryInitWithConfig(std.testing.allocator, .{ .transport_adapter = &adapter });
+    defer client.deinit();
+    var op = try client.open(.GET, "http://fixture.test/compressed", .{ .response_limit = .{ .bytes = 3 } });
+    defer op.deinit();
+    _ = try op.finishRequest(null);
+    var body: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try op.read(&body));
+    try std.testing.expectEqualStrings("abc", &body);
+    try op.finish(.{});
 }
 
 test "HTTP1 no-body responses ignore payload metadata before limits and decoders" {
@@ -12746,7 +12876,7 @@ test "HTTP2 upload pump requires initial server SETTINGS before controls" {
     );
 }
 
-test "blocked HTTP2 upload preserves early final headers data and reset" {
+test "streaming blocked HTTP2 upload and separate no-body terminators preserve semantics" {
     const allocator = std.testing.allocator;
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
@@ -12780,9 +12910,11 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
         }
 
         fn runFallible(self: *@This()) !void {
-            for (0..5) |index| {
+            for (0..9) |index| {
+                if (!self.listener.socket.waitReadable(2000)) return error.Timeout;
                 var accepted = try self.listener.accept();
                 defer accepted.socket.close();
+                try accepted.socket.setRecvTimeout(2000);
                 var preface: [http.HTTP2_PREFACE.len]u8 = undefined;
                 try readExact(&accepted.socket, &preface);
                 var payload: [64 * 1024]u8 = undefined;
@@ -12805,8 +12937,8 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
 
                 var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
                 defer manager.deinit();
-                if (index == 3 or index == 4) {
-                    const status_value: []const u8 = if (index == 3) "204" else "200";
+                if (index >= 3) {
+                    const status_value: []const u8 = if (index == 4 or index == 6) "200" else if (index == 7) "304" else "204";
                     const fields = [_]hpack.HeaderEntry{
                         .{ .name = ":status", .value = status_value, .representation = .without_indexing },
                         .{ .name = "content-length", .value = "999999", .representation = .without_indexing },
@@ -12818,11 +12950,23 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
                         &fields,
                         null,
                         16_384,
-                        true,
+                        index < 5,
                         std.heap.page_allocator,
                     );
                     defer std.heap.page_allocator.free(frames);
                     try accepted.socket.sendAll(frames);
+                    if (index == 5) {
+                        try writeHTTP2Frame(&accepted.socket, .data, 0x01, stream_id, &.{});
+                    } else if (index == 6 or index == 7) {
+                        try writeHTTP2Frame(&accepted.socket, .data, 0x08, stream_id, &.{ 1, 0 });
+                        const trailers = try h2stream.buildHeadersAndContinuations(&manager, stream_id, &.{
+                            .{ .name = "x-finished", .value = "yes", .representation = .without_indexing },
+                        }, null, 16_384, true, std.heap.page_allocator);
+                        defer std.heap.page_allocator.free(trailers);
+                        try accepted.socket.sendAll(trailers);
+                    } else if (index == 8) {
+                        try writeHTTP2Frame(&accepted.socket, .data, 0x01, stream_id, "x");
+                    }
                 } else if (index != 1) {
                     const fields = [_]hpack.HeaderEntry{
                         .{ .name = ":status", .value = "413", .representation = .without_indexing },
@@ -12920,7 +13064,7 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
     });
     defer buffered.deinit();
     try std.testing.expectEqual(@as(u16, 413), buffered.status.code);
-    for ([_]types.Method{ .GET, .HEAD }, 0..) |method, index| {
+    for ([_]types.Method{ .GET, .HEAD, .GET, .HEAD, .GET, .GET }, 0..) |method, index| {
         var op = try client.open(method, url, .{
             .version = .HTTP_2,
             .response_limit = .{ .bytes = 1 },
@@ -12929,12 +13073,18 @@ test "blocked HTTP2 upload preserves early final headers data and reset" {
         defer op.deinit();
         const head = try op.finishRequest(null);
         try std.testing.expectEqual(
-            if (index == 0) @as(u16, 204) else @as(u16, 200),
+            if (index == 1 or index == 3) @as(u16, 200) else if (index == 4) @as(u16, 304) else @as(u16, 204),
             head.status.code,
         );
         var byte: [1]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 0), try op.read(&byte));
-        try op.finish(.{});
+        if (index == 5) {
+            try std.testing.expectError(error.ResponseBodyOverrun, op.read(&byte));
+            try std.testing.expectError(error.ResponseBodyOverrun, op.finish(.{}));
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), try op.read(&byte));
+            if (index == 3 or index == 4) try std.testing.expectEqualStrings("yes", op.trailers().?.get("x-finished").?);
+            try op.finish(.{});
+        }
     }
 
     server_thread.join();

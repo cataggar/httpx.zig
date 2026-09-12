@@ -2843,7 +2843,7 @@ pub const Server = struct {
         last_client_stream_id: *u31,
     ) !void {
         try self.ensureContentLengthHeader(response);
-        const response_stream = stream_manager.getStream(stream_id) orelse
+        var response_stream = stream_manager.getStream(stream_id) orelse
             return error.InvalidStreamState;
         if (!response_stream.canSend()) return error.InvalidStreamState;
 
@@ -2915,6 +2915,9 @@ pub const Server = struct {
                     queued_header_deadline,
                     last_client_stream_id,
                 );
+                // The pump may insert streams and move the hashmap values.
+                response_stream = stream_manager.getStream(stream_id) orelse
+                    return error.StreamReset;
                 if (!response_stream.canSend()) return error.StreamReset;
             }
             const stream_window: usize = @intCast(response_stream.send_window);
@@ -5150,6 +5153,95 @@ test "HTTP2 server response obeys stream and connection send windows" {
             try std.testing.expectEqualStrings("lateping", payload[0..frame.length]);
             break;
         }
+    }
+}
+
+test "streaming server response survives multiplexed send-window growth and reset" {
+    for ([_]bool{ false, true }) |reset| {
+        var wire = std.ArrayList(u8).empty;
+        defer wire.deinit(std.testing.allocator);
+        var peer = h2stream.StreamManager.init(std.testing.allocator, true);
+        defer peer.deinit();
+        for (0..32) |index| {
+            const frames = try h2stream.buildHeadersAndContinuations(&peer, @intCast(3 + index * 2), &.{
+                .{ .name = ":method", .value = "GET" },
+                .{ .name = ":scheme", .value = "http" },
+                .{ .name = ":authority", .value = "fixture.test" },
+                .{ .name = ":path", .value = "/" },
+            }, null, 16_384, true, std.testing.allocator);
+            defer std.testing.allocator.free(frames);
+            try wire.appendSlice(std.testing.allocator, frames);
+        }
+        if (reset) {
+            const frame = h2stream.buildRstStreamFrame(1, .cancel);
+            try wire.appendSlice(std.testing.allocator, &frame);
+        } else {
+            const payload = h2stream.buildWindowUpdatePayload(9);
+            const header = (http.HTTP2FrameHeader{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 1 }).serialize();
+            try wire.appendSlice(std.testing.allocator, &header);
+            try wire.appendSlice(std.testing.allocator, &payload);
+        }
+        const Fixture = struct {
+            input: []const u8,
+            output: std.ArrayList(u8) = .empty,
+            fn read(ptr: *anyopaque, output: []u8) !usize {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const n = @min(output.len, self.input.len);
+                @memcpy(output[0..n], self.input[0..n]);
+                self.input = self.input[n..];
+                return n;
+            }
+            fn write(ptr: *anyopaque, input: []const u8) !usize {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try self.output.appendSlice(std.testing.allocator, input);
+                return input.len;
+            }
+        };
+        var fixture = Fixture{ .input = wire.items };
+        defer fixture.output.deinit(std.testing.allocator);
+        var conn = http.HTTP2Connection.init(std.testing.allocator, .{ .context = &fixture, .readFn = Fixture.read }, .{ .context = &fixture, .writeFn = Fixture.write });
+        var manager = h2stream.StreamManager.init(std.testing.allocator, false);
+        defer manager.deinit();
+        {
+            const stream = try manager.getOrCreateStream(1);
+            try stream.open();
+            stream.receiveEndStream();
+            stream.send_window = 0;
+        }
+        const initial_capacity = manager.streams.capacity();
+        var server = Server.init(std.testing.allocator);
+        defer server.deinit();
+        var response = Response.init(std.testing.allocator, 200);
+        defer response.deinit();
+        response.body = "stream-ok";
+        var context = IoContext.init(.{ .request_deadline = Deadline.afterMs(1000) });
+        var pending = std.ArrayList(http.HTTP2Connection.Frame).empty;
+        defer {
+            for (pending.items) |*frame| frame.deinit(std.testing.allocator);
+            pending.deinit(std.testing.allocator);
+        }
+        var pending_bytes: usize = 0;
+        var continuation: ?u31 = null;
+        var header_deadline: ?Deadline = null;
+        var last_stream: u31 = 1;
+        const result = server.sendHTTP2Response(&conn, &manager, 1, &response, &context, &pending, &pending_bytes, &continuation, &header_deadline, &last_stream);
+        if (reset) try std.testing.expectError(error.StreamReset, result) else try result;
+        try std.testing.expect(manager.streams.capacity() > initial_capacity);
+        try std.testing.expectEqual(@as(usize, 32), pending.items.len);
+        try std.testing.expectEqual(h2stream.StreamState.closed, manager.getStream(1).?.state);
+        var offset: usize = 0;
+        var body_bytes: usize = 0;
+        while (offset < fixture.output.items.len) {
+            const header = http.HTTP2FrameHeader.parse(fixture.output.items[offset..][0..9].*);
+            offset += 9;
+            if (header.frame_type == .data) {
+                try std.testing.expectEqualStrings("stream-ok", fixture.output.items[offset..][0..header.length]);
+                try std.testing.expect((header.flags & 1) != 0);
+                body_bytes += header.length;
+            }
+            offset += header.length;
+        }
+        try std.testing.expectEqual(@as(usize, if (reset) 0 else 9), body_bytes);
     }
 }
 

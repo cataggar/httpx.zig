@@ -283,10 +283,13 @@ fn waitSocketReady(
         if (is_windows) {
             var read_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
             var write_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
+            var except_set: winsock.fd_set = .{ .fd_count = 0, .fd_array = undefined };
             const handle = toWinsockSocket(sock);
             if (writable) {
                 write_set.fd_array[0] = handle;
                 write_set.fd_count = 1;
+                except_set.fd_array[0] = handle;
+                except_set.fd_count = 1;
             } else {
                 read_set.fd_array[0] = handle;
                 read_set.fd_count = 1;
@@ -299,7 +302,7 @@ fn waitSocketReady(
                 0,
                 if (writable) null else &read_set,
                 if (writable) &write_set else null,
-                null,
+                if (writable) &except_set else null,
                 &tv,
             );
             if (rc == winsock.SOCKET_ERROR) return if (writable) error.SendFailed else error.RecvFailed;
@@ -1948,6 +1951,20 @@ test "UdpSocket helper API compile checks" {
     _ = broadcast_ptr;
     _ = recv_buf_ptr;
     _ = send_buf_ptr;
+}
+
+test "streaming Windows refused connect completes through exception readiness" {
+    if (!is_windows) return error.SkipZigTest;
+    var endpoint = try Socket.create();
+    defer endpoint.close();
+    try endpoint.bind(try net.Address.parseIp("127.0.0.1", 0));
+    const target = try endpoint.getLocalAddress();
+    var connector = try Socket.create();
+    defer connector.close();
+    const context = IoContext.init(.{ .request_deadline = io_context.Deadline.afterMs(2000) });
+    const started = io_context.monotonicNowNs();
+    try std.testing.expectError(error.ConnectFailed, connector.connectWithContext(target, 0, &context));
+    try std.testing.expect(io_context.monotonicNowNs() - started < std.time.ns_per_s);
 }
 
 test "streaming Unix backlog connect retries with bounded timeout cancellation and recovery" {

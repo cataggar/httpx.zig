@@ -1112,11 +1112,14 @@ pub const DNSResolver = struct {
                 .miss => self.cache.stats.misses += 1,
             }
             self.cache.lock.unlock(common.threadIo());
+            defer switch (cached) {
+                .positive => |cached_addresses| self.allocator.free(cached_addresses),
+                else => {},
+            };
 
             try context.check();
             switch (cached) {
                 .positive => |cached_addresses| {
-                    defer self.allocator.free(cached_addresses);
                     const addrs = try self.filterAddresses(cached_addresses, family, order);
                     for (addrs) |*a| a.setPort(options.port);
                     return .{
@@ -2139,6 +2142,60 @@ test "DNS parsing is allocation safe for partial arrays" {
         error.InvalidDnsName,
         parseDnsMessage(truncated[0..17], std.testing.allocator),
     );
+}
+
+test "streaming DNS cached positive clone is freed when cancellation follows allocation" {
+    const Hook = struct {
+        context: *IoContext,
+        expire: bool,
+        armed: bool = false,
+        triggered: bool = false,
+        live: usize = 0,
+        fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const result = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            self.live += 1;
+            if (self.armed and len == @sizeOf(net.Address)) {
+                self.armed = false;
+                self.triggered = true;
+                if (self.expire) self.context.setPhaseDeadline(Deadline.at(0)) else self.context.cancel();
+            }
+            return result;
+        }
+        fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            return std.testing.allocator.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.live -= 1;
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        const vtable = Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    for ([_]bool{ false, true }) |expire| {
+        var context = IoContext.init(.{});
+        var hook = Hook{ .context = &context, .expire = expire };
+        const allocator = Allocator{ .ptr = &hook, .vtable = &Hook.vtable };
+        var resolver = DNSResolver.init(allocator, .{ .dns_servers = &.{} });
+        defer resolver.deinit();
+        const key = try resolver.makeCacheKey("cached.test", .any);
+        defer allocator.free(key);
+        const addresses = [_]net.Address{net.Address.initIp4(.{ 127, 0, 0, 1 }, 80)};
+        resolver.cache.cacheStore(key, &addresses, 60_000);
+        const before = hook.live;
+        hook.armed = true;
+        try std.testing.expectError(if (expire) error.Timeout else error.Cancelled, resolver.resolveWithContext("cached.test", .{}, &context));
+        try std.testing.expect(hook.triggered);
+        try std.testing.expectEqual(before, hook.live);
+        context = IoContext.init(.{});
+        var result = try resolver.resolveWithContext("cached.test", .{ .port = 81 }, &context);
+        try std.testing.expectEqual(@as(usize, 1), result.addresses.len);
+        result.deinit();
+        try std.testing.expectEqual(before, hook.live);
+    }
 }
 
 test "DNS cache lookup clones addresses before concurrent invalidation" {

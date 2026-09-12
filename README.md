@@ -356,7 +356,13 @@ lifetime and both HTTP/1.x and HTTP/2 preserve it on the wire.
 Streaming counters and limits are `u64`; caller and transport body buffers are
 fixed at 16–64 KiB. gzip/deflate, Brotli, and Zstandard are decoded
 incrementally, and response limits apply to decoded bytes. Decoder history is
-bounded by the format window (Zstandard windows above 32 MiB are rejected).
+bounded by the format window (client-operation Zstandard windows above 32 MiB
+are rejected; the generic decoder uses its configured `StreamingLimits`).
+The generic Zstandard decoder and client operation share block-aware framing:
+each codec step receives at most one block and has 128 KiB output storage.
+Combined blocks and concatenated frames from successive compressor chunks are
+decoded incrementally, with bounded encoded read-ahead and explicit truncation
+errors rather than buffering a whole body.
 TCP connect/read/write, pool waits, configured DNS UDP/TCP queries, and TLS
 record I/O check cancellation in bounded readiness waits. System
 `getaddrinfo` runs in a detached, heap-owned worker: cancellation stops waiting
