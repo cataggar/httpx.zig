@@ -376,6 +376,7 @@ Per-request overrides for configuration.
 | `read_timeout_ms` | `?u64` | `null` | Request-specific read phase timeout override (ms). |
 | `write_timeout_ms` | `?u64` | `null` | Request-specific write phase timeout override (ms). |
 | `timeouts` | `?Timeouts` | `null` | Explicit request-specific `Timeouts` struct override. |
+| `require_interruptible_dns` | `bool` | `false` | Reject hostname routes without a configured pure-Zig DNS resolver, on every platform. |
 | `policy` | `RequestPolicyOverrides` | `{}` | Nullable per-feature overrides resolved against `ClientConfig.policy`. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
 | `proxy` | `?Proxy` | `null` | Per-request forward proxy override. |
@@ -452,6 +453,73 @@ also disables automatic decompression and cookie handling.
 Custom `TransportAdapter` callbacks are synchronous; the embedding application
 must ensure their own blocking behavior is bounded. A context check around a
 callback does not interrupt the callback itself.
+
+### Strict DNS qualification
+
+Set `OpenOptions.require_interruptible_dns = true` for streaming operations or
+`RequestOptions.require_interruptible_dns = true` for buffered requests to require
+interruptible HTTPX-owned hostname resolution. Configure `ClientConfig.dns_resolver`
+with a pure-Zig `DNSResolver` using the embedding application's DNS servers. This
+requirement applies on **all platforms, including Linux**.
+
+The gate checks the final request URI after request interceptors and `no_proxy`
+handling. With an active proxy, its host is the local DNS target, not the origin
+host. Actual IP-literal targets and Unix endpoints need no resolver. Without a
+configured resolver, other strict routes return
+`error.SystemDnsCancellationUnsupported` before acquiring a connection or
+entering native resolution. Buffered redirects recheck their resulting routes.
+This conservative route requirement also applies to potentially pooled
+connections and custom transport adapters.
+
+```zig
+var resolver = httpx.DNSResolver.init(allocator, .{
+    .dns_servers = configured_dns_servers,
+});
+defer resolver.deinit();
+var client = httpx.Client.initWithConfig(allocator, .{
+    .dns_resolver = &resolver,
+    .policy = httpx.ClientPolicy.embeddingOwned(),
+});
+defer client.deinit();
+var op = try client.open(.GET, url, .{
+    .require_interruptible_dns = true,
+    .response_limit = .{ .bytes = 16 * 1024 * 1024 },
+    .timeouts = .{ .request_ms = 30_000 },
+});
+defer op.deinit();
+const head = try op.finishRequest(null);
+// Borrow head.headers and consume with op.read(caller_buffer).
+try op.finish(.{});
+```
+
+The resolver and its borrowed server configuration must outlive the client and
+all its operations. Configured DNS uses context-aware UDP and TCP fallback;
+expired deadlines and cancellation stop those exchanges without detached
+lookup workers.
+
+The default `require_interruptible_dns = false` preserves ordinary behavior.
+System resolution still uses a detached, self-owning worker. Cancellation stops
+the caller's wait, **not** the native lookup; that worker retains its resources
+until native completion. `httpx.system_dns_cancellation` is therefore
+`SystemDnsCancellation.completion_only` on every platform in this implementation.
+This reports cancellation capability, not system resolver availability. Do not
+treat prompt return from a detached lookup as bounded native work or cleanup.
+The strict DNS gate does not make arbitrary adapter callbacks, allocator locks,
+CPU-bound cryptography, or filesystem operations forcibly interruptible.
+
+Use `timeouts.request_ms` for the entire operation lifetime: `timeout_ms` only
+overrides phase timeouts. An adapter translating an absolute parent deadline
+must reject an already-expired deadline rather than convert it to zero, because
+zero disables the request timeout.
+
+### Unix endpoint and protocol selection
+
+An explicit Unix endpoint never falls back to TCP. Plain HTTP/1.x is supported;
+Unix with HTTP/2 enabled/selected or a TLS URI returns
+`error.UnsupportedStreamingTransport`, rather than silently downgrading the
+protocol. Disable client HTTP/2 selection when using a plain HTTP/1.x Unix
+endpoint. Public HTTP/3 remains rejected with `error.UnsupportedHttpVersion`
+before transport access, including when a Unix endpoint is configured.
 
 When multiple body-style fields are provided, precedence is:
 

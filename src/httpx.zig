@@ -27,6 +27,8 @@ pub const socket = @import("net/socket.zig");
 const io_context = @import("io/context.zig");
 
 pub const address = @import("net/address.zig");
+pub const SystemDnsCancellation = address.SystemDnsCancellation;
+pub const system_dns_cancellation = address.system_dns_cancellation;
 
 pub const unix = @import("net/unix.zig");
 
@@ -818,6 +820,7 @@ pub fn optsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_
 
 test {
     _ = client_mod;
+    _ = @import("client/dns_qualification_test.zig");
     _ = socket;
     _ = address;
     _ = dns;

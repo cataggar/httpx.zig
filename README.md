@@ -365,6 +365,19 @@ call returns. Unix-domain connects use the same nonblocking readiness loop as
 TCP, except that a full Linux Unix listener backlog requires bounded retries of
 `connect` itself rather than writable-socket completion.
 
+For strict hostname DNS cancellation, set `require_interruptible_dns = true`
+in `OpenOptions` or `RequestOptions` and supply a pure-Zig
+`ClientConfig.dns_resolver` using your application's DNS servers. This applies
+on every platform; IP-literal targets and Unix endpoints are exempt. The final
+route is checked after interceptors and proxy bypass. Otherwise strict requests
+fail before native DNS with `SystemDnsCancellationUnsupported`.
+`httpx.system_dns_cancellation` reports `.completion_only` for the detached
+system resolver; default non-strict behavior is unchanged. See
+[strict DNS qualification](docs/api/client.md#strict-dns-qualification).
+
+Unix with HTTP/2 selected or a TLS URI is explicitly unsupported, not silently
+downgraded or redirected to TCP. Public HTTP/3 remains rejected.
+
 The operation and client handles may move between calls; borrowed response
 heads and trailers remain valid until operation `deinit`. The client and its
 allocator must outlive every operation and buffered response. A body/framing

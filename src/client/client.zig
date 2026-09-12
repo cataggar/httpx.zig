@@ -331,6 +331,9 @@ pub const RequestOptions = struct {
     /// Optional borrowed cancellation token. It must outlive the request.
     /// The client only observes this token and never signals it.
     cancel_token: ?*const types.CancellationToken = null,
+    /// Require configured pure-Zig DNS for hostname routes on every platform.
+    /// IP literals and Unix endpoints do not require a resolver.
+    require_interruptible_dns: bool = false,
     policy: types.RequestPolicyOverrides = .{},
     version: ?types.Version = null,
     multipart_fields: ?[]const MultipartField = null,
@@ -1131,6 +1134,7 @@ pub const Client = struct {
             context,
             effective_policy.decompression,
             logical_request_id,
+            open_options.require_interruptible_dns,
         ) catch |err| {
             notifyInterceptorErrors(interceptors, err, &attempt_context);
             return err;
@@ -1219,6 +1223,7 @@ pub const Client = struct {
         context: IoContext,
         decompression: types.DecompressionPolicy,
         logical_request_id: u64,
+        require_interruptible_dns: bool,
     ) !ClientOperation {
         const impl = try self.allocator.create(OperationImpl);
         errdefer self.allocator.destroy(impl);
@@ -1239,6 +1244,7 @@ pub const Client = struct {
             decompression,
             logical_request_id,
         );
+        impl.require_interruptible_dns = require_interruptible_dns;
         errdefer impl.deinitResources();
         try impl.start();
         impl.owns_request = owns_request;
@@ -1971,6 +1977,7 @@ pub const Client = struct {
             context.*,
             effective_policy.decompression,
             0,
+            req_opts.require_interruptible_dns,
         );
         defer op.deinit();
 
@@ -4349,6 +4356,7 @@ const OperationImpl = struct {
     context: IoContext,
     decompression: types.DecompressionPolicy,
     logical_request_id: u64,
+    require_interruptible_dns: bool = false,
 
     lease: ?ConnectionLease = null,
     owned_socket: ?Socket = null,
@@ -4537,6 +4545,16 @@ const OperationImpl = struct {
             if (self.proxy) |configured| {
                 if (configured.shouldBypassProxy(request_host)) self.proxy = null;
             }
+        }
+        if (self.require_interruptible_dns and
+            self.shared.config.dns_resolver == null and
+            self.unix_socket_path == null)
+        {
+            const dns_host = if (self.proxy) |configured|
+                configured.host
+            else
+                self.req.uri.host orelse return error.InvalidUri;
+            if (!address_mod.isIpAddress(dns_host)) return error.SystemDnsCancellationUnsupported;
         }
         if (self.shared.config.transport_adapter != null) {
             if (self.req.version == .HTTP_2) {

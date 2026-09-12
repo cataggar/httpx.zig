@@ -15,6 +15,13 @@ const IoContext = @import("../io/context.zig").IoContext;
 pub const Address = net.Address;
 pub const AddressList = net.AddressList;
 
+pub const SystemDnsCancellation = enum { interruptible, completion_only, unavailable };
+
+/// Cancellation stops waiting for system DNS, not the detached native lookup.
+/// Worker cleanup requires native completion on every platform. This describes
+/// cancellation capability, not whether a system resolver is available.
+pub const system_dns_cancellation: SystemDnsCancellation = .completion_only;
+
 /// Resolves a hostname to a network address.
 pub fn resolve(allocator: Allocator, hostname: []const u8, port: u16) !net.Address {
     if (parseIp4(hostname)) |ip4| {

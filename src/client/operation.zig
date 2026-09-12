@@ -74,6 +74,9 @@ pub const OpenOptions = struct {
     header_ms: ?u64 = null,
     timeouts: ?types.Timeouts = null,
     cancel_token: ?*const types.CancellationToken = null,
+    /// Require configured pure-Zig DNS for hostname routes on every platform.
+    /// IP literals and Unix endpoints do not require a resolver.
+    require_interruptible_dns: bool = false,
     policy: types.RequestPolicyOverrides = .{},
     version: ?types.Version = null,
     proxy: ?types.Proxy = null,
