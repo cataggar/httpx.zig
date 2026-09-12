@@ -1,10 +1,11 @@
-//! Immutable, native-free certificate path policy. Certificate signatures use
+//! Immutable certificate path policy. Certificate signatures use
 //! only the request's selected verifier; system roots are discovery input, not
 //! permission to bypass path policy. See docs/api/standard-trust.md.
 const std = @import("std");
 const builtin = @import("builtin");
 const trust = @import("trust.zig");
 const x509 = @import("x509_policy.zig");
+const platform = @import("platform_trust.zig");
 const Error = trust.TrustError;
 const Allocator = std.mem.Allocator;
 
@@ -14,15 +15,18 @@ pub const Options = struct {
     max_certificate_der_bytes: usize = 256 * 1024,
     max_trust_store_der_bytes: usize = 16 * 1024 * 1024,
     max_pem_bytes: usize = 32 * 1024 * 1024,
-    /// Peak allocator payload used by stdlib system-root discovery.
+    /// Peak Zig allocator payload used by system discovery. OS-owned API
+    /// allocations are not controlled by a Zig allocator.
     max_system_load_bytes: usize = 64 * 1024 * 1024,
+    /// Includes distrust-only certificates, not just anchor candidates.
+    max_system_certificates: usize = 8192,
     /// Root-discovery snapshot time, not the per-handshake verification time.
     load_time_seconds: ?i64 = null,
 
     fn validate(self: Options) Error!void {
         if (self.max_trust_anchors == 0 or self.max_certificate_der_bytes == 0 or
             self.max_trust_store_der_bytes < self.max_certificate_der_bytes or
-            self.max_pem_bytes == 0 or self.max_system_load_bytes == 0)
+            self.max_pem_bytes == 0 or self.max_system_load_bytes == 0 or self.max_system_certificates == 0)
             return error.TlsInvalidTrustConfiguration;
     }
 };
@@ -41,6 +45,7 @@ pub const TrustContext = struct {
     allocator: Allocator,
     anchors: []Anchor,
     borrowed: ?trust.TrustProvider = null,
+    platform_snapshot: ?platform.Snapshot = null,
     /// System certificates outside this strict profile are never trusted.
     skipped_system_anchors: usize = 0,
 
@@ -69,10 +74,13 @@ pub const TrustContext = struct {
             }
         }.lessThan);
         const anchors = try builder.anchors.toOwnedSlice(allocator);
+        const snapshot = builder.platform_snapshot;
+        builder.platform_snapshot = null;
         return .{
             .allocator = allocator,
             .anchors = anchors,
             .skipped_system_anchors = builder.skipped,
+            .platform_snapshot = snapshot,
         };
     }
 
@@ -87,6 +95,7 @@ pub const TrustContext = struct {
     pub fn deinit(self: *TrustContext) void {
         for (self.anchors) |anchor| self.allocator.free(anchor.bytes);
         self.allocator.free(self.anchors);
+        if (self.platform_snapshot) |*snapshot| snapshot.deinit();
         self.* = undefined;
     }
 
@@ -106,6 +115,7 @@ pub const TrustContext = struct {
         }
         try peers[0].checkPolicy(request.now_seconds, request.role, false, 0);
         if (request.expected_identity) |identity| try peers[0].checkIdentity(identity);
+        _ = try self.checkMetadata(peers[0], request, false, false);
         if (request.limits.max_path_depth < 2) return error.TlsCertificatePathTooDeep;
 
         const visited = try allocator.alloc(bool, peers.len);
@@ -154,6 +164,10 @@ pub const TrustContext = struct {
                 failure = err;
                 continue;
             };
+            const self_signature_required = self.checkMetadata(issuer, request, true, is_anchor) catch |err| {
+                failure = err;
+                continue;
+            };
             if (child.authority_key_id) |authority_id| {
                 if (issuer.subject_key_id) |subject_id| {
                     if (!std.mem.eql(u8, authority_id, subject_id)) {
@@ -167,6 +181,13 @@ pub const TrustContext = struct {
                 failure = err;
                 continue;
             };
+            if (self_signature_required) {
+                verifyEdge(issuer, issuer, request.signature_verifier) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    failure = err;
+                    continue;
+                };
+            }
             // An anchor's provenance is its configured/system trust source.
             // Its self-signature is not a trust proof; all child edges are.
             if (is_anchor) return;
@@ -176,6 +197,22 @@ pub const TrustContext = struct {
             depth += 1;
         }
         return if (depth_limited) error.TlsCertificatePathTooDeep else failure;
+    }
+
+    fn checkMetadata(self: *const TrustContext, certificate: x509.Certificate, request: trust.VerifyPeerRequest, issuer: bool, anchor: bool) Error!bool {
+        const snapshot = self.platform_snapshot orelse return false;
+        return switch (snapshot.decide(certificate.der_bytes, .{
+            .role = request.role,
+            .identity = request.expected_identity,
+            .now_seconds = request.now_seconds,
+            .issuer = issuer,
+            .self_issued = certificate.selfIssued(),
+        })) {
+            .deny => error.TlsCertificateConstraintViolation,
+            .chain_only => if (anchor) error.TlsCertificateConstraintViolation else false,
+            .anchor => false,
+            .self_signed_anchor => anchor,
+        };
     }
 
     fn frame(self: *const TrustContext, child: x509.Certificate, index: usize, ca_below: usize) Frame {
@@ -219,13 +256,12 @@ fn verifyEdge(child: x509.Certificate, issuer: x509.Certificate, verifier: trust
     };
 }
 
-/// Native-free system root-file discovery is available on these targets.
-/// Other targets require explicit custom anchors or a supplied TrustProvider.
-/// In particular, stdlib keychain/ROOT export does not preserve all platform
-/// distrust and purpose metadata, so it is not used as an OS trust evaluator.
+/// Root-file discovery or a metadata-aware, read-only OS snapshot is available.
+/// Unsupported OS metadata fails closed; this is not OS chain-engine parity.
 pub fn supportsSystemRoots() bool {
     return switch (builtin.os.tag) {
-        .linux, .freebsd, .openbsd, .netbsd, .dragonfly, .illumos, .haiku, .serenity => true,
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly, .illumos, .haiku, .serenity, .windows => true,
+        .macos => true,
         else => false,
     };
 }
@@ -236,10 +272,12 @@ const Builder = struct {
     anchors: std.ArrayList(Anchor) = .empty,
     der_bytes: usize = 0,
     skipped: usize = 0,
+    platform_snapshot: ?platform.Snapshot = null,
 
     fn deinit(self: *Builder) void {
         for (self.anchors.items) |anchor| self.allocator.free(anchor.bytes);
         self.anchors.deinit(self.allocator);
+        if (self.platform_snapshot) |*snapshot| snapshot.deinit();
     }
 
     fn add(self: *Builder, bytes: []const u8) Error!void {
@@ -315,6 +353,26 @@ const Builder = struct {
         if (comptime !supportsSystemRoots()) return error.TlsTrustStoreLoadFailed;
         var limited = LoadAllocator{ .child = self.allocator, .limit = self.options.max_system_load_bytes };
         const allocator = limited.allocator();
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .macos) {
+            const loader = if (builtin.os.tag == .windows) @import("platform_trust_windows.zig") else @import("platform_trust_macos.zig");
+            var snapshot = loader.load(allocator, .{
+                .max_certificates = self.options.max_system_certificates,
+                .max_certificate_bytes = self.options.max_certificate_der_bytes,
+                .max_der_bytes = self.options.max_trust_store_der_bytes,
+            }) catch |err| return if (err == error.OutOfMemory and limited.limit_hit) error.TlsTrustStoreLoadFailed else err;
+            // The limiting allocator lives only during construction. Ownership
+            // transfers to its underlying allocator, never to its stack address.
+            snapshot.allocator = self.allocator;
+            self.platform_snapshot = snapshot;
+            for (snapshot.entries.items) |entry| {
+                if (!entry.anchor_candidate) continue;
+                self.add(entry.der) catch |err| switch (err) {
+                    error.TlsMalformedCertificate, error.TlsCertificateUsageInvalid, error.TlsCertificateConstraintViolation => self.skipped += 1,
+                    else => return err,
+                };
+            }
+            return;
+        }
         var bundle: std.crypto.Certificate.Bundle = .empty;
         defer bundle.deinit(allocator);
         const now: std.Io.Timestamp = if (self.options.load_time_seconds) |seconds|

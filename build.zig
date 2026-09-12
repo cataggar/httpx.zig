@@ -2,11 +2,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 fn linkPlatformLibs(compile: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    linkTrustPlatformLibs(compile.root_module, target);
     if (target.result.os.tag == .windows) {
         // Winsock symbols are provided by these system libraries on Windows.
         compile.root_module.linkSystemLibrary("ws2_32", .{});
         compile.root_module.linkSystemLibrary("mswsock", .{});
         compile.root_module.linkSystemLibrary("c", .{});
+    }
+}
+
+fn linkTrustPlatformLibs(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    switch (target.result.os.tag) {
+        .windows => module.linkSystemLibrary("crypt32", .{}),
+        .macos => {
+            module.linkFramework("Security", .{});
+            module.linkFramework("CoreFoundation", .{});
+        },
+        else => {},
     }
 }
 
@@ -36,7 +48,9 @@ pub fn build(b: *std.Build) void {
     // Dependencies must be added here so they propagate to downstream packages.
     const httpx_module = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
     });
+    linkTrustPlatformLibs(httpx_module, target);
 
     httpx_module.addImport("zstd", zstd_dep.module("zstd"));
     httpx_module.addImport("brotli", brotli_dep.module("brotli"));
@@ -181,6 +195,27 @@ pub fn build(b: *std.Build) void {
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
+
+    inline for (.{
+        .{ "test-tls-standard-trust", "src/tls/platform_trust_test.zig", "Run deterministic certificate and platform metadata policy tests" },
+        .{ "test-tls-system-trust", "src/tls/standard_trust_system_test.zig", "Read-only native system trust snapshot qualification" },
+    }) |entry| {
+        const trust_tests = b.addTest(.{
+            .name = entry[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(entry[1]),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        linkTrustPlatformLibs(trust_tests.root_module, target);
+        const step = b.step(entry[0], entry[2]);
+        if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
+            step.dependOn(&b.addRunArtifact(trust_tests).step);
+        } else {
+            step.dependOn(&b.addInstallArtifact(trust_tests, .{}).step);
+        }
+    }
 
     const provider_tests = b.addTest(.{
         .root_module = b.createModule(.{

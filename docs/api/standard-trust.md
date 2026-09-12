@@ -40,7 +40,8 @@ Complete all calls before destroying the context.
 
 `Options.source` accepts the existing `TrustSource`:
 
-- `.system`: snapshot available platform root files at initialization.
+- `.system`: snapshot available platform root files or read-only OS trust
+  metadata at initialization.
 - `.system_plus_custom`: require system discovery to succeed, then add custom
   anchors. Failure does **not** silently degrade to custom-only mode.
 - `.custom_only`: exclusively use `.der_certificates`, `.pem_bytes`, or
@@ -52,20 +53,25 @@ Custom PEM accepts certificate blocks and surrounding ASCII whitespace, not
 private keys, bag attributes, arbitrary text, or incomplete blocks. A named
 relative PEM path is relative to the current working directory. Anchors must
 be CA certificates within the supported profile, not arbitrary self-signed
-leaf pins. An empty usable store fails with `TlsNoTrustAnchors`.
+leaf pins. An empty parsed CA store fails with `TlsNoTrustAnchors`; platform
+metadata can further restrict which candidates are eligible for a request.
 
 All non-anchor certificate signatures go through the supplied
 `CertificateSignatureVerifier`, normally `CryptoCertificateVerifier` backed
 by the selected `CryptoProvider`. Unsupported algorithms, invalid signatures,
 and allocation failures are returned; there is no std/native verification
-fallback. Root discovery uses stdlib parsing only to read root material, never
-`Certificate.verify`, `Bundle.verify`, or native chain verification.
+fallback. Where stdlib root-file parsing is used, it is discovery only.
+Neither `Certificate.verify`, `Bundle.verify`, nor native chain verification
+is used.
 
 A configured anchor is trusted because of its source, **not** because it has
 a valid self-signature. Anchor CA, validity, key-usage, EKU, path-length, and
-supported-extension restrictions still apply. Its self-signature is not
-verified, so an older anchor's SHA-1 self-signature does not authorize SHA-1
-signatures on peer certificates.
+supported-extension restrictions still apply. Normally its self-signature
+is not verified, so an older anchor's SHA-1 self-signature does not authorize
+SHA-1 signatures on peer certificates. A macOS `trustRoot` setting additionally
+requires a self-issued certificate and a valid self-signature through the
+selected verifier; this intentionally excludes SHA-1 `trustRoot` self-signatures.
+This extra classification check does not itself establish trust.
 
 ## Policy profile
 
@@ -124,11 +130,23 @@ It additionally caps extensions at 64, GeneralNames/attributes at 256, and
 opaque constructed name nesting at eight levels.
 
 Initialization defaults are 4,096 anchors, 256 KiB per certificate, 16 MiB
-retained DER, 32 MiB input PEM, and 64 MiB peak stdlib discovery allocation.
-All are configurable through `Options`; zero/inconsistent limits fail.
-`load_time_seconds` selects a deterministic root-discovery snapshot time;
-per-request verification always uses `VerifyPeerRequest.now_seconds`.
+anchor DER, 32 MiB input PEM, and 64 MiB peak Zig-managed discovery allocation.
+Native snapshots separately cap 8,192 system certificates (including distrust
+entries), 16 MiB metadata-associated DER, 64 rules per certificate/domain,
+64 KiB per Windows property, and 254 ASCII bytes per hostname constraint.
+The native snapshot retains its own DER and rule copies. OS-owned allocations
+inside Crypt32/CoreFoundation are not governed by a Zig allocator; counts and
+output sizes are checked before copying. The discovery budget does not include
+the separately bounded final anchor copies.
+`Options` configures the anchor, certificate-count, DER, PEM, and discovery
+budgets; zero/inconsistent limits fail. Rule/property/hostname caps are fixed
+implementation limits.
+`load_time_seconds` selects the root-file loader's snapshot time. Native
+snapshots read current OS state; all verification validity/cutoff checks use
+`VerifyPeerRequest.now_seconds`.
 `anchorCount()` and `skipped_system_anchors` expose snapshot statistics.
+The count is anchor candidates, not an assertion of eligibility for a given
+purpose/identity; the skipped count covers DER/profile parsing exclusions.
 Malformed/unsupported system anchors are excluded, never silently trusted;
 malformed/unsupported custom anchors fail initialization.
 
@@ -139,18 +157,61 @@ malformed/unsupported custom anchors fail initialization.
 | aarch64 Linux | Zig stdlib standard CA-file/directory discovery | DER/PEM/file | Native Debug/ReleaseSafe local chain tests; local OS root-load test |
 | x86_64 Linux | Same implementation | DER/PEM/file | Source/type compilation; native runtime still requires CI |
 | FreeBSD/OpenBSD/NetBSD/DragonFly/illumos/Haiku/Serenity | Zig stdlib designated CA file | DER/PEM/file | Implemented file-store dispatch; not runtime-qualified here |
-| macOS / Mac Catalyst | Explicit `TlsTrustStoreLoadFailed` | DER/PEM/file or supplied provider | macOS source/type compilation only |
-| Windows | Explicit `TlsTrustStoreLoadFailed` | DER/PEM/file or supplied provider | Windows source/type compilation only |
-| Other targets | Explicit `TlsTrustStoreLoadFailed` | Where the target supports required Zig allocation/IO | Not qualified |
+| macOS desktop | Security/CoreFoundation anchor and trust-settings snapshot | DER/PEM/file or supplied provider | Implemented; source/type compilation here; native CI required |
+| Windows | Crypt32 ROOT/Disallowed metadata snapshot, **blocked when unsupported CTLs exist** | DER/PEM/file or supplied provider | Partial system profile; source/link compilation, not native runtime qualification |
+| Other targets, including Mac Catalyst | Explicit `TlsTrustStoreLoadFailed` | Where the target supports required Zig allocation/IO | Not qualified |
 
-macOS's stdlib keychain export includes `System.keychain` certificates without
-effective per-certificate trust/distrust settings. Windows ROOT export omits
-purpose/distrust metadata; delegating to native chain verification would also
-perform certificate signatures outside the selected primitive provider.
-Neither export is represented as complete production OS trust here. Proper
-platform trust metadata/root selection, implemented without hidden signature
-fallback, remains a distinct requirement for those defaults. Custom-only
-trust is not labeled system trust.
+Windows links Crypt32. macOS links Security and CoreFoundation. These are
+platform system libraries accessed through Zig declarations: no C source,
+shim, third-party TLS/crypto library, or OS certificate-signature fallback.
+Linux/custom policy remains pure Zig, with no added Linux native linkage.
+Downstream build integration must propagate the same platform links.
+
+### Windows snapshot and pending CTL support
+
+Read-only, existing logical ROOT and Disallowed stores are inspected in current
+user and local machine scope. Duplicate restrictions intersect; explicit
+distrust is applied to selected leaf/intermediate/anchor certificates, including
+custom duplicates in `system_plus_custom`. DER EKU and context EKU properties
+are intersected by `CertGetEnhancedKeyUsage`; absent usage and explicitly empty
+(disabled) usage remain distinct.
+
+Disallowed EKU and time properties are retained. Time cutoffs conservatively
+reject **all** use at/after the earliest cutoff, rather than grandfathering
+older issuance. Unsupported root-program certificate policies, name
+constraints, and chain policies exclude the affected certificate. Property
+errors, malformed values, and size races fail initialization.
+
+Hash-only CTLs are **not yet implemented**. CTLs found in logical stores, or
+cached AuthRoot/Disallowed CTL values detected through existing read-only Zig
+NT registry bindings, fail initialization. This can block ordinary provisioned
+Windows machines; general Windows system trust is not claimed complete.
+Completing it needs bounded CTL interpretation and an approved fingerprint
+matching seam: ABI-v1 currently exposes signatures, not hashes. Detection is
+not a permanent OS/API blocker and must not be removed to make CI green.
+The loader never downloads roots or invokes a native chain engine.
+
+### macOS snapshot and strict projection
+
+`SecTrustCopyAnchorCertificates` supplies baseline anchors; public trust-settings
+APIs supply user, administrator, and system records. Domain priority is user
+before administrator before system. Absence differs from an empty settings
+array (`trustRoot`). `deny`, `unspecified`, `trustRoot`, and `trustAsRoot` are
+distinct; non-CA leaf pinning remains outside this profile.
+
+Supported rules constrain SSL server/client purpose, certificate versus data
+signing key use, and exact DNS/IP identity. Rules are alternatives, with deny
+winning within a domain. An unspecified result cannot establish trust or mask
+a lower-domain deny. A present but nonmatching higher-domain record does not
+inherit a broader grant from below. This is intentionally stricter than relying
+on unspecified platform fallback behavior.
+
+Application code-identity constraints, allowed-error waivers, non-SSL policies,
+unknown rule/property keys, and unsupported identity forms fail closed rather
+than becoming unrestricted trust. All retained metadata is copied; CF objects
+are released on success and failure. Discovery is an immutable best-effort
+snapshot, not an atomic OS trust-settings transaction. Reinitialize after trust
+settings change. Full trustd/OS chain-policy parity is not claimed.
 
 File-store discovery inherits Zig's snapshot behavior, including exclusion of
 expired/unrecognized certificates and subject-name deduplication. A skipped
@@ -160,13 +221,26 @@ handshake qualification is claimed by these local tests.
 
 ## Local validation
 
-Run from the package root, keeping caches inside this worktree:
+Run from the package root, keeping caches inside this worktree. Direct commands
+below are for Linux; use the build targets on Windows/macOS to supply OS links:
 
 ```sh
 zig test src/tls/standard_trust_test.zig --cache-dir .zig-cache/trust-policy
 zig test src/tls/standard_trust_test.zig --cache-dir .zig-cache/trust-policy -O ReleaseSafe
 zig test src/tls/standard_trust_system_test.zig --cache-dir .zig-cache/trust-policy
+zig build test-tls-standard-trust test-tls-system-trust --summary all
+zig build test-tls-standard-trust test-tls-system-trust -Doptimize=ReleaseSafe --summary all
 ```
+
+`test-tls-standard-trust` includes hermetic platform metadata cases and
+process-local native API fixtures on their own OS. `test-tls-system-trust`
+reads the installed store; it never changes it. The dedicated native CI
+workflow runs both in Debug/ReleaseSafe on hosted Linux, Windows, and macOS.
+It has not been run remotely as part of local implementation. Unsupported
+system state fails that qualification gate, rather than being skipped.
+No mutable user/machine trust-store fixture or hidden setup command is included.
+Actual domain/store mutation tests require a separately approved, explicitly
+guarded disposable-runner fixture; never run them on a shared development host.
 
 `trust_fixtures.zig` creates deterministic local Ed25519 and P-256 chains in
 pure Zig. `fixtures/trust/root_ed25519.pem` is the reproducible named file

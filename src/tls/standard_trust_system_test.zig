@@ -2,7 +2,7 @@
 const std = @import("std");
 const policy = @import("standard_trust.zig");
 
-test "supported native-free system stores supply bounded usable roots" {
+test "supported read-only system stores supply bounded anchor candidates" {
     if (!policy.supportsSystemRoots()) {
         try std.testing.expectError(error.TlsTrustStoreLoadFailed, policy.TrustContext.init(
             std.testing.allocator,
@@ -11,6 +11,8 @@ test "supported native-free system stores supply bounded usable roots" {
         ));
         return;
     }
+    if (@import("builtin").os.tag == .windows and try @import("platform_trust_windows.zig").hasUnsupportedCachedCtl())
+        std.debug.print("system trust blocked: cached hash-only Windows CTL policy is not yet supported\n", .{});
     var owner = try policy.TrustContext.init(std.testing.allocator, std.testing.io, .{});
     defer owner.deinit();
     try std.testing.expect(owner.anchorCount() > 0);
