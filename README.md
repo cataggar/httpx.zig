@@ -362,7 +362,16 @@ record I/O check cancellation in bounded readiness waits. System
 `getaddrinfo` runs in a detached, heap-owned worker: cancellation stops waiting
 immediately, while the worker self-cleans after the non-interruptible platform
 call returns. Unix-domain connects use the same nonblocking readiness loop as
-TCP.
+TCP, except that a full Linux Unix listener backlog requires bounded retries of
+`connect` itself rather than writable-socket completion.
+
+The operation and client handles may move between calls; borrowed response
+heads and trailers remain valid until operation `deinit`. The client and its
+allocator must outlive every operation and buffered response. A body/framing
+failure remains an error when `finish` is called later; failed completion is
+never reported as successful reuse. See the
+[streaming ownership contract](docs/api/client.md#streaming-operation-ownership-and-completion)
+for limits, interceptors, and callback lifetimes.
 
 ### Simplified API Aliases
 

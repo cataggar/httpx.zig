@@ -1017,14 +1017,33 @@ pub const Socket = struct {
                 return error.ConnectFailed;
             }
         } else {
-            const rc = posix.system.connect(self.handle, addr_ptr, addr_len);
-            switch (posix.errno(rc)) {
-                .SUCCESS => {
-                    self.connected = true;
-                    return;
-                },
-                .INPROGRESS, .ALREADY => {},
-                else => return error.ConnectFailed,
+            while (true) {
+                try context.check();
+                if (deadline_ns) |deadline| {
+                    if (io_context.monotonicNowNs() >= deadline) return error.ConnectionTimeout;
+                }
+                const rc = posix.system.connect(self.handle, addr_ptr, addr_len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        try context.check();
+                        self.connected = true;
+                        return;
+                    },
+                    .INPROGRESS, .ALREADY => break,
+                    .AGAIN => {
+                        if (builtin.os.tag != .linux or addr_ptr.family != posix.AF.UNIX) {
+                            return error.ConnectFailed;
+                        }
+                        // A full Unix accept queue has not started connecting.
+                        // Retry connect, not writable/SO_ERROR completion.
+                        const delay = if (deadline_ns) |deadline|
+                            @min(io_context.max_wait_slice_ns, deadline -| io_context.monotonicNowNs())
+                        else
+                            io_context.max_wait_slice_ns;
+                        try context.waitForNs(delay);
+                    },
+                    else => return error.ConnectFailed,
+                }
             }
         }
 
@@ -1929,4 +1948,92 @@ test "UdpSocket helper API compile checks" {
     _ = broadcast_ptr;
     _ = recv_buf_ptr;
     _ = send_buf_ptr;
+}
+
+test "streaming Unix backlog connect retries with bounded timeout cancellation and recovery" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const unix_mod = @import("unix.zig");
+    const Deadline = io_context.Deadline;
+    const now = io_context.monotonicNowNs;
+    var path_buffer: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "httpx-unix-backlog-{d}.sock", .{now()});
+    var listener = try unix_mod.UnixListener.init(path);
+    defer listener.deinit();
+    var borrowed_listener = Socket.fromHandle(listener.fd);
+    try borrowed_listener.listen(1);
+    const setup = IoContext.init(.{ .request_deadline = Deadline.afterMs(3000) });
+    var first = try unix_mod.UnixClient.connectWithContext(path, 0, &setup);
+    defer first.close();
+    var second = try unix_mod.UnixClient.connectWithContext(path, 0, &setup);
+    defer second.close();
+
+    const timeout = IoContext.init(.{ .request_deadline = Deadline.afterMs(25) });
+    const timeout_started = now();
+    try std.testing.expectError(error.Timeout, unix_mod.UnixClient.connectWithContext(path, 1000, &timeout));
+    try std.testing.expect(now() - timeout_started < std.time.ns_per_s);
+    try std.testing.expectError(error.ConnectionTimeout, unix_mod.UnixClient.connectWithContext(path, 25, &setup));
+
+    const Canceller = struct {
+        fn run(context: *IoContext) void {
+            const delay = IoContext.init(.{});
+            delay.waitForMs(25) catch unreachable;
+            context.cancel();
+        }
+    };
+    {
+        var context = IoContext.init(.{ .request_deadline = Deadline.afterMs(1000) });
+        const thread = try std.Thread.spawn(.{}, Canceller.run, .{&context});
+        defer thread.join();
+        const started = now();
+        try std.testing.expectError(error.Cancelled, unix_mod.UnixClient.connectWithContext(path, 500, &context));
+        try std.testing.expect(now() - started < std.time.ns_per_s);
+    }
+
+    const Acceptor = struct {
+        listener: *unix_mod.UnixListener,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.acceptLater() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn acceptLater(self: *@This()) !void {
+            const delay = IoContext.init(.{ .request_deadline = Deadline.afterMs(1000) });
+            try delay.waitForMs(25);
+            try waitSocketReady(self.listener.fd, false, &delay, null);
+            var accepted = try self.listener.accept();
+            accepted.socket.close();
+        }
+    };
+    var acceptor = Acceptor{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, Acceptor.run, .{&acceptor});
+    var joined = false;
+    defer if (!joined) thread.join();
+    const retry = IoContext.init(.{ .request_deadline = Deadline.afterMs(1000) });
+    const retry_started = now();
+    var connected = try unix_mod.UnixClient.connectWithContext(path, 500, &retry);
+    defer connected.close();
+    try std.testing.expect(now() - retry_started >= 20 * std.time.ns_per_ms);
+    thread.join();
+    joined = true;
+    try std.testing.expect(acceptor.failure == null);
+
+    try waitSocketReady(listener.fd, false, &setup, null);
+    var queued_second = try listener.accept();
+    queued_second.socket.close();
+    try waitSocketReady(listener.fd, false, &setup, null);
+    var peer = Socket.fromHandle((try listener.accept()).socket.fd);
+    defer peer.close();
+    var sender = Socket.fromHandle(connected.fd);
+    try sender.sendAllWithContext("ok", &setup);
+    var response: [2]u8 = undefined;
+    var received: usize = 0;
+    while (received < response.len) {
+        const n = try peer.recvWithContext(response[received..], &setup);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        received += n;
+    }
+    try std.testing.expectEqualStrings("ok", &response);
 }

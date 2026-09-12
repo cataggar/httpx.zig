@@ -816,6 +816,13 @@ pub fn optsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_
     return optionsWithAllocator(allocator, url, options_in);
 }
 
+test {
+    _ = client_mod;
+    _ = socket;
+    _ = address;
+    _ = dns;
+}
+
 test "top-level alias compile checks" {
     const get_ptr: *const fn ([]const u8, RequestOptions) anyerror!Response = get;
     const get_alloc_ptr: *const fn (std.mem.Allocator, []const u8, RequestOptions) anyerror!Response = getWithAllocator;

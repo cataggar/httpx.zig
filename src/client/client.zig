@@ -4355,6 +4355,7 @@ const OperationImpl = struct {
     protocol: OperationProtocol = .http1,
     tls_active: bool = false,
     state: OperationState = .request_body,
+    failure: ?anyerror = null,
     terminal_disposition: ?pool_mod.LeaseDisposition = null,
     owner_lock: std.atomic.Value(u32) = .init(0),
     adapter_acquired: bool = false,
@@ -4739,6 +4740,7 @@ const OperationImpl = struct {
 
     fn writeRequest(self: *Self, data: []const u8) !usize {
         try self.context.check();
+        if (self.failure) |err| return err;
         if (self.h2_early_response_started) return error.EarlyResponse;
         if (self.state != .request_body) {
             if (self.context.isCancelled()) return error.Cancelled;
@@ -4801,6 +4803,7 @@ const OperationImpl = struct {
 
     fn waitForContinue(self: *Self) !ContinueResult {
         try self.context.check();
+        if (self.failure) |err| return err;
         if (self.state != .request_body) {
             return if (self.response_head_ready) .final_response else error.InvalidOperationState;
         }
@@ -4839,6 +4842,7 @@ const OperationImpl = struct {
 
     fn finishRequest(self: *Self, trailers: ?[]const [2][]const u8) !*const ResponseHead {
         try self.context.check();
+        if (self.failure) |err| return err;
         if (self.response_head_ready) return &self.response_head;
         if (self.state != .request_body) return error.InvalidOperationState;
 
@@ -5012,6 +5016,7 @@ const OperationImpl = struct {
 
     fn readResponse(self: *Self, output: []u8) !usize {
         try self.context.check();
+        if (self.failure) |err| return err;
         if (self.state == .response_complete) return 0;
         if (self.state != .response_body) return error.InvalidOperationState;
         if (output.len == 0) return 0;
@@ -5404,6 +5409,7 @@ const OperationImpl = struct {
 
     fn finish(self: *Self, options: FinishOptions) !void {
         try self.context.check();
+        if (self.failure) |err| return err;
         if (self.state == .terminal) return;
         if (self.state == .request_body) return error.RequestNotFinished;
         if (self.state == .response_body) {
@@ -5569,6 +5575,7 @@ const OperationImpl = struct {
     }
 
     fn fail(self: *Self, err: anyerror) void {
+        if (self.failure == null) self.failure = err;
         if (self.protocol != .http2 or self.lease == null) {
             if (self.protocol == .http3) self.resetHttp3Stream();
             self.terminalCleanup(.broken);
@@ -10276,7 +10283,7 @@ test "operation cancel interrupts HTTP1 response head wait" {
     try std.testing.expect(stall.failure == null);
 }
 
-test "finish drain uses a distinct bounded deadline and closes on timeout" {
+test "streaming finish drain uses a distinct bounded deadline and retains timeout" {
     const allocator = std.testing.allocator;
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
@@ -10334,6 +10341,7 @@ test "finish drain uses a distinct bounded deadline and closes on timeout" {
     defer op.deinit();
     _ = try op.finishRequest(null);
     const started = common.nowMillis();
+    try std.testing.expectError(error.Timeout, op.finish(.{}));
     try std.testing.expectError(error.Timeout, op.finish(.{}));
     const elapsed = common.nowMillis() - started;
     try std.testing.expect(elapsed >= 0 and elapsed < 1_000);
@@ -10494,6 +10502,8 @@ test "public streaming rejects short conflicting and malformed response framing"
         var buffer: [8]u8 = undefined;
         try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
         try std.testing.expectError(error.ResponseBodyUnderrun, op.read(&buffer));
+        try std.testing.expectError(error.ResponseBodyUnderrun, op.finish(.{}));
+        try std.testing.expectError(error.ResponseBodyUnderrun, op.read(&buffer));
     }
     {
         var op = try client.open(.GET, url, .{
@@ -10501,6 +10511,7 @@ test "public streaming rejects short conflicting and malformed response framing"
         });
         defer op.deinit();
         try std.testing.expectError(error.ConflictingFramingHeaders, op.finishRequest(null));
+        try std.testing.expectError(error.ConflictingFramingHeaders, op.finish(.{}));
     }
     {
         var op = try client.open(.GET, url, .{
@@ -10511,6 +10522,7 @@ test "public streaming rejects short conflicting and malformed response framing"
         var buffer: [8]u8 = undefined;
         try std.testing.expectEqual(@as(usize, 3), try op.read(&buffer));
         try std.testing.expectError(error.MalformedChunk, op.read(&buffer));
+        try std.testing.expectError(error.MalformedChunk, op.finish(.{}));
     }
     {
         var op = try client.open(.GET, url, .{
@@ -10520,6 +10532,7 @@ test "public streaming rejects short conflicting and malformed response framing"
         _ = try op.finishRequest(null);
         var buffer: [8]u8 = undefined;
         try std.testing.expectError(error.ResponseBodyOverrun, op.read(&buffer));
+        try std.testing.expectError(error.ResponseBodyOverrun, op.finish(.{}));
     }
     {
         var op = try client.open(.GET, url, .{
@@ -10530,6 +10543,7 @@ test "public streaming rejects short conflicting and malformed response framing"
         var buffer: [8]u8 = undefined;
         try std.testing.expectEqual(@as(usize, 1), try op.read(&buffer));
         try std.testing.expectError(error.InvalidHeader, op.read(&buffer));
+        try std.testing.expectError(error.InvalidHeader, op.finish(.{}));
     }
 
     server_thread.join();
@@ -11060,6 +11074,7 @@ test "public streaming request length errors close the connection" {
         });
         defer op.deinit();
         try std.testing.expectError(error.RequestBodyOverrun, op.writeAll("too long"));
+        try std.testing.expectError(error.RequestBodyOverrun, op.finish(.{}));
     }
     {
         var op = try client.open(.POST, url, .{
@@ -11069,6 +11084,7 @@ test "public streaming request length errors close the connection" {
         defer op.deinit();
         try op.writeAll("no");
         try std.testing.expectError(error.RequestBodyUnderrun, op.finishRequest(null));
+        try std.testing.expectError(error.RequestBodyUnderrun, op.finish(.{}));
     }
 
     server_thread.join();
@@ -13051,4 +13067,81 @@ test "cross-origin POST redirect drops body and all effective credentials" {
     try std.testing.expect(requestHeaderValue(redirected, HeaderName.CONTENT_TYPE) == null);
     try std.testing.expect(requestHeaderValue(redirected, "Content-Encoding") == null);
     try std.testing.expectEqualStrings("preserved", requestHeaderValue(redirected, "X-Safe").?);
+}
+
+test "streaming borrowed head and trailers survive operation and client handle moves" {
+    const Fixture = struct {
+        wire: []const u8 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Duplicate: one\r\nX-Duplicate: two\r\n\r\n2\r\nhi\r\n0\r\nX-End: done\r\n\r\n",
+        closed: usize = 0,
+
+        fn write(_: *anyopaque, bytes: []const u8) !usize {
+            return bytes.len;
+        }
+
+        fn read(context: *anyopaque, output: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const length = @min(output.len, self.wire.len);
+            @memcpy(output[0..length], self.wire[0..length]);
+            self.wire = self.wire[length..];
+            return length;
+        }
+
+        fn close(context: *anyopaque, _: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.closed += 1;
+        }
+
+        fn openHead(client: *Client, head: **const ResponseHead) !ClientOperation {
+            var op = try client.open(.GET, "http://fixture.test/moved", .{});
+            errdefer op.deinit();
+            head.* = try op.finishRequest(null);
+            return op;
+        }
+    };
+    var fixture = Fixture{};
+    var adapter = TransportAdapter{
+        .context = &fixture,
+        .readFn = Fixture.read,
+        .writeFn = Fixture.write,
+        .closeFn = Fixture.close,
+    };
+    var original_client = try Client.tryInitWithConfig(std.testing.allocator, .{
+        .transport_adapter = &adapter,
+        .policy = types.ClientPolicy.embeddingOwned(),
+    });
+    var client_owner = &original_client;
+    defer client_owner.deinit();
+    var head: *const ResponseHead = undefined;
+    var original_op = try Fixture.openHead(&original_client, &head);
+    var op_owner = &original_op;
+    defer op_owner.deinit();
+    try std.testing.expectEqual(head, try original_op.finishRequest(null));
+    try std.testing.expect(original_op.trailers() == null);
+
+    var moved_client = original_client;
+    client_owner = &moved_client;
+    original_client = undefined;
+    var moved_op = original_op;
+    op_owner = &moved_op;
+    original_op = undefined;
+    try std.testing.expectEqual(head, try moved_op.finishRequest(null));
+    try std.testing.expectEqualStrings("one", head.headers.entries.items[1].value);
+    try std.testing.expectEqualStrings("two", head.headers.entries.items[2].value);
+    var body: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try moved_op.read(&body));
+    try std.testing.expectEqualStrings("hi", &body);
+
+    var final_op = moved_op;
+    op_owner = &final_op;
+    moved_op = undefined;
+    try final_op.finish(.{});
+    try std.testing.expectEqual(@as(u16, 200), head.status.code);
+    const trailers = final_op.trailers().?;
+    try std.testing.expectEqualStrings("done", trailers.get("X-End").?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+    try final_op.finish(.{});
+    try std.testing.expectEqual(trailers, final_op.trailers().?);
+    final_op.deinit();
+    final_op.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
 }

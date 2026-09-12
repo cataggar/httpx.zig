@@ -393,6 +393,66 @@ each individual read. `null` uses `Timeouts.tls_handshake_ms`/`header_ms`
 (zero there falls back to connect/read); an explicit `OpenOptions` value of
 zero disables that phase timeout.
 
+### Streaming operation ownership and completion
+
+`Client.open(method, url, OpenOptions)` is the canonical streaming entry point.
+Buffered `request`/`get`/`post` calls collect through the same operation engine;
+streaming callers do not need to allocate an entire request or response body.
+
+| Operation method | Contract |
+| --- | --- |
+| `write(bytes)` / `writeAll(bytes)` | Incremental upload, enforcing the selected body framing and request limit. |
+| `writeFromReader(reader)` | Borrows a reader and uses a fixed 32 KiB transfer buffer. |
+| `waitForContinue()` | Returns `.send_body` or `.final_response` for the explicit Expect boundary. |
+| `finishRequest(trailers)` | Ends the upload and receives the final response head; pass `null` when not sending trailers. |
+| `read(buffer)` | Produces response bytes into caller storage; zero indicates completed response framing. |
+| `trailers()` | Borrows parsed response trailers when available. |
+| `finish(.{})` | Drains and validates any remaining response using the independent drain timeout, then releases the connection. |
+| `abort()` / `cancel()` | Aborts the owned operation or signals concurrent cancellation, respectively; incomplete connections are not reused. |
+| `deinit()` | Releases operation memory, aborting unfinished work. Repeated calls on the same handle are harmless. |
+
+The operation and public client handles may move between calls. Do not use two
+copies as independent owners. Operation internals, the returned `ResponseHead`,
+and its header storage remain heap-stable: a borrowed head survives such moves.
+Response trailers are separate from the head and are obtained with `trailers()`.
+All borrowed head/header/trailer pointers expire at operation `deinit`; do not
+deinitialize them separately. Clone headers if they must outlive the operation.
+
+The client must remain initialized until every operation is deinitialized and
+every buffered response is released, including operations already finished or
+aborted. The backing allocator and borrowed configuration objects must outlive
+the client. A configured DNS resolver, transport adapter, and callback contexts
+are borrowed, not transferred. A cancellation token must outlive its operation.
+Only `cancel()` may race owner-thread I/O; moves and `deinit()` must not race
+either I/O or cancellation.
+
+Framing, transport, allocation, and drain failures close the affected lease and
+remain errors on subsequent completion attempts. In particular, `finish()` does
+not turn a previously failed body read into successful completion. Successful
+`finish()` remains idempotent. Cancellation and current deadline checks retain
+precedence over a previously recorded failure.
+
+`ClientConfig.max_request_size` and `max_response_size` are `u64` limits; zero
+means unlimited, not an empty body. `OpenOptions.response_limit = .bytes` sets
+an exact per-operation limit, including `.bytes = 0` for no response payload;
+`.unlimited` explicitly removes it and `.inherit` uses the client limit.
+With decompression enabled, response limits count decoded bytes. HTTP/1 response
+metadata is bounded to 8 KiB and 100 fields by the shared parser; HTTP/2 uses
+`http2_settings.max_header_list_size` (8 KiB by default). Keep finite metadata
+and payload limits when accepting responses of unknown size.
+
+Streaming `open` is a single attempt, without the buffered retry/redirect loop.
+It retains configured request interceptors and reports failures during `open`
+to error interceptors. Subsequent operation I/O returns errors directly; the
+buffered response/retry/redirect interceptor lifecycle is not invoked for those
+calls. `ClientPolicy.embeddingOwned()` disables automatic policy behavior but
+does not unregister application interceptors. For raw adapter responses it
+also disables automatic decompression and cookie handling.
+
+Custom `TransportAdapter` callbacks are synchronous; the embedding application
+must ensure their own blocking behavior is bounded. A context check around a
+callback does not interrupt the callback itself.
+
 When multiple body-style fields are provided, precedence is:
 
 1. `body`

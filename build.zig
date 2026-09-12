@@ -165,7 +165,9 @@ pub fn build(b: *std.Build) void {
         run_all_examples.dependOn(last);
     }
 
+    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const tests = b.addTest(.{
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/httpx.zig"),
             .target = target,
