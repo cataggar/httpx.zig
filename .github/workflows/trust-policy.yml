@@ -45,8 +45,20 @@ jobs:
             throw "Expected native ${{ matrix.architecture }} host, got $actual"
           }
           Write-Output "Synthetic metadata evidence: host=$actual target=${{ matrix.target }} mode=${{ matrix.optimize }}"
-      - name: Run bounded synthetic metadata comparisons
+      - name: Compile bounded synthetic metadata comparisons
         shell: pwsh
         run: |
-          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --cache-dir .zig-cache/disallowed-conformance
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --test-no-exec --cache-dir .zig-cache/disallowed-conformance -femit-bin=.zig-cache/disallowed-evidence.exe
+          $code = $LASTEXITCODE
+          Write-Output "Evidence compiler exit=$code binary_present=$(Test-Path .zig-cache/disallowed-evidence.exe)"
+          if ($code -ne 0) { exit $code }
+      - name: Execute the bounded native evidence binary
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path .zig-cache/disallowed-evidence.exe).Path
+          $digest = (Get-FileHash -Algorithm SHA256 $binary).Hash
+          Write-Output "Native evidence execution target=${{ matrix.target }} mode=${{ matrix.optimize }} binary_sha256=$digest"
+          & $binary
+          $code = $LASTEXITCODE
+          Write-Output "Native evidence exit=$code"
+          if ($code -ne 0) { exit $code }
