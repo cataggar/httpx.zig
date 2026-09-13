@@ -1291,6 +1291,8 @@ pub const TLSConfig = struct {
     crypto_provider: ?CryptoProvider = null,
     /// Explicit policy overrides the legacy verify_server/ca_bundle_path fields.
     server_authentication: ?ServerAuthentication = null,
+    /// Borrowed policy adapter; must use the explicitly selected crypto provider.
+    certificate_crypto: ?*CryptoCertificateVerifier = null,
     trust_limits: TrustLimits = .{},
     alpn_protocols: []const []const u8 = &.{"http/1.1"},
     verify_server: bool = true,
@@ -1455,6 +1457,11 @@ pub const TLSSession = struct {
         for (self.config.alpn_protocols) |protocol| {
             if (protocol.len == 0 or protocol.len > 255) return error.TlsIllegalParameter;
         }
+        const provider = self.currentCryptoProvider();
+        if (self.config.certificate_crypto) |adapter| {
+            if (self.config.crypto_provider == null or !adapter.matchesProvider(provider))
+                return error.TlsInvalidTrustConfiguration;
+        }
         const authentication = self.config.server_authentication orelse if (self.config.verify_server)
             ServerAuthentication{ .verify = if (self.config.ca_bundle_path) |path|
                 .{ .custom_only = .{ .pem_file_path = path } }
@@ -1462,6 +1469,8 @@ pub const TLSSession = struct {
                 .system }
         else
             .dangerously_insecure_skip_certificate_verification;
+        if (self.config.certificate_crypto != null and authentication == .dangerously_insecure_skip_certificate_verification)
+            return error.TlsInvalidTrustConfiguration;
         const io = any_io.threadIo();
         const now = std.Io.Timestamp.now(io, .real);
         var trust_context: ?TrustContext = null;
@@ -1488,12 +1497,12 @@ pub const TLSSession = struct {
             SocketIoWriter.init(socket, &self.hs_write_buf);
 
         var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
-        const provider = self.currentCryptoProvider();
         try provider.random(&entropy);
         defer crypto_provider.secureWipe(&entropy);
 
         self.stored_client = try TlsClient.init(&io_reader.reader, &io_writer.writer, .{
             .crypto_provider = provider,
+            .certificate_crypto = self.config.certificate_crypto,
             .allocator = self.config.allocator,
             .host = .{ .explicit = host },
             .trust_provider = trust_provider,
@@ -1777,6 +1786,67 @@ test "TLS handshake configuration failure never invokes reconnect" {
     session.reconnect_ctx = &reconnect;
     try std.testing.expectError(error.TlsIllegalParameter, session.handshake("example.invalid"));
     try std.testing.expectEqual(@as(usize, 0), reconnect.calls);
+}
+
+test "TLS certificate adapter mismatches fail before entropy trust or socket I/O" {
+    const Reject = struct {
+        var entropy_calls: usize = 0;
+        var trust_calls: usize = 0;
+
+        fn random(_: *anyopaque, _: []u8) CryptoProviderError!void {
+            entropy_calls += 1;
+            return error.EntropyUnavailable;
+        }
+        fn verify(_: *anyopaque, _: VerifyPeerRequest) TrustError!void {
+            trust_calls += 1;
+            return error.TlsUnknownCa;
+        }
+    };
+    Reject.entropy_calls = 0;
+    Reject.trust_calls = 0;
+    var standard = StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var other = StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var provider = standard.provider();
+    var vtable = provider.vtable.*;
+    vtable.random = Reject.random;
+    provider.vtable = &vtable;
+    var adapter = CryptoCertificateVerifier.init(provider);
+    var copied_vtable = vtable;
+    var different_vtable = provider;
+    different_vtable.vtable = &copied_vtable;
+    var different_abi = provider;
+    different_abi.abi_version += 1;
+    var different_context = provider;
+    different_context.context = other.provider().context;
+    var socket = try Socket.create();
+    defer socket.close();
+    var trust_context: u8 = 0;
+    for ([_]?CryptoProvider{ null, different_context, different_vtable, different_abi }) |selected| {
+        var session = TLSSession.init(.{
+            .allocator = std.testing.allocator,
+            .crypto_provider = selected,
+            .certificate_crypto = &adapter,
+            .server_authentication = .{ .verify = .{ .provider = .{
+                .context = &trust_context,
+                .vtable = &.{ .verify_peer = Reject.verify },
+            } } },
+        });
+        defer session.deinit();
+        session.attachSocket(&socket);
+        try std.testing.expectError(error.TlsInvalidTrustConfiguration, session.handshake("localhost"));
+        try std.testing.expect(session.failed);
+    }
+    var insecure = TLSSession.init(.{
+        .allocator = std.testing.allocator,
+        .crypto_provider = provider,
+        .certificate_crypto = &adapter,
+        .verify_server = false,
+    });
+    defer insecure.deinit();
+    insecure.attachSocket(&socket);
+    try std.testing.expectError(error.TlsInvalidTrustConfiguration, insecure.handshake("localhost"));
+    try std.testing.expectEqual(@as(usize, 0), Reject.entropy_calls);
+    try std.testing.expectEqual(@as(usize, 0), Reject.trust_calls);
 }
 
 test "TLS record transport error mapping preserves cancellation and deadline" {

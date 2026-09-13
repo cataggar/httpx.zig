@@ -105,6 +105,8 @@ pub const min_buffer_len = tls.max_ciphertext_record_len;
 
 pub const Options = struct {
     crypto_provider: provider_api.CryptoProvider,
+    /// Borrowed policy adapter with identical provider identity; immutable during use.
+    certificate_crypto: ?*cert_crypto.CryptoCertificateVerifier = null,
     allocator: std.mem.Allocator,
     /// How to perform host verification of server certificates.
     host: union(enum) {
@@ -246,6 +248,12 @@ fn validateSelectedAlpnProtocol(selected: []const u8, offered: []const []const u
     return error.TlsIllegalParameter;
 }
 
+fn validateCertificateCrypto(selected: provider_api.CryptoProvider, adapter: ?*cert_crypto.CryptoCertificateVerifier) error{TlsInvalidTrustConfiguration}!void {
+    if (adapter) |bound| {
+        if (!bound.matchesProvider(selected)) return error.TlsInvalidTrustConfiguration;
+    }
+}
+
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
 ///
 /// `host` is only borrowed during this function call.
@@ -253,6 +261,9 @@ fn validateSelectedAlpnProtocol(selected: []const u8, offered: []const []const u
 /// `input` is asserted to have buffer capacity at least `min_buffer_len`.
 pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client {
     assert(input.buffer.len >= min_buffer_len);
+    try validateCertificateCrypto(options.crypto_provider, options.certificate_crypto);
+    if (options.certificate_crypto != null and (options.trust_provider == null or options.host == .no_verification))
+        return error.TlsInvalidTrustConfiguration;
     const host = switch (options.host) {
         .no_verification => "",
         .explicit => |host| host,
@@ -718,6 +729,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 }
                             }
                             if (certificate_count == 0) return error.TlsMalformedCertificateChain;
+                            try validateCertificateCrypto(options.crypto_provider, options.certificate_crypto);
                             var signature_verifier = cert_crypto.CryptoCertificateVerifier.init(options.crypto_provider);
                             const identity: ?peer_trust.PeerIdentity = switch (options.host) {
                                 .no_verification => null,
@@ -728,7 +740,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 .chain_der = peer_certificates[0..certificate_count],
                                 .expected_identity = identity,
                                 .now_seconds = if (options.clock_io) |io| std.Io.Timestamp.now(io, .real).toSeconds() else options.realtime_now.toSeconds(),
-                                .signature_verifier = signature_verifier.verifier(),
+                                .signature_verifier = if (options.certificate_crypto) |adapter| adapter.verifier() else signature_verifier.verifier(),
                                 .scratch_allocator = options.allocator,
                                 .limits = options.trust_limits,
                             };
@@ -1545,10 +1557,17 @@ fn peerIdentity(host: []const u8) peer_trust.PeerIdentity {
 test "TLS client invokes selected trust before accepting the peer public key" {
     const Reject = struct {
         calls: usize = 0,
+        expected_adapter: ?*cert_crypto.CryptoCertificateVerifier = null,
 
         fn verify(context: *anyopaque, request: peer_trust.VerifyPeerRequest) peer_trust.TrustError!void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.calls += 1;
+            if (self.expected_adapter) |adapter| {
+                const expected = adapter.verifier();
+                if (request.signature_verifier.context != expected.context or
+                    request.signature_verifier.vtable != expected.vtable)
+                    return error.TlsInvalidTrustConfiguration;
+            }
             if (request.chain_der.len != 1 or
                 !mem.eql(u8, request.chain_der[0], "\x30\x00") or
                 !mem.eql(u8, request.expected_identity.?.dns_name, "localhost"))
@@ -1568,18 +1587,64 @@ test "TLS client invokes selected trust before accepting the peer public key" {
     var input = Reader.fixed(&input_bytes);
     var output = Writer.fixed(&output_bytes);
     var standard = @import("crypto/standard.zig").StandardProvider.init(std.testing.io, std.testing.allocator);
+    var adapter = cert_crypto.CryptoCertificateVerifier.init(standard.provider());
     var reject: Reject = .{};
-    try std.testing.expectError(error.TlsUnknownCa, init(&input, &output, .{
-        .crypto_provider = standard.provider(),
+    for ([_]bool{ false, true }) |bound| {
+        reject.expected_adapter = if (bound) &adapter else null;
+        input = Reader.fixed(&input_bytes);
+        output = Writer.fixed(&output_bytes);
+        try std.testing.expectError(error.TlsUnknownCa, init(&input, &output, .{
+            .crypto_provider = standard.provider(),
+            .certificate_crypto = if (bound) &adapter else null,
+            .allocator = std.testing.allocator,
+            .host = .{ .explicit = "localhost" },
+            .trust_provider = .{ .context = &reject, .vtable = &.{ .verify_peer = Reject.verify } },
+            .entropy = &@as([Options.entropy_len]u8, @splat(1)),
+            .read_buffer = &application_read,
+            .write_buffer = &application_write,
+            .realtime_now = std.Io.Timestamp.now(std.testing.io, .real),
+        }));
+    }
+    try std.testing.expectEqual(@as(usize, 2), reject.calls);
+}
+
+test "TLS raw client rejects a mismatched certificate adapter before I/O" {
+    const Reject = struct {
+        fn verify(_: *anyopaque, _: peer_trust.VerifyPeerRequest) peer_trust.TrustError!void {
+            return error.TlsUnknownCa;
+        }
+    };
+    var first = @import("crypto/standard.zig").StandardProvider.init(std.testing.io, std.testing.allocator);
+    var second = @import("crypto/standard.zig").StandardProvider.init(std.testing.io, std.testing.allocator);
+    var adapter = cert_crypto.CryptoCertificateVerifier.init(first.provider());
+    var input_bytes: [min_buffer_len]u8 = @splat(0);
+    var output_bytes: [min_buffer_len]u8 = undefined;
+    var application_read: [min_buffer_len]u8 = undefined;
+    var application_write: [min_buffer_len]u8 = undefined;
+    var input = Reader.fixed(&input_bytes);
+    var output = Writer.fixed(&output_bytes);
+    var trust_context: u8 = 0;
+    var options: Options = .{
+        .crypto_provider = second.provider(),
+        .certificate_crypto = &adapter,
         .allocator = std.testing.allocator,
         .host = .{ .explicit = "localhost" },
-        .trust_provider = .{ .context = &reject, .vtable = &.{ .verify_peer = Reject.verify } },
+        .trust_provider = .{ .context = &trust_context, .vtable = &.{ .verify_peer = Reject.verify } },
         .entropy = &@as([Options.entropy_len]u8, @splat(1)),
         .read_buffer = &application_read,
         .write_buffer = &application_write,
         .realtime_now = std.Io.Timestamp.now(std.testing.io, .real),
-    }));
-    try std.testing.expectEqual(@as(usize, 1), reject.calls);
+    };
+    try std.testing.expectError(error.TlsInvalidTrustConfiguration, init(&input, &output, options));
+    try std.testing.expectEqual(@as(usize, 0), output.end);
+    options.crypto_provider = first.provider();
+    options.trust_provider = null;
+    try std.testing.expectError(error.TlsInvalidTrustConfiguration, init(&input, &output, options));
+    try std.testing.expectEqual(@as(usize, 0), output.end);
+    options.trust_provider = .{ .context = &trust_context, .vtable = &.{ .verify_peer = Reject.verify } };
+    options.host = .no_verification;
+    try std.testing.expectError(error.TlsInvalidTrustConfiguration, init(&input, &output, options));
+    try std.testing.expectEqual(@as(usize, 0), output.end);
 }
 
 test "TLS peer identity keeps IP literals distinct from DNS names" {
