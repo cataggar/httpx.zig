@@ -1961,87 +1961,14 @@ test "streaming Windows refused connect completes through exception readiness" {
     const target = try endpoint.getLocalAddress();
     var connector = try Socket.create();
     defer connector.close();
-    const context = IoContext.init(.{ .request_deadline = io_context.Deadline.afterMs(2000) });
+    // Native Windows reported this refusal after 2002ms in raw Winsock and
+    // 2029ms through IoContext. Allow OS refusal a separate bounded window;
+    // this does not replace the short deadline and cancellation regressions.
+    const refusal_timeout_ms = 5_000;
+    const context = IoContext.init(.{ .request_deadline = io_context.Deadline.afterMs(refusal_timeout_ms) });
     const started = io_context.monotonicNowNs();
     try std.testing.expectError(error.ConnectFailed, connector.connectWithContext(target, 0, &context));
-    try std.testing.expect(io_context.monotonicNowNs() - started < std.time.ns_per_s);
-}
-
-test "streaming Windows connect refusal diagnostics" {
-    if (!is_windows) return error.SkipZigTest;
-    var endpoint = try Socket.create();
-    defer endpoint.close();
-    try endpoint.bind(try net.Address.parseIp("127.0.0.1", 0));
-    const target = try endpoint.getLocalAddress();
-    try std.testing.expect(target.getPort() != 0);
-    const target_ip = target.toIpAddress().ip4;
-    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &target_ip.bytes);
-
-    // Measure Winsock independently of IoContext before changing the refusal
-    // fixture's timing contract. Keep the port bound throughout both attempts.
-    const diagnostic_timeout_ms = 10_000;
-    var raw_connector = try Socket.create();
-    defer raw_connector.close();
-    try setSocketNonBlocking(raw_connector.handle, true);
-    const raw_handle = toWinsockSocket(raw_connector.handle);
-    const raw_started = io_context.monotonicNowNs();
-    const connect_rc = winsock.connect(raw_handle, &target.any, @intCast(target.getOsSockLen()));
-    const connect_error = if (connect_rc == winsock.SOCKET_ERROR) winsock.WSAGetLastError() else 0;
-    std.debug.print("\nWindows refusal raw connect: port={d} rc={d} wsa_error={d}\n", .{
-        target.getPort(), connect_rc, connect_error,
-    });
-
-    var raw_error = connect_error;
-    if (connect_rc == winsock.SOCKET_ERROR and connect_error == winsock.WSAEWOULDBLOCK) {
-        var write_set: winsock.fd_set = .{ .fd_count = 1, .fd_array = undefined };
-        var except_set: winsock.fd_set = .{ .fd_count = 1, .fd_array = undefined };
-        write_set.fd_array[0] = raw_handle;
-        except_set.fd_array[0] = raw_handle;
-        var tv = posix.timeval{ .sec = diagnostic_timeout_ms / 1000, .usec = 0 };
-        const select_rc = winsock.select(0, null, &write_set, &except_set, &tv);
-        const select_error = if (select_rc == winsock.SOCKET_ERROR) winsock.WSAGetLastError() else 0;
-        std.debug.print("Windows refusal raw select: elapsed_ms={d} rc={d} wsa_error={d} write_count={d} except_count={d}\n", .{
-            (io_context.monotonicNowNs() - raw_started) / std.time.ns_per_ms,
-            select_rc,
-            select_error,
-            write_set.fd_count,
-            except_set.fd_count,
-        });
-        try std.testing.expect(select_rc > 0);
-
-        // SO_ERROR may clear the pending error, so inspect it only once and
-        // only after select reports completion.
-        var error_len: i32 = @sizeOf(i32);
-        const getsockopt_rc = winsock.getsockopt(
-            raw_handle,
-            @intCast(posix.SOL.SOCKET),
-            winsock.SO_ERROR,
-            @ptrCast(&raw_error),
-            &error_len,
-        );
-        const getsockopt_error = if (getsockopt_rc == winsock.SOCKET_ERROR) winsock.WSAGetLastError() else 0;
-        std.debug.print("Windows refusal raw SO_ERROR: rc={d} wsa_error={d} so_error={d} length={d}\n", .{
-            getsockopt_rc, getsockopt_error, raw_error, error_len,
-        });
-        try std.testing.expectEqual(@as(i32, 0), getsockopt_rc);
-        try std.testing.expectEqual(@as(u32, 1), except_set.fd_count);
-    }
-    try std.testing.expectEqual(@as(i32, winsock.WSAECONNREFUSED), raw_error);
-
-    var context_connector = try Socket.create();
-    defer context_connector.close();
-    const context = IoContext.init(.{
-        .request_deadline = io_context.Deadline.afterMs(diagnostic_timeout_ms),
-    });
-    const context_started = io_context.monotonicNowNs();
-    const result = context_connector.connectWithContext(target, 0, &context);
-    const result_name: []const u8 = if (result) |_| "connected" else |err| @errorName(err);
-    std.debug.print("Windows refusal IoContext: elapsed_ms={d} deadline_ms={d} result={s}\n", .{
-        (io_context.monotonicNowNs() - context_started) / std.time.ns_per_ms,
-        diagnostic_timeout_ms,
-        result_name,
-    });
-    try std.testing.expectError(error.ConnectFailed, result);
+    try std.testing.expect(io_context.monotonicNowNs() - started < refusal_timeout_ms * std.time.ns_per_ms);
 }
 
 test "streaming Unix backlog connect retries with bounded timeout cancellation and recovery" {
