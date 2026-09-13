@@ -1,6 +1,8 @@
 //! Owned, immutable OS trust metadata. No platform certificate verification.
 const std = @import("std");
 const trust = @import("trust.zig");
+const crypto = @import("crypto/provider.zig");
+const metadata_digest = @import("metadata_digest.zig");
 const Error = trust.TrustError;
 const Allocator = std.mem.Allocator;
 
@@ -10,6 +12,8 @@ pub const Limits = struct {
     max_der_bytes: usize = 32 * 1024 * 1024,
     max_rules_per_domain: usize = 64,
     max_property_bytes: usize = 64 * 1024,
+    max_fingerprint_lists: usize = 8,
+    max_fingerprint_entries: usize = 16384,
 };
 
 pub const Use = struct {
@@ -150,11 +154,35 @@ pub const Entry = struct {
     }
 };
 
+/// A restriction lookup key, never a source of trust anchors. Native CTL
+/// decoding must reject unsupported identifier forms before constructing it.
+pub const FingerprintEntry = struct {
+    identifier: [64]u8 = @splat(0),
+    policy: Windows,
+    sha256: ?[32]u8 = null,
+
+    pub fn init(algorithm: crypto.HashAlgorithm, identifier: []const u8, policy: Windows) Error!FingerprintEntry {
+        if (identifier.len != algorithm.digestLength()) return error.TlsTrustStoreLoadFailed;
+        var result = FingerprintEntry{ .policy = policy };
+        @memcpy(result.identifier[0..identifier.len], identifier);
+        return result;
+    }
+};
+
+pub const FingerprintList = struct {
+    algorithm: crypto.HashAlgorithm,
+    this_update: i64,
+    next_update: ?i64 = null,
+    entries: []const FingerprintEntry,
+};
+
 pub const Snapshot = struct {
     allocator: Allocator,
     limits: Limits,
     entries: std.ArrayList(Entry) = .empty,
     der_bytes: usize = 0,
+    fingerprint_lists: std.ArrayList(FingerprintList) = .empty,
+    fingerprint_entries: usize = 0,
 
     pub fn init(allocator: Allocator, limits: Limits) Snapshot {
         return .{ .allocator = allocator, .limits = limits };
@@ -166,6 +194,8 @@ pub const Snapshot = struct {
             for (entry.domains) |rules| if (rules) |owned| self.allocator.free(owned);
         }
         self.entries.deinit(self.allocator);
+        for (self.fingerprint_lists.items) |list| self.allocator.free(list.entries);
+        self.fingerprint_lists.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -198,6 +228,87 @@ pub const Snapshot = struct {
             if (std.mem.eql(u8, entry.der, der)) return entry.decide(use);
         }
         return .anchor; // No platform restriction on a custom/peer certificate.
+    }
+
+    /// Copies all retained data. Adding hashes does not add an Entry or anchor.
+    pub fn addFingerprintList(self: *Snapshot, list: FingerprintList) Error!void {
+        if (self.fingerprint_lists.items.len >= self.limits.max_fingerprint_lists or
+            list.entries.len > self.limits.max_fingerprint_entries - self.fingerprint_entries or
+            (list.next_update != null and list.next_update.? < list.this_update))
+            return error.TlsTrustStoreLoadFailed;
+        const entries = try self.allocator.dupe(FingerprintEntry, list.entries);
+        errdefer self.allocator.free(entries);
+        std.mem.sort(FingerprintEntry, entries, list.algorithm.digestLength(), struct {
+            fn lessThan(length: usize, a: FingerprintEntry, b: FingerprintEntry) bool {
+                return std.mem.order(u8, a.identifier[0..length], b.identifier[0..length]) == .lt;
+            }
+        }.lessThan);
+        var owned = list;
+        owned.entries = entries;
+        try self.fingerprint_lists.append(self.allocator, owned);
+        self.fingerprint_entries += entries.len;
+    }
+
+    pub fn check(
+        self: *const Snapshot,
+        certificate_der: []const u8,
+        use: Use,
+        hasher: ?metadata_digest.MetadataDigest,
+        scratch: Allocator,
+    ) Error!Decision {
+        const decision = self.decide(certificate_der, use);
+        if (decision == .deny) return decision;
+        var digests: Digests = .{
+            .hasher = hasher,
+            .scratch = scratch,
+            .input = certificate_der,
+        };
+        for (self.fingerprint_lists.items) |list| {
+            if (use.now_seconds < list.this_update or
+                (list.next_update != null and use.now_seconds > list.next_update.?))
+                return error.TlsTrustStoreLoadFailed;
+            if (list.entries.len == 0) continue;
+            const digest = try digests.get(list.algorithm);
+            var low: usize = 0;
+            var high = list.entries.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (std.mem.order(u8, list.entries[mid].identifier[0..digest.len], digest) == .lt)
+                    low = mid + 1
+                else
+                    high = mid;
+            }
+            while (low < list.entries.len and std.mem.eql(u8, list.entries[low].identifier[0..digest.len], digest)) : (low += 1) {
+                const entry = list.entries[low];
+                if (!entry.policy.permits(use)) return .deny;
+                if (entry.sha256) |expected| {
+                    if (!std.mem.eql(u8, &expected, try digests.get(.sha256))) return .deny;
+                }
+            }
+        }
+        return decision;
+    }
+};
+
+const Digests = struct {
+    hasher: ?metadata_digest.MetadataDigest,
+    scratch: Allocator,
+    input: []const u8,
+    values: [4][64]u8 = undefined,
+    ready: [4]bool = @splat(false),
+
+    fn get(self: *Digests, algorithm: crypto.HashAlgorithm) Error![]const u8 {
+        const index = @intFromEnum(algorithm);
+        const output = self.values[index][0..algorithm.digestLength()];
+        if (!self.ready[index]) {
+            const hasher = self.hasher orelse return error.TlsInvalidTrustConfiguration;
+            hasher.hash(self.scratch, algorithm, self.input, output) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.TlsTrustStoreLoadFailed,
+            };
+            self.ready[index] = true;
+        }
+        return output;
     }
 };
 
@@ -304,4 +415,91 @@ test "macOS non-root trust and exact IP constraints" {
     use.self_issued = false;
     use.identity = .{ .ip_address = .{ .v4 = .{ 127, 0, 0, 1 } } };
     try std.testing.expectEqual(Decision.deny, entry.decide(use));
+}
+
+test "fingerprint metadata ownership limits and allocation failures" {
+    const Test = struct {
+        fn run(allocator: Allocator) !void {
+            var snapshot = Snapshot.init(allocator, .{ .max_fingerprint_lists = 1, .max_fingerprint_entries = 1 });
+            defer snapshot.deinit();
+            var entries = [_]FingerprintEntry{try FingerprintEntry.init(.sha1, &@as([20]u8, @splat(1)), .{ .roles = 0 })};
+            const list = FingerprintList{ .algorithm = .sha1, .this_update = 50, .next_update = 150, .entries = &entries };
+            try snapshot.addFingerprintList(list);
+            entries[0].identifier[0] = 99;
+            try std.testing.expectEqual(@as(u8, 1), snapshot.fingerprint_lists.items[0].entries[0].identifier[0]);
+            try std.testing.expectEqual(@as(usize, 0), snapshot.entries.items.len);
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.addFingerprintList(list));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{});
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, FingerprintEntry.init(.sha1, &.{0}, .{}));
+    var snapshot = Snapshot.init(std.testing.allocator, .{ .max_fingerprint_entries = 0 });
+    defer snapshot.deinit();
+    const entry = try FingerprintEntry.init(.sha256, &@as([32]u8, @splat(1)), .{});
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.addFingerprintList(.{
+        .algorithm = .sha256,
+        .this_update = 100,
+        .entries = &.{entry},
+    }));
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.addFingerprintList(.{
+        .algorithm = .sha256,
+        .this_update = 100,
+        .next_update = 99,
+        .entries = &.{},
+    }));
+}
+
+test "fingerprint lists intersect duplicate rules cache per call and use request time" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn hash(context: *anyopaque, _: Allocator, _: crypto.HashAlgorithm, _: []const u8, output: []u8) crypto.ProviderError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            @memset(output, 1);
+        }
+    };
+    var fake = Fake{};
+    const hasher = metadata_digest.MetadataDigest{
+        .context = &fake,
+        .digest_fn = Fake.hash,
+        .options = .{ .allow_sha1_identifiers = true },
+    };
+    var snapshot = Snapshot.init(std.testing.allocator, .{});
+    defer snapshot.deinit();
+    const unrestricted = try FingerprintEntry.init(.sha1, &@as([20]u8, @splat(1)), .{});
+    const other = try FingerprintEntry.init(.sha1, &@as([20]u8, @splat(0)), .{ .roles = 0 });
+    const list = FingerprintList{
+        .algorithm = .sha1,
+        .this_update = 50,
+        .next_update = 150,
+        .entries = &.{ unrestricted, other },
+    };
+    try snapshot.addFingerprintList(list);
+    try snapshot.addFingerprintList(list);
+    try std.testing.expectEqual(Decision.anchor, try snapshot.check("not an anchor grant", server_use, hasher, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    var later = server_use;
+    later.now_seconds = 151;
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.check("certificate", later, hasher, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectError(error.TlsInvalidTrustConfiguration, snapshot.check("certificate", server_use, null, std.testing.allocator));
+    const denied = try FingerprintEntry.init(.sha1, &@as([20]u8, @splat(1)), .{ .denied_roles = 1 });
+    try snapshot.addFingerprintList(.{ .algorithm = .sha1, .this_update = 50, .entries = &.{ unrestricted, denied } });
+    try std.testing.expectEqual(Decision.deny, try snapshot.check("certificate", server_use, hasher, std.testing.allocator));
+}
+
+test "a secondary SHA256 mismatch is not silently treated as an absent restriction" {
+    const Fake = struct {
+        fn hash(_: *anyopaque, _: Allocator, _: crypto.HashAlgorithm, _: []const u8, output: []u8) crypto.ProviderError!void {
+            @memset(output, 1);
+        }
+    };
+    var context: u8 = 0;
+    const hasher = metadata_digest.MetadataDigest{ .context = &context, .digest_fn = Fake.hash, .options = .{ .allow_sha1_identifiers = true } };
+    var snapshot = Snapshot.init(std.testing.allocator, .{});
+    defer snapshot.deinit();
+    var entry = try FingerprintEntry.init(.sha1, &@as([20]u8, @splat(1)), .{});
+    entry.sha256 = @splat(2);
+    try snapshot.addFingerprintList(.{ .algorithm = .sha1, .this_update = 50, .entries = &.{entry} });
+    try std.testing.expectEqual(Decision.deny, try snapshot.check("certificate", server_use, hasher, std.testing.allocator));
 }

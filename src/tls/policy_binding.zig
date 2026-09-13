@@ -3,6 +3,8 @@
 //! neither that adapter/provider nor the immutable roots. All must outlive
 //! pooled TLS sessions and active calls; keep this view at a stable address
 //! after provider(). Each call supplies its own concurrency-safe scratch.
+//! Do not retarget/mutate the binding or adapter/provider configuration while
+//! borrowed views are in use.
 const std = @import("std");
 const trust = @import("trust.zig");
 const metadata = @import("metadata_digest.zig");

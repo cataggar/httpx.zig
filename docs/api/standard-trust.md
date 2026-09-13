@@ -189,7 +189,7 @@ cached AuthRoot/Disallowed CTL values detected through existing read-only Zig
 NT registry bindings, fail initialization. This can block ordinary provisioned
 Windows machines; general Windows system trust is not claimed complete.
 Completing it needs bounded CTL interpretation and canonical binding
-integration. `metadata_digest.zig` and `policy_binding.zig` define the chosen
+runtime integration. `metadata_digest.zig` and `policy_binding.zig` define the chosen
 separate identifier-hash/paired-view contract without changing ABI-v1 request
 or vtable layouts. The native CTL loader is still guarded at this checkpoint.
 Detection is not a permanent OS/API blocker and must not be removed merely
@@ -206,6 +206,29 @@ digest length and are cleared on every failure. Binding
 `allow_sha1_identifiers` defaults false, independently of native-provider
 capability/deployment approval. Identifier hashing never enables SHA-1
 signatures, HMAC, HKDF or PRF, creates an anchor, or permits a primitive fallback.
+
+The canonical owner now exposes
+`roots.bind(adapter_pointer, metadata_digest.Options) !PolicyBinding`.
+The adapter supplies `verifier()` and `metadataHasher(options)` from the same
+selected provider. A new per-handshake adapter is not interchangeable with an
+older binding, even when both wrap the same backend: create the binding and
+verifier together, or use the binding's existing `signatureVerifier()` handle.
+Short-lived paired views are valid for synchronous verification only when no
+pooled object retains their handles. Stored views require stable owners for the
+entire pool lifetime. Caller-supplied ABI-v1 trust providers remain borrowed and
+are forwarded their unchanged request. Do not mutate or retarget binding or
+adapter/provider configuration while borrowed views are in use.
+
+Private fingerprint-policy plumbing copies bounded lists, intersects duplicate
+restrictions, checks list times against the request's current time, and caches
+digests only on the verification stack. A secondary SHA-256 mismatch rejects
+the certificate rather than dropping its restriction. Hashes are evaluated on
+selected path certificates through the binding; they never add anchor entries.
+The current limits are eight lists and 16,384 total records. Missing digest
+support fails closed; hash allocation failures remain `OutOfMemory`. Hermetic
+tests exercise this plumbing with real selected standard-provider hashes and
+signatures. Shared production adapter/runtime wiring and native CTL decoding
+have not yet been incorporated here.
 
 ### macOS snapshot and strict projection
 

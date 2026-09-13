@@ -6,6 +6,8 @@ const builtin = @import("builtin");
 const trust = @import("trust.zig");
 const x509 = @import("x509_policy.zig");
 const platform = @import("platform_trust.zig");
+const metadata_digest = @import("metadata_digest.zig");
+const policy_binding = @import("policy_binding.zig");
 const Error = trust.TrustError;
 const Allocator = std.mem.Allocator;
 
@@ -88,6 +90,18 @@ pub const TrustContext = struct {
         return self.borrowed orelse .{ .context = self, .vtable = &.{ .verify_peer = verifyPeer } };
     }
 
+    /// Both handles must come from the same stable selected-provider adapter.
+    /// Keep roots, adapter/provider, and the resulting binding alive for every
+    /// pooled session retaining its provider. Use binding.signatureVerifier()
+    /// in requests; a fresh adapter, even for the same backend, is rejected.
+    pub fn bind(self: *const TrustContext, adapter: anytype, options: metadata_digest.Options) Error!policy_binding.PolicyBinding {
+        comptime {
+            if (@typeInfo(@TypeOf(adapter)) != .pointer)
+                @compileError("bind requires a stable adapter pointer");
+        }
+        return policy_binding.PolicyBinding.init(self, verifyBound, adapter.verifier(), adapter.metadataHasher(options));
+    }
+
     pub fn anchorCount(self: *const TrustContext) usize {
         return self.anchors.len;
     }
@@ -101,6 +115,16 @@ pub const TrustContext = struct {
 
     fn verifyPeer(context: *anyopaque, request: trust.VerifyPeerRequest) Error!void {
         const self: *const TrustContext = @ptrCast(@alignCast(context));
+        try self.verifyPolicy(request, null);
+    }
+
+    fn verifyBound(context: *const anyopaque, request: trust.VerifyPeerRequest, hasher: metadata_digest.MetadataDigest) Error!void {
+        const self: *const TrustContext = @ptrCast(@alignCast(context));
+        if (self.borrowed) |provider_value| return provider_value.verifyPeer(request);
+        try self.verifyPolicy(request, hasher);
+    }
+
+    fn verifyPolicy(self: *const TrustContext, request: trust.VerifyPeerRequest, hasher: ?metadata_digest.MetadataDigest) Error!void {
         try request.validate();
         if (request.role == .server and request.expected_identity == null)
             return error.TlsInvalidTrustConfiguration;
@@ -115,7 +139,7 @@ pub const TrustContext = struct {
         }
         try peers[0].checkPolicy(request.now_seconds, request.role, false, 0);
         if (request.expected_identity) |identity| try peers[0].checkIdentity(identity);
-        _ = try self.checkMetadata(peers[0], request, false, false);
+        _ = try self.checkMetadata(peers[0], request, false, false, hasher);
         if (request.limits.max_path_depth < 2) return error.TlsCertificatePathTooDeep;
 
         const visited = try allocator.alloc(bool, peers.len);
@@ -164,7 +188,8 @@ pub const TrustContext = struct {
                 failure = err;
                 continue;
             };
-            const self_signature_required = self.checkMetadata(issuer, request, true, is_anchor) catch |err| {
+            const self_signature_required = self.checkMetadata(issuer, request, true, is_anchor, hasher) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 failure = err;
                 continue;
             };
@@ -199,15 +224,15 @@ pub const TrustContext = struct {
         return if (depth_limited) error.TlsCertificatePathTooDeep else failure;
     }
 
-    fn checkMetadata(self: *const TrustContext, certificate: x509.Certificate, request: trust.VerifyPeerRequest, issuer: bool, anchor: bool) Error!bool {
-        const snapshot = self.platform_snapshot orelse return false;
-        return switch (snapshot.decide(certificate.der_bytes, .{
+    fn checkMetadata(self: *const TrustContext, certificate: x509.Certificate, request: trust.VerifyPeerRequest, issuer: bool, anchor: bool, hasher: ?metadata_digest.MetadataDigest) Error!bool {
+        const snapshot = if (self.platform_snapshot) |*value| value else return false;
+        return switch (try snapshot.check(certificate.der_bytes, .{
             .role = request.role,
             .identity = request.expected_identity,
             .now_seconds = request.now_seconds,
             .issuer = issuer,
             .self_issued = certificate.selfIssued(),
-        })) {
+        }, hasher, request.scratch_allocator)) {
             .deny => error.TlsCertificateConstraintViolation,
             .chain_only => if (anchor) error.TlsCertificateConstraintViolation else false,
             .anchor => false,
