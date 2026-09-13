@@ -3891,16 +3891,14 @@ test "TLS public handshake helpers fragment records and retain the selected prov
     }
 }
 
-test "TLS public handshake helper fixture joins its writer after peer closure" {
+test "TLS public handshake helper fixture joins its writer after local send failure" {
     const message: [max_plaintext_len + 97]u8 = @splat(0x61);
-    const sockets = try testSocketPair();
-    var sender = sockets[0];
-    defer sender.close();
-    var receiver = sockets[1];
-    defer receiver.close();
-    try sender.setSendBufferSize(4096);
-    try receiver.setRecvBufferSize(4096);
-    try sender.setSendTimeout(5000);
+    var sender = try Socket.create();
+    // Peer shutdown need not reject writes. Close the local endpoint before
+    // sharing it so descriptor reuse or scheduling cannot change the outcome.
+    sender.close();
+    try std.testing.expect(!sender.isValid());
+    try std.testing.expectError(error.SendFailed, sender.send("fixture"));
     var write_context = HandshakeWriteThreadContext{
         .socket = &sender,
         .provider = testProvider(),
@@ -3909,15 +3907,8 @@ test "TLS public handshake helper fixture joins its writer after peer closure" {
         .message = &message,
         .key = test_write_key[0..16],
     };
-    try receiver.shutdownBoth();
     const thread = try std.Thread.spawn(.{}, HandshakeWriteThreadContext.run, .{&write_context});
-    var joined = false;
-    defer if (!joined) {
-        receiver.shutdownBoth() catch {};
-        thread.join();
-    };
     thread.join();
-    joined = true;
     try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), write_context.err);
     try std.testing.expectEqual(@as(u64, 8), write_context.sequence);
 }
