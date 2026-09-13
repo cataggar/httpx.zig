@@ -69,6 +69,10 @@ pub const FinishOptions = operation.FinishOptions;
 pub const ClientOperation = operation.ClientOperation;
 const RequestProgress = operation.RequestProgress;
 
+test {
+    _ = @import("tls_pairing_test.zig");
+}
+
 const RequestTimeouts = struct {
     connect_ms: u64,
     read_ms: u64,

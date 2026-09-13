@@ -90,7 +90,11 @@ defer client.deinit();
 | `user_agent` | `[]const u8` | `"httpx.zig/0.1.8"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
-| `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
+| `verify_ssl` | `bool` | `true` | Legacy certificate-verification selection; an explicit `server_authentication` takes precedence. |
+| `tls_crypto_provider` | `?CryptoProvider` | `null` | Borrowed provider for TLS handshakes and records; null selects the session-owned standard provider. |
+| `tls_certificate_crypto` | `?*CryptoCertificateVerifier` | `null` | Exact borrowed adapter used by a policy binding; requires a matching explicit TLS provider. |
+| `server_authentication` | `?ServerAuthentication` | `null` | Explicit trust source or provider, overriding client and request `verify_ssl` values. |
+| `tls_trust_limits` | `TrustLimits` | `{}` | Bounds peer certificates and path construction during TLS authentication. |
 | `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
 | `http3_enabled` | `bool` | `false` | Reserved. Setting it causes public requests to return `error.UnsupportedHttpVersion`. |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS values sent during connection setup (`header_table_size`, `max_frame_size`, etc.). |
@@ -104,6 +108,12 @@ defer client.deinit();
 | `log_fn` | `?LogFn` | `null` | Optional logging callback. When set, `Client.log()` delegates formatted messages to this function. Leave unset to disable client-side logging. |
 
 If you do not set a field, the implicit default value is used. Builder helpers only override the fields you call.
+
+TLS provider, adapter, binding, and root owners must stay at stable addresses
+with immutable configuration until all operations and pooled sessions end.
+See [canonically bound clients](./tls.md#canonically-bound-high-level-clients)
+for construction, independent identifier-hash permissions, and platform limits.
+These options apply to `Client.open` and its HTTP/1.1 and HTTP/2 lease paths.
 
 ### Client Policy
 
@@ -380,7 +390,7 @@ Per-request overrides for configuration.
 | `policy` | `RequestPolicyOverrides` | `{}` | Nullable per-feature overrides resolved against `ClientConfig.policy`. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
 | `proxy` | `?Proxy` | `null` | Per-request forward proxy override. |
-| `verify_ssl` | `?bool` | `null` | Per-request SSL verification toggle override. |
+| `verify_ssl` | `?bool` | `null` | Legacy verification override; explicit `ClientConfig.server_authentication` takes precedence. |
 | `keep_alive` | `?bool` | `null` | Per-request connection pool reuse toggle override. |
 | `unix_socket_path` | `?[]const u8` | `null` | Per-request Unix Domain Socket path routing override. |
 

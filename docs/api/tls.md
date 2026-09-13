@@ -3,13 +3,13 @@
 The TLS module implements TLS 1.2/1.3 using an explicit `CryptoProvider` for
 handshakes and records, with a pure-Zig standard implementation.
 
-::: warning Runtime integration slice
-Standalone `TLSConfig` and `connectClient` accept a selected provider and
-dispatch certificate policy to the [canonical trust implementation](./standard-trust.md).
-High-level `ClientConfig`/`Client.open` selected-provider and paired trust
-construction are **not wired by this slice**. The canonical paired factory,
-runtime/provider provenance checks, and native policy qualification remain
-separate integration work. This is not a release or readiness claim.
+::: warning Native qualification
+`TLSConfig`, `connectClient`, and high-level `ClientConfig`/`Client.open`
+accept a selected provider and dispatch certificate policy to the
+[canonical trust implementation](./standard-trust.md). Paired adapters and
+the canonical root factory are connected through the streaming lease paths.
+Native platform policy and optional-backend qualification remain separate
+release gates; unsupported system metadata still fails closed.
 :::
 
 ::: warning TLS implementation status
@@ -63,8 +63,9 @@ using `std.crypto`. `TLSConfig.crypto_provider` selects a borrowed provider for
 the entire client handshake and subsequent records. `null` uses a standard
 implementation owned by the session/connection; no pointer to a temporary
 standard provider is transferred by `connectClient`. Capability refusal and
-callback errors never trigger a different primitive backend. High-level
-`ClientConfig` selection remains deferred.
+callback errors never trigger a different primitive backend.
+`ClientConfig.tls_crypto_provider` selects the same borrowed provider for
+high-level HTTP/1.1 and HTTP/2 operations and their pooled TLS sessions.
 
 ```zig
 var standard = httpx.StandardCryptoProvider.init(io, thread_safe_allocator);
@@ -152,6 +153,8 @@ the actual selected TLS provider before I/O and again before certificate
 verification. A different provider, omitted explicit provider, or insecure
 configuration fails with `TlsInvalidTrustConfiguration`; runtime never
 downcasts an erased signature-verifier context to discover its provider.
+The pre-I/O check is at the TLS boundary; high-level clients can already have
+established TCP or a proxy tunnel before reaching it.
 The exact configured adapter's signature handle reaches the trust callback.
 For a `PolicyBinding`, this is the same context and vtable returned by
 `binding.signatureVerifier()`. Construct the binding's signature and metadata
@@ -166,6 +169,44 @@ borrows them and does not destroy them. These optional fields extend
 source-level TLS/client configuration; they do not change ABI-v1 request or
 existing provider/verifier vtable layouts. Policy time remains current for each
 verification request rather than being taken from root-store load time.
+
+### Canonically bound high-level clients
+
+Create both handles from the same stable adapter using the existing root
+factory, then supply that adapter and selected provider to the client:
+
+```zig
+var selected = httpx.StandardCryptoProvider.init(io, allocator);
+var roots = try httpx.tls.TrustContext.init(allocator, io, .{
+    .source = .system,
+});
+defer roots.deinit();
+var adapter = httpx.CryptoCertificateVerifier.init(selected.provider());
+var binding = try roots.bind(&adapter, .{ .allow_sha1_identifiers = true });
+var client = try httpx.Client.tryInitWithConfig(allocator, .{
+    .tls_crypto_provider = selected.provider(),
+    .tls_certificate_crypto = &adapter,
+    .server_authentication = .{ .verify = .{ .provider = binding.provider() } },
+});
+defer client.deinit();
+```
+
+System discovery remains subject to the platform profile and may reject
+unsupported metadata. Identifier hashing has two independent gates, described
+below; this example explicitly enables the binding's SHA-1 identifier gate,
+not SHA-1 certificate signatures.
+
+`ClientConfig.server_authentication` overrides the legacy `verify_ssl`
+selection, including per-request overrides. `tls_trust_limits` bounds the
+actual handshake's certificate and path processing. `Client.makeTlsConfig`
+forwards these fields with its allocator and the requested ALPN list; any
+resulting session must end before that client is destroyed.
+
+The immutable client configuration is shared by its operations and pool.
+Changing or moving a borrowed provider, adapter, binding, or roots while those
+operations or pooled sessions exist is unsupported. HTTP/3 and Unix-plus-TLS
+restrictions, cancellation/deadline handling, and embedding-owned policy are
+unchanged.
 
 ### Metadata-only certificate digests
 
@@ -205,10 +246,10 @@ provider owners to remain at stable addresses and alive.
 A fingerprint match alone does not establish a trust anchor. A `PolicyBinding`
 rejects a different signature context or vtable before private policy dispatch;
 the canonical policy still owns anchor selection and certificate validation.
-This primitive adapter does not change `VerifyPeerRequest`, either existing verifier/provider
-vtable, or the primitive ABI version. The adapter and binding are implemented;
-canonical root-factory/private-digest integration and platform CTL interpretation
-require their separately reviewed integration and platform qualification.
+This primitive adapter does not change `VerifyPeerRequest`, either existing
+verifier/provider vtable, or the primitive ABI version. The canonical
+`roots.bind` factory uses this production adapter directly. Platform CTL
+interpretation and native qualification retain their separate release gates.
 
 The public `connectClient` regression tests exercise the actual binding and
 metadata descriptor through TLS 1.2/1.3 handshakes, application records, and
@@ -219,7 +260,7 @@ failures reject without fallback. The binding fixture uses an exact certificate
 pin, identity/time checks, and its issuer signature; it is not a general PKIX
 policy or qualification of a platform trust store.
 
-### Remaining integration
+### Canonical composition and qualification
 
 The canonical policy files are unchanged by this runtime port. The handshake
 uses `TrustContext.init(allocator, io, .{ .source = source,
@@ -228,11 +269,17 @@ the peer, not taken from the root-load snapshot. See the canonical trust
 documentation for its supported profile and platform limits.
 
 The canonical `roots.bind(adapter_pointer, metadata_digest.Options)` factory
-and its runtime adapter/provenance wiring still require composition. In
-particular, matching signature handles alone do not prove that a binding from
-provider A is being used with TLS provider A rather than B. This slice does
-not claim that cross-provider rejection is implemented. It adds no alternate
-factory, DN normalization, or duplicate certificate policy.
+is exercised with the production adapter through public `connectClient` and
+`Client.open` HTTP/1.1 and HTTP/2 leases. TLS 1.2/1.3 fixtures use a real local
+certificate chain, synthetic fingerprint restrictions, and selected-provider
+hash/signature/record spies. They cover independent identifier gates, provider
+errors, path limits, pool reuse, and cleanup. Context-only and vtable-only
+provider mismatches reject even with the exact bound signature handle supplied;
+an absent or different adapter is also rejected.
+
+These hermetic cases do not qualify an operating-system store, public-CA
+endpoint, native cryptographic backend, or cancellation latency. No alternate
+factory, DN normalization, or duplicate certificate policy is introduced.
 
 The existing `zig build test-tls-provider` runner covers primitives and the
 certificate adapter; both also run under `zig build test`. Neither needs a
@@ -248,9 +295,10 @@ The public trust-provider contract is the first foundation for secure,
 provider-neutral X.509 validation. It is available as `httpx.TrustProvider`
 and `httpx.tls.TrustProvider`.
 
-::: warning Standalone runtime API
-The contract is connected to standalone TLS client handshakes. It does not
-implicitly add selected-provider or paired-root options to `Client.open`.
+::: warning Borrowed trust configuration
+The contract is connected to standalone and streaming client handshakes.
+Select high-level providers through `ClientConfig`; copying their handles
+does not extend the lifetime of the owners.
 :::
 
 ### Ownership and concurrency
