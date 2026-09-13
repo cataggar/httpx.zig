@@ -74,7 +74,7 @@ fn certificate(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, issuer: Ecdsa.K
 }
 
 const Scenario = enum { round_trip, seal_denied, open_denied, capability_denied, key_update_denied };
-const BindingCase = enum { paired, wrong_adapter, wrong_provider, policy_denied, backend_denied, hash_failed, signature_failed };
+const BindingCase = enum { paired, wrong_adapter, wrong_provider, wrong_provider_context, wrong_provider_vtable, policy_denied, backend_denied, hash_failed, signature_failed };
 
 const Observed = struct {
     standard: Standard,
@@ -297,6 +297,18 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
     var certificate_crypto = engine.CryptoCertificateVerifier.init(selected);
     var other_adapter = engine.CryptoCertificateVerifier.init(selected);
     var other_provider = Standard.init(testing.io, testing.allocator);
+    var other_observed: Observed = .{ .standard = .init(testing.io, testing.allocator), .version = version };
+    var different_context = selected;
+    different_context.context = other_observed.standard.provider().context;
+    var copied_vtable = vtable;
+    var different_vtable = selected;
+    different_vtable.vtable = &copied_vtable;
+    if (binding_case == .wrong_provider_context or binding_case == .wrong_provider_vtable) {
+        const alternate = if (binding_case == .wrong_provider_context) different_context else different_vtable;
+        try testing.expectEqualDeep(selected.vtable.capabilities(selected.context), alternate.vtable.capabilities(alternate.context));
+        try testing.expectEqual(binding_case == .wrong_provider_vtable, selected.context == alternate.context);
+        try testing.expectEqual(binding_case == .wrong_provider_context, selected.vtable == alternate.vtable);
+    }
     var certificate_reader = try @import("crypto/der.zig").sequence(leaf);
     const leaf_tbs = try certificate_reader.element();
     _ = try certificate_reader.take(0x30);
@@ -319,7 +331,16 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
     policy.expected_verifier = binding.signatureVerifier();
     const config: engine.TLSConfig = .{
         .allocator = testing.allocator,
-        .crypto_provider = if (binding_case == .wrong_provider) other_provider.provider() else if (explicit_provider) selected else null,
+        .crypto_provider = if (binding_case == .wrong_provider_context)
+            different_context
+        else if (binding_case == .wrong_provider_vtable)
+            different_vtable
+        else if (binding_case == .wrong_provider)
+            other_provider.provider()
+        else if (explicit_provider)
+            selected
+        else
+            null,
         .certificate_crypto = if (binding_case == .wrong_adapter) &other_adapter else if (explicit_provider and (binding_case != null or scenario == .round_trip)) &certificate_crypto else null,
         .server_authentication = .{ .verify = if (binding_case != null)
             .{ .provider = binding.provider() }
@@ -327,14 +348,19 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
             .{ .custom_only = .{ .der_certificates = &.{root} } } },
     };
     if (binding_case) |case| {
+        if (case != .wrong_adapter) {
+            const configured_verifier = config.certificate_crypto.?.verifier();
+            try testing.expectEqual(binding.signatureVerifier().context, configured_verifier.context);
+            try testing.expectEqual(binding.signatureVerifier().vtable, configured_verifier.vtable);
+        }
         if (case != .paired) {
             const expected = switch (case) {
-                .wrong_adapter, .wrong_provider => error.TlsInvalidTrustConfiguration,
+                .wrong_adapter, .wrong_provider, .wrong_provider_context, .wrong_provider_vtable => error.TlsInvalidTrustConfiguration,
                 .signature_failed => error.TlsCertificateSignatureInvalid,
                 else => error.TlsCertificateConstraintViolation,
             };
             try testing.expectError(expected, engine.connectClient(testing.allocator, &client_socket, &config, "localhost"));
-            const mismatched = case == .wrong_adapter or case == .wrong_provider;
+            const mismatched = case == .wrong_adapter or case == .wrong_provider or case == .wrong_provider_context or case == .wrong_provider_vtable;
             try testing.expectEqual(@as(usize, if (mismatched) 0 else 1), observed.policy_calls);
             try testing.expectEqual(@as(usize, if (case == .hash_failed or case == .signature_failed) 1 else 0), observed.metadata_creates);
             try testing.expectEqual(observed.metadata_creates, observed.metadata_updates);
