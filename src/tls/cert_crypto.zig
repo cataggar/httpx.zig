@@ -26,6 +26,11 @@ pub const CryptoCertificateVerifier = struct {
         return .{ .context = self, .vtable = &.{ .verify = verify } };
     }
 
+    pub fn matchesProvider(self: *const CryptoCertificateVerifier, selected: p.CryptoProvider) bool {
+        return self.crypto.abi_version == selected.abi_version and
+            self.crypto.context == selected.context and self.crypto.vtable == selected.vtable;
+    }
+
     /// Hashes public trust-store identifiers, not certificate signatures.
     /// No slices or hash state survive this synchronous call.
     pub fn digestMetadata(

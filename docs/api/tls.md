@@ -130,13 +130,72 @@ Restricted PSS key parameters are enforced before dispatch. SHA-1 certificate
 signatures, unsupported curve/hash combinations and unsupported parameters
 fail explicitly.
 
-`digestMetadata(scratch, algorithm, input, output, options)` hashes public
-identifiers through the same selected primitive provider. Its module-level
-`certificate_crypto.MetadataDigestOptions.allow_sha1_identifiers` defaults to
-`false`; opting in never enables SHA-1 signatures. Output must have the exact
-digest length; failures wipe it and all per-call hash handles are destroyed.
-This helper is not the canonical `metadataHasher`/provenance adapter. The
-paired factory integration is intentionally deferred.
+### Same-provider certificate adapters
+
+`TLSConfig.certificate_crypto` and the raw TLS client's
+`Options.certificate_crypto` accept a borrowed `*CryptoCertificateVerifier`.
+High-level clients forward `ClientConfig.tls_certificate_crypto`.
+Supply the same adapter instance used by a policy's expected signature handle:
+
+```zig
+var adapter = httpx.CryptoCertificateVerifier.init(selected_crypto.provider());
+const config: tls.TLSConfig = .{
+    .allocator = allocator,
+    .crypto_provider = selected_crypto.provider(),
+    .certificate_crypto = &adapter,
+    .server_authentication = .{ .verify = .{ .provider = policy_provider } },
+};
+```
+
+Runtime compares the adapter's provider ABI version, context, and vtable with
+the actual selected TLS provider before I/O and again before certificate
+verification. A different provider, omitted explicit provider, or insecure
+configuration fails with `TlsInvalidTrustConfiguration`; runtime never
+downcasts an erased signature-verifier context to discover its provider.
+The exact configured adapter's signature handle reaches the trust callback.
+When no adapter is supplied, existing custom trust-provider callbacks continue
+to receive the ordinary per-handshake verifier.
+
+The adapter/provider/binding/root owners must remain stable, immutable during
+use, and alive through all pooled TLS sessions and leases. The TLS configuration
+borrows them and does not destroy them. These optional fields extend
+source-level TLS/client configuration; they do not change ABI-v1 request or
+existing provider/verifier vtable layouts. Policy time remains current for each
+verification request rather than being taken from root-store load time.
+
+### Metadata-only certificate digests
+
+`CryptoCertificateVerifier.digestMetadata` uses the selected provider's
+`hashCreate`, `update`, `snapshot`, and `deinit` operations. It never substitutes
+stdlib hashing or an operating-system certificate-chain engine:
+
+```zig
+var adapter = httpx.CryptoCertificateVerifier.init(selected_crypto.provider());
+var identifier: [20]u8 = undefined;
+try adapter.digestMetadata(
+    allocator, .sha1, certificate_der, &identifier,
+    .{ .allow_sha1_identifiers = true },
+);
+```
+
+SHA-1 identifier hashing is denied unless explicitly enabled for that call;
+the selected backend must independently advertise SHA-1 hashing support.
+This permission changes no signature, HMAC, HKDF, or PRF capability. The
+certificate-signature adapter rejects SHA-1 signatures even when metadata
+hashing is enabled. MD5 is not an available algorithm.
+
+Output must be exactly the algorithm's digest length. Every error clears the
+provided output, including invalid length, disabled/unsupported algorithms,
+allocation failure, and backend failure. Hash state is allocated with the
+caller's scratch allocator and destroyed on every path; no input, output, or
+hash handle is retained. Concurrent calls require a thread-safe provider and
+scratch allocator. Borrowed verifier handles still require their adapter and
+provider owners to remain at stable addresses and alive.
+
+A fingerprint match alone does not establish a trust anchor. This primitive
+adapter does not change `VerifyPeerRequest`, either existing verifier/provider
+vtable, or the primitive ABI version. Canonical policy binding and platform CTL
+interpretation require their separately reviewed integration.
 
 ### Remaining integration
 

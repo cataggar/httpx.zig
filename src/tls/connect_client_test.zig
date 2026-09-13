@@ -197,9 +197,11 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
     vtable.aeadOpen = Observed.open;
     vtable.hkdfExpand = Observed.expand;
     selected.vtable = &vtable;
+    var certificate_crypto = engine.CryptoCertificateVerifier.init(selected);
     const config: engine.TLSConfig = .{
         .allocator = testing.allocator,
         .crypto_provider = if (explicit_provider) selected else null,
+        .certificate_crypto = if (explicit_provider and scenario == .round_trip) &certificate_crypto else null,
         .server_authentication = .{ .verify = .{ .custom_only = .{ .der_certificates = &.{root} } } },
     };
     var connection = try engine.connectClient(testing.allocator, &client_socket, &config, "localhost");

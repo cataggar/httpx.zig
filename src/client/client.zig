@@ -111,6 +111,12 @@ pub const ClientConfig = struct {
     max_response_size: u64 = 100 * 1024 * 1024,
     max_request_size: u64 = 10 * 1024 * 1024,
     verify_ssl: bool = true,
+    /// Borrowed crypto, adapter, and trust owners must stay stable and immutable
+    /// through all operations and pooled sessions.
+    tls_crypto_provider: ?tls_mod.CryptoProvider = null,
+    tls_certificate_crypto: ?*tls_mod.CryptoCertificateVerifier = null,
+    server_authentication: ?tls_mod.ServerAuthentication = null,
+    tls_trust_limits: tls_mod.TrustLimits = .{},
     http2_enabled: bool = false,
     http3_enabled: bool = false,
     /// Deprecated and ignored. Server push is not implemented and
@@ -687,6 +693,35 @@ const ClientState = struct {
     };
 };
 
+test "client TLS configuration preserves explicit borrowed crypto and trust policy" {
+    const Reject = struct {
+        fn verify(_: *anyopaque, _: tls_mod.VerifyPeerRequest) tls_mod.TrustError!void {
+            return error.TlsUnknownCa;
+        }
+    };
+    var standard = tls_mod.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var adapter = tls_mod.CryptoCertificateVerifier.init(standard.provider());
+    var trust_context: u8 = 0;
+    var client = Client.initWithConfig(std.testing.allocator, .{
+        .tls_crypto_provider = standard.provider(),
+        .tls_certificate_crypto = &adapter,
+        .server_authentication = .{ .verify = .{ .provider = .{
+            .context = &trust_context,
+            .vtable = &.{ .verify_peer = Reject.verify },
+        } } },
+        .tls_trust_limits = .{ .max_path_depth = 4 },
+    });
+    defer client.deinit();
+    const config = client.makeTlsConfig(false, &.{ "h2", "http/1.1" });
+    try std.testing.expectEqual(@intFromPtr(&standard), @intFromPtr(config.crypto_provider.?.context));
+    try std.testing.expectEqual(&adapter, config.certificate_crypto.?);
+    try std.testing.expectEqual(@intFromPtr(&trust_context), @intFromPtr(config.server_authentication.?.verify.provider.context));
+    try std.testing.expectEqual(@as(usize, 4), config.trust_limits.max_path_depth);
+    try std.testing.expectEqualStrings("h2", config.alpn_protocols[0]);
+    try std.testing.expect(!config.verify_server);
+    try std.testing.expect(client.configuration().verify_ssl);
+}
+
 /// Thread-safe HTTP client handle.
 ///
 /// Request methods, cookie operations, interceptor registration, and pool
@@ -758,6 +793,18 @@ pub const Client = struct {
     /// Returns the immutable configuration snapshot captured at initialization.
     pub fn configuration(self: *const Self) *const ClientConfig {
         return &self.shared.config;
+    }
+
+    pub fn makeTlsConfig(self: *const Self, verify_ssl: bool, protocols: []const []const u8) TLSConfig {
+        return .{
+            .allocator = self.allocator,
+            .verify_server = verify_ssl,
+            .alpn_protocols = protocols,
+            .crypto_provider = self.shared.config.tls_crypto_provider,
+            .certificate_crypto = self.shared.config.tls_certificate_crypto,
+            .server_authentication = self.shared.config.server_authentication,
+            .trust_limits = self.shared.config.tls_trust_limits,
+        };
     }
 
     fn beginRequest(self: *Self) !u64 {
@@ -2109,10 +2156,7 @@ pub const Client = struct {
 
             if (req.uri.isTLS()) {
                 const tls_session = lease.tlsSession() orelse tls_blk: {
-                    const tls_config = if (verify_ssl)
-                        TLSConfig.withH2(self.allocator)
-                    else
-                        TLSConfig.insecureWithH2(self.allocator);
+                    const tls_config = self.makeTlsConfig(verify_ssl, &.{ "h2", "http/1.1" });
                     const new_session = lease.initializeTls(tls_config);
                     if (timeouts.connect_ms > 0) try socket.setRecvTimeout(timeouts.connect_ms);
                     try self.handshakePooledTls(
@@ -2195,18 +2239,11 @@ pub const Client = struct {
         if (req.uri.isTLS()) {
             // Build ALPN list based on enabled protocols.
             // When both HTTP/2 and HTTP/3 are enabled, advertise all three.
-            const tls_session_cfg = blk: {
-                if (self.shared.config.http3_enabled and self.shared.config.http2_enabled) {
-                    break :blk if (verify_ssl)
-                        TLSConfig.withH3(self.allocator)
-                    else
-                        TLSConfig.insecureWithH3(self.allocator);
-                } else if (verify_ssl) {
-                    break :blk TLSConfig.withH2(self.allocator);
-                } else {
-                    break :blk TLSConfig.insecureWithH2(self.allocator);
-                }
-            };
+            const protocols: []const []const u8 = if (self.shared.config.http3_enabled and self.shared.config.http2_enabled)
+                &.{ "h3", "h2", "http/1.1" }
+            else
+                &.{ "h2", "http/1.1" };
+            const tls_session_cfg = self.makeTlsConfig(verify_ssl, protocols);
             var session = TLSSession.init(tls_session_cfg);
             defer session.deinit();
             session.attachSocket(&socket);
@@ -3623,7 +3660,7 @@ pub const Client = struct {
         verify_ssl: bool,
         decompression: types.DecompressionPolicy,
     ) !Response {
-        const tls_cfg = if (verify_ssl) TLSConfig.init(self.allocator) else TLSConfig.insecure(self.allocator);
+        const tls_cfg = self.makeTlsConfig(verify_ssl, &.{"http/1.1"});
 
         // Set up reconnect context for TLS version fallback.
         // When TLS 1.3 fails and the server closes the connection,
@@ -4655,12 +4692,8 @@ const OperationImpl = struct {
         if (self.req.uri.isTLS()) {
             const existing_session = self.lease.?.tlsSession();
             const session = existing_session orelse session: {
-                const config = if (wants_h2)
-                    (if (self.verify_ssl) TLSConfig.withH2(self.allocator) else TLSConfig.insecureWithH2(self.allocator))
-                else if (self.verify_ssl)
-                    TLSConfig.init(self.allocator)
-                else
-                    TLSConfig.insecure(self.allocator);
+                const client = self.clientHandle();
+                const config = client.makeTlsConfig(self.verify_ssl, if (wants_h2) &.{ "h2", "http/1.1" } else &.{"http/1.1"});
                 break :session self.lease.?.initializeTls(config);
             };
             if (existing_session == null) {
