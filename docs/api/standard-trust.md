@@ -179,7 +179,9 @@ are intersected by `CertGetEnhancedKeyUsage`; absent usage and explicitly empty
 Disallowed EKU and time properties are retained. Time cutoffs conservatively
 reject **all** use at/after the earliest cutoff, rather than grandfathering
 older issuance. Unsupported root-program certificate policies, name
-constraints, and chain policies exclude the affected certificate. Property
+constraints, chain policies, and not-before issuance/purpose properties
+(`CERT_NOT_BEFORE_FILETIME_PROP_ID` 126 and
+`CERT_NOT_BEFORE_ENHKEY_USAGE_PROP_ID` 127) exclude the affected certificate. Property
 errors, malformed values, and size races fail initialization.
 
 Hash-only CTLs are **not yet implemented**. CTLs found in logical stores, or

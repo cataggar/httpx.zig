@@ -98,23 +98,34 @@ fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, roo
 }
 
 fn readPolicy(snapshot: *metadata.Snapshot, certificate: *const crypt32.CERT_CONTEXT) Error!metadata.Windows {
-    var result = metadata.Windows{ .roles = try effectiveRoles(snapshot.allocator, snapshot.limits.max_property_bytes, certificate) };
+    const roles = try effectiveRoles(snapshot.allocator, snapshot.limits.max_property_bytes, certificate);
+    return readPolicyProperties(snapshot.allocator, snapshot.limits.max_property_bytes, .{
+        .context = certificate,
+        .function = queryProperty,
+    }, roles);
+}
+
+const cert_not_before_filetime_prop_id: u32 = 126;
+const cert_not_before_enhkey_usage_prop_id: u32 = 127;
+
+fn readPolicyProperties(allocator: Allocator, limit: usize, query: Query, roles: u2) Error!metadata.Windows {
+    var result = metadata.Windows{ .roles = roles };
     // These properties encode additional policies that this offline profile
     // does not implement. Presence is restrictive, never unrestricted trust.
-    for ([_]u32{ 83, 84, 105 }) |property_id| {
-        if (try property(snapshot.allocator, snapshot.limits.max_property_bytes, certificate, property_id)) |bytes| {
-            defer snapshot.allocator.free(bytes);
+    for ([_]u32{ 83, 84, 105, cert_not_before_filetime_prop_id, cert_not_before_enhkey_usage_prop_id }) |property_id| {
+        if (try readProperty(allocator, limit, query, property_id)) |bytes| {
+            defer allocator.free(bytes);
             result.unsupported = true;
         }
     }
     for ([_]u32{ 104, 128 }) |property_id| {
-        if (try property(snapshot.allocator, snapshot.limits.max_property_bytes, certificate, property_id)) |bytes| {
-            defer snapshot.allocator.free(bytes);
+        if (try readProperty(allocator, limit, query, property_id)) |bytes| {
+            defer allocator.free(bytes);
             result.merge(.{ .disallow_at = try filetime(bytes) });
         }
     }
-    if (try property(snapshot.allocator, snapshot.limits.max_property_bytes, certificate, 122)) |bytes| {
-        defer snapshot.allocator.free(bytes);
+    if (try readProperty(allocator, limit, query, 122)) |bytes| {
+        defer allocator.free(bytes);
         result.denied_roles = try deniedRoles(bytes);
     }
     return result;
@@ -258,6 +269,79 @@ test "Windows property query failure size races and allocation ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.allocated, .{});
     for ([_]Fake{ .{ .size = 0 }, .{ .size = 9 }, .{ .fail_read = true }, .{ .changed_size = true } }) |fake| {
         try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 8, .{ .context = &fake, .function = Fake.query }, 9));
+    }
+}
+
+const IssuancePropertyQuery = struct {
+    present: u2,
+    queried: u2 = 0,
+    read: u2 = 0,
+    failure: enum { none, size_query, read_query, size_changed } = .none,
+
+    fn query(context: *const anyopaque, id: u32, buffer: ?[]u8) QueryError!usize {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(context)));
+        const bit: u2 = switch (id) {
+            cert_not_before_filetime_prop_id => 1,
+            cert_not_before_enhkey_usage_prop_id => 2,
+            else => return error.Missing,
+        };
+        self.queried |= bit;
+        if (self.present & bit == 0) return error.Missing;
+        const value: []const u8 = if (bit == 1)
+            "\x00\x00\x00\x00\x00\x00\x00\x00"
+        else
+            "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
+        if (buffer) |bytes| {
+            if (self.failure == .read_query) return error.Failure;
+            @memcpy(bytes, value);
+            self.read |= bit;
+            return if (self.failure == .size_changed) bytes.len - 1 else bytes.len;
+        }
+        if (self.failure == .size_query) return error.Failure;
+        return value.len;
+    }
+
+    fn descriptor(self: *@This()) Query {
+        return .{ .context = self, .function = query };
+    }
+};
+
+test "Windows policy dispatch detects both issuance restriction properties without a CTL" {
+    for ([_]u2{ 0, 1, 2, 3 }) |present| {
+        var fixture = IssuancePropertyQuery{ .present = present };
+        const result = try readPolicyProperties(std.testing.allocator, 16, fixture.descriptor(), 3);
+        try std.testing.expectEqual(@as(u2, 3), fixture.queried);
+        try std.testing.expectEqual(present, fixture.read);
+        try std.testing.expectEqual(present != 0, result.unsupported);
+        for ([_]@import("trust.zig").PeerRole{ .server, .client }) |role| {
+            try std.testing.expectEqual(present == 0, result.permits(.{
+                .role = role,
+                .identity = null,
+                .now_seconds = 1_800_000_000,
+                .issuer = true,
+                .self_issued = true,
+            }));
+        }
+    }
+}
+
+test "Windows issuance property dispatch preserves errors bounds and allocation cleanup" {
+    const Test = struct {
+        fn run(allocator: Allocator) !void {
+            var fixture = IssuancePropertyQuery{ .present = 3 };
+            const result = try readPolicyProperties(allocator, 16, fixture.descriptor(), 3);
+            try std.testing.expect(result.unsupported);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{});
+    for ([_]u2{ 1, 2 }) |present| {
+        var fixture = IssuancePropertyQuery{ .present = present };
+        inline for (.{ .size_query, .read_query, .size_changed }) |failure| {
+            fixture.failure = failure;
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, readPolicyProperties(std.testing.allocator, 16, fixture.descriptor(), 3));
+        }
+        fixture.failure = .none;
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, readPolicyProperties(std.testing.allocator, 1, fixture.descriptor(), 3));
     }
 }
 
