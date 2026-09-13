@@ -5,6 +5,7 @@ const signature = @import("cert_signature.zig");
 const p = @import("crypto/provider.zig");
 const der = @import("crypto/der.zig");
 const algorithm_encoding = @import("crypto/algorithm_encoding.zig");
+const metadata_digest = @import("metadata_digest.zig");
 const Error = signature.CertificateSignatureError;
 const Certificate = std.crypto.Certificate;
 
@@ -29,6 +30,16 @@ pub const CryptoCertificateVerifier = struct {
     pub fn matchesProvider(self: *const CryptoCertificateVerifier, selected: p.CryptoProvider) bool {
         return self.crypto.abi_version == selected.abi_version and
             self.crypto.context == selected.context and self.crypto.vtable == selected.vtable;
+    }
+
+    pub fn metadataHasher(self: *CryptoCertificateVerifier, options: metadata_digest.Options) metadata_digest.MetadataDigest {
+        return .{ .context = self, .digest_fn = digestMetadataCallback, .options = options };
+    }
+
+    fn digestMetadataCallback(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
+        const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
+        // MetadataDigest.hash enforces the per-binding permission before dispatch.
+        return self.digestMetadata(scratch, algorithm, input, out, .{ .allow_sha1_identifiers = true });
     }
 
     /// Hashes public trust-store identifiers, not certificate signatures.
@@ -432,7 +443,10 @@ test "certificate metadata digest preserves hash callback failures and destroys 
 
         fn capabilities(context: *anyopaque) p.Capabilities {
             var caps = owner(context).standard.provider().vtable.capabilities(context);
-            if (owner(context).failure == .unsupported) caps.setHash(.sha256, false);
+            if (owner(context).failure == .unsupported) {
+                caps.setHash(.sha1, false);
+                caps.setHash(.sha256, false);
+            }
             return caps;
         }
 
@@ -470,31 +484,41 @@ test "certificate metadata digest preserves hash callback failures and destroys 
     vtable.hashSnapshot = Observed.snapshot;
     vtable.hashDestroy = Observed.destroy;
     provider.vtable = &vtable;
-    const adapter = CryptoCertificateVerifier.init(provider);
-    for (std.enums.values(Observed.Failure)) |failure| {
-        observed.failure = failure;
-        observed.creates = 0;
-        observed.destroys = 0;
-        var out: [32]u8 = @splat(0xa5);
-        const expected = if (failure == .unsupported) error.UnsupportedAlgorithm else error.InternalError;
-        try testing.expectError(expected, adapter.digestMetadata(testing.allocator, .sha256, "abc", &out, .{}));
-        try testing.expectEqual(@as(usize, if (failure == .unsupported) 0 else 1), observed.creates);
-        try testing.expectEqual(@as(usize, if (failure == .update or failure == .snapshot) 1 else 0), observed.destroys);
-        try testing.expect(std.mem.allEqual(u8, &out, 0));
+    var adapter = CryptoCertificateVerifier.init(provider);
+    const hasher = adapter.metadataHasher(.{ .allow_sha1_identifiers = true });
+    for ([_]p.HashAlgorithm{ .sha1, .sha256 }) |algorithm| {
+        for ([_]bool{ false, true }) |descriptor| {
+            for (std.enums.values(Observed.Failure)) |failure| {
+                observed.failure = failure;
+                observed.creates = 0;
+                observed.destroys = 0;
+                var out: [32]u8 = @splat(0xa5);
+                const output = out[0..algorithm.digestLength()];
+                const expected = if (failure == .unsupported) error.UnsupportedAlgorithm else error.InternalError;
+                const result = if (descriptor)
+                    hasher.hash(testing.allocator, algorithm, "abc", output)
+                else
+                    adapter.digestMetadata(testing.allocator, algorithm, "abc", output, .{ .allow_sha1_identifiers = true });
+                try testing.expectError(expected, result);
+                try testing.expectEqual(@as(usize, if (failure == .unsupported) 0 else 1), observed.creates);
+                try testing.expectEqual(@as(usize, if (failure == .update or failure == .snapshot) 1 else 0), observed.destroys);
+                try testing.expect(std.mem.allEqual(u8, output, 0));
+            }
+        }
     }
 }
 
 test "certificate metadata digest shares immutable provider without sharing hash state" {
     const testing = std.testing;
     const Shared = struct {
-        adapter: *const CryptoCertificateVerifier,
+        hasher: metadata_digest.MetadataDigest,
         failed: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
             const expected = "\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23\xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad";
             for (0..64) |_| {
                 var out: [32]u8 = undefined;
-                self.adapter.digestMetadata(testing.allocator, .sha256, "abc", &out, .{}) catch {
+                self.hasher.hash(testing.allocator, .sha256, "abc", &out) catch {
                     self.failed.store(true, .monotonic);
                     return;
                 };
@@ -503,8 +527,8 @@ test "certificate metadata digest shares immutable provider without sharing hash
         }
     };
     var standard = @import("crypto/standard.zig").StandardProvider.init(testing.io, testing.allocator);
-    const adapter = CryptoCertificateVerifier.init(standard.provider());
-    var shared: Shared = .{ .adapter = &adapter };
+    var adapter = CryptoCertificateVerifier.init(standard.provider());
+    var shared: Shared = .{ .hasher = adapter.metadataHasher(.{}) };
     var threads: [4]std.Thread = undefined;
     var started: usize = 0;
     errdefer for (threads[0..started]) |thread| thread.join();
@@ -515,4 +539,83 @@ test "certificate metadata digest shares immutable provider without sharing hash
     for (threads) |thread| thread.join();
     started = 0;
     try testing.expect(!shared.failed.load(.monotonic));
+}
+
+test "certificate metadataHasher preserves adapter identity options and failure clearing" {
+    const testing = std.testing;
+    var standard = @import("crypto/standard.zig").StandardProvider.init(testing.io, testing.allocator);
+    var adapter = CryptoCertificateVerifier.init(standard.provider());
+    const disabled = adapter.metadataHasher(.{});
+    const enabled = adapter.metadataHasher(.{ .allow_sha1_identifiers = true });
+    try testing.expectEqual(adapter.verifier().context, disabled.context);
+    try testing.expectEqual(adapter.verifier().context, enabled.context);
+    try testing.expect(!disabled.options.allow_sha1_identifiers);
+    try testing.expect(enabled.options.allow_sha1_identifiers);
+    var output: [32]u8 = @splat(0xa5);
+    try testing.expectError(error.UnsupportedAlgorithm, disabled.hash(testing.allocator, .sha1, "abc", output[0..20]));
+    try testing.expect(std.mem.allEqual(u8, output[0..20], 0));
+    try enabled.hash(testing.allocator, .sha1, "abc", output[0..20]);
+    try testing.expectEqualSlices(u8, "\xa9\x99\x3e\x36\x47\x06\x81\x6a\xba\x3e\x25\x71\x78\x50\xc2\x6c\x9c\xd0\xd8\x9d", output[0..20]);
+    @memset(&output, 0xa5);
+    try testing.expectError(error.InvalidDigestLength, enabled.hash(testing.allocator, .sha1, "abc", &output));
+    try testing.expect(std.mem.allEqual(u8, &output, 0));
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    @memset(&output, 0xa5);
+    try testing.expectError(error.OutOfMemory, enabled.hash(failing.allocator(), .sha256, "abc", &output));
+    try testing.expect(std.mem.allEqual(u8, &output, 0));
+}
+
+test "certificate metadataHasher binds signatures and rejects another adapter instance" {
+    const testing = std.testing;
+    const trust = @import("trust.zig");
+    const Binding = @import("policy_binding.zig").PolicyBinding;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const Fixture = struct {
+        spki: []const u8,
+        signature_bytes: [64]u8,
+        expected_digest: [32]u8,
+
+        fn verify(context: *const anyopaque, request: trust.VerifyPeerRequest, hasher: metadata_digest.MetadataDigest) trust.TrustError!void {
+            const self: *const @This() = @ptrCast(@alignCast(context));
+            var digest: [32]u8 = undefined;
+            hasher.hash(request.scratch_allocator, .sha256, request.chain_der[0], &digest) catch |err|
+                return if (err == error.OutOfMemory) error.OutOfMemory else error.TlsCertificateConstraintViolation;
+            if (!std.mem.eql(u8, &digest, &self.expected_digest)) return error.TlsCertificateConstraintViolation;
+            request.signature_verifier.verify(.{
+                .algorithm = .{ .oid = "\x2b\x65\x70" },
+                .issuer_spki_der = self.spki,
+                .tbs_certificate_der = request.chain_der[0],
+                .signature = &self.signature_bytes,
+            }) catch return error.TlsCertificateSignatureInvalid;
+        }
+    };
+    const message = "paired provider fixture";
+    const pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x42));
+    const spki = "\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00".* ++ pair.public_key.toBytes();
+    var fixture: Fixture = .{
+        .spki = &spki,
+        .signature_bytes = (try pair.sign(message, null)).toBytes(),
+        .expected_digest = undefined,
+    };
+    std.crypto.hash.sha2.Sha256.hash(message, &fixture.expected_digest, .{});
+    var standard = @import("crypto/standard.zig").StandardProvider.init(testing.io, testing.allocator);
+    var adapter = CryptoCertificateVerifier.init(standard.provider());
+    var other = CryptoCertificateVerifier.init(standard.provider());
+    const hasher = adapter.metadataHasher(.{});
+    try testing.expectError(error.TlsInvalidTrustConfiguration, Binding.init(&fixture, Fixture.verify, other.verifier(), hasher));
+    var binding = try Binding.init(&fixture, Fixture.verify, adapter.verifier(), hasher);
+    var request: trust.VerifyPeerRequest = .{
+        .role = .server,
+        .chain_der = &.{message},
+        .expected_identity = .{ .dns_name = "localhost" },
+        .now_seconds = 1_800_000_000,
+        .signature_verifier = binding.signatureVerifier(),
+        .scratch_allocator = testing.allocator,
+    };
+    try binding.provider().verifyPeer(request);
+    request.signature_verifier = other.verifier();
+    try testing.expectError(error.TlsInvalidTrustConfiguration, binding.provider().verifyPeer(request));
+    request.signature_verifier = adapter.verifier();
+    fixture.signature_bytes[0] ^= 1;
+    try testing.expectError(error.TlsCertificateSignatureInvalid, binding.provider().verifyPeer(request));
 }

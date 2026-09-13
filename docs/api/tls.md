@@ -153,6 +153,10 @@ verification. A different provider, omitted explicit provider, or insecure
 configuration fails with `TlsInvalidTrustConfiguration`; runtime never
 downcasts an erased signature-verifier context to discover its provider.
 The exact configured adapter's signature handle reaches the trust callback.
+For a `PolicyBinding`, this is the same context and vtable returned by
+`binding.signatureVerifier()`. Construct the binding's signature and metadata
+handles from that adapter; another adapter instance is rejected even if it
+wraps an identical primitive-provider descriptor.
 When no adapter is supplied, existing custom trust-provider callbacks continue
 to receive the ordinary per-handshake verifier.
 
@@ -165,21 +169,27 @@ verification request rather than being taken from root-store load time.
 
 ### Metadata-only certificate digests
 
-`CryptoCertificateVerifier.digestMetadata` uses the selected provider's
+`CryptoCertificateVerifier.metadataHasher(options)` returns a borrowed
+`MetadataDigest` with the same context as `adapter.verifier()`. Its `hash`
+method enforces per-binding identifier policy and uses the selected provider's
 `hashCreate`, `update`, `snapshot`, and `deinit` operations. It never substitutes
 stdlib hashing or an operating-system certificate-chain engine:
 
 ```zig
 var adapter = httpx.CryptoCertificateVerifier.init(selected_crypto.provider());
+const hasher = adapter.metadataHasher(.{ .allow_sha1_identifiers = true });
 var identifier: [20]u8 = undefined;
-try adapter.digestMetadata(
-    allocator, .sha1, certificate_der, &identifier,
-    .{ .allow_sha1_identifiers = true },
-);
+try hasher.hash(allocator, .sha1, certificate_der, &identifier);
 ```
 
-SHA-1 identifier hashing is denied unless explicitly enabled for that call;
+The existing `digestMetadata(..., options)` remains available for individual
+calls with the same buffer, error, and cleanup guarantees.
+SHA-1 identifier hashing is denied unless explicitly enabled;
 the selected backend must independently advertise SHA-1 hashing support.
+For the optional SymCrypt TLS provider this additionally requires its
+independent `allow_sha1_identifier_hash = true` deployment option. The policy
+option is named `allow_sha1_identifiers`; neither opt-in substitutes for the
+other.
 This permission changes no signature, HMAC, HKDF, or PRF capability. The
 certificate-signature adapter rejects SHA-1 signatures even when metadata
 hashing is enabled. MD5 is not an available algorithm.
@@ -192,10 +202,13 @@ hash handle is retained. Concurrent calls require a thread-safe provider and
 scratch allocator. Borrowed verifier handles still require their adapter and
 provider owners to remain at stable addresses and alive.
 
-A fingerprint match alone does not establish a trust anchor. This primitive
-adapter does not change `VerifyPeerRequest`, either existing verifier/provider
-vtable, or the primitive ABI version. Canonical policy binding and platform CTL
-interpretation require their separately reviewed integration.
+A fingerprint match alone does not establish a trust anchor. A `PolicyBinding`
+rejects a different signature context or vtable before private policy dispatch;
+the canonical policy still owns anchor selection and certificate validation.
+This primitive adapter does not change `VerifyPeerRequest`, either existing verifier/provider
+vtable, or the primitive ABI version. The adapter and binding are implemented;
+canonical root-factory/private-digest integration and platform CTL interpretation
+require their separately reviewed integration and platform qualification.
 
 ### Remaining integration
 
