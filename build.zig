@@ -15,6 +15,10 @@ fn linkTrustPlatformLibs(module: *std.Build.Module, target: std.Build.ResolvedTa
     switch (target.result.os.tag) {
         .windows => module.linkSystemLibrary("crypt32", .{}),
         .macos => {
+            if (module.owner.sysroot) |sdk| {
+                module.addSystemFrameworkPath(.{ .cwd_relative = module.owner.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+                module.addLibraryPath(.{ .cwd_relative = module.owner.pathJoin(&.{ sdk, "usr/lib" }) });
+            }
             module.linkFramework("Security", .{});
             module.linkFramework("CoreFoundation", .{});
         },

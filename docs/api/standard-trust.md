@@ -166,8 +166,11 @@ platform system libraries accessed through Zig declarations: no C source,
 shim, third-party TLS/crypto library, or OS certificate-signature fallback.
 
 macOS builds require an Apple SDK providing those frameworks, including when
-cross-compiling. CI builds both macOS architectures on macOS runners with the
-installed SDK; it does not omit the framework links or vendor an SDK.
+cross-compiling. Pass its root with `--sysroot /path/to/MacOSX.sdk` when selecting
+an explicit macOS target. The build uses that SDK's framework and library search
+paths. CI discovers the installed SDK with `xcrun` and supplies it for both macOS
+architectures; it does not omit the framework links or vendor an SDK.
+
 Linux/custom policy remains pure Zig, with no added Linux native linkage.
 Downstream build integration must propagate the same platform links.
 
