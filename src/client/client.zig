@@ -71,6 +71,7 @@ const RequestProgress = operation.RequestProgress;
 
 test {
     _ = @import("tls_pairing_test.zig");
+    _ = @import("tls_eof_test.zig");
 }
 
 const RequestTimeouts = struct {
@@ -3700,7 +3701,7 @@ pub const Client = struct {
         defer parser.deinit();
 
         while (!parser.isComplete()) {
-            const n = try session.read(&buf);
+            const n = try readTlsForHttp(&session, &buf);
             if (n == 0) break;
             total_read += n;
             if (@as(u64, total_read) > self.shared.config.max_response_size) return error.ResponseTooLarge;
@@ -3764,7 +3765,7 @@ pub const Client = struct {
         expect_body: bool,
         decompression: types.DecompressionPolicy,
     ) !Response {
-        return self.readResponseFromReadFn(session, TLSSession.read, expect_body, decompression);
+        return self.readResponseFromReadFn(session, readTlsForHttp, expect_body, decompression);
     }
 
     fn readResponseFromIo(self: *Self, r: *std.Io.Reader, decompression: types.DecompressionPolicy) !Response {
@@ -4772,7 +4773,7 @@ const OperationImpl = struct {
         const n = if (self.shared.config.transport_adapter) |adapter|
             try adapter.readFn(adapter.context, output)
         else if (self.tls_active)
-            try self.tlsSession().readWithContext(output, &self.context)
+            try tlsReadResultForHttp(self.tlsSession(), self.tlsSession().readWithContext(output, &self.context))
         else
             try self.socket().recvWithContext(output, &self.context);
         try self.context.check();
@@ -6811,6 +6812,17 @@ const SocketHTTP2Transport = struct {
     }
 };
 
+fn tlsReadResultForHttp(session: *const TLSSession, result: anyerror!usize) !usize {
+    return result catch |err| {
+        if (err == error.TlsCloseNotify and session.received_close_notify) return 0;
+        return err;
+    };
+}
+
+fn readTlsForHttp(session: *TLSSession, output: []u8) !usize {
+    return tlsReadResultForHttp(session, session.read(output));
+}
+
 const TLSHTTP2Transport = struct {
     session: *TLSSession,
 
@@ -6822,7 +6834,7 @@ const TLSHTTP2Transport = struct {
     fn readNoEof(self: *TLSHTTP2Transport, out: []u8) !void {
         var read: usize = 0;
         while (read < out.len) {
-            const n = try self.session.read(out[read..]);
+            const n = try readTlsForHttp(self.session, out[read..]);
             if (n == 0) return error.UnexpectedEof;
             read += n;
         }

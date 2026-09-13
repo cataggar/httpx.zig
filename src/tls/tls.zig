@@ -292,6 +292,7 @@ const ApplicationReadState = struct {
     socket: *Socket,
     context: ?*const IoContext = null,
     write_poisoned: ?*bool = null,
+    received_close_notify: ?*bool = null,
     version: tls.ProtocolVersion,
     is_server: bool,
     cipher_suite: tls.CipherSuite,
@@ -516,6 +517,10 @@ fn dispatchApplicationRecord(
         @intFromEnum(ContentType.alert) => {
             if (record.content.len != 2) return error.TlsDecodeError;
             const description: tls.Alert.Description = @enumFromInt(record.content[1]);
+            if (state.received_close_notify) |received| {
+                received.* = record.content[0] == @intFromEnum(tls.Alert.Level.warning) and
+                    description == .close_notify and state.post_handshake_len.* == 0;
+            }
             return errors.fromAlert(description);
         },
         @intFromEnum(ContentType.handshake) => {
@@ -1335,6 +1340,9 @@ pub const TLSSession = struct {
     config: TLSConfig,
     standard_crypto_provider: StandardCryptoProvider = undefined,
     failed: bool = false,
+    /// Set only by an authenticated warning close_notify at a message boundary.
+    /// The legacy TlsCloseNotify error alone also represents other alerts.
+    received_close_notify: bool = false,
     negotiated_alpn: alpn.NegotiatedAlpn = .{},
     tls_version: ?tls.ProtocolVersion = null,
     socket: ?*Socket = null,
@@ -1386,6 +1394,7 @@ pub const TLSSession = struct {
     }
 
     pub fn deinit(self: *TLSSession) void {
+        self.received_close_notify = false;
         if (self.app_write_key) |*k| crypto_provider.secureWipe(k);
         if (self.app_write_iv) |*k| crypto_provider.secureWipe(k);
         if (self.app_write_secret) |*k| crypto_provider.secureWipe(k);
@@ -1679,6 +1688,7 @@ pub const TLSSession = struct {
             .socket = socket,
             .context = context,
             .write_poisoned = &self.write_poisoned,
+            .received_close_notify = &self.received_close_notify,
             .version = version,
             .is_server = false,
             .cipher_suite = cs,

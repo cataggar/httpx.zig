@@ -443,6 +443,14 @@ not turn a previously failed body read into successful completion. Successful
 `finish()` remains idempotent. Cancellation and current deadline checks retain
 precedence over a previously recorded failure.
 
+An authenticated warning TLS `close_notify` is transport EOF for HTTP framing:
+an incomplete `Content-Length` body returns `error.ResponseBodyUnderrun`,
+incomplete chunk data or trailers return `error.MalformedChunk`, and a
+close-delimited HTTP/1 body completes without reusing the connection. EOF in
+HTTP/1 headers or an incomplete HTTP/2 frame returns `error.UnexpectedEof`.
+Other alerts, unauthenticated or truncated TLS records, cancellation, and
+deadline errors are not clean EOF. Raw TLS reads retain their alert errors.
+
 `ClientConfig.max_request_size` and `max_response_size` are `u64` limits; zero
 means unlimited, not an empty body. `OpenOptions.response_limit = .bytes` sets
 an exact per-operation limit, including `.bytes = 0` for no response payload;
