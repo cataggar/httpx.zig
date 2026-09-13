@@ -210,6 +210,15 @@ vtable, or the primitive ABI version. The adapter and binding are implemented;
 canonical root-factory/private-digest integration and platform CTL interpretation
 require their separately reviewed integration and platform qualification.
 
+The public `connectClient` regression tests exercise the actual binding and
+metadata descriptor through TLS 1.2/1.3 handshakes, application records, and
+TLS 1.3 KeyUpdate. They assert the request handle equals
+`binding.signatureVerifier()`, selected hash/signature/record callbacks execute,
+and mismatched adapters/providers, independent identifier gates, and provider
+failures reject without fallback. The binding fixture uses an exact certificate
+pin, identity/time checks, and its issuer signature; it is not a general PKIX
+policy or qualification of a platform trust store.
+
 ### Remaining integration
 
 The canonical policy files are unchanged by this runtime port. The handshake

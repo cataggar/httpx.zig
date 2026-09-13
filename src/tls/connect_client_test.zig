@@ -9,6 +9,9 @@ const Standard = @import("crypto/standard.zig").StandardProvider;
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const IoContext = @import("../io/context.zig").IoContext;
 const Deadline = @import("../io/context.zig").Deadline;
+const trust = @import("trust.zig");
+const metadata = @import("metadata_digest.zig");
+const PolicyBinding = @import("policy_binding.zig").PolicyBinding;
 
 fn element(allocator: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]const u8 {
     const body = try std.mem.concat(allocator, u8, parts);
@@ -71,6 +74,7 @@ fn certificate(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, issuer: Ecdsa.K
 }
 
 const Scenario = enum { round_trip, seal_denied, open_denied, capability_denied, key_update_denied };
+const BindingCase = enum { paired, wrong_adapter, wrong_provider, policy_denied, backend_denied, hash_failed, signature_failed };
 
 const Observed = struct {
     standard: Standard,
@@ -79,6 +83,16 @@ const Observed = struct {
     seals: usize = 0,
     opens: usize = 0,
     expansions: usize = 0,
+    binding_case: ?BindingCase = null,
+    in_policy: bool = false,
+    policy_calls: usize = 0,
+    metadata_creates: usize = 0,
+    metadata_updates: usize = 0,
+    metadata_snapshots: usize = 0,
+    metadata_destroys: usize = 0,
+    policy_signatures: usize = 0,
+    metadata_error: ?p.ProviderError = null,
+    error_output_cleared: bool = false,
 
     fn owner(context: *anyopaque) *@This() {
         const implementation: *Standard = @ptrCast(@alignCast(context));
@@ -91,6 +105,7 @@ const Observed = struct {
         result.aeads = 0;
         if (self.denial != .capability_denied) result.setAead(.aes_128_gcm, true);
         if (self.version == .tls_1_2) result.hkdf_hashes = 0;
+        if (self.binding_case == .backend_denied) result.setHash(.sha1, false);
         return result;
     }
 
@@ -113,6 +128,83 @@ const Observed = struct {
         self.expansions += 1;
         if (self.denial == .key_update_denied) return error.UnsupportedOperation;
         return self.standard.provider().vtable.hkdfExpand(context, algorithm, key, info, out);
+    }
+
+    fn hashCreate(context: *anyopaque, allocator: std.mem.Allocator, algorithm: p.HashAlgorithm, out: *?*anyopaque) p.ProviderError!void {
+        const self = owner(context);
+        if (self.in_policy) self.metadata_creates += 1;
+        return self.standard.provider().vtable.hashCreate(context, allocator, algorithm, out);
+    }
+
+    fn hashUpdate(context: *anyopaque, handle: *anyopaque, bytes: []const u8) p.ProviderError!void {
+        const self = owner(context);
+        if (self.in_policy) self.metadata_updates += 1;
+        if (self.in_policy and self.binding_case == .hash_failed) return error.InternalError;
+        return self.standard.provider().vtable.hashUpdate(context, handle, bytes);
+    }
+
+    fn hashSnapshot(context: *anyopaque, handle: *anyopaque, out: []u8) p.ProviderError!void {
+        const self = owner(context);
+        if (self.in_policy) self.metadata_snapshots += 1;
+        return self.standard.provider().vtable.hashSnapshot(context, handle, out);
+    }
+
+    fn hashDestroy(context: *anyopaque, allocator: std.mem.Allocator, handle: *anyopaque) void {
+        const self = owner(context);
+        if (self.in_policy) self.metadata_destroys += 1;
+        self.standard.provider().vtable.hashDestroy(context, allocator, handle);
+    }
+
+    fn verify(context: *anyopaque, scheme: p.SignatureScheme, key: p.PublicKey, parts: []const []const u8, signature_bytes: []const u8) p.ProviderError!void {
+        const self = owner(context);
+        if (self.in_policy) {
+            self.policy_signatures += 1;
+            if (self.binding_case == .signature_failed) return error.SignatureInvalid;
+        }
+        return self.standard.provider().vtable.verify(context, scheme, key, parts, signature_bytes);
+    }
+};
+
+// Test-only exact fixture pin, identity/time checks and issuer signature.
+// This exercises binding dispatch; it is not a replacement PKIX policy.
+const FixturePolicy = struct {
+    leaf: []const u8,
+    issuer_spki: []const u8,
+    tbs: []const u8,
+    signature_bytes: []const u8,
+    identifier: [20]u8,
+    expected_verifier: trust.CertificateSignatureVerifier,
+    observed: *Observed,
+
+    fn verify(context: *const anyopaque, request: trust.VerifyPeerRequest, hasher: metadata.MetadataDigest) trust.TrustError!void {
+        const self: *const @This() = @ptrCast(@alignCast(context));
+        const observed = self.observed;
+        observed.policy_calls += 1;
+        if (request.signature_verifier.context != self.expected_verifier.context or
+            request.signature_verifier.vtable != self.expected_verifier.vtable)
+            return error.TlsInvalidTrustConfiguration;
+        if (request.chain_der.len != 1 or !std.mem.eql(u8, self.leaf, request.chain_der[0])) return error.TlsUnknownCa;
+        const identity = request.expected_identity orelse return error.TlsHostnameMismatch;
+        if (identity != .dns_name or !std.mem.eql(u8, identity.dns_name, "localhost")) return error.TlsHostnameMismatch;
+        if (request.now_seconds < 1_704_067_200) return error.TlsCertificateNotYetValid;
+        if (request.now_seconds >= 2_524_608_000) return error.TlsCertificateExpired;
+        const now = std.Io.Timestamp.now(testing.io, .real).toSeconds();
+        if (request.now_seconds < now - 5 or request.now_seconds > now + 5) return error.TlsInvalidTrustConfiguration;
+        observed.in_policy = true;
+        defer observed.in_policy = false;
+        var identifier: [20]u8 = @splat(0xa5);
+        hasher.hash(request.scratch_allocator, .sha1, self.leaf, &identifier) catch |err| {
+            observed.metadata_error = err;
+            observed.error_output_cleared = std.mem.allEqual(u8, &identifier, 0);
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.TlsCertificateConstraintViolation;
+        };
+        if (!std.mem.eql(u8, &self.identifier, &identifier)) return error.TlsCertificateConstraintViolation;
+        request.signature_verifier.verify(.{
+            .algorithm = .{ .oid = "\x2a\x86\x48\xce\x3d\x04\x03\x02" },
+            .issuer_spki_der = self.issuer_spki,
+            .tbs_certificate_der = self.tbs,
+            .signature = self.signature_bytes,
+        }) catch return error.TlsCertificateSignatureInvalid;
     }
 };
 
@@ -155,7 +247,7 @@ fn readConnection(connection: *engine.Connection, bytes: []u8, context: ?*const 
     return connection.read(bytes);
 }
 
-fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider: bool, with_context: bool) !void {
+fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider: bool, with_context: bool, binding_case: ?BindingCase) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -189,23 +281,83 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
         client_socket.close();
         thread.join();
     };
-    var observed: Observed = .{ .standard = .init(testing.io, testing.allocator), .version = version };
+    var observed: Observed = .{ .standard = .init(testing.io, testing.allocator), .version = version, .binding_case = binding_case };
     var selected = observed.standard.provider();
     var vtable = selected.vtable.*;
     vtable.capabilities = Observed.capabilities;
     vtable.aeadSeal = Observed.seal;
     vtable.aeadOpen = Observed.open;
     vtable.hkdfExpand = Observed.expand;
+    vtable.hashCreate = Observed.hashCreate;
+    vtable.hashUpdate = Observed.hashUpdate;
+    vtable.hashSnapshot = Observed.hashSnapshot;
+    vtable.hashDestroy = Observed.hashDestroy;
+    vtable.verify = Observed.verify;
     selected.vtable = &vtable;
     var certificate_crypto = engine.CryptoCertificateVerifier.init(selected);
+    var other_adapter = engine.CryptoCertificateVerifier.init(selected);
+    var other_provider = Standard.init(testing.io, testing.allocator);
+    var certificate_reader = try @import("crypto/der.zig").sequence(leaf);
+    const leaf_tbs = try certificate_reader.element();
+    _ = try certificate_reader.take(0x30);
+    const leaf_signature = try certificate_reader.take(3);
+    try certificate_reader.finish();
+    const issuer_spki = "\x30\x59\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00".* ++ root_key.public_key.toUncompressedSec1();
+    var policy: FixturePolicy = .{
+        .leaf = leaf,
+        .issuer_spki = &issuer_spki,
+        .tbs = leaf_tbs.encoded,
+        .signature_bytes = leaf_signature[1..],
+        .identifier = undefined,
+        .expected_verifier = certificate_crypto.verifier(),
+        .observed = &observed,
+    };
+    std.crypto.hash.Sha1.hash(leaf, &policy.identifier, .{});
+    var binding = try PolicyBinding.init(&policy, FixturePolicy.verify, certificate_crypto.verifier(), certificate_crypto.metadataHasher(.{
+        .allow_sha1_identifiers = binding_case != .policy_denied,
+    }));
+    policy.expected_verifier = binding.signatureVerifier();
     const config: engine.TLSConfig = .{
         .allocator = testing.allocator,
-        .crypto_provider = if (explicit_provider) selected else null,
-        .certificate_crypto = if (explicit_provider and scenario == .round_trip) &certificate_crypto else null,
-        .server_authentication = .{ .verify = .{ .custom_only = .{ .der_certificates = &.{root} } } },
+        .crypto_provider = if (binding_case == .wrong_provider) other_provider.provider() else if (explicit_provider) selected else null,
+        .certificate_crypto = if (binding_case == .wrong_adapter) &other_adapter else if (explicit_provider and (binding_case != null or scenario == .round_trip)) &certificate_crypto else null,
+        .server_authentication = .{ .verify = if (binding_case != null)
+            .{ .provider = binding.provider() }
+        else
+            .{ .custom_only = .{ .der_certificates = &.{root} } } },
     };
+    if (binding_case) |case| {
+        if (case != .paired) {
+            const expected = switch (case) {
+                .wrong_adapter, .wrong_provider => error.TlsInvalidTrustConfiguration,
+                .signature_failed => error.TlsCertificateSignatureInvalid,
+                else => error.TlsCertificateConstraintViolation,
+            };
+            try testing.expectError(expected, engine.connectClient(testing.allocator, &client_socket, &config, "localhost"));
+            const mismatched = case == .wrong_adapter or case == .wrong_provider;
+            try testing.expectEqual(@as(usize, if (mismatched) 0 else 1), observed.policy_calls);
+            try testing.expectEqual(@as(usize, if (case == .hash_failed or case == .signature_failed) 1 else 0), observed.metadata_creates);
+            try testing.expectEqual(observed.metadata_creates, observed.metadata_updates);
+            try testing.expectEqual(@as(usize, if (case == .signature_failed) 1 else 0), observed.metadata_snapshots);
+            try testing.expectEqual(observed.metadata_creates, observed.metadata_destroys);
+            try testing.expectEqual(@as(usize, if (case == .signature_failed) 1 else 0), observed.policy_signatures);
+            if (case == .policy_denied or case == .backend_denied or case == .hash_failed) {
+                try testing.expectEqual(if (case == .hash_failed) error.InternalError else error.UnsupportedAlgorithm, observed.metadata_error.?);
+                try testing.expect(observed.error_output_cleared);
+            }
+            return;
+        }
+    }
     var connection = try engine.connectClient(testing.allocator, &client_socket, &config, "localhost");
     defer connection.deinit();
+    if (binding_case == .paired) {
+        try testing.expectEqual(@as(usize, 1), observed.policy_calls);
+        try testing.expectEqual(@as(usize, 1), observed.metadata_creates);
+        try testing.expectEqual(@as(usize, 1), observed.metadata_updates);
+        try testing.expectEqual(@as(usize, 1), observed.metadata_snapshots);
+        try testing.expectEqual(@as(usize, 1), observed.metadata_destroys);
+        try testing.expectEqual(@as(usize, 1), observed.policy_signatures);
+    }
     try testing.expectEqual(version, connection.tlsVersion());
     try testing.expectEqualStrings("http/1.1", connection.negotiatedAlpn().?);
     if (explicit_provider) {
@@ -256,29 +408,41 @@ fn exercise(version: tls.ProtocolVersion, scenario: Scenario, explicit_provider:
 
 test "connectClient retains selected provider through authenticated records and key updates" {
     for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
-        try exercise(version, .round_trip, true, false);
+        try exercise(version, .round_trip, true, false, null);
     }
 }
 
 test "connectClient preserves post-handshake provider restrictions and failures" {
     for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
         for ([_]Scenario{ .seal_denied, .open_denied, .capability_denied }) |scenario| {
-            try exercise(version, scenario, true, false);
+            try exercise(version, scenario, true, false, null);
         }
     }
-    try exercise(.tls_1_3, .key_update_denied, true, false);
+    try exercise(.tls_1_3, .key_update_denied, true, false, null);
 }
 
 test "connectClient default provider belongs to the returned connection" {
-    try exercise(.tls_1_3, .round_trip, false, false);
+    try exercise(.tls_1_3, .round_trip, false, false, null);
 }
 
 test "connectClient context-aware records retain provider dispatch and fail closed" {
     for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
         for ([_]Scenario{ .round_trip, .seal_denied, .open_denied, .capability_denied }) |scenario| {
-            try exercise(version, scenario, true, true);
+            try exercise(version, scenario, true, true, null);
         }
     }
-    try exercise(.tls_1_3, .key_update_denied, true, true);
-    try exercise(.tls_1_3, .round_trip, false, true);
+    try exercise(.tls_1_3, .key_update_denied, true, true, null);
+    try exercise(.tls_1_3, .round_trip, false, true, null);
+}
+
+test "connectClient uses the exact policy binding through metadata signatures records and failures" {
+    for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
+        for (std.enums.values(BindingCase)) |case| {
+            try exercise(version, .round_trip, true, false, case);
+        }
+        for ([_]Scenario{ .seal_denied, .open_denied, .capability_denied }) |scenario| {
+            try exercise(version, scenario, true, false, .paired);
+        }
+    }
+    try exercise(.tls_1_3, .key_update_denied, true, false, .paired);
 }
