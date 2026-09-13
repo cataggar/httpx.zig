@@ -457,3 +457,106 @@ test "native Windows CTL decoding owns restrictions after releasing process-loca
     try std.testing.expectEqual(@as(usize, 1), snapshot.fingerprint_entries);
     try std.testing.expectEqualSlices(u8, &@as([20]u8, @splat(1)), snapshot.fingerprint_lists.items[0].entries[0].identifier[0..20]);
 }
+
+test "native Windows CTL empty-time projection uses only an unattached fixture leaf" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Probe = struct {
+        const Blob = extern struct { size: u32, data: [*]const u8 };
+        const Attribute = extern struct { oid: [*:0]const u8, count: u32, values: [*]const Blob };
+        const Entry = extern struct { identifier: Blob, count: u32, attributes: [*]const Attribute };
+        const State = enum { absent, empty, known_fixture_value, other_value, other_length, query_error };
+        const Observation = struct { state: State, length: u32 = 0, code: u32 = 0 };
+
+        extern "crypt32" fn CertSetCertificateContextPropertiesFromCTLEntry(
+            *const crypt32.CERT_CONTEXT,
+            *const Entry,
+            u32,
+        ) callconv(.winapi) windows.BOOL;
+
+        fn apply(certificate: *const crypt32.CERT_CONTEXT, identifier: *const [20]u8, attributes: []const Attribute) bool {
+            const entry: Entry = .{
+                .identifier = .{ .size = identifier.len, .data = identifier },
+                .count = @intCast(attributes.len),
+                .attributes = attributes.ptr,
+            };
+            return CertSetCertificateContextPropertiesFromCTLEntry(certificate, &entry, 0).toBool();
+        }
+
+        fn observe(certificate: *const crypt32.CERT_CONTEXT, id: u32, expected: *const [8]u8) Observation {
+            var length: u32 = 0;
+            if (!CertGetCertificateContextProperty(certificate, id, null, &length).toBool()) {
+                const code = @intFromEnum(windows.GetLastError());
+                return .{ .state = if (code == not_found) .absent else .query_error, .code = code };
+            }
+            if (length == 0) return .{ .state = .empty };
+            if (length != 8) return .{ .state = .other_length, .length = length };
+            var bytes: [8]u8 = undefined;
+            if (!CertGetCertificateContextProperty(certificate, id, &bytes, &length).toBool())
+                return .{ .state = .query_error, .code = @intFromEnum(windows.GetLastError()) };
+            if (length != 8) return .{ .state = .other_length, .length = length };
+            return .{ .state = if (std.mem.eql(u8, &bytes, expected)) .known_fixture_value else .other_value, .length = length };
+        }
+
+        fn report(stage: []const u8, success: bool, native_error: u32, time: Observation, other: Observation) void {
+            std.debug.print("Windows fixture CTL projection: stage={s} success={} error={d} prop104={s}/{d}/{d} prop128={s}/{d}/{d}\n", .{
+                stage, success, native_error, @tagName(time.state), time.length, time.code, @tagName(other.state), other.length, other.code,
+            });
+        }
+    };
+    const fixtures = @import("trust_fixtures.zig");
+    var chain = try fixtures.Chain.init(std.testing.allocator, .ecdsa_p256);
+    defer chain.deinit();
+    // Never open a store or add this leaf to one. CTL projection changes only
+    // this fresh context's in-process properties; freeing it discards them.
+    const certificate = CertCreateCertificateContext(.{ .CERT = .ASN }, chain.leaf.ptr, @intCast(chain.leaf.len)) orelse
+        return error.TlsTrustStoreLoadFailed;
+    defer _ = crypt32.CertFreeCertificateContext(certificate);
+    var selected = @import("crypto/standard.zig").StandardProvider.init(std.testing.io, std.testing.allocator);
+    var identifier: [20]u8 = undefined;
+    {
+        var hash = try selected.provider().hashCreate(std.testing.allocator, .sha1);
+        defer hash.deinit();
+        try hash.update(chain.leaf);
+        try hash.snapshot(&identifier);
+    }
+    var time: [8]u8 = undefined;
+    std.mem.writeInt(u64, &time, @as(u64, 1_800_000_000 + 11_644_473_600) * 10_000_000, .little);
+    var encoded: [10]u8 = undefined;
+    @memcpy(encoded[0..2], "\x04\x08");
+    @memcpy(encoded[2..], &time);
+    const full = [_]Probe.Blob{.{ .size = encoded.len, .data = &encoded }};
+    const empty = [_]Probe.Blob{.{ .size = 2, .data = "\x04\x00" }};
+    const time_attribute: Probe.Attribute = .{ .oid = "1.3.6.1.4.1.311.10.11.104", .count = 1, .values = &full };
+    const empty_attribute: Probe.Attribute = .{ .oid = time_attribute.oid, .count = 1, .values = &empty };
+    const other_attribute: Probe.Attribute = .{ .oid = "1.3.6.1.4.1.311.10.11.128", .count = 1, .values = &full };
+    try std.testing.expectEqual(Probe.State.absent, Probe.observe(certificate, 104, &time).state);
+    try std.testing.expectEqual(Probe.State.absent, Probe.observe(certificate, 128, &time).state);
+
+    const initial = Probe.apply(certificate, &identifier, &.{empty_attribute});
+    const initial_error = if (initial) 0 else @intFromEnum(windows.GetLastError());
+    Probe.report("empty104_initial", initial, initial_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
+    const seeded = Probe.apply(certificate, &identifier, &.{ time_attribute, other_attribute });
+    const seed_error = if (seeded) 0 else @intFromEnum(windows.GetLastError());
+    Probe.report("fixed_fixture", seeded, seed_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
+    try std.testing.expect(seeded);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 104, &time).state);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
+
+    const absent = Probe.apply(certificate, &identifier, &.{other_attribute});
+    const absent_error = if (absent) 0 else @intFromEnum(windows.GetLastError());
+    Probe.report("absent104", absent, absent_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
+    try std.testing.expect(absent);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 104, &time).state);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
+
+    const projected = Probe.apply(certificate, &identifier, &.{empty_attribute});
+    const projection_error = if (projected) 0 else @intFromEnum(windows.GetLastError());
+    Probe.report("empty104", projected, projection_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
+    try std.testing.expect(projected);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
+    const repeated = Probe.apply(certificate, &identifier, &.{empty_attribute});
+    const repeat_error = if (repeated) 0 else @intFromEnum(windows.GetLastError());
+    Probe.report("repeat_empty104", repeated, repeat_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
+    try std.testing.expect(repeated);
+    try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
+}

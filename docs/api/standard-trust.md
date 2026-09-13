@@ -208,6 +208,19 @@ locator fields are not alternate matching keys; no MD5 computation is enabled.
 Purpose, disable-time, and unsupported issuance/policy restrictions are
 retained rather than discarded.
 
+Native Windows runs have encountered an **explicit empty** AuthRoot attribute
+104. This is not a missing attribute or an eight-byte zero FILETIME, and it
+remains rejected pending a justified projection. Microsoft's
+[`CertSetCertificateContextPropertiesFromCTLEntry` contract](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certsetcertificatecontextpropertiesfromctlentry)
+describes CTL-to-property copying but does not specify this empty-value case.
+A native diagnostic fixture exercises that CTL-specific API on a fresh,
+unattached **leaf** context: known eight-byte values, omission of 104, explicit
+empty 104, repetition, and retention of independent property 128. It never
+opens a store, installs a certificate, modifies a root, or verifies a chain.
+Only fixed stage/state labels, lengths, and native status codes are reported.
+This memory-only experiment is evidence gathering, not permission to clear
+production restrictions or a claim of Windows trust qualification.
+
 Certificates found in the local AuthRoot cache are marked as program material
 without adding anchors. System anchors marked this way must appear in every
 applicable current AuthRoot list. Missing/expired program metadata fails closed.
