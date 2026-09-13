@@ -68,7 +68,79 @@ test "CTL purpose cutoff and unsupported issuance policies are not erased" {
     }
 }
 
-test "CTL unknown time encodings still fail atomically with native diagnostics" {
+test "CTL absent empty104 and zero FILETIME remain distinct" {
+    const cases = [_]struct {
+        attributes: []const fixtures.Attribute,
+        unsupported: bool,
+        cutoff: ?i64,
+    }{
+        .{ .attributes = &.{}, .unsupported = false, .cutoff = null },
+        .{ .attributes = &.{.{ .id = 104, .value = "" }}, .unsupported = true, .cutoff = null },
+        .{ .attributes = &.{.{ .id = 104, .value = "\x00" ** 8 }}, .unsupported = false, .cutoff = -11_644_473_600 },
+    };
+    for (cases) |case| {
+        const encoded = try fixtures.content(allocator, .{ .entries = &.{.{ .identifier = &identifier, .attributes = case.attributes }} });
+        defer allocator.free(encoded);
+        var snapshot = platform.Snapshot.init(allocator, .{});
+        defer snapshot.deinit();
+        try ctl.append(&snapshot, .authroot, encoded);
+        const actual = snapshot.fingerprint_lists.items[0].entries[0].policy;
+        try std.testing.expectEqual(case.unsupported, actual.unsupported);
+        try std.testing.expectEqual(case.cutoff, actual.disallow_at);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.entries.items.len);
+    }
+}
+
+test "CTL empty104 preserves purpose cutoff native policy and Disallowed denial" {
+    var time: [8]u8 = undefined;
+    std.mem.writeInt(u64, &time, @as(u64, 1_800_000_000 + 11_644_473_600) * 10_000_000, .little);
+    const attributes = [_]fixtures.Attribute{
+        .{ .id = 9, .value = server_eku },
+        .{ .id = 122, .value = client_eku },
+        .{ .id = 128, .value = &time },
+        .{ .id = 104, .value = "" },
+    };
+    for ([_]platform.FingerprintList.Kind{ .authroot, .disallowed }) |kind| {
+        const encoded = try fixtures.content(allocator, .{
+            .usage_oid = if (kind == .authroot) ctl.authroot_usage else ctl.disallowed_usage,
+            .entries = &.{.{ .identifier = &identifier, .attributes = &attributes }},
+        });
+        defer allocator.free(encoded);
+        var snapshot = platform.Snapshot.init(allocator, .{});
+        defer snapshot.deinit();
+        const native = try snapshot.add("certificate", true);
+        snapshot.entries.items[native].windows = .{ .disallow_at = 1_900_000_000 };
+        try ctl.append(&snapshot, kind, encoded);
+        const actual = snapshot.fingerprint_lists.items[0].entries[0].policy;
+        try std.testing.expect(actual.unsupported);
+        try std.testing.expectEqual(@as(u2, if (kind == .authroot) 1 else 0), actual.roles);
+        try std.testing.expectEqual(@as(u2, 2), actual.denied_roles);
+        try std.testing.expectEqual(@as(?i64, 1_800_000_000), actual.disallow_at);
+        try std.testing.expectEqual(@as(?i64, 1_900_000_000), snapshot.entries.items[native].windows.?.disallow_at);
+        var context: u8 = 0;
+        const hasher = digest.MetadataDigest{ .context = &context, .digest_fn = hash, .options = .{ .allow_sha1_identifiers = true } };
+        for ([_]@import("trust.zig").PeerRole{ .server, .client }) |role| {
+            for ([_]i64{ 1_799_999_999, 1_800_000_000, 1_800_000_001 }) |now| {
+                var request_use = use;
+                request_use.role = role;
+                request_use.now_seconds = now;
+                request_use.custom_anchor = true;
+                try std.testing.expectEqual(platform.Decision.deny, try snapshot.check("certificate", request_use, hasher, allocator));
+            }
+        }
+        const Test = struct {
+            fn run(backing: std.mem.Allocator, bytes: []const u8, list_kind: platform.FingerprintList.Kind) !void {
+                var copied = platform.Snapshot.init(backing, .{});
+                defer copied.deinit();
+                try ctl.append(&copied, list_kind, bytes);
+                try std.testing.expect(copied.fingerprint_lists.items[0].entries[0].policy.unsupported);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(allocator, Test.run, .{ encoded, kind });
+    }
+}
+
+test "CTL malformed time encodings still fail atomically" {
     for ([_]platform.FingerprintList.Kind{ .authroot, .disallowed }) |kind| {
         for ([_]u32{ 104, 128 }) |id| {
             for ([_][]const u8{
@@ -81,6 +153,7 @@ test "CTL unknown time encodings still fail atomically with native diagnostics" 
                 "\x04\x08abcdefgh",
                 "\x04\x08abcdefgh\x00",
             }) |value| {
+                if (id == 104 and value.len == 0) continue;
                 const encoded = try fixtures.content(allocator, .{
                     .usage_oid = if (kind == .authroot) ctl.authroot_usage else ctl.disallowed_usage,
                     .entries = &.{

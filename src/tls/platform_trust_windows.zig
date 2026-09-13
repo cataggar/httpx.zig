@@ -160,6 +160,7 @@ fn readPolicy(snapshot: *metadata.Snapshot, certificate: *const crypt32.CERT_CON
     }, roles);
 }
 
+const cert_disallowed_filetime_prop_id: u32 = 104;
 const cert_not_before_filetime_prop_id: u32 = 126;
 const cert_not_before_enhkey_usage_prop_id: u32 = 127;
 
@@ -176,7 +177,11 @@ fn readPolicyProperties(allocator: Allocator, limit: usize, query: Query, roles:
     for ([_]u32{ 104, 128 }) |property_id| {
         if (try readProperty(allocator, limit, query, property_id)) |bytes| {
             defer allocator.free(bytes);
-            result.merge(.{ .disallow_at = try filetime(bytes) });
+            if (property_id == cert_disallowed_filetime_prop_id and bytes.len == 0) {
+                result.unsupported = true;
+            } else {
+                result.merge(.{ .disallow_at = try filetime(bytes) });
+            }
         }
     }
     if (try readProperty(allocator, limit, query, 122)) |bytes| {
@@ -199,7 +204,7 @@ fn property(allocator: Allocator, limit: usize, certificate: *const crypt32.CERT
 fn queryProperty(context: *const anyopaque, id: u32, buffer: ?[]u8) QueryError!usize {
     const certificate: *const crypt32.CERT_CONTEXT = @ptrCast(@alignCast(context));
     var size: u32 = if (buffer) |bytes| @intCast(bytes.len) else 0;
-    if (!CertGetCertificateContextProperty(certificate, id, if (buffer) |bytes| bytes.ptr else null, &size).toBool()) {
+    if (!CertGetCertificateContextProperty(certificate, id, if (buffer) |bytes| (if (bytes.len == 0) null else bytes.ptr) else null, &size).toBool()) {
         return if (@intFromEnum(windows.GetLastError()) == not_found) error.Missing else error.Failure;
     }
     return size;
@@ -210,7 +215,8 @@ fn readProperty(allocator: Allocator, limit: usize, query: Query, id: u32) Error
         error.Missing => null,
         error.Failure => error.TlsTrustStoreLoadFailed,
     };
-    if (needed == 0 or needed > limit or needed > std.math.maxInt(u32)) return error.TlsTrustStoreLoadFailed;
+    if (limit == 0 or (needed == 0 and id != cert_disallowed_filetime_prop_id) or needed > limit or needed > std.math.maxInt(u32))
+        return error.TlsTrustStoreLoadFailed;
     const bytes = try allocator.alloc(u8, needed);
     errdefer allocator.free(bytes);
     const actual = query.function(query.context, id, bytes) catch return error.TlsTrustStoreLoadFailed;
@@ -325,6 +331,59 @@ test "Windows property query failure size races and allocation ownership" {
     for ([_]Fake{ .{ .size = 0 }, .{ .size = 9 }, .{ .fail_read = true }, .{ .changed_size = true } }) |fake| {
         try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 8, .{ .context = &fake, .function = Fake.query }, 9));
     }
+}
+
+test "Windows present empty104 is unsupported rather than absent or a cutoff" {
+    const Fake = struct {
+        state: enum { absent, empty, value } = .empty,
+        fail_read: bool = false,
+        changed_size: bool = false,
+        empty128: bool = false,
+
+        fn query(context: *const anyopaque, id: u32, buffer: ?[]u8) QueryError!usize {
+            const self: *const @This() = @ptrCast(@alignCast(context));
+            if (id != 104 and id != 128) return error.Missing;
+            if (id == 104 and self.state == .absent) return error.Missing;
+            var time: [8]u8 = undefined;
+            const seconds: u64 = if (id == 104) 1_800_000_000 else 1_900_000_000;
+            std.mem.writeInt(u64, &time, (seconds + 11_644_473_600) * 10_000_000, .little);
+            const value: []const u8 = if ((id == 104 and self.state == .empty) or (id == 128 and self.empty128)) "" else &time;
+            if (buffer) |bytes| {
+                if (self.fail_read) return error.Failure;
+                if (self.changed_size and id == 104) return 8;
+                if (bytes.len != value.len) return error.Failure;
+                @memcpy(bytes, value);
+            }
+            return value.len;
+        }
+
+        fn run(allocator: Allocator) !void {
+            const self = @This(){};
+            const result = try readPolicyProperties(allocator, 16, .{ .context = &self, .function = query }, 1);
+            try std.testing.expect(result.unsupported);
+            try std.testing.expectEqual(@as(u2, 1), result.roles);
+            try std.testing.expectEqual(@as(?i64, 1_900_000_000), result.disallow_at);
+        }
+    };
+    inline for (.{ .absent, .empty, .value }) |state| {
+        const fake = Fake{ .state = state };
+        const result = try readPolicyProperties(std.testing.allocator, 16, .{ .context = &fake, .function = Fake.query }, 1);
+        try std.testing.expectEqual(state == .empty, result.unsupported);
+        try std.testing.expectEqual(@as(?i64, if (state == .value) 1_800_000_000 else 1_900_000_000), result.disallow_at);
+        try std.testing.expectEqual(state != .empty, result.permits(.{
+            .role = .server,
+            .identity = null,
+            .now_seconds = 1_700_000_000,
+            .issuer = true,
+            .self_issued = true,
+        }));
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.run, .{});
+    for ([_]Fake{ .{ .fail_read = true }, .{ .changed_size = true }, .{ .empty128 = true } }) |fake| {
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, readPolicyProperties(std.testing.allocator, 16, .{ .context = &fake, .function = Fake.query }, 1));
+    }
+    const empty = Fake{};
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 0, .{ .context = &empty, .function = Fake.query }, 104));
 }
 
 const IssuancePropertyQuery = struct {
@@ -458,7 +517,7 @@ test "native Windows CTL decoding owns restrictions after releasing process-loca
     try std.testing.expectEqualSlices(u8, &@as([20]u8, @splat(1)), snapshot.fingerprint_lists.items[0].entries[0].identifier[0..20]);
 }
 
-test "native Windows CTL empty-time projection uses only an unattached fixture leaf" {
+test "native Windows CTL empty104 stays present and preserves an independent restriction" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const Probe = struct {
         const Blob = extern struct { size: u32, data: [*]const u8 };
@@ -496,12 +555,6 @@ test "native Windows CTL empty-time projection uses only an unattached fixture l
             if (length != 8) return .{ .state = .other_length, .length = length };
             return .{ .state = if (std.mem.eql(u8, &bytes, expected)) .known_fixture_value else .other_value, .length = length };
         }
-
-        fn report(stage: []const u8, success: bool, native_error: u32, time: Observation, other: Observation) void {
-            std.debug.print("Windows fixture CTL projection: stage={s} success={} error={d} prop104={s}/{d}/{d} prop128={s}/{d}/{d}\n", .{
-                stage, success, native_error, @tagName(time.state), time.length, time.code, @tagName(other.state), other.length, other.code,
-            });
-        }
     };
     const fixtures = @import("trust_fixtures.zig");
     var chain = try fixtures.Chain.init(std.testing.allocator, .ecdsa_p256);
@@ -532,31 +585,24 @@ test "native Windows CTL empty-time projection uses only an unattached fixture l
     try std.testing.expectEqual(Probe.State.absent, Probe.observe(certificate, 104, &time).state);
     try std.testing.expectEqual(Probe.State.absent, Probe.observe(certificate, 128, &time).state);
 
-    const initial = Probe.apply(certificate, &identifier, &.{empty_attribute});
-    const initial_error = if (initial) 0 else @intFromEnum(windows.GetLastError());
-    Probe.report("empty104_initial", initial, initial_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
-    const seeded = Probe.apply(certificate, &identifier, &.{ time_attribute, other_attribute });
-    const seed_error = if (seeded) 0 else @intFromEnum(windows.GetLastError());
-    Probe.report("fixed_fixture", seeded, seed_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
-    try std.testing.expect(seeded);
+    try std.testing.expect(Probe.apply(certificate, &identifier, &.{empty_attribute}));
+    try std.testing.expectEqual(Probe.State.empty, Probe.observe(certificate, 104, &time).state);
+    try std.testing.expectEqual(Probe.State.absent, Probe.observe(certificate, 128, &time).state);
+    try std.testing.expect(Probe.apply(certificate, &identifier, &.{ time_attribute, other_attribute }));
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 104, &time).state);
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
 
-    const absent = Probe.apply(certificate, &identifier, &.{other_attribute});
-    const absent_error = if (absent) 0 else @intFromEnum(windows.GetLastError());
-    Probe.report("absent104", absent, absent_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
-    try std.testing.expect(absent);
+    try std.testing.expect(Probe.apply(certificate, &identifier, &.{other_attribute}));
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 104, &time).state);
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
 
-    const projected = Probe.apply(certificate, &identifier, &.{empty_attribute});
-    const projection_error = if (projected) 0 else @intFromEnum(windows.GetLastError());
-    Probe.report("empty104", projected, projection_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
-    try std.testing.expect(projected);
+    try std.testing.expect(Probe.apply(certificate, &identifier, &.{empty_attribute}));
+    try std.testing.expectEqual(Probe.State.empty, Probe.observe(certificate, 104, &time).state);
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
-    const repeated = Probe.apply(certificate, &identifier, &.{empty_attribute});
-    const repeat_error = if (repeated) 0 else @intFromEnum(windows.GetLastError());
-    Probe.report("repeat_empty104", repeated, repeat_error, Probe.observe(certificate, 104, &time), Probe.observe(certificate, 128, &time));
-    try std.testing.expect(repeated);
+    try std.testing.expect(Probe.apply(certificate, &identifier, &.{empty_attribute}));
+    try std.testing.expectEqual(Probe.State.empty, Probe.observe(certificate, 104, &time).state);
     try std.testing.expectEqual(Probe.State.known_fixture_value, Probe.observe(certificate, 128, &time).state);
+    const result = try readPolicyProperties(std.testing.allocator, 4096, .{ .context = certificate, .function = queryProperty }, 3);
+    try std.testing.expect(result.unsupported);
+    try std.testing.expectEqual(@as(?i64, 1_800_000_000), result.disallow_at);
 }

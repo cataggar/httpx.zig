@@ -209,17 +209,31 @@ Purpose, disable-time, and unsupported issuance/policy restrictions are
 retained rather than discarded.
 
 Native Windows runs have encountered an **explicit empty** AuthRoot attribute
-104. This is not a missing attribute or an eight-byte zero FILETIME, and it
-remains rejected pending a justified projection. Microsoft's
+104. The [native conformance run](https://github.com/cataggar/httpx.zig/actions/runs/34769265281)
+observed a **present zero-length property**, not absence, after applying
+Microsoft's
 [`CertSetCertificateContextPropertiesFromCTLEntry` contract](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certsetcertificatecontextpropertiesfromctlentry)
-describes CTL-to-property copying but does not specify this empty-value case.
-A native diagnostic fixture exercises that CTL-specific API on a fresh,
-unattached **leaf** context: known eight-byte values, omission of 104, explicit
-empty 104, repetition, and retention of independent property 128. It never
-opens a store, installs a certificate, modifies a root, or verifies a chain.
-Only fixed stage/state labels, lengths, and native status codes are reported.
-This memory-only experiment is evidence gathering, not permission to clear
-production restrictions or a claim of Windows trust qualification.
+to a fresh, unattached leaf context. Omitting 104 retained the existing
+eight-byte property; empty 104 replaced its value without removing the property
+or independent property 128. The API documentation does not establish the
+empty state's authorization meaning.
+
+This profile therefore retains empty 104 as an **unsupported per-certificate
+restriction**, in both CTL and native property snapshots. A matching subject is
+ineligible at every verification time and for either TLS role, including custom
+duplicates; unrelated roots can still be loaded. This is not a guessed
+timestamp, deletion marker, or permission to remove other native/CTL
+restrictions. Disallowed-list membership remains independently prohibitive.
+Absent 104 adds no such restriction; an eight-byte zero FILETIME remains an
+actual encoded cutoff. Nonempty 104 and all 128 values still require exactly
+eight bytes; other empty, malformed, and unsupported forms retain their
+existing fail-closed behavior.
+
+The native fixture asserts these structural observations without opening a
+store, installing certificates, modifying roots, or verifying a chain. This
+conservative exclusion can reject certificates that Windows accepts: full
+Windows authorization semantics for empty 104 remain unimplemented, and a
+successful snapshot load does not establish platform or public-TLS equivalence.
 
 Certificates found in the local AuthRoot cache are marked as program material
 without adding anchors. System anchors marked this way must appear in every

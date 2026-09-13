@@ -125,6 +125,34 @@ test "canonical binding enforces fingerprint restrictions at every selected path
     }
 }
 
+test "canonical empty104 excludes only matched subjects without approving affected custom anchors" {
+    const ctl = @import("windows_ctl.zig");
+    const ctl_fixtures = @import("ctl_fixtures.zig");
+    for ([_]bool{ false, true }) |matches| {
+        for (0..3) |position| {
+            var harness = try Harness.init(std.testing.allocator);
+            defer harness.deinit();
+            var adapter = PairedAdapter{ .selected = harness.standard.provider() };
+            const certificates = [_][]const u8{ harness.chain.leaf, harness.chain.intermediate, harness.chain.root };
+            var identifier: [20]u8 = undefined;
+            try adapter.metadataHasher(.{ .allow_sha1_identifiers = true }).hash(harness.allocator, .sha1, certificates[position], &identifier);
+            if (!matches) identifier[0] ^= 1;
+            const encoded = try ctl_fixtures.content(harness.allocator, .{
+                .entries = &.{.{ .identifier = &identifier, .attributes = &.{.{ .id = 104, .value = "" }} }},
+            });
+            defer harness.allocator.free(encoded);
+            try ctl.append(&harness.owner.platform_snapshot.?, .authroot, encoded);
+            var binding = try harness.owner.bind(&adapter, .{ .allow_sha1_identifiers = true });
+            const request = harness.request(binding.signatureVerifier(), &.{ harness.chain.leaf, harness.chain.intermediate });
+            if (matches) {
+                try std.testing.expectError(error.TlsCertificateConstraintViolation, binding.provider().verifyPeer(request));
+            } else {
+                try binding.provider().verifyPeer(request);
+            }
+        }
+    }
+}
+
 test "canonical binding requires metadata opt-in and the original adapter handle" {
     var harness = try Harness.init(std.testing.allocator);
     defer harness.deinit();

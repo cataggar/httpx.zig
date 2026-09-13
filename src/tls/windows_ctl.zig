@@ -2,7 +2,6 @@
 //! stores/cache. This is not a CMS signature verifier or a downloaded-root
 //! importer. CTLs add restrictions only; they never create trust anchors.
 const std = @import("std");
-const builtin = @import("builtin");
 const x509 = @import("x509_policy.zig");
 const platform = @import("platform_trust.zig");
 const crypto = @import("crypto/provider.zig");
@@ -134,7 +133,17 @@ fn readEntry(bytes: []const u8, kind: platform.FingerprintList.Kind, algorithm: 
                     }
                     result.sha256 = value[0..32].*;
                 },
-                104, 128 => result.policy.merge(.{ .disallow_at = try filetime(kind, id, value) }),
+                104 => {
+                    // Native CTL projection preserves an empty104 as present,
+                    // not removed. Unknown authorization semantics exclude
+                    // this subject; never fabricate a cutoff or clear a rule.
+                    if (value.len == 0) {
+                        result.policy.unsupported = true;
+                    } else {
+                        result.policy.merge(.{ .disallow_at = try filetime(value) });
+                    }
+                },
+                128 => result.policy.merge(.{ .disallow_at = try filetime(value) }),
                 122 => {
                     const denied = try roles(value, true);
                     result.policy.denied_roles |= if (denied == 0) @as(u2, 3) else denied;
@@ -188,50 +197,7 @@ fn roles(bytes: []const u8, deny_unknown: bool) Error!u2 {
     return result;
 }
 
-fn filetime(kind: platform.FingerprintList.Kind, property_id: u32, bytes: []const u8) Error!i64 {
-    if (bytes.len != 8) {
-        if (builtin.is_test and builtin.os.tag == .windows) {
-            // One structural line before this CTL load aborts; never emit
-            // identifiers, certificate data, timestamps, or raw value bytes.
-            std.debug.print("Windows CTL time property: kind={s} id={d} length={d} shape={s}\n", .{
-                @tagName(kind),
-                property_id,
-                bytes.len,
-                @tagName(timeValueShape(bytes)),
-            });
-        }
-        return error.TlsTrustStoreLoadFailed;
-    }
+fn filetime(bytes: []const u8) Error!i64 {
+    if (bytes.len != 8) return error.TlsTrustStoreLoadFailed;
     return @as(i64, @intCast(std.mem.readInt(u64, bytes[0..8], .little) / 10_000_000)) - 11_644_473_600;
-}
-
-const TimeValueShape = enum { empty, non_der, der_octets, der_sequence, der_utc_time, der_generalized_time, der_other };
-
-fn timeValueShape(bytes: []const u8) TimeValueShape {
-    if (bytes.len == 0) return .empty;
-    var reader = Reader.init(bytes);
-    const value = reader.any() catch return .non_der;
-    reader.finish() catch return .non_der;
-    return switch (value.tag) {
-        0x04 => .der_octets,
-        0x30 => .der_sequence,
-        0x17 => .der_utc_time,
-        0x18 => .der_generalized_time,
-        else => .der_other,
-    };
-}
-
-test "CTL time diagnostics classify only complete structural envelopes" {
-    const t = std.testing;
-    try t.expectEqual(TimeValueShape.empty, timeValueShape(""));
-    try t.expectEqual(TimeValueShape.non_der, timeValueShape("not DER"));
-    try t.expectEqual(TimeValueShape.der_octets, timeValueShape("\x04\x08abcdefgh"));
-    try t.expectEqual(TimeValueShape.der_octets, timeValueShape("\x04\x08ijklmnop"));
-    try t.expectEqual(TimeValueShape.der_sequence, timeValueShape("\x30\x00"));
-    try t.expectEqual(TimeValueShape.der_utc_time, timeValueShape("\x17\x0d250101000000Z"));
-    try t.expectEqual(TimeValueShape.der_generalized_time, timeValueShape("\x18\x0f20250101000000Z"));
-    try t.expectEqual(TimeValueShape.der_other, timeValueShape("\x05\x00"));
-    for ([_][]const u8{ "\x04\x08short", "\x04\x08abcdefgh\x00", "\x04\x81\x08abcdefgh", "\x04\x80\x00\x00" }) |bytes| {
-        try t.expectEqual(TimeValueShape.non_der, timeValueShape(bytes));
-    }
 }
