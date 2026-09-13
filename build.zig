@@ -120,6 +120,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tls_config_options", .path = "examples/tls_config_options.zig" },
         .{ .name = "tls_handshake_details", .path = "examples/tls_handshake_details.zig" },
         .{ .name = "tls_custom_ca", .path = "examples/tls_custom_ca.zig" },
+        .{ .name = "tls_provider_interop", .path = "examples/tls_provider_interop.zig", .skip_run_all = true },
         .{ .name = "tls_mtls", .path = "examples/tls_mtls.zig" },
         .{ .name = "streaming_compression_example", .path = "examples/streaming_compression_example.zig" },
         .{ .name = "http_cache_example", .path = "examples/http_cache_example.zig" },

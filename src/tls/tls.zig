@@ -17,6 +17,7 @@ const IoContext = @import("../io/context.zig").IoContext;
 pub const trust = @import("trust.zig");
 pub const cert_signature = @import("cert_signature.zig");
 pub const TrustProvider = trust.TrustProvider;
+pub const TrustContext = @import("standard_trust.zig").TrustContext;
 pub const VerifyPeerRequest = trust.VerifyPeerRequest;
 pub const PeerRole = trust.PeerRole;
 pub const PeerIdentity = trust.PeerIdentity;
@@ -37,7 +38,25 @@ pub const CryptoProviderCapabilities = crypto_provider.Capabilities;
 pub const CryptoCapabilities = crypto_provider.Capabilities;
 pub const CryptoProviderError = crypto_provider.ProviderError;
 pub const StandardCryptoProvider = @import("crypto/standard.zig").StandardProvider;
-pub const CryptoCertificateVerifier = @import("cert_crypto.zig").CryptoCertificateVerifier;
+const provider_record = @import("crypto/record.zig");
+const primitives = @import("crypto/tls_primitives.zig");
+pub const encryptTLS13 = primitives.encryptTLS13;
+pub const decryptTLS13 = primitives.decryptTLS13;
+pub const encryptTLS12 = primitives.encryptTLS12;
+pub const decryptTLS12 = primitives.decryptTLS12;
+pub const hmacSha256Expand = primitives.hmacSha256Expand;
+pub const hmacSha384Expand = primitives.hmacSha384Expand;
+pub const deriveMasterSecret256 = primitives.deriveMasterSecret256;
+pub const deriveMasterSecret384 = primitives.deriveMasterSecret384;
+pub const deriveKeyBlock256 = primitives.deriveKeyBlock256;
+pub const deriveKeyBlock384 = primitives.deriveKeyBlock384;
+pub const hkdfExtract = primitives.hkdfExtract;
+pub const hkdfExpandLabel = primitives.hkdfExpandLabel;
+pub const deriveHandshakeSecret13 = primitives.deriveHandshakeSecret13;
+pub const deriveTrafficKeys13 = primitives.deriveTrafficKeys13;
+pub const certificate_crypto = @import("cert_crypto.zig");
+pub const CryptoCertificateVerifier = certificate_crypto.CryptoCertificateVerifier;
+const server_identity = @import("server_identity.zig");
 
 pub const server = @import("server.zig");
 pub const acceptServer = server.acceptServer;
@@ -85,155 +104,22 @@ pub fn nonceTLS13(iv: *const [12]u8, seq: u64) [12]u8 {
     return nonce;
 }
 
-pub fn encryptTLS13(
-    comptime Aead: type,
-    out: []u8,
-    plaintext: []const u8,
-    record_header: *const [record_header_len]u8,
-    nonce: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    var tag: [Aead.tag_length]u8 = undefined;
-    Aead.encrypt(out[0..plaintext.len], &tag, plaintext, &record_header.*, nonce.*, key.*);
-    @memcpy(out[plaintext.len..][0..Aead.tag_length], &tag);
-    return out[0 .. plaintext.len + Aead.tag_length];
-}
-
-pub fn decryptTLS13(
-    comptime Aead: type,
-    ciphertext: []u8,
-    record_header: *const [record_header_len]u8,
-    nonce: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    if (ciphertext.len < Aead.tag_length) return error.TlsDecryptError;
-    const tag: [Aead.tag_length]u8 = ciphertext[ciphertext.len - Aead.tag_length ..][0..Aead.tag_length].*;
-    const ct_len = ciphertext.len - Aead.tag_length;
-    Aead.decrypt(ciphertext[0..ct_len], ciphertext[0..ct_len], tag, &record_header.*, nonce.*, key.*) catch return error.TlsDecryptError;
-    return ciphertext[0..ct_len];
-}
-
-fn encryptTLS12Aead(
-    comptime Aead: type,
-    comptime record_iv_length: usize,
-    out: []u8,
-    plaintext: []const u8,
-    hdr: *const [record_header_len]u8,
-    seq: u64,
-    iv: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    const fixed_iv_length = Aead.nonce_length - record_iv_length;
-    comptime std.debug.assert(record_iv_length == 0 or record_iv_length == 8);
-
-    var nonce: [12]u8 = undefined;
-    if (record_iv_length == 0) {
-        nonce = iv.*;
-        var seq_bytes: [8]u8 = undefined;
-        mem.writeInt(u64, &seq_bytes, seq, .big);
-        for (seq_bytes, 0..) |byte, i| {
-            nonce[fixed_iv_length - 8 + i] ^= byte;
-        }
-    } else {
-        @memcpy(nonce[0..fixed_iv_length], iv[0..fixed_iv_length]);
-        mem.writeInt(u64, nonce[fixed_iv_length..][0..8], seq, .big);
-        @memcpy(out[0..record_iv_length], nonce[fixed_iv_length..]);
-    }
-
-    var aad: [record_header_len + 8]u8 = undefined;
-    mem.writeInt(u64, aad[0..8], seq, .big);
-    aad[8] = hdr[0];
-    aad[9] = hdr[1];
-    aad[10] = hdr[2];
-    mem.writeInt(u16, aad[11..13], @intCast(plaintext.len), .big);
-
-    var tag: [Aead.tag_length]u8 = undefined;
-    const ciphertext = out[record_iv_length..][0..plaintext.len];
-    Aead.encrypt(ciphertext, &tag, plaintext, &aad, nonce, key.*);
-    @memcpy(out[record_iv_length + plaintext.len ..][0..Aead.tag_length], &tag);
-    return out[0 .. record_iv_length + plaintext.len + Aead.tag_length];
-}
-
-fn decryptTLS12Aead(
-    comptime Aead: type,
-    comptime record_iv_length: usize,
-    ciphertext: []u8,
-    hdr: *const [record_header_len]u8,
-    seq: u64,
-    iv: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    const fixed_iv_length = Aead.nonce_length - record_iv_length;
-    comptime std.debug.assert(record_iv_length == 0 or record_iv_length == 8);
-    if (ciphertext.len < record_iv_length + Aead.tag_length) return error.TlsDecryptError;
-
-    var nonce: [12]u8 = undefined;
-    if (record_iv_length == 0) {
-        nonce = iv.*;
-        var seq_bytes: [8]u8 = undefined;
-        mem.writeInt(u64, &seq_bytes, seq, .big);
-        for (seq_bytes, 0..) |byte, i| {
-            nonce[fixed_iv_length - 8 + i] ^= byte;
-        }
-    } else {
-        @memcpy(nonce[0..fixed_iv_length], iv[0..fixed_iv_length]);
-        @memcpy(nonce[fixed_iv_length..], ciphertext[0..record_iv_length]);
-    }
-
-    const plain_len = ciphertext.len - record_iv_length - Aead.tag_length;
-    var aad: [record_header_len + 8]u8 = undefined;
-    mem.writeInt(u64, aad[0..8], seq, .big);
-    aad[8] = hdr[0];
-    aad[9] = hdr[1];
-    aad[10] = hdr[2];
-    mem.writeInt(u16, aad[11..13], @intCast(plain_len), .big);
-    const tag: [Aead.tag_length]u8 = ciphertext[ciphertext.len - Aead.tag_length ..][0..Aead.tag_length].*;
-    const encrypted = ciphertext[record_iv_length..][0..plain_len];
-    Aead.decrypt(encrypted, encrypted, tag, &aad, nonce, key.*) catch return error.TlsDecryptError;
-    return encrypted;
-}
-
-/// RFC 5288 AES-GCM TLS 1.2 record protection.
-///
-/// Wire layout: explicit_nonce(8) || ciphertext || tag(16).
-pub fn encryptTLS12(
-    comptime Aead: type,
-    out: []u8,
-    plaintext: []const u8,
-    hdr: *const [record_header_len]u8,
-    seq: u64,
-    iv: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    return encryptTLS12Aead(Aead, 8, out, plaintext, hdr, seq, iv, key);
-}
-
-pub fn decryptTLS12(
-    comptime Aead: type,
-    ciphertext: []u8,
-    hdr: *const [record_header_len]u8,
-    seq: u64,
-    iv: *const [12]u8,
-    key: *const [Aead.key_length]u8,
-) ![]u8 {
-    return decryptTLS12Aead(Aead, 8, ciphertext, hdr, seq, iv, key);
-}
-
 fn tls12CiphertextLen(cipher_suite: tls.CipherSuite, plaintext_len: usize) !usize {
     return plaintext_len + switch (cipher_suite) {
         .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        => @as(usize, 8 + crypto.aead.aes_gcm.Aes128Gcm.tag_length),
+        => @as(usize, 8 + crypto_provider.AeadAlgorithm.tag_length),
         .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
         .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        => @as(usize, crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length),
+        => @as(usize, crypto_provider.AeadAlgorithm.tag_length),
         else => return error.TlsUnsupportedCipherSuite,
     };
 }
 
 fn encryptTLS12ForSuite(
+    provider: CryptoProvider,
     out: []u8,
     plaintext: []const u8,
     hdr: *const [record_header_len]u8,
@@ -242,23 +128,11 @@ fn encryptTLS12ForSuite(
     key: *const [32]u8,
     cipher_suite: tls.CipherSuite,
 ) ![]u8 {
-    return switch (cipher_suite) {
-        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            break :blk try encryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, out, plaintext, hdr, seq, iv, &k);
-        },
-        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
-            return encryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, out, plaintext, hdr, seq, iv, key);
-        },
-        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
-            return encryptTLS12Aead(crypto.aead.chacha_poly.ChaCha20Poly1305, 0, out, plaintext, hdr, seq, iv, key);
-        },
-        else => error.TlsUnsupportedCipherSuite,
-    };
+    return provider_record.seal(provider, .tls_1_2, cipher_suite, out, plaintext, hdr, key, iv, seq);
 }
 
 fn decryptTLS12ForSuite(
+    provider: CryptoProvider,
     ciphertext: []u8,
     hdr: *const [record_header_len]u8,
     seq: u64,
@@ -266,23 +140,11 @@ fn decryptTLS12ForSuite(
     key: *const [32]u8,
     cipher_suite: tls.CipherSuite,
 ) ![]u8 {
-    return switch (cipher_suite) {
-        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            break :blk try decryptTLS12(crypto.aead.aes_gcm.Aes128Gcm, ciphertext, hdr, seq, iv, &k);
-        },
-        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
-            return decryptTLS12(crypto.aead.aes_gcm.Aes256Gcm, ciphertext, hdr, seq, iv, key);
-        },
-        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
-            return decryptTLS12Aead(crypto.aead.chacha_poly.ChaCha20Poly1305, 0, ciphertext, hdr, seq, iv, key);
-        },
-        else => error.TlsUnsupportedCipherSuite,
-    };
+    return provider_record.open(provider, .tls_1_2, cipher_suite, ciphertext, hdr, key, iv, seq);
 }
 
 fn decryptTLS13ForSuite(
+    provider: CryptoProvider,
     ciphertext: []u8,
     hdr: *const [record_header_len]u8,
     seq: u64,
@@ -290,21 +152,7 @@ fn decryptTLS13ForSuite(
     key: *const [32]u8,
     cipher_suite: tls.CipherSuite,
 ) ![]u8 {
-    const nonce = nonceTLS13(iv, seq);
-    return switch (cipher_suite) {
-        .AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, ciphertext, hdr, &nonce, &k);
-        },
-        .AES_256_GCM_SHA384 => {
-            return decryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, ciphertext, hdr, &nonce, key);
-        },
-        .CHACHA20_POLY1305_SHA256 => {
-            return decryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, ciphertext, hdr, &nonce, key);
-        },
-        else => error.TlsUnsupportedCipherSuite,
-    };
+    return provider_record.open(provider, .tls_1_3, cipher_suite, ciphertext, hdr, key, iv, seq);
 }
 
 fn transportIoError(err: anyerror, fallback: anyerror) anyerror {
@@ -324,14 +172,31 @@ fn writeBoundedEncryptedRecord(
     data: []const u8,
     content_type: ContentType,
 ) !usize {
+    var standard = StandardCryptoProvider.init(any_io.threadIo(), std.heap.page_allocator);
+    return writeBoundedEncryptedRecordWithProvider(standard.provider(), sender, version, key, iv, cipher_suite, seq, data, content_type);
+}
+
+fn writeBoundedEncryptedRecordWithProvider(
+    provider: CryptoProvider,
+    sender: anytype,
+    version: tls.ProtocolVersion,
+    key: [32]u8,
+    iv: [12]u8,
+    cipher_suite: tls.CipherSuite,
+    seq: *u64,
+    data: []const u8,
+    content_type: ContentType,
+) !usize {
     const plaintext_len = @min(data.len, max_plaintext_len);
     if (plaintext_len == 0) return 0;
     const plaintext = data[0..plaintext_len];
     const record_sequence = seq.*;
+    const next_seq = std.math.add(u64, seq.*, 1) catch return error.TlsSequenceOverflow;
 
     switch (version) {
         .tls_1_3 => {
             var inner_buf: [max_plaintext_len + 1]u8 = undefined;
+            defer crypto_provider.secureWipe(&inner_buf);
             @memcpy(inner_buf[0..plaintext.len], plaintext);
             inner_buf[plaintext.len] = @intFromEnum(content_type);
             const inner = inner_buf[0 .. plaintext.len + 1];
@@ -343,32 +208,11 @@ fn writeBoundedEncryptedRecord(
                 .length = @intCast(inner.len + 16),
             };
             hdr_val.format(&hdr);
-            const nonce_val = nonceTLS13(&iv, record_sequence);
-
             var out_buf: [max_record_len]u8 = undefined;
             @memcpy(out_buf[0..record_header_len], &hdr);
-            const enc_len = switch (cipher_suite) {
-                .AES_128_GCM_SHA256 => blk: {
-                    var k: [16]u8 = undefined;
-                    @memcpy(&k, key[0..16]);
-                    const enc = try encryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, out_buf[record_header_len..], inner, &hdr, &nonce_val, &k);
-                    break :blk enc.len;
-                },
-                .AES_256_GCM_SHA384 => blk: {
-                    var k: [32]u8 = undefined;
-                    @memcpy(&k, key[0..32]);
-                    const enc = try encryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, out_buf[record_header_len..], inner, &hdr, &nonce_val, &k);
-                    break :blk enc.len;
-                },
-                .CHACHA20_POLY1305_SHA256 => blk: {
-                    var k: [32]u8 = undefined;
-                    @memcpy(&k, key[0..32]);
-                    const enc = try encryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, out_buf[record_header_len..], inner, &hdr, &nonce_val, &k);
-                    break :blk enc.len;
-                },
-                else => return error.TlsUnsupportedCipherSuite,
-            };
-            seq.* +%= 1;
+            const encrypted = try provider_record.seal(provider, version, cipher_suite, out_buf[record_header_len..], inner, &hdr, &key, &iv, record_sequence);
+            const enc_len = encrypted.len;
+            seq.* = next_seq;
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch |err|
                 return transportIoError(err, error.WriteFailed);
         },
@@ -384,18 +228,20 @@ fn writeBoundedEncryptedRecord(
 
             var out_buf: [max_record_len]u8 = undefined;
             @memcpy(out_buf[0..record_header_len], &hdr);
-            const encrypted = try encryptTLS12ForSuite(
+            const encrypted = try provider_record.seal(
+                provider,
+                version,
+                cipher_suite,
                 out_buf[record_header_len..],
                 plaintext,
                 &hdr,
-                record_sequence,
-                &iv,
                 &key,
-                cipher_suite,
+                &iv,
+                record_sequence,
             );
             const enc_len = encrypted.len;
             std.debug.assert(enc_len == ciphertext_len);
-            seq.* +%= 1;
+            seq.* = next_seq;
             sender.sendAll(out_buf[0 .. record_header_len + enc_len]) catch |err|
                 return transportIoError(err, error.WriteFailed);
         },
@@ -442,6 +288,7 @@ const ApplicationRecord = struct {
 };
 
 const ApplicationReadState = struct {
+    crypto_provider: ?CryptoProvider = null,
     socket: *Socket,
     context: ?*const IoContext = null,
     write_poisoned: ?*bool = null,
@@ -471,6 +318,7 @@ fn parseTLS13InnerPlaintext(plaintext: []u8) !ApplicationRecord {
     while (content_type_pos > 0) {
         content_type_pos -= 1;
         if (plaintext[content_type_pos] != 0) {
+            if (content_type_pos > max_plaintext_len) return error.TlsRecordOverflow;
             return .{
                 .content_type = plaintext[content_type_pos],
                 .content = plaintext[0..content_type_pos],
@@ -478,37 +326,6 @@ fn parseTLS13InnerPlaintext(plaintext: []u8) !ApplicationRecord {
         }
     }
     return error.TlsUnexpectedMessage;
-}
-
-fn updateTLS13TrafficKeys(
-    cipher_suite: tls.CipherSuite,
-    secret: *[48]u8,
-    key: *[32]u8,
-    iv: *[12]u8,
-) !void {
-    switch (cipher_suite) {
-        .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 => {
-            const updated_secret = hkdfExpandLabel(secret[0..32], "traffic upd", "", 32);
-            @memset(secret, 0);
-            @memcpy(secret[0..updated_secret.len], &updated_secret);
-            const keys = deriveTrafficKeys13(&updated_secret);
-            @memset(key, 0);
-            if (cipher_suite == .AES_128_GCM_SHA256) {
-                @memcpy(key[0..keys.key16.len], &keys.key16);
-            } else {
-                key.* = keys.key32;
-            }
-            iv.* = keys.iv;
-        },
-        .AES_256_GCM_SHA384 => {
-            const updated_secret = hkdfExpandLabel(secret, "traffic upd", "", 48);
-            secret.* = updated_secret;
-            const keys = deriveTrafficKeys13(&updated_secret);
-            key.* = keys.key32;
-            iv.* = keys.iv;
-        },
-        else => return error.TlsUnsupportedCipherSuite,
-    }
 }
 
 fn validateNewSessionTicket(body: []const u8) !void {
@@ -542,6 +359,8 @@ fn validateNewSessionTicket(body: []const u8) !void {
 }
 
 fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
+    var standard = StandardCryptoProvider.init(any_io.threadIo(), std.heap.page_allocator);
+    const provider = state.crypto_provider orelse standard.provider();
     if (body.len != 1) return error.TlsDecodeError;
     const request: tls.KeyUpdateRequest = @enumFromInt(body[0]);
     switch (request) {
@@ -580,7 +399,7 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
             return error.TlsHandshakeNotComplete;
     }
 
-    try updateTLS13TrafficKeys(state.cipher_suite, read_secret, read_key, read_iv);
+    try provider_record.updateTrafficKeys(provider, state.cipher_suite, read_secret, read_key, read_iv);
     state.read_seq.* = 0;
 
     if (request == .update_requested) {
@@ -593,7 +412,8 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
         };
         if (state.context) |context| {
             var sender = ContextSocketSender{ .socket = state.socket, .context = context };
-            _ = writeBoundedEncryptedRecord(
+            _ = writeBoundedEncryptedRecordWithProvider(
+                provider,
                 &sender,
                 .tls_1_3,
                 write_key.?.*,
@@ -608,7 +428,8 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
                 return err;
             };
         } else {
-            _ = writeBoundedEncryptedRecord(
+            _ = writeBoundedEncryptedRecordWithProvider(
+                provider,
                 state.socket,
                 .tls_1_3,
                 write_key.?.*,
@@ -622,7 +443,7 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
                 return err;
             };
         }
-        try updateTLS13TrafficKeys(state.cipher_suite, write_secret.?, write_key.?, write_iv.?);
+        try provider_record.updateTrafficKeys(provider, state.cipher_suite, write_secret.?, write_key.?, write_iv.?);
         state.write_seq.* = 0;
     }
 }
@@ -732,6 +553,8 @@ fn readEncryptedBytes(state: *ApplicationReadState, output: []u8) !usize {
 }
 
 fn readApplicationData(state: *ApplicationReadState, output: []u8) !usize {
+    var standard = StandardCryptoProvider.init(any_io.threadIo(), std.heap.page_allocator);
+    const provider = state.crypto_provider orelse standard.provider();
     if (state.app_read_key.* == null or state.app_read_iv.* == null) {
         return error.TlsHandshakeNotComplete;
     }
@@ -769,32 +592,37 @@ fn readApplicationData(state: *ApplicationReadState, output: []u8) !usize {
         const record_body = state.read_buf[record_header_len..][0..length];
         const read_key = state.app_read_key.* orelse return error.TlsHandshakeNotComplete;
         const read_iv = state.app_read_iv.* orelse return error.TlsHandshakeNotComplete;
+        const next_seq = std.math.add(u64, state.read_seq.*, 1) catch return error.TlsSequenceOverflow;
         const record = switch (state.version) {
             .tls_1_3 => blk: {
                 if (header[0] != @intFromEnum(ContentType.application_data)) {
                     return error.TlsUnexpectedMessage;
                 }
-                const plaintext = try decryptTLS13ForSuite(
+                const plaintext = try provider_record.open(
+                    provider,
+                    state.version,
+                    state.cipher_suite,
                     record_body,
                     header,
-                    state.read_seq.*,
-                    &read_iv,
                     &read_key,
-                    state.cipher_suite,
+                    &read_iv,
+                    state.read_seq.*,
                 );
-                state.read_seq.* += 1;
+                state.read_seq.* = next_seq;
                 break :blk try parseTLS13InnerPlaintext(plaintext);
             },
             .tls_1_2 => blk: {
-                const plaintext = try decryptTLS12ForSuite(
+                const plaintext = try provider_record.open(
+                    provider,
+                    state.version,
+                    state.cipher_suite,
                     record_body,
                     header,
-                    state.read_seq.*,
-                    &read_iv,
                     &read_key,
-                    state.cipher_suite,
+                    &read_iv,
+                    state.read_seq.*,
                 );
-                state.read_seq.* += 1;
+                state.read_seq.* = next_seq;
                 break :blk ApplicationRecord{
                     .content_type = header[0],
                     .content = plaintext,
@@ -823,235 +651,6 @@ fn readApplicationData(state: *ApplicationReadState, output: []u8) !usize {
     }
 }
 
-pub fn hmacSha256Expand(secret: []const u8, label: []const u8, seed: []const u8, out: []u8) void {
-    const Hmac = crypto.auth.hmac.sha2.HmacSha256;
-    const ls_len = label.len + seed.len;
-    var ls: [128]u8 = undefined;
-    @memcpy(ls[0..label.len], label);
-    @memcpy(ls[label.len..][0..seed.len], seed);
-    // RFC 5246 §5:
-    //   A(0) = label || seed
-    //   A(i) = HMAC(secret, A(i-1))        <- NO seed in the A-chain
-    //   output = HMAC(secret, A(1)||label||seed) || HMAC(secret, A(2)||label||seed) || ...
-    var a: [32]u8 = undefined;
-    var result: [32]u8 = undefined;
-    Hmac.create(&a, ls[0..ls_len], secret); // A(1)
-    var offset: usize = 0;
-    while (offset + 32 <= out.len) : (offset += 32) {
-        var a_ls: [32 + 128]u8 = undefined;
-        @memcpy(a_ls[0..32], &a);
-        @memcpy(a_ls[32..][0..ls_len], ls[0..ls_len]);
-        Hmac.create(&result, a_ls[0 .. 32 + ls_len], secret);
-        @memcpy(out[offset..][0..32], &result);
-        Hmac.create(&a, &a, secret); // A(i+1) = HMAC(A(i))
-    }
-    if (offset < out.len) {
-        var a_ls: [32 + 128]u8 = undefined;
-        @memcpy(a_ls[0..32], &a);
-        @memcpy(a_ls[32..][0..ls_len], ls[0..ls_len]);
-        Hmac.create(&result, a_ls[0 .. 32 + ls_len], secret);
-        @memcpy(out[offset..], result[0 .. out.len - offset]);
-    }
-}
-
-pub fn hmacSha384Expand(secret: []const u8, label: []const u8, seed: []const u8, out: []u8) void {
-    const Hmac = crypto.auth.hmac.sha2.HmacSha384;
-    const ls_len = label.len + seed.len;
-    var ls: [128]u8 = undefined;
-    @memcpy(ls[0..label.len], label);
-    @memcpy(ls[label.len..][0..seed.len], seed);
-    var a: [48]u8 = undefined;
-    var result: [48]u8 = undefined;
-    Hmac.create(&a, ls[0..ls_len], secret); // A(1)
-    var offset: usize = 0;
-    while (offset + 48 <= out.len) : (offset += 48) {
-        var a_ls: [48 + 128]u8 = undefined;
-        @memcpy(a_ls[0..48], &a);
-        @memcpy(a_ls[48..][0..ls_len], ls[0..ls_len]);
-        Hmac.create(&result, a_ls[0 .. 48 + ls_len], secret);
-        @memcpy(out[offset..][0..48], &result);
-        Hmac.create(&a, &a, secret); // A(i+1) = HMAC(A(i))
-    }
-    if (offset < out.len) {
-        var a_ls: [48 + 128]u8 = undefined;
-        @memcpy(a_ls[0..48], &a);
-        @memcpy(a_ls[48..][0..ls_len], ls[0..ls_len]);
-        Hmac.create(&result, a_ls[0 .. 48 + ls_len], secret);
-        @memcpy(out[offset..], result[0 .. out.len - offset]);
-    }
-}
-
-/// TLS 1.2 master secret is ALWAYS 48 bytes regardless of cipher hash
-/// (RFC 5246 §6.1): P_hash with the suite's hash, here SHA-256.
-pub fn deriveMasterSecret256(
-    pre_master_secret: *const [32]u8,
-    client_random: *const [32]u8,
-    server_random: *const [32]u8,
-) [48]u8 {
-    const seed = client_random.* ++ server_random.*;
-    var master_secret: [48]u8 = undefined;
-    hmacSha256Expand(pre_master_secret, "master secret", &seed, &master_secret);
-    return master_secret;
-}
-
-pub fn deriveMasterSecret384(
-    pre_master_secret: *const [32]u8,
-    client_random: *const [32]u8,
-    server_random: *const [32]u8,
-) [48]u8 {
-    const seed = client_random.* ++ server_random.*;
-    var master_secret: [48]u8 = undefined;
-    hmacSha384Expand(pre_master_secret, "master secret", &seed, &master_secret);
-    return master_secret;
-}
-
-pub fn deriveKeyBlock256(
-    master_secret: *const [48]u8,
-    server_random: *const [32]u8,
-    client_random: *const [32]u8,
-    comptime length: usize,
-) [length]u8 {
-    const seed = server_random.* ++ client_random.*;
-    var key_block: [length]u8 = undefined;
-    hmacSha256Expand(master_secret, "key expansion", &seed, &key_block);
-    return key_block;
-}
-
-pub fn deriveKeyBlock384(
-    master_secret: *const [48]u8,
-    server_random: *const [32]u8,
-    client_random: *const [32]u8,
-    comptime length: usize,
-) [length]u8 {
-    const seed = server_random.* ++ client_random.*;
-    var key_block: [length]u8 = undefined;
-    hmacSha384Expand(master_secret, "key expansion", &seed, &key_block);
-    return key_block;
-}
-
-pub fn hkdfExtract(ikm: []const u8, salt: []const u8, comptime hash_len: usize) [hash_len]u8 {
-    if (hash_len == 32) {
-        const Hmac = crypto.auth.hmac.sha2.HmacSha256;
-        var prk: [hash_len]u8 = undefined;
-        Hmac.create(&prk, ikm, salt);
-        return prk;
-    } else {
-        const Hmac = crypto.auth.hmac.sha2.HmacSha384;
-        var prk: [hash_len]u8 = undefined;
-        Hmac.create(&prk, ikm, salt);
-        return prk;
-    }
-}
-
-pub fn hkdfExpandLabel(
-    prk: []const u8,
-    comptime label: []const u8,
-    context: []const u8,
-    comptime out_len: usize,
-) [out_len]u8 {
-    const max_label_len = 255;
-    const max_context_len = 255;
-    const tls13 = "tls13 ";
-    var buf: [2 + 1 + tls13.len + max_label_len + 1 + max_context_len]u8 = undefined;
-    // RFC 8446 Section 7.1: HkdfLabel = uint16 length || opaque label<7..255-1> || opaque context<0..255-1>
-    // The u16 length field is the desired OUTPUT length, NOT the size of the info buffer.
-    mem.writeInt(u16, buf[0..2], out_len, .big);
-    buf[2] = @as(u8, @intCast(tls13.len + label.len));
-    buf[3..][0..tls13.len].* = tls13.*;
-    var i: usize = 3 + tls13.len;
-    @memcpy(buf[i..][0..label.len], label);
-    i += label.len;
-    buf[i] = @as(u8, @intCast(context.len));
-    i += 1;
-    @memcpy(buf[i..][0..context.len], context);
-    i += context.len;
-    const info = buf[0..i];
-
-    // HKDF-Expand with the hash matching the PRK length (RFC 8446 §7.1:
-    // secrets are 32 bytes for SHA-256 suites, 48 for SHA-384 suites).
-    if (prk.len == 32) {
-        return hkdfExpandT(crypto.auth.hmac.sha2.HmacSha256, prk, info, out_len);
-    } else {
-        return hkdfExpandT(crypto.auth.hmac.sha2.HmacSha384, prk, info, out_len);
-    }
-}
-
-fn hkdfExpandT(comptime Hmac: type, prk: []const u8, info: []const u8, comptime out_len: usize) [out_len]u8 {
-    const mac_len = Hmac.mac_length;
-    var result: [out_len]u8 = undefined;
-    // T(1) = HMAC(PRK, info || 0x01)
-    var a: [mac_len]u8 = undefined;
-    var st = Hmac.init(prk);
-    st.update(info);
-    st.update(&[_]u8{0x01});
-    st.final(&a);
-    var offset: usize = @min(out_len, mac_len);
-    @memcpy(result[0..offset], a[0..offset]);
-    // T(i) = HMAC(PRK, T(i-1) || info || i)
-    var counter: u8 = 2;
-    while (offset < out_len) : (counter += 1) {
-        st = Hmac.init(prk);
-        st.update(&a);
-        st.update(info);
-        st.update(&[_]u8{counter});
-        st.final(&a);
-        const take = @min(mac_len, out_len - offset);
-        @memcpy(result[offset..][0..take], a[0..take]);
-        offset += take;
-    }
-    return result;
-}
-
-pub fn deriveHandshakeSecret13(
-    shared_secret: []const u8,
-    comptime hash_len: usize,
-) [hash_len]u8 {
-    // TLS 1.3 key derivation (RFC 8446 Section 7.1):
-    // 1. early_secret = HKDF-Extract(zero PSK, zero salt) — both are hash_len zeros
-    // 2. derived_secret = HKDF-Expand-Label(early_secret, "derived", Hash(""), hash_len)
-    //    Hash("") = empty hash digest (32 bytes of SHA-256 or 48 bytes of SHA-384)
-    // 3. handshake_secret = HKDF-Extract(handshake_derived_secret, shared_secret)
-    //
-    // Note: hkdfExtract(ikm, salt) = HKDF-Extract(salt, ikm)
-    const zero_psk: [hash_len]u8 = .{0} ** hash_len;
-    const zero_salt: [hash_len]u8 = .{0} ** hash_len;
-    const early_secret = hkdfExtract(&zero_psk, &zero_salt, hash_len);
-
-    // Compute Hash("") — the hash of an empty string, used as context for "derived"
-    const empty_hash: [hash_len]u8 = blk: {
-        if (hash_len == 32) {
-            var h = crypto.hash.sha2.Sha256.init(.{});
-            var result: [32]u8 = undefined;
-            h.final(&result);
-            break :blk result;
-        } else {
-            var h = crypto.hash.sha2.Sha384.init(.{});
-            var result: [48]u8 = undefined;
-            h.final(&result);
-            break :blk result;
-        }
-    };
-
-    const handshake_derived_secret = hkdfExpandLabel(&early_secret, "derived", &empty_hash, hash_len);
-    // HKDF-Extract(handshake_derived_secret, shared_secret)
-    // = hkdfExtract(ikm=shared_secret, salt=handshake_derived_secret)
-    return hkdfExtract(shared_secret, &handshake_derived_secret, hash_len);
-}
-
-/// Derives record protection keys and IVs from a traffic secret.
-/// The requested length feeds the HKDF label info, so key16 is NOT a prefix
-/// of key32. Callers pick per cipher: 16 for AES-128-GCM, 32 for AES-256-
-/// GCM and ChaCha20-Poly1305. IV is always 12 bytes.
-pub fn deriveTrafficKeys13(
-    secret: []const u8,
-) struct { key16: [16]u8, key32: [32]u8, iv: [12]u8 } {
-    return .{
-        .key16 = hkdfExpandLabel(secret, "key", "", 16),
-        .key32 = hkdfExpandLabel(secret, "key", "", 32),
-        .iv = hkdfExpandLabel(secret, "iv", "", 12),
-    };
-}
-
 /// Selects the record-protection key bytes for `cs` from a deriveTrafficKeys13
 /// result. `keys` must be passed by pointer so the returned slice stays valid.
 pub fn trafficKeyFor(cs: tls.CipherSuite, keys: anytype) []const u8 {
@@ -1061,22 +660,25 @@ pub fn trafficKeyFor(cs: tls.CipherSuite, keys: anytype) []const u8 {
     };
 }
 
-pub fn readTLSRecord(socket: *Socket, buf: *[4096]u8) ![]const u8 {
+pub fn readTLSRecord(socket: *Socket, buf: []u8) ![]const u8 {
+    if (buf.len < record_header_len) return error.OutputTooSmall;
     var total: usize = 0;
     while (total < 5) {
         const n = socket.recv(buf[total..5]) catch |err| switch (err) {
             error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-            else => return error.ReadFailed,
+            else => return transportIoError(err, error.ReadFailed),
         };
         if (n == 0) return error.TlsConnectionTruncated;
         total += n;
     }
     const length = mem.readInt(u16, buf[3..5], .big);
-    if (length > max_ciphertext_len) return error.TlsRecordOverflow;
+    const legacy_hello = buf[0] == @intFromEnum(ContentType.handshake) and buf[2] == 1;
+    if (buf[1] != 3 or (buf[2] != 3 and !legacy_hello)) return error.TlsIllegalParameter;
+    if (length > max_ciphertext_len or length > buf.len - record_header_len) return error.TlsRecordOverflow;
     while (total < 5 + length) {
         const n = socket.recv(buf[total..][0 .. 5 + length - total]) catch |err| switch (err) {
             error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-            else => return error.ReadFailed,
+            else => return transportIoError(err, error.ReadFailed),
         };
         if (n == 0) return error.TlsConnectionTruncated;
         total += n;
@@ -1102,12 +704,13 @@ fn readHandshakeRecord(socket: *Socket, buf: *[4096]u8) ![]const u8 {
 
 pub fn sendTLSHandshakeRecord(socket: *Socket, msg: []const u8) !void {
     var buf: [5 + max_plaintext_len]u8 = undefined;
+    if (msg.len > max_plaintext_len) return error.TlsRecordOverflow;
     buf[0] = @intFromEnum(ContentType.handshake);
     buf[1] = 0x03;
     buf[2] = 0x03;
     mem.writeInt(u16, buf[3..5], @intCast(msg.len), .big);
     @memcpy(buf[5..][0..msg.len], msg);
-    socket.sendAll(buf[0 .. 5 + msg.len]) catch return error.WriteFailed;
+    socket.sendAll(buf[0 .. 5 + msg.len]) catch |err| return transportIoError(err, error.WriteFailed);
 }
 
 pub fn sendTLSChangeCipherSpec(socket: *Socket) !void {
@@ -1121,12 +724,13 @@ pub fn sendTLSChangeCipherSpec(socket: *Socket) !void {
         0x01,
         0x01,
     };
-    socket.sendAll(&ccs) catch return error.WriteFailed;
+    socket.sendAll(&ccs) catch |err| return transportIoError(err, error.WriteFailed);
 }
 
 /// Send a TLS 1.2 handshake message protected with the negotiated AEAD
 /// (RFC 5246): outer record keeps content_type=handshake and version 0x0303.
 pub fn sendTLS12EncryptedHandshake(
+    provider: CryptoProvider,
     socket: *Socket,
     msg: []const u8,
     key: []const u8,
@@ -1134,88 +738,40 @@ pub fn sendTLS12EncryptedHandshake(
     seq: *u64,
     cs: tls.CipherSuite,
 ) !void {
-    const ciphertext_len = try tls12CiphertextLen(cs, msg.len);
-    var hdr_buf: [record_header_len]u8 = undefined;
-    const hdr_val = RecordHeader{
-        .content_type = .handshake,
-        .version = .tls_1_2,
-        .length = @intCast(ciphertext_len),
-    };
-    hdr_val.format(&hdr_buf);
-
-    var out_buf: [record_header_len + max_plaintext_len + 256]u8 = undefined;
-    @memcpy(out_buf[0..record_header_len], &hdr_buf);
-
-    var key_buf: [32]u8 = .{0} ** 32;
-    if (key.len > key_buf.len) return error.TlsUnsupportedCipherSuite;
-    @memcpy(key_buf[0..key.len], key);
-    const encrypted = try encryptTLS12ForSuite(
-        out_buf[record_header_len..],
-        msg,
-        &hdr_buf,
-        seq.*,
-        iv,
-        &key_buf,
-        cs,
-    );
-    const enc_len = encrypted.len;
-    std.debug.assert(enc_len == ciphertext_len);
-
-    socket.sendAll(out_buf[0 .. record_header_len + enc_len]) catch return error.WriteFailed;
-    seq.* += 1;
+    return sendEncryptedHandshake(provider, socket, .tls_1_2, msg, key, iv, seq, cs);
 }
 
 /// Read one AEAD-protected TLS 1.2 record (handshake or application_data)
 /// and return the decrypted plaintext.
 pub fn readTLS12EncryptedRecord(
+    provider: CryptoProvider,
     socket: *Socket,
-    buf: *[4096]u8,
+    buf: []u8,
     key: []const u8,
     iv: *const [12]u8,
     seq: *u64,
     cs: tls.CipherSuite,
 ) ![]const u8 {
-    var total: usize = 0;
-    while (total < 5) {
-        const n = socket.recv(buf[total..5]) catch |err| switch (err) {
-            error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-            else => return error.ReadFailed,
-        };
-        if (n == 0) return error.TlsConnectionTruncated;
-        total += n;
-    }
+    var key_buf = try paddedRecordKey(cs, key);
+    defer crypto_provider.secureWipe(&key_buf);
+    const next_seq = std.math.add(u64, seq.*, 1) catch return error.TlsSequenceOverflow;
+    const data = try readTLSRecord(socket, buf);
+    if (buf[2] != 3) return error.TlsIllegalParameter;
     switch (buf[0]) {
-        @intFromEnum(ContentType.alert) => {
-            if (buf[5] == 2) { // fatal
-                return errors.fromAlert(@enumFromInt(buf[6]));
-            }
-            return error.TlsHandshakeFailure;
-        },
-        @intFromEnum(ContentType.handshake), @intFromEnum(ContentType.application_data) => {},
+        @intFromEnum(ContentType.alert), @intFromEnum(ContentType.handshake), @intFromEnum(ContentType.application_data) => {},
         else => return error.TlsUnexpectedMessage,
     }
-    const length = mem.readInt(u16, buf[3..5], .big);
-    if (length > max_ciphertext_len) return error.TlsRecordOverflow;
-    while (total < 5 + length) {
-        const n = socket.recv(buf[total..][0 .. 5 + length - total]) catch |err| switch (err) {
-            error.ConnectionResetByPeer => return error.TlsConnectionTruncated,
-            else => return error.ReadFailed,
-        };
-        if (n == 0) return error.TlsConnectionTruncated;
-        total += n;
+    const plain = try decryptTLS12ForSuite(provider, @constCast(data), buf[0..5], seq.*, iv, &key_buf, cs);
+    seq.* = next_seq;
+    if (buf[0] == @intFromEnum(ContentType.alert)) {
+        if (plain.len != 2) return error.TlsDecodeError;
+        return errors.fromAlert(@enumFromInt(plain[1]));
     }
-
-    const hdr: *const [record_header_len]u8 = buf[0..5];
-    const ct = buf[5..][0..length];
-    var key_buf: [32]u8 = .{0} ** 32;
-    if (key.len > key_buf.len) return error.TlsUnsupportedCipherSuite;
-    @memcpy(key_buf[0..key.len], key);
-    const plain = try decryptTLS12ForSuite(ct, hdr, seq.*, iv, &key_buf, cs);
-    seq.* += 1;
     return plain;
 }
 
 pub fn sendTLS13EncryptedHandshake(
+    provider: CryptoProvider,
     socket: *Socket,
     msg: []const u8,
     key: []const u8,
@@ -1223,90 +779,58 @@ pub fn sendTLS13EncryptedHandshake(
     seq: *u64,
     cs: tls.CipherSuite,
 ) !void {
-    var inner_buf: [max_plaintext_len + 1]u8 = undefined;
-    @memcpy(inner_buf[0..msg.len], msg);
-    inner_buf[msg.len] = @intFromEnum(ContentType.handshake);
-    const inner_len = msg.len + 1;
-
-    var hdr_buf: [record_header_len]u8 = undefined;
-    const hdr_val = RecordHeader{
-        .content_type = .application_data,
-        .version = .tls_1_2,
-        .length = @intCast(inner_len + 16),
-    };
-    hdr_val.format(&hdr_buf);
-
-    var nonce_storage = nonceTLS13(iv[0..12], seq.*);
-    const nonce = &nonce_storage;
-    var out_buf: [record_header_len + max_plaintext_len + 256]u8 = undefined;
-    @memcpy(out_buf[0..record_header_len], &hdr_buf);
-
-    const enc_len = switch (cs) {
-        .AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            const enc = try encryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, out_buf[record_header_len..], inner_buf[0..inner_len], &hdr_buf, nonce, &k);
-            break :blk enc.len;
-        },
-        .AES_256_GCM_SHA384 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            const enc = try encryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, out_buf[record_header_len..], inner_buf[0..inner_len], &hdr_buf, nonce, &k);
-            break :blk enc.len;
-        },
-        .CHACHA20_POLY1305_SHA256 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            const enc = try encryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, out_buf[record_header_len..], inner_buf[0..inner_len], &hdr_buf, nonce, &k);
-            break :blk enc.len;
-        },
-        else => return error.TlsUnsupportedCipherSuite,
-    };
-
-    const total = record_header_len + enc_len;
-    socket.sendAll(out_buf[0..total]) catch return error.WriteFailed;
-    seq.* += 1;
+    if (iv.len != 12) return error.InvalidInput;
+    return sendEncryptedHandshake(provider, socket, .tls_1_3, msg, key, iv[0..12], seq, cs);
 }
 
 pub fn readTLS13EncryptedHandshake(
+    provider: CryptoProvider,
     socket: *Socket,
-    buf: *[4096]u8,
+    buf: []u8,
     key: []const u8,
     iv: []const u8,
     seq: *u64,
     cs: tls.CipherSuite,
 ) ![]const u8 {
+    if (iv.len != 12) return error.InvalidInput;
+    var key_buf = try paddedRecordKey(cs, key);
+    defer crypto_provider.secureWipe(&key_buf);
+    const next_seq = std.math.add(u64, seq.*, 1) catch return error.TlsSequenceOverflow;
     const record_data = try readTLSRecord(socket, buf);
-    const hdr_ptr: *const [record_header_len]u8 = buf[0..record_header_len];
-    var nonce_storage = nonceTLS13(iv[0..12], seq.*);
-    const nonce = &nonce_storage;
-
-    const decrypted = switch (cs) {
-        .AES_128_GCM_SHA256 => blk: {
-            var k: [16]u8 = undefined;
-            @memcpy(&k, key[0..16]);
-            break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes128Gcm, @constCast(record_data), hdr_ptr, nonce, &k);
-        },
-        .AES_256_GCM_SHA384 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            break :blk try decryptTLS13(crypto.aead.aes_gcm.Aes256Gcm, @constCast(record_data), hdr_ptr, nonce, &k);
-        },
-        .CHACHA20_POLY1305_SHA256 => blk: {
-            var k: [32]u8 = undefined;
-            @memcpy(&k, key[0..32]);
-            break :blk try decryptTLS13(crypto.aead.chacha_poly.ChaCha20Poly1305, @constCast(record_data), hdr_ptr, nonce, &k);
-        },
-        else => return error.TlsUnsupportedCipherSuite,
-    };
-
-    seq.* += 1;
-    if (decrypted.len == 0) return error.TlsDecryptError;
-    return decrypted[0 .. decrypted.len - 1];
+    if (buf[0] != @intFromEnum(ContentType.application_data)) return error.TlsUnexpectedMessage;
+    if (buf[2] != 3) return error.TlsIllegalParameter;
+    const decrypted = try decryptTLS13ForSuite(provider, @constCast(record_data), buf[0..5], seq.*, iv[0..12], &key_buf, cs);
+    const inner = try parseTLS13InnerPlaintext(decrypted);
+    seq.* = next_seq;
+    if (inner.content_type == @intFromEnum(ContentType.alert)) {
+        if (inner.content.len != 2) return error.TlsDecodeError;
+        return errors.fromAlert(@enumFromInt(inner.content[1]));
+    }
+    if (inner.content_type != @intFromEnum(ContentType.handshake)) return error.TlsUnexpectedMessage;
+    return inner.content;
 }
 
-const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
-const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
+fn paddedRecordKey(suite: tls.CipherSuite, key: []const u8) ![32]u8 {
+    const expected: usize = switch (suite) {
+        .AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_128_GCM_SHA256, .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => 16,
+        .AES_256_GCM_SHA384, .CHACHA20_POLY1305_SHA256, .ECDHE_RSA_WITH_AES_256_GCM_SHA384, .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => 32,
+        else => return error.TlsUnsupportedCipherSuite,
+    };
+    if (key.len != expected) return error.InvalidInput;
+    var padded: [32]u8 = @splat(0);
+    @memcpy(padded[0..expected], key);
+    return padded;
+}
+
+fn sendEncryptedHandshake(provider: CryptoProvider, socket: *Socket, version: tls.ProtocolVersion, msg: []const u8, key: []const u8, iv: *const [12]u8, seq: *u64, cs: tls.CipherSuite) !void {
+    if (msg.len == 0) return error.InvalidInput;
+    var key_buf = try paddedRecordKey(cs, key);
+    defer crypto_provider.secureWipe(&key_buf);
+    var sent: usize = 0;
+    while (sent < msg.len) {
+        sent += try writeBoundedEncryptedRecordWithProvider(provider, socket, version, key_buf, iv.*, cs, seq, msg[sent..], .handshake);
+    }
+}
 
 fn pemDecode(allocator: Allocator, pem: []const u8) ![]const u8 {
     const begin_marker = "-----BEGIN ";
@@ -1340,7 +864,10 @@ fn pemDecode(allocator: Allocator, pem: []const u8) ![]const u8 {
         if (c != '\n' and c != '\r' and c != ' ' and c != '\t') b64_len += 1;
     }
     var b64_buf = try allocator.alloc(u8, b64_len);
-    defer allocator.free(b64_buf);
+    defer {
+        crypto_provider.secureWipe(b64_buf);
+        allocator.free(b64_buf);
+    }
     var pos: usize = 0;
     for (pem[start..end]) |c| {
         if (c != '\n' and c != '\r' and c != ' ' and c != '\t') {
@@ -1352,6 +879,7 @@ fn pemDecode(allocator: Allocator, pem: []const u8) ![]const u8 {
     const decoded_len = Decoder.calcSizeForSlice(b64_buf[0..b64_len]) catch return error.TlsInvalidPem;
     const decoded = try allocator.alloc(u8, decoded_len);
     Decoder.decode(decoded, b64_buf[0..b64_len]) catch {
+        crypto_provider.secureWipe(decoded);
         allocator.free(decoded);
         return error.TlsInvalidPem;
     };
@@ -1359,41 +887,48 @@ fn pemDecode(allocator: Allocator, pem: []const u8) ![]const u8 {
 }
 
 pub fn loadCertChain(allocator: Allocator, path: []const u8) ![]const []const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    return loadCertChainWithIo(allocator, any_io.threadIo(), path);
+}
+
+fn loadCertChainWithIo(allocator: Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
     const dir = std.Io.Dir.cwd();
-    const pem = try dir.readFileAlloc(io, path, allocator, .unlimited);
+    const pem = try dir.readFileAlloc(io, path, allocator, .limited(512 * 1024));
     defer allocator.free(pem);
-    var count: usize = 0;
     var search_pos: usize = 0;
-    while (search_pos < pem.len) {
-        if (mem.indexOf(u8, pem[search_pos..], "-----BEGIN CERTIFICATE-----")) |_| {
-            count += 1;
-            if (mem.indexOf(u8, pem[search_pos..], "-----END CERTIFICATE-----")) |end_pos| {
-                search_pos += end_pos + 25;
-            } else break;
-        } else break;
+    var certs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (certs.items) |certificate| allocator.free(certificate);
+        certs.deinit(allocator);
     }
-    if (count == 0) return error.TlsNoCertificates;
-    var certs = try allocator.alloc([]const u8, count);
-    var cert_idx: usize = 0;
-    search_pos = 0;
-    while (cert_idx < count) {
+    var total: usize = 0;
+    while (search_pos < pem.len) {
         const begin_pos = mem.indexOf(u8, pem[search_pos..], "-----BEGIN CERTIFICATE-----") orelse break;
         const cert_start = search_pos + begin_pos;
-        const end_pos = mem.indexOf(u8, pem[cert_start..], "-----END CERTIFICATE-----") orelse break;
+        const end_pos = mem.indexOf(u8, pem[cert_start..], "-----END CERTIFICATE-----") orelse return error.TlsInvalidPem;
         const cert_end = cert_start + end_pos + 25;
-        certs[cert_idx] = try pemDecode(allocator, pem[cert_start..cert_end]);
+        if (certs.items.len == 16) return error.TlsRecordOverflow;
+        const certificate = try pemDecode(allocator, pem[cert_start..cert_end]);
+        errdefer allocator.free(certificate);
+        total += certificate.len;
+        if (certificate.len == 0 or total > 256 * 1024) return error.TlsRecordOverflow;
+        try certs.append(allocator, certificate);
         search_pos = cert_end;
-        cert_idx += 1;
     }
-    return certs;
+    if (certs.items.len == 0) return error.TlsNoCertificates;
+    return certs.toOwnedSlice(allocator);
 }
 
 pub fn loadPrivateKey(allocator: Allocator, path: []const u8) ![]const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    return loadPrivateKeyWithIo(allocator, any_io.threadIo(), path);
+}
+
+fn loadPrivateKeyWithIo(allocator: Allocator, io: std.Io, path: []const u8) ![]const u8 {
     const dir = std.Io.Dir.cwd();
-    const pem = try dir.readFileAlloc(io, path, allocator, .unlimited);
-    defer allocator.free(pem);
+    const pem = try dir.readFileAlloc(io, path, allocator, .limited(32 * 1024));
+    defer {
+        crypto_provider.secureWipe(pem);
+        allocator.free(pem);
+    }
     const rsa_begin = "-----BEGIN RSA PRIVATE KEY-----";
     const pkcs8_begin = "-----BEGIN PRIVATE KEY-----";
     const ec_begin = "-----BEGIN EC PRIVATE KEY-----";
@@ -1406,7 +941,13 @@ pub fn loadPrivateKey(allocator: Allocator, path: []const u8) ![]const u8 {
     const end_marker = if (is_pkcs1) "-----END RSA PRIVATE KEY-----" else if (is_ec) "-----END EC PRIVATE KEY-----" else "-----END PRIVATE KEY-----";
     const end_pos = mem.indexOf(u8, pem[final_start..], end_marker) orelse return error.TlsInvalidPrivateKey;
     const key_end = final_start + end_pos + end_marker.len;
-    return pemDecode(allocator, pem[final_start..key_end]);
+    const decoded = try pemDecode(allocator, pem[final_start..key_end]);
+    if (decoded.len > 16 * 1024) {
+        crypto_provider.secureWipe(@constCast(decoded));
+        allocator.free(decoded);
+        return error.TlsInvalidPrivateKey;
+    }
+    return decoded;
 }
 
 pub const ServerTLSConfig = struct {
@@ -1414,87 +955,86 @@ pub const ServerTLSConfig = struct {
     key_der: ?[]const u8 = null,
     allocator: ?Allocator = null,
     ecdsa_keypair: ?crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair = null,
+    /// Borrowed selected-provider context must outlive the config and connections.
+    crypto_provider: ?CryptoProvider = null,
+    identity: ?*server_identity.Identity = null,
+
+    pub fn init(
+        allocator: Allocator,
+        io: std.Io,
+        certificates: []const []const u8,
+        private_key: @import("crypto/provider.zig").PrivateKey,
+        provider: ?CryptoProvider,
+    ) !ServerTLSConfig {
+        if (certificates.len == 0) return error.TlsNoCertificates;
+        if (certificates.len > 16 or private_key.bytes.len > 16 * 1024) return error.TlsRecordOverflow;
+        var total: usize = 0;
+        for (certificates) |certificate| {
+            if (certificate.len == 0 or certificate.len > 256 * 1024) return error.TlsRecordOverflow;
+            total += certificate.len;
+        }
+        if (total > 256 * 1024) return error.TlsRecordOverflow;
+        var result: ServerTLSConfig = .{ .allocator = allocator, .crypto_provider = provider };
+        errdefer result.deinit();
+        const chain = try allocator.alloc([]const u8, certificates.len);
+        @memset(chain, &.{});
+        result.cert_chain_der = chain;
+        for (chain, certificates) |*destination, certificate| destination.* = try allocator.dupe(u8, certificate);
+        result.key_der = try allocator.dupe(u8, private_key.bytes);
+        const public = try certificate_crypto.certificatePublicKeyInfo(chain[0]);
+        var owned_private = private_key;
+        owned_private.bytes = result.key_der.?;
+        result.identity = try server_identity.Identity.create(
+            allocator,
+            io,
+            provider,
+            public.key,
+            public.pss_parameters,
+            owned_private,
+        );
+        return result;
+    }
 
     pub fn deinit(self: *ServerTLSConfig) void {
+        if (self.identity) |identity| identity.destroy();
+        self.identity = null;
+        if (self.ecdsa_keypair) |*pair| @import("crypto/provider.zig").secureWipeValue(pair);
+        self.ecdsa_keypair = null;
         if (self.allocator) |a| {
             for (self.cert_chain_der) |cert| a.free(cert);
             a.free(self.cert_chain_der);
-            if (self.key_der) |k| a.free(k);
+            if (self.key_der) |k| {
+                @import("crypto/provider.zig").secureWipe(@constCast(k));
+                a.free(k);
+            }
         }
+        self.cert_chain_der = &.{};
+        self.key_der = null;
+        self.allocator = null;
     }
 };
 
 pub fn loadServerTLSConfig(allocator: Allocator, cert_path: []const u8, key_path: []const u8) !ServerTLSConfig {
-    const cert_chain = try loadCertChain(allocator, cert_path);
-    const key_der = try loadPrivateKey(allocator, key_path);
-    var config = ServerTLSConfig{
-        .cert_chain_der = cert_chain,
-        .key_der = key_der,
-        .allocator = allocator,
-    };
-    // Try to parse ECDSA P-256 private key from PKCS#8 DER
-    if (config.key_der) |kd| {
-        config.ecdsa_keypair = parseEcdsaP256KeyFromPkcs8(kd);
-    }
-    return config;
+    return loadServerTLSConfigWithProvider(allocator, any_io.threadIo(), cert_path, key_path, null);
 }
 
-fn parseEcdsaP256KeyFromPkcs8(der: []const u8) ?crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair {
-    // Supports both:
-    // PKCS#8: SEQUENCE { INTEGER, SEQUENCE { OID, OID }, OCTET STRING { ECPrivateKey } }
-    // SEC1:   SEQUENCE { INTEGER(1), OCTET STRING(32 bytes private key), [0] OID, [1] pub }
-    // Strategy: recursively scan for OCTET STRING (tag 0x04) with exactly 32 bytes content.
-    return scanDerForEcKey(der, 0, der.len);
-}
-
-fn scanDerForEcKey(der: []const u8, start: usize, end: usize) ?crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair {
-    var i = start;
-    while (i + 1 < end) {
-        const tag = der[i];
-        i += 1;
-        if (i >= end) return null;
-        var length: usize = 0;
-        const len_byte = der[i];
-        i += 1;
-        if (len_byte < 0x80) {
-            length = len_byte;
-        } else if (len_byte == 0x81) {
-            if (i >= end) return null;
-            length = der[i];
-            i += 1;
-        } else if (len_byte == 0x82) {
-            if (i + 1 >= end) return null;
-            length = @as(usize, der[i]) << 8 | der[i + 1];
-            i += 2;
-        } else if (len_byte >= 0x83 and len_byte <= 0x86) {
-            const len_len: usize = @intCast(len_byte & 0x0f);
-            if (i + len_len > end) return null;
-            length = 0;
-            for (0..len_len) |j| {
-                length = (length << 8) | der[i + j];
-            }
-            i += len_len;
-        } else {
-            i += length;
-            continue;
-        }
-        if (i + length > end) return null;
-        // OCTET STRING containing 32 bytes of EC private key
-        if (tag == 0x04 and length == 32) {
-            const raw_key: [32]u8 = der[i..][0..32].*;
-            const sk = crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(raw_key) catch {
-                i += length;
-                continue;
-            };
-            return crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(sk) catch return null;
-        }
-        // If this is a constructed/SEQUENCE type (bit 5 set), descend into it
-        if (tag & 0x20 != 0) {
-            if (scanDerForEcKey(der, i, i + length)) |kp| return kp;
-        }
-        i += length;
+pub fn loadServerTLSConfigWithProvider(allocator: Allocator, io: std.Io, cert_path: []const u8, key_path: []const u8, provider: ?CryptoProvider) !ServerTLSConfig {
+    const cert_chain = try loadCertChainWithIo(allocator, io, cert_path);
+    defer {
+        for (cert_chain) |certificate| allocator.free(certificate);
+        allocator.free(cert_chain);
     }
-    return null;
+    const key_der = try loadPrivateKeyWithIo(allocator, io, key_path);
+    defer {
+        crypto_provider.secureWipe(@constCast(key_der));
+        allocator.free(key_der);
+    }
+    const public = try certificate_crypto.certificatePublicKey(cert_chain[0]);
+    return ServerTLSConfig.init(allocator, io, cert_chain, .{
+        .algorithm = public.algorithm,
+        .encoding = try server_identity.privateEncoding(public.algorithm, key_der),
+        .bytes = key_der,
+    }, provider);
 }
 
 pub const Connection = struct {
@@ -1504,6 +1044,9 @@ pub const Connection = struct {
     tls_version: tls.ProtocolVersion = .tls_1_2,
     is_server: bool = false,
     connected: bool = false,
+    crypto_provider: ?CryptoProvider = null,
+    standard_crypto_provider: StandardCryptoProvider = undefined,
+    failed: bool = false,
     app_write_key: ?[32]u8 = null,
     app_write_iv: ?[12]u8 = null,
     app_write_secret: ?[48]u8 = null,
@@ -1517,6 +1060,7 @@ pub const Connection = struct {
     hs_read_seq: u64 = 0,
     cipher_suite: ?tls.CipherSuite = null,
     sni_hostname: ?[]const u8 = null,
+    owned_sni_hostname: ?[]u8 = null,
     read_buf: [max_record_len]u8 = undefined,
     read_buf_len: usize = 0,
     read_buf_pos: usize = 0,
@@ -1547,6 +1091,7 @@ pub const Connection = struct {
     }
 
     pub fn sendAlert(self: *Connection, level: tls.Alert.Level, desc: tls.Alert.Description) void {
+        if (self.failed) return;
         const payload = [_]u8{ @intFromEnum(level), @intFromEnum(desc) };
         // After the handshake completes, alerts MUST be encrypted under the
         // negotiated keys (RFC 5246 §7.2 / RFC 8446 §6).
@@ -1567,6 +1112,41 @@ pub const Connection = struct {
 
     pub fn closeNotify(self: *Connection) void {
         self.sendAlert(.warning, .close_notify);
+        self.deinit();
+    }
+
+    pub fn cryptoProvider(self: *Connection) CryptoProvider {
+        if (self.crypto_provider) |provider| return provider;
+        self.standard_crypto_provider = .init(any_io.threadIo(), self.allocator);
+        return self.standard_crypto_provider.provider();
+    }
+
+    /// Non-I/O cleanup; the socket and an explicitly supplied provider are borrowed.
+    pub fn deinit(self: *Connection) void {
+        const wipe = @import("crypto/provider.zig").secureWipe;
+        if (self.app_write_key) |*bytes| wipe(bytes);
+        if (self.app_write_iv) |*bytes| wipe(bytes);
+        if (self.app_write_secret) |*bytes| wipe(bytes);
+        if (self.app_read_key) |*bytes| wipe(bytes);
+        if (self.app_read_iv) |*bytes| wipe(bytes);
+        if (self.app_read_secret) |*bytes| wipe(bytes);
+        self.app_write_key = null;
+        self.app_write_iv = null;
+        self.app_write_secret = null;
+        self.app_read_key = null;
+        self.app_read_iv = null;
+        self.app_read_secret = null;
+        wipe(&self.read_buf);
+        wipe(&self.encrypted_buf);
+        wipe(&self.post_handshake_buf);
+        self.read_buf_len = 0;
+        self.encrypted_buf_len = 0;
+        self.post_handshake_len = 0;
+        if (self.owned_sni_hostname) |hostname| self.allocator.free(hostname);
+        self.owned_sni_hostname = null;
+        self.sni_hostname = null;
+        self.failed = true;
+        self.connected = false;
     }
 
     pub fn reader(self: *Connection) any_io.AnyReader {
@@ -1605,10 +1185,12 @@ pub const Connection = struct {
 
     fn writeRecord(self: *Connection, data: []const u8, ctype: tls.ContentType) !usize {
         if (self.write_poisoned) return error.TlsWriteStatePoisoned;
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.deinit();
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-        return writeBoundedEncryptedRecord(self.socket, self.tls_version, key, iv, cs, &self.write_seq, data, ctype) catch |err| {
+        return writeBoundedEncryptedRecordWithProvider(self.cryptoProvider(), self.socket, self.tls_version, key, iv, cs, &self.write_seq, data, ctype) catch |err| {
             self.write_poisoned = true;
             return err;
         };
@@ -1621,11 +1203,13 @@ pub const Connection = struct {
 
     pub fn writeWithContext(self: *Connection, data: []const u8, context: *const IoContext) !usize {
         if (self.write_poisoned) return error.TlsWriteStatePoisoned;
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.deinit();
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var sender = ContextSocketSender{ .socket = self.socket, .context = context };
-        return writeBoundedEncryptedRecord(&sender, self.tls_version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+        return writeBoundedEncryptedRecordWithProvider(self.cryptoProvider(), &sender, self.tls_version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
             self.write_poisoned = true;
             try context.check();
             return err;
@@ -1653,12 +1237,18 @@ pub const Connection = struct {
     }
 
     pub fn readWithContext(self: *Connection, buf: []u8, context: *const IoContext) !usize {
-        return self.readInternal(buf, context);
+        return self.readInternal(buf, context) catch |err| {
+            try context.check();
+            return err;
+        };
     }
 
     fn readInternal(self: *Connection, buf: []u8, context: ?*const IoContext) !usize {
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.deinit();
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var state = ApplicationReadState{
+            .crypto_provider = self.cryptoProvider(),
             .socket = self.socket,
             .context = context,
             .write_poisoned = &self.write_poisoned,
@@ -1682,7 +1272,7 @@ pub const Connection = struct {
             .post_handshake_buf = &self.post_handshake_buf,
             .post_handshake_len = &self.post_handshake_len,
         };
-        return readApplicationData(&state, buf);
+        return try readApplicationData(&state, buf);
     }
 };
 
@@ -1697,6 +1287,11 @@ const ContextSocketSender = struct {
 
 pub const TLSConfig = struct {
     allocator: Allocator,
+    /// Borrowed provider context must outlive this session and its operations.
+    crypto_provider: ?CryptoProvider = null,
+    /// Explicit policy overrides the legacy verify_server/ca_bundle_path fields.
+    server_authentication: ?ServerAuthentication = null,
+    trust_limits: TrustLimits = .{},
     alpn_protocols: []const []const u8 = &.{"http/1.1"},
     verify_server: bool = true,
     ca_bundle_path: ?[]const u8 = null,
@@ -1736,6 +1331,8 @@ pub const TlsConfig = TLSConfig;
 
 pub const TLSSession = struct {
     config: TLSConfig,
+    standard_crypto_provider: StandardCryptoProvider = undefined,
+    failed: bool = false,
     negotiated_alpn: alpn.NegotiatedAlpn = .{},
     tls_version: ?tls.ProtocolVersion = null,
     socket: ?*Socket = null,
@@ -1780,18 +1377,46 @@ pub const TLSSession = struct {
         return .{ .config = config };
     }
 
+    fn currentCryptoProvider(self: *TLSSession) CryptoProvider {
+        if (self.config.crypto_provider) |provider| return provider;
+        self.standard_crypto_provider = .init(any_io.threadIo(), self.config.allocator);
+        return self.standard_crypto_provider.provider();
+    }
+
     pub fn deinit(self: *TLSSession) void {
-        if (self.app_write_key) |*k| @memset(k, 0);
-        if (self.app_write_iv) |*k| @memset(k, 0);
-        if (self.app_write_secret) |*k| @memset(k, 0);
-        if (self.app_read_key) |*k| @memset(k, 0);
-        if (self.app_read_iv) |*k| @memset(k, 0);
-        if (self.app_read_secret) |*k| @memset(k, 0);
+        if (self.app_write_key) |*k| crypto_provider.secureWipe(k);
+        if (self.app_write_iv) |*k| crypto_provider.secureWipe(k);
+        if (self.app_write_secret) |*k| crypto_provider.secureWipe(k);
+        if (self.app_read_key) |*k| crypto_provider.secureWipe(k);
+        if (self.app_read_iv) |*k| crypto_provider.secureWipe(k);
+        if (self.app_read_secret) |*k| crypto_provider.secureWipe(k);
+        if (self.hs_write_key) |*k| crypto_provider.secureWipe(k);
+        if (self.hs_read_key) |*k| crypto_provider.secureWipe(k);
+        if (self.hs_write_iv) |*k| crypto_provider.secureWipe(k);
+        if (self.hs_read_iv) |*k| crypto_provider.secureWipe(k);
+        if (self.stored_client) |*client| crypto_provider.secureWipeValue(client);
+        self.stored_client = null;
+        self.hs_write_key = null;
+        self.hs_read_key = null;
+        self.hs_write_iv = null;
+        self.hs_read_iv = null;
+        crypto_provider.secureWipe(&self.hs_read_buf);
+        crypto_provider.secureWipe(&self.hs_write_buf);
+        crypto_provider.secureWipe(&self.read_buf);
+        crypto_provider.secureWipe(&self.encrypted_buf);
+        crypto_provider.secureWipe(&self.post_handshake_buf);
         self.read_buf_len = 0;
         self.read_buf_pos = 0;
         self.encrypted_buf_len = 0;
         self.encrypted_buf_pos = 0;
         self.post_handshake_len = 0;
+        self.app_write_key = null;
+        self.app_read_key = null;
+        self.app_write_iv = null;
+        self.app_read_iv = null;
+        self.app_write_secret = null;
+        self.app_read_secret = null;
+        self.failed = true;
     }
 
     pub fn attachSocket(self: *TLSSession, socket: *Socket) void {
@@ -1803,6 +1428,7 @@ pub const TLSSession = struct {
     }
 
     pub fn handshakeWithContext(self: *TLSSession, host: []const u8, context: *const IoContext) !void {
+        errdefer self.deinit();
         self.handshakeInternal(host, context) catch |err| {
             try context.check();
             return err;
@@ -1823,6 +1449,33 @@ pub const TLSSession = struct {
     }
 
     fn handshakeDo(self: *TLSSession, socket: *Socket, host: []const u8, context: ?*const IoContext) !void {
+        self.deinit();
+        errdefer self.deinit();
+        try self.config.trust_limits.validate();
+        for (self.config.alpn_protocols) |protocol| {
+            if (protocol.len == 0 or protocol.len > 255) return error.TlsIllegalParameter;
+        }
+        const authentication = self.config.server_authentication orelse if (self.config.verify_server)
+            ServerAuthentication{ .verify = if (self.config.ca_bundle_path) |path|
+                .{ .custom_only = .{ .pem_file_path = path } }
+            else
+                .system }
+        else
+            .dangerously_insecure_skip_certificate_verification;
+        const io = any_io.threadIo();
+        const now = std.Io.Timestamp.now(io, .real);
+        var trust_context: ?TrustContext = null;
+        defer if (trust_context) |*roots| roots.deinit();
+        const trust_provider: ?TrustProvider = switch (authentication) {
+            .dangerously_insecure_skip_certificate_verification => null,
+            .verify => |source| blk: {
+                trust_context = try TrustContext.init(self.config.allocator, io, .{
+                    .source = source,
+                    .load_time_seconds = now.toSeconds(),
+                });
+                break :blk trust_context.?.provider();
+            },
+        };
         self.encrypted_buf_len = 0;
         self.encrypted_buf_pos = 0;
         var io_reader = if (context) |io_context|
@@ -1835,41 +1488,30 @@ pub const TLSSession = struct {
             SocketIoWriter.init(socket, &self.hs_write_buf);
 
         var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
-        std.Io.Threaded.global_single_threaded.io().random(&entropy);
+        const provider = self.currentCryptoProvider();
+        try provider.random(&entropy);
+        defer crypto_provider.secureWipe(&entropy);
 
         self.stored_client = try TlsClient.init(&io_reader.reader, &io_writer.writer, .{
-            .host = if (self.config.verify_server)
-                .{ .explicit = host }
-            else
-                .no_verification,
-            .ca = if (self.config.verify_server)
-                .self_signed
-            else
-                .no_verification,
+            .crypto_provider = provider,
+            .allocator = self.config.allocator,
+            .host = .{ .explicit = host },
+            .trust_provider = trust_provider,
+            .trust_limits = self.config.trust_limits,
             .write_buffer = &self.hs_write_buf,
             .read_buffer = &self.hs_read_buf,
             .entropy = &entropy,
-            .realtime_now = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real),
+            .realtime_now = now,
+            .clock_io = io,
             .alpn_protocols = self.config.alpn_protocols,
         });
-        defer self.stored_client = null;
+        defer {
+            crypto_provider.secureWipeValue(&self.stored_client.?);
+            self.stored_client = null;
+        }
         self.tls_version = self.stored_client.?.tls_version;
 
-        self.cipher_suite = switch (self.stored_client.?.tls_version) {
-            .tls_1_3 => switch (self.stored_client.?.application_cipher) {
-                .AES_128_GCM_SHA256 => .AES_128_GCM_SHA256,
-                .AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
-                .CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
-                .AEGIS_256_SHA512, .AEGIS_128L_SHA256 => return error.TlsUnsupportedCipherSuite,
-            },
-            .tls_1_2 => switch (self.stored_client.?.application_cipher) {
-                .AES_128_GCM_SHA256 => .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                .AES_256_GCM_SHA384 => .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                .CHACHA20_POLY1305_SHA256 => .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                .AEGIS_256_SHA512, .AEGIS_128L_SHA256 => return error.TlsUnsupportedCipherSuite,
-            },
-            else => return error.TlsUnsupportedCipherSuite,
-        };
+        self.cipher_suite = self.stored_client.?.negotiated_cipher_suite;
 
         switch (self.stored_client.?.tls_version) {
             .tls_1_3 => {
@@ -1946,6 +1588,7 @@ pub const TLSSession = struct {
         }
         @memcpy(self.encrypted_buf[0..buffered_encrypted.len], buffered_encrypted);
         self.encrypted_buf_len = buffered_encrypted.len;
+        self.failed = false;
     }
 
     pub fn isHTTP2(self: *const TLSSession) bool {
@@ -1959,12 +1602,14 @@ pub const TLSSession = struct {
     /// Sends at most one TLS application-data record.
     pub fn write(self: *TLSSession, data: []const u8) !usize {
         if (self.write_poisoned) return error.TlsWriteStatePoisoned;
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.failed = true;
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
-        return writeBoundedEncryptedRecord(socket, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+        return writeBoundedEncryptedRecordWithProvider(self.currentCryptoProvider(), socket, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
             self.write_poisoned = true;
             return err;
         };
@@ -1972,13 +1617,15 @@ pub const TLSSession = struct {
 
     pub fn writeWithContext(self: *TLSSession, data: []const u8, context: *const IoContext) !usize {
         if (self.write_poisoned) return error.TlsWriteStatePoisoned;
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.failed = true;
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const key = self.app_write_key orelse return error.TlsHandshakeNotComplete;
         const iv = self.app_write_iv orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var sender = ContextSocketSender{ .socket = socket, .context = context };
-        return writeBoundedEncryptedRecord(&sender, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
+        return writeBoundedEncryptedRecordWithProvider(self.currentCryptoProvider(), &sender, version, key, iv, cs, &self.write_seq, data, .application_data) catch |err| {
             self.write_poisoned = true;
             try context.check();
             return err;
@@ -2006,14 +1653,20 @@ pub const TLSSession = struct {
     }
 
     pub fn readWithContext(self: *TLSSession, buf: []u8, context: *const IoContext) !usize {
-        return self.readInternal(buf, context);
+        return self.readInternal(buf, context) catch |err| {
+            try context.check();
+            return err;
+        };
     }
 
     fn readInternal(self: *TLSSession, buf: []u8, context: ?*const IoContext) !usize {
+        if (self.failed) return error.TlsHandshakeNotComplete;
+        errdefer self.failed = true;
         const socket = self.socket orelse return 0;
         const version = self.tls_version orelse return error.TlsHandshakeNotComplete;
         const cs = self.cipher_suite orelse return error.TlsHandshakeNotComplete;
         var state = ApplicationReadState{
+            .crypto_provider = self.currentCryptoProvider(),
             .socket = socket,
             .context = context,
             .write_poisoned = &self.write_poisoned,
@@ -2069,6 +1722,38 @@ test "TLS reconnect is restricted to transport failures" {
     }
 }
 
+test "TLS session provider entropy failure is preserved and retires the session" {
+    const Reject = struct {
+        fn random(_: *anyopaque, _: []u8) CryptoProviderError!void {
+            return error.EntropyUnavailable;
+        }
+        fn verify(_: *anyopaque, _: VerifyPeerRequest) TrustError!void {
+            return error.TlsUnknownCa;
+        }
+    };
+    var standard = StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var provider = standard.provider();
+    var vtable = provider.vtable.*;
+    vtable.random = Reject.random;
+    provider.vtable = &vtable;
+    var trust_context: u8 = 0;
+    var socket = try Socket.create();
+    defer socket.close();
+    var session = TLSSession.init(.{
+        .allocator = std.testing.allocator,
+        .crypto_provider = provider,
+        .server_authentication = .{ .verify = .{ .provider = .{
+            .context = &trust_context,
+            .vtable = &.{ .verify_peer = Reject.verify },
+        } } },
+    });
+    defer session.deinit();
+    session.attachSocket(&socket);
+    try std.testing.expectError(error.EntropyUnavailable, session.handshake("localhost"));
+    try std.testing.expect(session.failed);
+    try std.testing.expectError(error.TlsHandshakeNotComplete, session.write("no retry"));
+}
+
 test "TLS handshake configuration failure never invokes reconnect" {
     const Reconnect = struct {
         calls: usize = 0,
@@ -2110,11 +1795,13 @@ pub fn connectClient(
     var conn = Connection{
         .allocator = allocator,
         .socket = socket,
+        .crypto_provider = config.crypto_provider,
         .is_server = false,
         .connected = true,
     };
 
     var session = TLSSession.init(config.*);
+    defer session.deinit();
     session.socket = socket;
     try session.handshake(host);
 
@@ -2364,6 +2051,13 @@ fn testCipherSuite(path: TestWritePath, version: tls.ProtocolVersion) tls.Cipher
     };
 }
 
+fn testProvider() CryptoProvider {
+    const Holder = struct {
+        var standard = StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    };
+    return Holder.standard.provider();
+}
+
 fn testRecordWireLen(version: tls.ProtocolVersion, plaintext_len: usize) usize {
     return record_header_len + switch (version) {
         .tls_1_3 => plaintext_len + 1 + crypto.aead.aes_gcm.Aes128Gcm.tag_length,
@@ -2422,7 +2116,8 @@ fn expectApplicationRecords(
                 try std.testing.expectEqual(@intFromEnum(ContentType.application_data), header[0]);
                 const nonce = nonceTLS13(&test_write_iv, seq);
                 const plaintext = try decryptTLS13(
-                    crypto.aead.aes_gcm.Aes128Gcm,
+                    testProvider(),
+                    .aes_128_gcm,
                     record_body,
                     header,
                     &nonce,
@@ -2435,7 +2130,8 @@ fn expectApplicationRecords(
             .tls_1_2 => {
                 try std.testing.expectEqual(@intFromEnum(ContentType.application_data), header[0]);
                 const plaintext = try decryptTLS12(
-                    crypto.aead.aes_gcm.Aes128Gcm,
+                    testProvider(),
+                    .aes_128_gcm,
                     record_body,
                     header,
                     seq,
@@ -2555,9 +2251,9 @@ const TestApplicationReader = union(TestWritePath) {
         read_secret: [48]u8,
         write_secret: [48]u8,
         write_sequence: u64,
-    ) void {
-        const read_keys = testTrafficKeys(cipher_suite, &read_secret);
-        const write_keys = testTrafficKeys(cipher_suite, &write_secret);
+    ) !void {
+        const read_keys = try testTrafficKeys(cipher_suite, &read_secret);
+        const write_keys = try testTrafficKeys(cipher_suite, &write_secret);
         switch (self.*) {
             .connection => |*connection| {
                 connection.is_server = is_server;
@@ -2636,13 +2332,13 @@ fn testReadCipherSuite(path: TestWritePath, version: tls.ProtocolVersion) tls.Ci
 fn testTrafficKeys(
     cipher_suite: tls.CipherSuite,
     secret: *const [48]u8,
-) struct { key: [32]u8, iv: [12]u8 } {
+) !struct { key: [32]u8, iv: [12]u8 } {
     const secret_slice = switch (cipher_suite) {
         .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 => secret[0..32],
         .AES_256_GCM_SHA384 => secret[0..48],
         else => unreachable,
     };
-    const keys = deriveTrafficKeys13(secret_slice);
+    const keys = try deriveTrafficKeys13(testProvider(), secret_slice);
     var key: [32]u8 = .{0} ** 32;
     if (cipher_suite == .AES_128_GCM_SHA256) {
         @memcpy(key[0..keys.key16.len], &keys.key16);
@@ -2693,7 +2389,8 @@ fn appendTestProtectedRecordWithKeys(
                     var key: [16]u8 = undefined;
                     @memcpy(&key, key_bytes[0..key.len]);
                     break :aes128 try encryptTLS13(
-                        crypto.aead.aes_gcm.Aes128Gcm,
+                        testProvider(),
+                        .aes_128_gcm,
                         &encrypted_buf,
                         inner[0..inner_len],
                         &header,
@@ -2702,7 +2399,8 @@ fn appendTestProtectedRecordWithKeys(
                     );
                 },
                 .AES_256_GCM_SHA384 => try encryptTLS13(
-                    crypto.aead.aes_gcm.Aes256Gcm,
+                    testProvider(),
+                    .aes_256_gcm,
                     &encrypted_buf,
                     inner[0..inner_len],
                     &header,
@@ -2710,7 +2408,8 @@ fn appendTestProtectedRecordWithKeys(
                     &key_bytes,
                 ),
                 .CHACHA20_POLY1305_SHA256 => try encryptTLS13(
-                    crypto.aead.chacha_poly.ChaCha20Poly1305,
+                    testProvider(),
+                    .chacha20_poly1305,
                     &encrypted_buf,
                     inner[0..inner_len],
                     &header,
@@ -2732,6 +2431,7 @@ fn appendTestProtectedRecordWithKeys(
                 .big,
             );
             break :blk try encryptTLS12ForSuite(
+                testProvider(),
                 &encrypted_buf,
                 content,
                 &header,
@@ -2797,6 +2497,7 @@ fn readTestTLS13Record(
         return error.TlsUnexpectedMessage;
     }
     const plaintext = try decryptTLS13ForSuite(
+        testProvider(),
         @constCast(ciphertext),
         record_buf[0..record_header_len],
         sequence.*,
@@ -2824,14 +2525,14 @@ fn makeTestTrafficSecret(cipher_suite: tls.CipherSuite, seed: u8) [48]u8 {
 fn testUpdatedTrafficSecret(
     cipher_suite: tls.CipherSuite,
     secret: *const [48]u8,
-) [48]u8 {
+) ![48]u8 {
     var updated: [48]u8 = .{0} ** 48;
     switch (cipher_suite) {
         .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 => {
-            updated[0..32].* = hkdfExpandLabel(secret[0..32], "traffic upd", "", 32);
+            updated[0..32].* = try hkdfExpandLabel(testProvider(), secret[0..32], "traffic upd", "", 32);
         },
         .AES_256_GCM_SHA384 => {
-            updated = hkdfExpandLabel(secret, "traffic upd", "", 48);
+            updated = try hkdfExpandLabel(testProvider(), secret, "traffic upd", "", 48);
         },
         else => unreachable,
     }
@@ -3156,26 +2857,62 @@ test "TLS partial record writes preserve cancellation and deadline failures" {
     }
 }
 
+test "TLS session poisons write state after a potentially partial record failure" {
+    var socket = try Socket.create();
+    defer socket.close();
+    var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+    defer session.deinit();
+    session.attachSocket(&socket);
+    session.tls_version = .tls_1_3;
+    session.cipher_suite = .AES_128_GCM_SHA256;
+    session.app_write_key = test_write_key;
+    session.app_write_iv = test_write_iv;
+    try std.testing.expectError(error.WriteFailed, session.write("payload"));
+    try std.testing.expectEqual(@as(u64, 1), session.write_seq);
+    try std.testing.expect(session.write_poisoned);
+    try std.testing.expectError(error.TlsWriteStatePoisoned, session.write("retry"));
+    try std.testing.expectEqual(@as(u64, 1), session.write_seq);
+}
+
+test "TLS context reads preserve cancellation deadlines and zero-byte semantics" {
+    for ([_]anyerror{ error.Cancelled, error.Timeout }) |failure| {
+        var socket = try Socket.create();
+        socket.close();
+        var context = IoContext.init(.{});
+        if (failure == error.Cancelled) context.cancel() else context.setPhaseTimeoutMs(0);
+        var bytes: [1]u8 = undefined;
+
+        var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
+        defer session.deinit();
+        session.attachSocket(&socket);
+        session.tls_version = .tls_1_3;
+        session.cipher_suite = .AES_128_GCM_SHA256;
+        session.app_read_key = test_write_key;
+        session.app_read_iv = test_write_iv;
+        try std.testing.expectEqual(@as(usize, 0), try session.readWithContext(bytes[0..0], &context));
+        try std.testing.expectError(failure, session.readWithContext(&bytes, &context));
+        try std.testing.expect(session.failed);
+
+        var connection = Connection{
+            .allocator = std.testing.allocator,
+            .socket = &socket,
+            .tls_version = .tls_1_3,
+            .cipher_suite = .AES_128_GCM_SHA256,
+            .app_read_key = test_write_key,
+            .app_read_iv = test_write_iv,
+        };
+        defer connection.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try connection.readWithContext(bytes[0..0], &context));
+        try std.testing.expectError(failure, connection.readWithContext(&bytes, &context));
+        try std.testing.expect(connection.failed);
+        try std.testing.expect(connection.app_read_key == null);
+    }
+}
+
 test "TLS writeAll rejects zero progress and preserves errors" {
     const ZeroProgressWriter = struct {
         fn write(_: *@This(), _: []const u8) !usize {
             return 0;
-        }
-
-        test "TLS session poisons write state after a potentially partial record failure" {
-            var socket = try Socket.create();
-            defer socket.close();
-            var session = TLSSession.init(TLSConfig.insecure(std.testing.allocator));
-            session.attachSocket(&socket);
-            session.tls_version = .tls_1_3;
-            session.cipher_suite = .AES_128_GCM_SHA256;
-            session.app_write_key = test_write_key;
-            session.app_write_iv = test_write_iv;
-            try std.testing.expectError(error.WriteFailed, session.write("payload"));
-            try std.testing.expectEqual(@as(u64, 1), session.write_seq);
-            try std.testing.expect(session.write_poisoned);
-            try std.testing.expectError(error.TlsWriteStatePoisoned, session.write("retry"));
-            try std.testing.expectEqual(@as(u64, 1), session.write_seq);
         }
     };
     var zero_writer = ZeroProgressWriter{};
@@ -3678,14 +3415,14 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
         for (requests) |request| {
             const initial_read_secret = makeTestTrafficSecret(case.cipher_suite, 0x21);
             const initial_write_secret = makeTestTrafficSecret(case.cipher_suite, 0x91);
-            const initial_read_keys = testTrafficKeys(case.cipher_suite, &initial_read_secret);
-            const initial_write_keys = testTrafficKeys(case.cipher_suite, &initial_write_secret);
+            const initial_read_keys = try testTrafficKeys(case.cipher_suite, &initial_read_secret);
+            const initial_write_keys = try testTrafficKeys(case.cipher_suite, &initial_write_secret);
 
-            const updated_read_secret = testUpdatedTrafficSecret(
+            const updated_read_secret = try testUpdatedTrafficSecret(
                 case.cipher_suite,
                 &initial_read_secret,
             );
-            const updated_read_keys = testTrafficKeys(case.cipher_suite, &updated_read_secret);
+            const updated_read_keys = try testTrafficKeys(case.cipher_suite, &updated_read_secret);
 
             var key_update = std.ArrayList(u8).empty;
             defer key_update.deinit(std.testing.allocator);
@@ -3755,7 +3492,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
             try peer.sendAll(wire.items);
 
             var reader = TestApplicationReader.init(case.path, &local, .tls_1_3, case.cipher_suite);
-            reader.configureTLS13Traffic(
+            try reader.configureTLS13Traffic(
                 case.is_server,
                 case.cipher_suite,
                 initial_read_secret,
@@ -3799,11 +3536,11 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                 };
                 try std.testing.expectEqualSlices(u8, &expected_response, response.content);
 
-                const updated_write_secret = testUpdatedTrafficSecret(
+                const updated_write_secret = try testUpdatedTrafficSecret(
                     case.cipher_suite,
                     &initial_write_secret,
                 );
-                const updated_write_keys = testTrafficKeys(case.cipher_suite, &updated_write_secret);
+                const updated_write_keys = try testTrafficKeys(case.cipher_suite, &updated_write_secret);
                 try std.testing.expectEqualSlices(u8, &updated_write_secret, &after_read.write_secret);
                 try std.testing.expectEqualSlices(u8, &updated_write_keys.key, &after_read.write_key);
                 try std.testing.expectEqualSlices(u8, &updated_write_keys.iv, &after_read.write_iv);
@@ -3996,6 +3733,7 @@ test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally"
     const round_trip = try std.testing.allocator.dupe(u8, scripted_sender.bytes.items);
     defer std.testing.allocator.free(round_trip);
     const decrypted = try decryptTLS12ForSuite(
+        testProvider(),
         round_trip[record_header_len..],
         round_trip[0..record_header_len],
         initial_seq,
@@ -4011,6 +3749,7 @@ test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally"
     try std.testing.expectError(
         error.TlsDecryptError,
         decryptTLS12ForSuite(
+            testProvider(),
             tampered[record_header_len..],
             tampered[0..record_header_len],
             initial_seq,
@@ -4064,6 +3803,61 @@ test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally"
     );
 }
 
+test "TLS public handshake helpers fragment records and retain the selected provider" {
+    const message: [max_plaintext_len + 97]u8 = @splat(0x61);
+    inline for (.{ tls.ProtocolVersion.tls_1_2, tls.ProtocolVersion.tls_1_3 }) |version| {
+        const suites = if (version == .tls_1_2)
+            [_]tls.CipherSuite{ .ECDHE_RSA_WITH_AES_128_GCM_SHA256, .ECDHE_RSA_WITH_AES_256_GCM_SHA384, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 }
+        else
+            [_]tls.CipherSuite{ .AES_128_GCM_SHA256, .AES_256_GCM_SHA384, .CHACHA20_POLY1305_SHA256 };
+        for (suites, 0..) |suite, index| {
+            const sockets = try testSocketPair();
+            var sender = sockets[0];
+            defer sender.close();
+            var receiver = sockets[1];
+            defer receiver.close();
+            const key = test_write_key[0..@as(usize, if (index == 0) 16 else 32)];
+            var write_seq: u64 = 7;
+            if (version == .tls_1_2)
+                try sendTLS12EncryptedHandshake(testProvider(), &sender, &message, key, &test_write_iv, &write_seq, suite)
+            else
+                try sendTLS13EncryptedHandshake(testProvider(), &sender, &message, key, &test_write_iv, &write_seq, suite);
+            try std.testing.expectEqual(@as(u64, 9), write_seq);
+            var read_seq: u64 = 7;
+            var buffer: [max_record_len]u8 = undefined;
+            var received: usize = 0;
+            while (received < message.len) {
+                const part = if (version == .tls_1_2)
+                    try readTLS12EncryptedRecord(testProvider(), &receiver, &buffer, key, &test_write_iv, &read_seq, suite)
+                else
+                    try readTLS13EncryptedHandshake(testProvider(), &receiver, &buffer, key, &test_write_iv, &read_seq, suite);
+                try std.testing.expect(part.len > 0 and part.len <= max_plaintext_len);
+                try std.testing.expectEqualSlices(u8, message[received..][0..part.len], part);
+                received += part.len;
+            }
+            try std.testing.expectEqual(write_seq, read_seq);
+        }
+    }
+}
+
+test "TLS public record helpers reject short buffers and exhausted sequences before I/O" {
+    var socket: Socket = undefined;
+    var buffer: [4]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, readTLSRecord(&socket, &buffer));
+    var sequence: u64 = std.math.maxInt(u64);
+    try std.testing.expectError(error.TlsSequenceOverflow, readTLS12EncryptedRecord(testProvider(), &socket, &buffer, &test_write_key, &test_write_iv, &sequence, .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256));
+    try std.testing.expectError(error.TlsSequenceOverflow, readTLS13EncryptedHandshake(testProvider(), &socket, &buffer, &test_write_key, &test_write_iv, &sequence, .CHACHA20_POLY1305_SHA256));
+    try std.testing.expectError(error.InvalidInput, sendTLS13EncryptedHandshake(testProvider(), &socket, "message", test_write_key[0..15], &test_write_iv, &sequence, .AES_128_GCM_SHA256));
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+    try sender.sendAll(&.{ 22, 3, 3, 0, 32 });
+    var short: [8]u8 = undefined;
+    try std.testing.expectError(error.TlsRecordOverflow, readTLSRecord(&receiver, &short));
+}
+
 test "TLS 1.2 ChaCha handshake record helpers round trip" {
     const suites = [_]tls.CipherSuite{
         .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -4080,6 +3874,7 @@ test "TLS 1.2 ChaCha handshake record helpers round trip" {
 
         var write_seq: u64 = 7;
         try sendTLS12EncryptedHandshake(
+            testProvider(),
             &sender,
             message,
             &test_write_key,
@@ -4090,6 +3885,7 @@ test "TLS 1.2 ChaCha handshake record helpers round trip" {
         var read_seq: u64 = 7;
         var record_buf: [4096]u8 = undefined;
         const plaintext = try readTLS12EncryptedRecord(
+            testProvider(),
             &receiver,
             &record_buf,
             &test_write_key,

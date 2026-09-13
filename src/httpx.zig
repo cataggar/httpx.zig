@@ -1030,6 +1030,15 @@ test "dns" {
     _ = AddressOrder;
 }
 
+test "tls server provider runtime" {
+    _ = @import("tls/server_runtime.zig");
+    _ = @import("tls/server_identity.zig");
+}
+
+test "tls connectClient provider transfer" {
+    _ = @import("tls/connect_client_test.zig");
+}
+
 test "tls trust contract exports" {
     _ = TrustProvider;
     _ = VerifyPeerRequest;

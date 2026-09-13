@@ -9,6 +9,7 @@ pub const Reader = struct {
     offset: usize = 0,
 
     pub fn take(self: *Reader, expected_tag: u8) Error![]const u8 {
+        if (self.offset > self.bytes.len) return error.InvalidEncoding;
         const rest = self.bytes[self.offset..];
         if (rest.len < 2 or rest[0] != expected_tag) return error.InvalidEncoding;
         var header_len: usize = 2;
@@ -30,9 +31,20 @@ pub const Reader = struct {
             return error.InvalidEncoding;
         // std's DER element primitive assumes valid index/length bounds.
         // Only call it after proving those bounds and canonical framing.
-        const element = Der.Element.parse(rest, 0) catch return error.InvalidEncoding;
-        self.offset += element.slice.end;
-        return rest[element.slice.start..element.slice.end];
+        const parsed = Der.Element.parse(rest, 0) catch return error.InvalidEncoding;
+        self.offset += parsed.slice.end;
+        return rest[parsed.slice.start..parsed.slice.end];
+    }
+
+    pub const Element = struct { tag: u8, encoded: []const u8, content: []const u8 };
+
+    pub fn element(self: *Reader) Error!Element {
+        if (self.offset >= self.bytes.len) return error.InvalidEncoding;
+        const start = self.offset;
+        const tag = self.bytes[start];
+        if (tag & 0x1f == 0x1f) return error.InvalidEncoding;
+        const content = try self.take(tag);
+        return .{ .tag = tag, .encoded = self.bytes[start..self.offset], .content = content };
     }
 
     pub fn finish(self: Reader) Error!void {

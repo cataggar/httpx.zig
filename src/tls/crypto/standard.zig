@@ -8,6 +8,7 @@ const std = @import("std");
 const p = @import("provider.zig");
 const der = @import("der.zig");
 const key_encoding = @import("key_encoding.zig");
+const RsaKey = @import("rsa_sign.zig").Key;
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 const Error = p.ProviderError;
@@ -62,11 +63,7 @@ const HashState = union(p.HashAlgorithm) {
 
 fn capabilities(_: *anyopaque) p.Capabilities {
     var result = p.Capabilities.all();
-    // std.crypto has RSA verification, but no RSA private-key signing.
-    result.signature_sign = 0;
-    result.setSign(.ecdsa_secp256r1_sha256, true);
-    result.setSign(.ecdsa_secp384r1_sha384, true);
-    result.setSign(.ed25519, true);
+    result.setSign(.rsa_pkcs1_sha1, false);
     return result;
 }
 
@@ -338,9 +335,17 @@ const SigningState = union(enum) {
     ecdsa_p256: Ecdsa256.KeyPair,
     ecdsa_p384: Ecdsa384.KeyPair,
     ed25519: Ed25519.KeyPair,
+    rsa: RsaKey,
 };
 
-fn signingKeyImport(_: *anyopaque, allocator: Allocator, input: p.PrivateKey, out: *?*anyopaque) Error!void {
+fn signingKeyImport(context: *anyopaque, allocator: Allocator, input: p.PrivateKey, out: *?*anyopaque) Error!void {
+    if (input.algorithm == .rsa or input.algorithm == .rsa_pss) {
+        const key = try allocator.create(SigningState);
+        errdefer destroy(SigningState, allocator, key);
+        key.* = .{ .rsa = try RsaKey.init(owner(context).io, input) };
+        out.* = key;
+        return;
+    }
     const material = try key_encoding.decode(input);
     const key = try allocator.create(SigningState);
     errdefer destroy(SigningState, allocator, key);
@@ -368,13 +373,14 @@ fn signingKeyImport(_: *anyopaque, allocator: Allocator, input: p.PrivateKey, ou
                 break :blk std.mem.eql(u8, &public.toUncompressedSec1(), &pair.public_key.toUncompressedSec1());
             },
             .ed25519 => |*pair| std.mem.eql(u8, encoded, &pair.public_key.toBytes()),
+            .rsa => unreachable,
         };
         if (!matches) return error.InvalidEncoding;
     }
     out.* = key;
 }
 
-fn sign(context: *anyopaque, raw: *anyopaque, _: p.SignatureScheme, parts: []const []const u8, out: []u8) Error!usize {
+fn sign(context: *anyopaque, raw: *anyopaque, scheme: p.SignatureScheme, parts: []const []const u8, out: []u8) Error!usize {
     switch (cast(SigningState, raw).*) {
         inline .ecdsa_p256, .ecdsa_p384 => |*key, a| {
             const Ecdsa = if (a == .ecdsa_p256) Ecdsa256 else Ecdsa384;
@@ -398,6 +404,7 @@ fn sign(context: *anyopaque, raw: *anyopaque, _: p.SignatureScheme, parts: []con
             @memcpy(out[0..64], &signature.toBytes());
             return 64;
         },
+        .rsa => |*key| return key.sign(owner(context).io, scheme, parts, out),
     }
 }
 

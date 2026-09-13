@@ -206,13 +206,14 @@ test "standard provider ECDSA and Ed25519 sign verify and reject wrong messages"
     }
 }
 
-test "standard provider rejects invalid private scalars and unsupported RSA signing" {
+test "standard provider rejects invalid private scalars and RSA encodings" {
     var owner = StandardProvider.init(testing.io, testing.allocator);
     const provider = owner.provider();
     const caps = try provider.capabilities();
     try testing.expect(caps.supportsVerify(.rsa_pss_rsae_sha256));
-    try testing.expect(!caps.supportsSign(.rsa_pss_rsae_sha256));
-    try testing.expectError(error.UnsupportedAlgorithm, provider.signingKeyImport(testing.allocator, .{ .algorithm = .rsa, .encoding = .rsa_pkcs1_der, .bytes = "\x30\x00" }));
+    try testing.expect(caps.supportsSign(.rsa_pss_rsae_sha256));
+    try testing.expect(!caps.supportsSign(.rsa_pkcs1_sha1));
+    try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{ .algorithm = .rsa, .encoding = .rsa_pkcs1_der, .bytes = "\x30\x00" }));
     try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(testing.allocator, .{ .algorithm = .ecdsa_p256, .encoding = .sec1_der, .bytes = "\x30\x00" }));
     inline for (.{ p.SignatureKeyAlgorithm.ecdsa_p256, p.SignatureKeyAlgorithm.ecdsa_p384 }) |algorithm| {
         const length = if (algorithm == .ecdsa_p256) 32 else 48;
@@ -297,13 +298,41 @@ fn base64Url(comptime length: usize, value: []const u8) ![length]u8 {
     return bytes;
 }
 
-test "standard provider RSA PKCS1 SHA256 RFC 7515 A.2 known answer" {
-    const modulus = try base64Url(256, "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddx" ++
+fn rsaModulusFixture() ![256]u8 {
+    return base64Url(256, "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddx" ++
         "HmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMs" ++
         "D1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSH" ++
         "SXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdV" ++
         "MTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8" ++
         "NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ");
+}
+
+const WipeCheckedAllocator = struct {
+    frees: usize = 0,
+
+    fn allocator(self: *WipeCheckedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn allocate(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        return testing.allocator.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn free(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *WipeCheckedAllocator = @ptrCast(@alignCast(context));
+        if (!std.mem.allEqual(u8, bytes, 0)) @panic("private-key allocation was not wiped before free");
+        self.frees += 1;
+        testing.allocator.rawFree(bytes, alignment, ret_addr);
+    }
+};
+
+test "standard provider RSA PKCS1 SHA256 RFC 7515 A.2 known answer" {
+    const modulus = try rsaModulusFixture();
     const signed = try base64Url(256, "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7" ++
         "AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4" ++
         "BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K" ++
@@ -327,6 +356,232 @@ test "standard provider RSA PKCS1 SHA256 RFC 7515 A.2 known answer" {
     try testing.expectError(error.SignatureInvalid, provider.verify(.rsa_pkcs1_sha256, key, &.{"wrong message"}, &signed));
     try testing.expectError(error.InvalidSignatureLength, provider.verify(.rsa_pkcs1_sha256, key, &parts, signed[0..255]));
     try testing.expectError(error.SignatureInvalid, provider.verify(.rsa_pss_rsae_sha256, key, &parts, &signed));
+
+    const private_der = try rsaPrivateFixture(testing.allocator, &modulus);
+    defer testing.allocator.free(private_der);
+    var checked: WipeCheckedAllocator = .{};
+    try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(checked.allocator(), .{
+        .algorithm = .rsa,
+        .encoding = .rsa_pkcs1_der,
+        .bytes = "\x30\x00",
+    }));
+    var private_key = try provider.signingKeyImport(checked.allocator(), .{
+        .algorithm = .rsa,
+        .encoding = .rsa_pkcs1_der,
+        .bytes = private_der,
+    });
+    defer private_key.deinit();
+    p.secureWipe(private_der);
+    var generated: [256]u8 = undefined;
+    try testing.expectEqual(256, (try private_key.sign(.rsa_pkcs1_sha256, &parts, &generated)).len);
+    try testing.expectEqualSlices(u8, &signed, &generated);
+    try testing.expectEqual(256, (try private_key.sign(.rsa_pkcs1_sha256, &parts, &generated)).len);
+    try testing.expectEqualSlices(u8, &signed, &generated);
+    for ([_]p.SignatureScheme{
+        .rsa_pkcs1_sha384, .rsa_pkcs1_sha512, .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512,
+    }) |scheme| {
+        try testing.expectEqual(256, (try private_key.sign(scheme, &parts, &generated)).len);
+        try provider.verify(scheme, key, &parts, &generated);
+        try testing.expectError(error.SignatureInvalid, provider.verify(scheme, key, &.{"different message"}, &generated));
+    }
+    try testing.expectError(error.OutputTooSmall, private_key.sign(.rsa_pkcs1_sha256, &parts, generated[0..255]));
+    try testing.expect(std.mem.allEqual(u8, generated[0..255], 0));
+    try testing.expectError(error.UnsupportedAlgorithm, private_key.sign(.rsa_pss_pss_sha256, &parts, &generated));
+    const Fail = struct {
+        fn randomSecure(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+            return error.EntropyUnavailable;
+        }
+    };
+    var failed_io = testing.io.vtable.*;
+    failed_io.randomSecure = Fail.randomSecure;
+    owner.io = .{ .userdata = null, .vtable = &failed_io };
+    for ([_]p.SignatureScheme{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha256 }) |scheme| {
+        @memset(&generated, 0xa5);
+        try testing.expectError(error.EntropyUnavailable, private_key.sign(scheme, &parts, &generated));
+        try testing.expect(std.mem.allEqual(u8, &generated, 0));
+    }
+    private_key.deinit();
+    private_key.deinit();
+    try testing.expectEqual(2, checked.frees);
+}
+
+fn appendDer(allocator: std.mem.Allocator, output: *std.ArrayList(u8), tag: u8, bytes: []const u8) !void {
+    try output.append(allocator, tag);
+    if (bytes.len < 128) {
+        try output.append(allocator, @intCast(bytes.len));
+    } else if (bytes.len < 256) {
+        try output.appendSlice(allocator, &.{ 0x81, @intCast(bytes.len) });
+    } else {
+        try testing.expect(bytes.len <= 65535);
+        try output.appendSlice(allocator, &.{ 0x82, @intCast(bytes.len >> 8), @intCast(bytes.len & 0xff) });
+    }
+    try output.appendSlice(allocator, bytes);
+}
+
+fn appendInteger(allocator: std.mem.Allocator, output: *std.ArrayList(u8), bytes: []const u8) !void {
+    var positive: std.ArrayList(u8) = .empty;
+    defer positive.deinit(allocator);
+    if (bytes[0] & 0x80 != 0) try positive.append(allocator, 0);
+    try positive.appendSlice(allocator, bytes);
+    try appendDer(allocator, output, 2, positive.items);
+}
+
+// These are the publicly published example private components in RFC 7515
+// Appendix A.2, not credentials or generated application keys.
+fn rsaPrivateFixture(allocator: std.mem.Allocator, modulus: []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "\x02\x01\x00");
+    try appendInteger(allocator, &body, modulus);
+    try appendInteger(allocator, &body, "\x01\x00\x01");
+    for ([_][]const u8{
+        "Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97I" ++
+            "jlA7_GQ5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0" ++
+            "BkTGoVEn2bKVRUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn" ++
+            "439X0M_V51gfpRLI9JYanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYT" ++
+            "CBr6XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLh" ++
+            "BOneufuBiB4cS98l2SR_RQyGWSeWjnczT0QU91p1DhOVRuOopznQ",
+        "4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdi" ++
+            "YrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPG" ++
+            "BY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc",
+        "uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxa" ++
+            "ewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA" ++
+            "-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc",
+        "BwKfV3Akq5_MFZDFZCnW-wzl-CCo83WoZvnLQwCTeDv8uzluRSnm71I3Q" ++
+            "CLdhrqE2e9YkxvuxdBfpT_PI7Yz-FOKnu1R6HsJeDCjn12Sk3vmAktV2zb" ++
+            "34MCdy7cpdTh_YVr7tss2u6vneTwrA86rZtu5Mbr1C1XsmvkxHQAdYo0",
+        "h_96-mK1R_7glhsum81dZxjTnYynPbZpHziZjeeHcXYsXaaMwkOlODsWa" ++
+            "7I9xXDoRwbKgB719rrmI2oKr6N3Do9U0ajaHF-NKJnwgjMd2w9cjz3_-ky" ++
+            "NlxAr2v4IKhGNpmM5iIgOS1VZnOZ68m6_pbLBSp3nssTdlqvd0tIiTHU",
+        "IYd7DHOhrWvxkwPQsRM2tOgrjbcrfvtQJipd-DlcxyVuuM9sQLdgjVk2o" ++
+            "y26F0EmpScGLq2MowX7fhd_QJQ3ydy5cY7YIBi87w93IKLEdfnbJtoOPLU" ++
+            "W0ITrJReOgo1cq9SbsxYawBgfp_gh6A5603k2-ZQwVK0JKSHuLFkuQ3U",
+    }) |encoded| {
+        var decoded: [512]u8 = undefined;
+        const length = try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded);
+        try std.base64.url_safe_no_pad.Decoder.decode(decoded[0..length], encoded);
+        try appendInteger(allocator, &body, decoded[0..length]);
+    }
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try appendDer(allocator, &result, 0x30, body.items);
+    return result.toOwnedSlice(allocator);
+}
+
+fn rsaPkcs8Fixture(allocator: std.mem.Allocator, private_der: []const u8, public_der: ?[]const u8, identifier: []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, if (public_der == null) "\x02\x01\x00" else "\x02\x01\x01");
+    try appendDer(allocator, &body, 0x30, identifier);
+    try appendDer(allocator, &body, 4, private_der);
+    if (public_der) |public| {
+        var bit_string: std.ArrayList(u8) = .empty;
+        defer bit_string.deinit(allocator);
+        try bit_string.append(allocator, 0);
+        try bit_string.appendSlice(allocator, public);
+        try appendDer(allocator, &body, 0x81, bit_string.items);
+    }
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try appendDer(allocator, &result, 0x30, body.items);
+    return result.toOwnedSlice(allocator);
+}
+
+test "standard provider RSA PKCS8 public-key binding PSS restrictions and private fault rejection" {
+    const allocator = testing.allocator;
+    const modulus = try rsaModulusFixture();
+    const public_der = "\x30\x82\x01\x0a\x02\x82\x01\x01\x00".* ++ modulus ++ "\x02\x03\x01\x00\x01".*;
+    const private_der = try rsaPrivateFixture(allocator, &modulus);
+    defer allocator.free(private_der);
+    const rsa_identifier = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00";
+    const pss_identifier = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
+    const sha256_parameters = "\x30\x34\xa0\x0f\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00" ++
+        "\xa1\x1c\x30\x1a\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08" ++
+        "\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\xa2\x03\x02\x01\x10";
+    var owner = StandardProvider.init(testing.io, allocator);
+    const provider = owner.provider();
+    for ([_]struct { public: ?[]const u8, identifier: []const u8, scheme: p.SignatureScheme }{
+        .{ .public = null, .identifier = rsa_identifier, .scheme = .rsa_pkcs1_sha512 },
+        .{ .public = &public_der, .identifier = rsa_identifier, .scheme = .rsa_pss_rsae_sha384 },
+        .{ .public = null, .identifier = pss_identifier, .scheme = .rsa_pss_pss_sha512 },
+        .{ .public = null, .identifier = pss_identifier ++ sha256_parameters, .scheme = .rsa_pss_pss_sha256 },
+    }) |item| {
+        const container = try rsaPkcs8Fixture(allocator, private_der, item.public, item.identifier);
+        defer allocator.free(container);
+        var key = try provider.signingKeyImport(allocator, .{
+            .algorithm = item.scheme.keyAlgorithm(),
+            .encoding = .pkcs8_der,
+            .bytes = container,
+        });
+        defer key.deinit();
+        var output: [256]u8 = undefined;
+        const signature = try key.sign(item.scheme, &.{ "PKCS8 ", "signature" }, &output);
+        try provider.verify(item.scheme, .{
+            .algorithm = item.scheme.keyAlgorithm(),
+            .encoding = .rsa_pkcs1_der,
+            .bytes = &public_der,
+        }, &.{"PKCS8 signature"}, signature);
+        if (item.identifier.len > pss_identifier.len and item.scheme.keyAlgorithm() == .rsa_pss) {
+            try testing.expectError(error.UnsupportedAlgorithm, key.sign(.rsa_pss_pss_sha384, &.{"wrong hash"}, &output));
+            try testing.expect(std.mem.allEqual(u8, &output, 0));
+        }
+    }
+    const RsaKey = @import("rsa_sign.zig").Key;
+    var faulted = try RsaKey.init(testing.io, .{ .algorithm = .rsa, .encoding = .rsa_pkcs1_der, .bytes = private_der });
+    defer p.secureWipeValue(&faulted);
+    faulted.private_exponent[faulted.length - 1] ^= 2;
+    var output: [256]u8 = @splat(0xa5);
+    try testing.expectError(error.SigningFailed, faulted.sign(testing.io, .rsa_pkcs1_sha256, &.{"fault verification"}, &output));
+    try testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+}
+
+test "standard provider RSA rejects corrupt components truncation public mismatch and failed entropy" {
+    const allocator = testing.allocator;
+    const modulus = try rsaModulusFixture();
+    const private_der = try rsaPrivateFixture(allocator, &modulus);
+    defer allocator.free(private_der);
+    var owner = StandardProvider.init(testing.io, allocator);
+    const provider = owner.provider();
+    const input: p.PrivateKey = .{ .algorithm = .rsa, .encoding = .rsa_pkcs1_der, .bytes = private_der };
+    try testing.expectError(error.OutOfMemory, provider.signingKeyImport(testing.failing_allocator, input));
+    var sequence = try @import("der.zig").sequence(private_der);
+    _ = try sequence.take(2);
+    for (0..8) |_| {
+        const component = try sequence.take(2);
+        const last_byte = @intFromPtr(component.ptr) - @intFromPtr(private_der.ptr) + component.len - 1;
+        private_der[last_byte] ^= 2;
+        try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(allocator, input));
+        private_der[last_byte] ^= 2;
+    }
+    for (0..private_der.len) |length| {
+        try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(allocator, .{
+            .algorithm = .rsa,
+            .encoding = .rsa_pkcs1_der,
+            .bytes = private_der[0..length],
+        }));
+    }
+    var public_der = "\x30\x82\x01\x0a\x02\x82\x01\x01\x00".* ++ modulus ++ "\x02\x03\x01\x00\x01".*;
+    public_der[public_der.len - 1] ^= 2;
+    const mismatched = try rsaPkcs8Fixture(allocator, private_der, &public_der, "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00");
+    defer allocator.free(mismatched);
+    try testing.expectError(error.InvalidEncoding, provider.signingKeyImport(allocator, .{
+        .algorithm = .rsa,
+        .encoding = .pkcs8_der,
+        .bytes = mismatched,
+    }));
+    const BrokenRandom = struct {
+        fn zero(userdata: ?*anyopaque, output: []u8) std.Io.RandomSecureError!void {
+            const count: *usize = @ptrCast(@alignCast(userdata.?));
+            count.* += 1;
+            @memset(output, 0);
+        }
+    };
+    var calls: usize = 0;
+    var broken_io = testing.io.vtable.*;
+    broken_io.randomSecure = BrokenRandom.zero;
+    owner.io = .{ .userdata = &calls, .vtable = &broken_io };
+    try testing.expectError(error.EntropyUnavailable, provider.signingKeyImport(allocator, input));
+    try testing.expectEqual(128, calls);
 }
 
 test "standard provider RSA PSS SHA384 RFC 7520 section 4.2 known answer" {

@@ -1,24 +1,25 @@
 # TLS API
 
-The TLS module implements TLS 1.2/1.3 using Zig cryptographic primitives and
-standard-library TLS state and wire-format helpers.
+The TLS module implements TLS 1.2/1.3 using an explicit `CryptoProvider` for
+handshakes and records, with a pure-Zig standard implementation.
 
-::: warning Production trust is not implemented
-The current client handshake does not implement production public-CA trust.
-`TLSConfig.verify_server` still selects the legacy self-signed verification
-path, and `ca_bundle_path` is not wired into it. Do not use this path for
-authenticated public HTTPS, including Azure. The primitive implementation
-described below does not fix or bypass these pending trust/handshake changes.
+::: warning Runtime integration slice
+Standalone `TLSConfig` and `connectClient` accept a selected provider and
+dispatch certificate policy to the [canonical trust implementation](./standard-trust.md).
+High-level `ClientConfig`/`Client.open` selected-provider and paired trust
+construction are **not wired by this slice**. The canonical paired factory,
+runtime/provider provenance checks, and native policy qualification remain
+separate integration work. This is not a release or readiness claim.
 :::
 
 ::: warning TLS implementation status
 The existing TLS engine includes:
 - **TLS 1.2 and 1.3** with full handshake support (RFC 5246 / RFC 8446)
-- **Key exchange:** X25519 (TLS 1.2/1.3)
+- **Key exchange:** capability-filtered X25519, P-256, P-384; the server also accepts TLS 1.3 hybrid X25519/ML-KEM-768
 - **AEAD cipher suites:** ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM
 - **ALPN negotiation** (RFC 7301) for automatic HTTP/2 selection with HTTP/1.1 fallback
 - **Handshake message encryption** (TLS 1.3)
-- **X.509 certificate parsing** (production chain policy remains pending)
+- **X.509 certificate policy:** the canonical bounded path validator, not a second runtime policy engine
 - **Custom record-layer encryption/decryption**
 :::
 
@@ -30,35 +31,40 @@ The existing TLS engine includes:
 | AES-128-GCM | ✅ | ✅ |
 | AES-256-GCM | ✅ | ✅ |
 | ChaCha20-Poly1305 | ✅ | ✅ |
-| ECDSA P-256 certificate signing | -- | ✅ |
+| ECDSA P-256/P-384 and RSA certificate signing | ✅ | ✅ |
 | Certificate loading (PEM) | ✅ | ✅ |
-| Production certificate chain verification (client-side) | Pending | Pending |
+| Canonical custom-root certificate verification (client-side) | ✅ | ✅ |
 | ALPN negotiation | ✅ | ✅ |
 | SNI extension | ✅ | ✅ |
 | Handshake message encryption | -- | ✅ |
-| Cipher suite selection from client list | -- | ✅ |
+| Capability-filtered cipher suite selection from client list | ✅ | ✅ |
 
 ## Architecture
 
 ```
 tls.zig              -- High-level Connection, TlsConfig, TlsSession, record-layer AEAD encrypt/decrypt
-├── client.zig       -- TLS 1.2/1.3 client handshake, X25519 key exchange, cipher suite negotiation
-├── server.zig       -- TLS 1.2/1.3 server handshake, ServerHello, cipher selection
+├── client.zig       -- Provider-owned client transcripts, key shares and handshake state
+├── server.zig       -- Server entry point for server_runtime.zig
+├── server_identity.zig -- Owned, serialized provider signing-key handle
 ├── alpn.zig         -- ALPN protocol negotiation
 ├── trust.zig        -- Provider-neutral trust policy, sources, limits, and peer-verification contract
 ├── cert_signature.zig -- Narrow certificate-signature verifier bridge
 ├── cert_crypto.zig  -- Certificate-signature adapter to the selected primitive provider
-├── crypto/standard.zig -- Pure-Zig CryptoProvider implementation (not yet a handshake backend)
+├── standard_trust.zig -- Canonical immutable roots and bounded path policy
+├── crypto/standard.zig -- Pure-Zig CryptoProvider implementation
+├── crypto/tls_primitives.zig -- Explicit-provider standalone TLS helpers
 └── errors.zig       -- Unified TLS error set and alert conversion
 ```
 
 ## Standard CryptoProvider Implementation
 
 `httpx.StandardCryptoProvider` implements the borrowed `CryptoProvider` contract
-using `std.crypto`. It is a working primitive backend, not yet selectable through
-`TLSConfig` or `ClientConfig`: handshakes and record protection still need their
-provider-neutral state conversion. No option silently selects this provider
-while continuing to use another implementation.
+using `std.crypto`. `TLSConfig.crypto_provider` selects a borrowed provider for
+the entire client handshake and subsequent records. `null` uses a standard
+implementation owned by the session/connection; no pointer to a temporary
+standard provider is transferred by `connectClient`. Capability refusal and
+callback errors never trigger a different primitive backend. High-level
+`ClientConfig` selection remains deferred.
 
 ```zig
 var standard = httpx.StandardCryptoProvider.init(io, thread_safe_allocator);
@@ -73,6 +79,16 @@ Its `Io` implementation and scratch allocator must also outlive those handles.
 Shared use requires a concurrent `Io` and thread-safe scratch allocator.
 Hash/key handles are individually owned; use `clone` for transcript copies
 and `take` for ownership transfer, and destroy each handle exactly once.
+
+### Standalone helper migration
+
+Public TLS encryption, decryption, PRF, HKDF, traffic-key and encrypted-handshake
+helpers require a `CryptoProvider` argument and propagate failures. AEAD helpers
+take a provider algorithm such as `.aes_128_gcm`, not a `std.crypto` type;
+`deriveHandshakeSecret13` also takes a scratch allocator. Callers must handle
+the error union with `try`/`catch`. This intentional signature change prevents
+standalone helpers from silently bypassing the selected backend. Provider
+ABI-v1 enums, requests and vtables are unchanged.
 
 Implemented operations:
 
@@ -89,17 +105,18 @@ Implemented operations:
   RFC 5958 version-one containers require their public key; PKCS#8 attributes
   remain explicitly unsupported. Malformed containers and mismatched curves,
   key lengths or public keys are rejected.
-- RSA PKCS#1 v1.5 and PSS verification for 2048/3072/4096-bit keys, with bounded
+- RSA PKCS#1 v1.5 and PSS signing/verification for 2048/3072/4096-bit keys, with bounded
   canonical PKCS#1 public-key DER and modulus-sized signatures. PSS uses the
-  scheme hash for MGF1 and a digest-sized salt.
+  scheme hash for MGF1 and a digest-sized salt. Private signing is blinded and
+  checks the result before publishing it; unsupported or inconsistent
+  PKCS#1/PKCS#8 key parameters fail explicitly.
 - Constant-time comparison.
 
 Entropy comes exclusively from `Io.randomSecure`; entropy failure is returned
 and never falls back to `Io.random`. Owned private-key, shared-secret, transcript,
 and key-derivation scratch storage is wiped before destruction.
-**RSA signing remains pending** in this backend; capabilities report it as
-unsupported. SHA-1 primitive availability is not permission to accept SHA-1
-certificates or negotiate legacy signatures; that decision belongs to policy.
+SHA-1 primitive availability is not permission to accept SHA-1 certificates
+or negotiate legacy signatures.
 
 ### Certificate-signature adapter
 
@@ -108,26 +125,41 @@ stable-address adapter. Its `.verifier()` handle can populate
 `VerifyPeerRequest.signature_verifier`. It parses bounded SPKI/algorithm
 encodings and delegates every signature verification to the selected provider,
 without fallback or trust decisions. Supported certificate signatures are RSA
-PKCS#1 SHA-1/256/384/512, P-256/SHA-256, P-384/SHA-384, and Ed25519.
-RSA-PSS certificate AlgorithmIdentifiers, restricted PSS SPKIs, other
-curve/hash combinations and unsupported parameters fail explicitly.
+PKCS#1 SHA-256/384/512, bounded RSA-PSS, P-256/SHA-256, P-384/SHA-384, and Ed25519.
+Restricted PSS key parameters are enforced before dispatch. SHA-1 certificate
+signatures, unsupported curve/hash combinations and unsupported parameters
+fail explicitly.
+
+`digestMetadata(scratch, algorithm, input, output, options)` hashes public
+identifiers through the same selected primitive provider. Its module-level
+`certificate_crypto.MetadataDigestOptions.allow_sha1_identifiers` defaults to
+`false`; opting in never enables SHA-1 signatures. Output must have the exact
+digest length; failures wipe it and all per-call hash handles are destroyed.
+This helper is not the canonical `metadataHasher`/provenance adapter. The
+paired factory integration is intentionally deferred.
 
 ### Remaining integration
 
-No target currently has production default/custom-root verification through
-this implementation. Zig 0.16's `Certificate.Parsed.verify` checks issuer,
-validity and signature, but does not implement the required CA/basic
-constraints, key usage, path constraints and critical-extension policy.
-Simply wrapping `Certificate.Bundle.verify` would not supply production PKI.
-Root discovery, bounded path construction and policy, SAN/IP matching, trust
-context ownership, and handshake trust dispatch remain required for issue #4.
-Provider-neutral client/server transcripts, key shares and records, RSA
-private-key loading/signing, and an instrumented whole-handshake dispatch test
-remain for issue #7.
+The canonical policy files are unchanged by this runtime port. The handshake
+uses `TrustContext.init(allocator, io, .{ .source = source,
+.load_time_seconds = now })`; verification time is sampled again when checking
+the peer, not taken from the root-load snapshot. See the canonical trust
+documentation for its supported profile and platform limits.
+
+The canonical `roots.bind(adapter_pointer, metadata_digest.Options)` factory
+and its runtime adapter/provenance wiring still require composition. In
+particular, matching signature handles alone do not prove that a binding from
+provider A is being used with TLS provider A rather than B. This slice does
+not claim that cross-provider rejection is implemented. It adds no alternate
+factory, DN normalization, or duplicate certificate policy.
 
 The existing `zig build test-tls-provider` runner covers primitives and the
 certificate adapter; both also run under `zig build test`. Neither needs a
-live endpoint or native cryptographic library.
+live endpoint or native cryptographic library. `connectClient` tests use
+authenticated loopback TLS 1.2/1.3, including returned-provider identity,
+record/capability rejection, KeyUpdate, and context-aware I/O. Build the
+opt-in fixture probe with `zig build example-tls_provider_interop -j2`;
+it is excluded from `run-all-examples`.
 
 ## Trust Provider Contract
 
@@ -135,11 +167,9 @@ The public trust-provider contract is the first foundation for secure,
 provider-neutral X.509 validation. It is available as `httpx.TrustProvider`
 and `httpx.tls.TrustProvider`.
 
-::: warning Foundation API
-The contract is not connected to the TLS handshakes yet. Existing
-`TLSConfig.verify_server` and `ca_bundle_path` runtime behavior is unchanged
-in this foundation change. Declaring a `TrustSource` does not activate it
-until the later trust-context and handshake integration lands.
+::: warning Standalone runtime API
+The contract is connected to standalone TLS client handshakes. It does not
+implicitly add selected-provider or paired-root options to `Client.open`.
 :::
 
 ### Ownership and concurrency
@@ -151,9 +181,8 @@ them. Copying a handle does not transfer ownership, neither handle has a
 
 Provider state is immutable after initialization and verification must be safe
 for concurrent calls. Peer DER, expected identities, signature inputs, and the
-scratch allocator are borrowed only for one synchronous call. A future
-standard provider will own copied/indexed trust anchors separately; it is
-intentionally not represented by a non-functional stub in this foundation.
+scratch allocator are borrowed only for one synchronous call. The canonical
+`TrustContext` owns copied/indexed trust anchors separately.
 
 ### Verification request
 
@@ -232,7 +261,11 @@ A reconnect callback must supply a fresh connection and honor the
 operation's cancellation and deadline policy. Request operations should own
 retries and leave the callback unset.
 
-Record I/O preserves underlying `Cancelled` and `Timeout` errors. The standard
+Record I/O preserves underlying `Cancelled` and `Timeout` errors. Context-aware
+handshake/read/write methods use cancellable socket operations, including
+KeyUpdate responses. A record's sequence advances before a potentially partial
+send, and failed writes poison the write state rather than reuse the nonce.
+The standard
 `Io.Reader`/`Writer` handshake interfaces have narrower error sets, however, so
 their socket adapters or the enclosing operation must retain the concrete
 transport error. A context-owning caller can use `IoContext.unwrapAfterBlocking`
@@ -244,11 +277,19 @@ partially transferred records are not resumable by retrying the operation.
 ```zig
 pub const TlsConfig = struct {
     allocator: Allocator,
+    crypto_provider: ?CryptoProvider = null,
+    server_authentication: ?ServerAuthentication = null,
+    trust_limits: TrustLimits = .{},
     alpn_protocols: []const []const u8 = &.{"http/1.1"},
     verify_server: bool = true,
     ca_bundle_path: ?[]const u8 = null,
 };
 ```
+
+`server_authentication` overrides legacy `verify_server`/`ca_bundle_path`.
+Otherwise verification uses system roots, or custom-only roots from
+`ca_bundle_path`; `verify_server = false` is the explicit legacy insecure path.
+Peer proof-of-possession is still required in insecure mode.
 
 ### Factory Methods
 
@@ -263,7 +304,9 @@ pub const TlsConfig = struct {
 
 ## ServerTlsConfig
 
-Configuration for TLS server connections. Holds loaded certificate chain and private key in DER format.
+Configuration for TLS server connections. Owns a copied certificate chain,
+private-key material, and a serialized imported signing handle. An explicitly
+selected provider remains borrowed and must outlive configuration and sessions.
 
 ```zig
 pub const ServerTlsConfig = struct {
@@ -271,18 +314,25 @@ pub const ServerTlsConfig = struct {
     key_der: ?[]const u8 = null,
     allocator: ?Allocator = null,
     ecdsa_keypair: ?crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair = null,
+    crypto_provider: ?CryptoProvider = null,
+    // Additional owned identity state is maintained by init/deinit.
 };
 ```
 
 ### Loading from PEM Files
 
 ```zig
-const server_tls = try tls.loadServerTlsConfig(allocator,
+var server_tls = try tls.loadServerTLSConfig(allocator,
     "examples/certs/server_ec.crt",
     "examples/certs/server_ec.key",
 );
 defer server_tls.deinit();
 ```
+
+Use `loadServerTLSConfigWithProvider(allocator, io, cert_path, key_path,
+selected_provider)` or `ServerTLSConfig.init(allocator, io, chain_der,
+private_key, selected_provider)` to select a backend. Do not destroy the config
+while a server handshake/signing operation is active.
 
 ## Server Configuration
 
@@ -306,6 +356,7 @@ The default `tls_alpn_protocols` is `&.{ "h2", "http/1.1" }`.
 :::
 
 The server automatically loads the certificate chain and private key on the first TLS connection. ALPN negotiation selects HTTP/1.1 or HTTP/2.
+`ServerConfig.tls_crypto_provider` selects the borrowed server backend.
 
 ALPN uses the RFC 7301 network format: ClientHello carries a u16-length
 `ProtocolNameList`; TLS 1.2 returns the selected one-element list in
@@ -345,19 +396,22 @@ pub const Connection = struct {
 | `isHttp3()` | Returns true if HTTP/3 was negotiated |
 | `tlsVersion()` | Returns the negotiated TLS protocol version |
 | `sendAlert(level, desc)` | Send a TLS alert to the peer |
-| `closeNotify()` | Send close_notify alert for clean shutdown |
+| `closeNotify()` | Send close_notify alert, then release connection-owned state |
+| `deinit()` | Non-I/O cleanup; does not close the borrowed socket or destroy the selected provider |
 | `reader()` | Get an `AnyReader` for reading decrypted data |
 | `writer()` | Get an `AnyWriter` for writing encrypted data |
 | `read(buffer)` | Read decrypted data from the connection |
 | `write(data)` | Seal and send at most one 16,384-byte plaintext record; returns plaintext bytes consumed |
 | `writeAll(data)` | Send the complete plaintext buffer as independently framed records |
+| `readWithContext(buffer, context)` | Context-aware decrypted read |
+| `writeWithContext(data, context)` / `writeAllWithContext(data, context)` | Context-aware record writes |
 
 ## Client Handshake
 
 Perform a full TLS 1.2 or 1.3 client handshake:
 
 ```zig
-const connection = try tls.connectClient(allocator, socket, &config, "example.com");
+var connection = try tls.connectClient(allocator, socket, &config, "example.com");
 defer connection.closeNotify();
 ```
 
@@ -366,7 +420,7 @@ defer connection.closeNotify();
 Accept a TLS connection on the server side:
 
 ```zig
-const connection = try tls.acceptServer(allocator, socket, alpn_protocols, server_tls_config);
+var connection = try tls.acceptServer(allocator, socket, alpn_protocols, server_tls_config);
 defer connection.closeNotify();
 ```
 
@@ -383,14 +437,12 @@ try std.testing.expect(alpn.isHttp1x("http/1.1"));
 
 ## Certificate Verification
 
-The current handshake certificate path predates the provider contract and
-uses `std.crypto.Certificate` directly. It parses certificates, verifies
-adjacent signatures, checks time/hostname data, and supports the internal CA
-bundle path when supplied directly to the low-level client.
-
-The new `TrustProvider` sources are deliberately not advertised as active
-verification behavior yet. Full X.509 parsing/path construction, platform and
-custom root loading, and TLS 1.2/1.3 handshake integration are deferred.
+The client passes the complete bounded peer chain, DNS/IP identity, current
+time, scratch allocator, and selected signature adapter to `TrustProvider`.
+The canonical policy owns path construction, anchor lookup and constraints;
+the runtime extracts only the leaf public key and its PSS restrictions for
+TLS proof-of-possession. It never accepts an arbitrary self-signed certificate
+as a substitute for configured trust.
 
 ### Certificate-Related Errors
 
@@ -409,8 +461,9 @@ custom root loading, and TLS 1.2/1.3 handshake integration are deferred.
 | `TlsCertificateTooLarge` / `TlsCertificateChainTooLarge` | Input exceeds configured byte/count limits |
 | `TlsCertificatePathTooDeep` / `TlsCertificatePathSearchLimitExceeded` | Path work exceeds configured limits |
 
-`TlsCertificateNotVerified` remains in the legacy handshake path until trust
-integration replaces that ambiguous result with the specific categories above.
+Provider refusal and certificate errors remain explicit. System-root support
+and paired metadata hashing are subject to the separate canonical integration
+and qualification described above.
 
 ## Types
 
@@ -433,7 +486,9 @@ Supported elliptic curves for key exchange:
 
 | Group | Notes |
 |-------|-------|
-| `x25519` | Default, only key exchange actually negotiated by both client and server |
+| `x25519` | TLS 1.2/1.3, subject to selected-provider capabilities |
+| `secp256r1` / `secp384r1` | TLS 1.2/1.3, subject to selected-provider capabilities |
+| `x25519mlkem768` | Server-side TLS 1.3 hybrid, requires both provider operations; not offered by this client |
 
 ### Error Set
 
