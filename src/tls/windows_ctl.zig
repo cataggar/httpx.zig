@@ -134,7 +134,7 @@ fn readEntry(bytes: []const u8, kind: platform.FingerprintList.Kind, algorithm: 
                     }
                     result.sha256 = value[0..32].*;
                 },
-                104, 128 => result.policy.merge(.{ .disallow_at = try filetime(id, value) }),
+                104, 128 => result.policy.merge(.{ .disallow_at = try filetime(kind, id, value) }),
                 122 => {
                     const denied = try roles(value, true);
                     result.policy.denied_roles |= if (denied == 0) @as(u2, 3) else denied;
@@ -188,12 +188,13 @@ fn roles(bytes: []const u8, deny_unknown: bool) Error!u2 {
     return result;
 }
 
-fn filetime(property_id: u32, bytes: []const u8) Error!i64 {
+fn filetime(kind: platform.FingerprintList.Kind, property_id: u32, bytes: []const u8) Error!i64 {
     if (bytes.len != 8) {
         if (builtin.is_test and builtin.os.tag == .windows) {
             // One structural line before this CTL load aborts; never emit
             // identifiers, certificate data, timestamps, or raw value bytes.
-            std.debug.print("Windows CTL time property: id={d} length={d} shape={s}\n", .{
+            std.debug.print("Windows CTL time property: kind={s} id={d} length={d} shape={s}\n", .{
+                @tagName(kind),
                 property_id,
                 bytes.len,
                 @tagName(timeValueShape(bytes)),

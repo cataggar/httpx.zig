@@ -69,27 +69,32 @@ test "CTL purpose cutoff and unsupported issuance policies are not erased" {
 }
 
 test "CTL unknown time encodings still fail atomically with native diagnostics" {
-    for ([_]u32{ 104, 128 }) |id| {
-        for ([_][]const u8{
-            "",
-            "\x00" ** 7,
-            "\x00" ** 9,
-            "250101000000Z",
-            "\x17\x0d250101000000Z",
-            "\x18\x0f20250101000000Z",
-            "\x04\x08abcdefgh",
-            "\x04\x08abcdefgh\x00",
-        }) |value| {
-            const encoded = try fixtures.content(allocator, .{ .entries = &.{
-                .{ .identifier = &identifier },
-                .{ .identifier = &identifier, .attributes = &.{.{ .id = id, .value = value }} },
-            } });
-            defer allocator.free(encoded);
-            var snapshot = platform.Snapshot.init(allocator, .{});
-            defer snapshot.deinit();
-            try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, encoded));
-            try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
-            try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_entries);
+    for ([_]platform.FingerprintList.Kind{ .authroot, .disallowed }) |kind| {
+        for ([_]u32{ 104, 128 }) |id| {
+            for ([_][]const u8{
+                "",
+                "\x00" ** 7,
+                "\x00" ** 9,
+                "250101000000Z",
+                "\x17\x0d250101000000Z",
+                "\x18\x0f20250101000000Z",
+                "\x04\x08abcdefgh",
+                "\x04\x08abcdefgh\x00",
+            }) |value| {
+                const encoded = try fixtures.content(allocator, .{
+                    .usage_oid = if (kind == .authroot) ctl.authroot_usage else ctl.disallowed_usage,
+                    .entries = &.{
+                        .{ .identifier = &identifier },
+                        .{ .identifier = &identifier, .attributes = &.{.{ .id = id, .value = value }} },
+                    },
+                });
+                defer allocator.free(encoded);
+                var snapshot = platform.Snapshot.init(allocator, .{});
+                defer snapshot.deinit();
+                try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, kind, encoded));
+                try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+                try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_entries);
+            }
         }
     }
 }
