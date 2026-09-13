@@ -6,7 +6,26 @@ const Error = @import("trust.zig").TrustError;
 pub const Summary = struct {
     pub const max_extensions = 8;
     const State = enum { malformed, unexpected_field, limit, complete };
-    const Name = enum { sorted_ctl, next_update_location, crl_next_publish, authority_key_identifier, crl_number, delta_crl, unknown };
+    const Name = enum {
+        sorted_ctl,
+        next_update_location,
+        crl_next_publish,
+        authority_key_identifier,
+        crl_number,
+        delta_crl,
+        sync_root_ctl,
+        flight_ctl,
+        cert_log_list,
+        pin_rules,
+        pin_rules_log_end_date,
+        hpkp_header_value,
+        remove_certificate,
+        cross_cert_dist_points,
+        certificate_extensions,
+        certificate_policies,
+        crl_dist_points,
+        unknown,
+    };
     const Shape = enum { empty, binary_or_malformed_der, der, sequence };
     const Detail = struct {
         name: Name = .unknown,
@@ -19,6 +38,10 @@ pub const Summary = struct {
         children: usize = 0,
         child_tags: [8]?u8 = @splat(null),
         children_complete: bool = false,
+        first_fields: usize = 0,
+        first_field_tags: [8]?u8 = @splat(null),
+        first_field_lengths: [8]usize = @splat(0),
+        first_fields_complete: bool = false,
     };
 
     state: State = .malformed,
@@ -82,6 +105,19 @@ pub const Summary = struct {
         if (std.mem.eql(u8, oid, "\x55\x1d\x23")) return .authority_key_identifier;
         if (std.mem.eql(u8, oid, "\x55\x1d\x14")) return .crl_number;
         if (std.mem.eql(u8, oid, "\x55\x1d\x1b")) return .delta_crl;
+        // Public wincrypt.h CTL extension constants; recognizing a name
+        // neither validates its value schema nor grants it policy authority.
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x32")) return .sync_root_ctl;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x33")) return .flight_ctl;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x34")) return .cert_log_list;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x21")) return .pin_rules;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x23")) return .pin_rules_log_end_date;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x3d")) return .hpkp_header_value;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x08\x01")) return .remove_certificate;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x0a\x09\x01")) return .cross_cert_dist_points;
+        if (std.mem.eql(u8, oid, "\x2b\x06\x01\x04\x01\x82\x37\x02\x01\x0e")) return .certificate_extensions;
+        if (std.mem.eql(u8, oid, "\x55\x1d\x20")) return .certificate_policies;
+        if (std.mem.eql(u8, oid, "\x55\x1d\x1f")) return .crl_dist_points;
         return .unknown;
     }
 
@@ -97,12 +133,25 @@ pub const Summary = struct {
         if (element.tag != 0x30) return;
         var children = Reader.init(element.content);
         while (children.peek() != null) {
-            if (detail.children == detail.child_tags.len) return;
+            if (detail.children == 256) return;
             const child = children.any() catch return;
-            detail.child_tags[detail.children] = child.tag;
+            if (detail.children < detail.child_tags.len) detail.child_tags[detail.children] = child.tag;
+            if (detail.children == 0 and child.tag == 0x30) firstFields(detail, child.content);
             detail.children += 1;
         }
         detail.children_complete = true;
+    }
+
+    fn firstFields(detail: *Detail, bytes: []const u8) void {
+        var fields = Reader.init(bytes);
+        while (fields.peek() != null) {
+            if (detail.first_fields == detail.first_field_tags.len) return;
+            const field = fields.any() catch return;
+            detail.first_field_tags[detail.first_fields] = field.tag;
+            detail.first_field_lengths[detail.first_fields] = field.content.len;
+            detail.first_fields += 1;
+        }
+        detail.first_fields_complete = true;
     }
 
     pub fn report(self: Summary, kind: []const u8) void {
@@ -110,10 +159,10 @@ pub const Summary = struct {
             kind, @tagName(self.state), self.remaining_length, self.outer_tag, self.count,
         });
         for (self.details[0..self.count], 0..) |detail, index| {
-            std.debug.print("CTL extension[{d}]: recognized={s} critical_present={} critical={} value_length={d} shape={s} tag={?d} content_length={d} children={d} complete={} child_tags={any}\n", .{
-                index,                                 @tagName(detail.name), detail.critical_present, detail.critical, detail.value_length,
-                @tagName(detail.shape),                detail.tag,            detail.content_length,   detail.children, detail.children_complete,
-                detail.child_tags[0..detail.children],
+            std.debug.print("CTL extension[{d}]: recognized={s} critical_present={} critical={} value_length={d} shape={s} tag={?d} content_length={d} children={d} complete={} child_tags={any} first_fields_complete={} first_field_tags={any} first_field_lengths={any}\n", .{
+                index,                                                              @tagName(detail.name),        detail.critical_present,                         detail.critical,                                    detail.value_length,
+                @tagName(detail.shape),                                             detail.tag,                   detail.content_length,                           detail.children,                                    detail.children_complete,
+                detail.child_tags[0..@min(detail.children, detail.child_tags.len)], detail.first_fields_complete, detail.first_field_tags[0..detail.first_fields], detail.first_field_lengths[0..detail.first_fields],
             });
         }
     }
@@ -145,4 +194,32 @@ test "CTL tail summary records critical unknown and complete child tag shapes" {
     try std.testing.expectEqual(@as(usize, 2), result.details[0].children);
     try std.testing.expectEqual(@as(?u8, 0x02), result.details[0].child_tags[0]);
     try std.testing.expectEqual(@as(?u8, 0x04), result.details[0].child_tags[1]);
+}
+
+test "CTL tail public SDK labels and bounded nested fields imply no authorization" {
+    const cases = .{
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x32", Summary.Name.sync_root_ctl },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x33", Summary.Name.flight_ctl },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x34", Summary.Name.cert_log_list },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x21", Summary.Name.pin_rules },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x23", Summary.Name.pin_rules_log_end_date },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x3d", Summary.Name.hpkp_header_value },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x08\x01", Summary.Name.remove_certificate },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x0a\x09\x01", Summary.Name.cross_cert_dist_points },
+        .{ "\x2b\x06\x01\x04\x01\x82\x37\x02\x01\x0e", Summary.Name.certificate_extensions },
+        .{ "\x55\x1d\x20", Summary.Name.certificate_policies },
+        .{ "\x55\x1d\x1f", Summary.Name.crl_dist_points },
+    };
+    inline for (cases) |case| try std.testing.expectEqual(case[1], Summary.name(case[0]));
+    var detail: Summary.Detail = .{};
+    Summary.shape(&detail, "\x30\x08\x30\x06\x04\x01x\x0c\x01y");
+    try std.testing.expect(detail.children_complete and detail.first_fields_complete);
+    try std.testing.expectEqual(@as(usize, 2), detail.first_fields);
+    try std.testing.expectEqual(@as(?u8, 0x04), detail.first_field_tags[0]);
+    try std.testing.expectEqual(@as(?u8, 0x0c), detail.first_field_tags[1]);
+    try std.testing.expectEqual(@as(usize, 1), detail.first_field_lengths[0]);
+    var bounded: Summary.Detail = .{};
+    Summary.shape(&bounded, "\x30\x82\x02\x02" ++ "\x30\x00" ** 257);
+    try std.testing.expectEqual(@as(usize, 256), bounded.children);
+    try std.testing.expect(!bounded.children_complete);
 }
