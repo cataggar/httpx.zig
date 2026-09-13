@@ -2,6 +2,7 @@
 //! stores/cache. This is not a CMS signature verifier or a downloaded-root
 //! importer. CTLs add restrictions only; they never create trust anchors.
 const std = @import("std");
+const builtin = @import("builtin");
 const x509 = @import("x509_policy.zig");
 const platform = @import("platform_trust.zig");
 const crypto = @import("crypto/provider.zig");
@@ -52,7 +53,14 @@ pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.K
     }
     // No CTL-wide extension/policy is silently discarded, including one
     // whose criticality could affect how individual subjects are interpreted.
-    if (list.peek() != null) return error.TlsTrustStoreLoadFailed;
+    if (list.peek() != null) {
+        if (builtin.is_test and builtin.os.tag == .windows) {
+            const Summary = @import("ctl_tail_diagnostic.zig").Summary;
+            const summary = Summary.inspect(list.inner.bytes[list.inner.offset..], snapshot.limits.max_property_bytes);
+            summary.report(@tagName(expected));
+        }
+        return error.TlsTrustStoreLoadFailed;
+    }
     try snapshot.addFingerprintList(.{
         .kind = expected,
         .algorithm = algorithm,

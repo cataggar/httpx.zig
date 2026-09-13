@@ -6,6 +6,10 @@ const digest = @import("metadata_digest.zig");
 const crypto = @import("crypto/provider.zig");
 const allocator = std.testing.allocator;
 
+test {
+    _ = @import("ctl_tail_diagnostic.zig");
+}
+
 const identifier: [20]u8 = @splat(1);
 const server_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
 const client_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x02";
@@ -220,6 +224,26 @@ test "CTL duplicate properties unknown extensions and truncated DER fail atomica
             try std.testing.expect(err == error.TlsMalformedCertificate or err == error.TlsTrustStoreLoadFailed);
         }
         try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+    }
+}
+
+test "CTL tail diagnostics do not authorize recognized or critical global extensions" {
+    const sorted = "\xa0\x14\x30\x12\x30\x10\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x0a\x01\x01\x04\x02\x30\x00";
+    const critical_unknown = "\xa0\x16\x30\x14\x30\x12\x06\x03\x2a\x03\x04\x01\x01\xff\x04\x08\x30\x06\x02\x01\x01\x04\x01x";
+    for ([_]platform.FingerprintList.Kind{ .authroot, .disallowed }) |kind| {
+        for ([_][]const u8{ sorted, critical_unknown, "\xa0\x80\x00\x00", "\x02\x01\x01" }) |tail| {
+            const encoded = try fixtures.content(allocator, .{
+                .usage_oid = if (kind == .authroot) ctl.authroot_usage else ctl.disallowed_usage,
+                .entries = &.{.{ .identifier = &identifier, .attributes = &.{.{ .id = 104, .value = "" }} }},
+                .extra_tail = tail,
+            });
+            defer allocator.free(encoded);
+            var snapshot = platform.Snapshot.init(allocator, .{});
+            defer snapshot.deinit();
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, kind, encoded));
+            try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+            try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_entries);
+        }
     }
 }
 
