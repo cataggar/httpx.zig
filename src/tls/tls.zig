@@ -3803,6 +3803,31 @@ test "TLS 1.2 ChaCha records use implicit nonces and round trip bidirectionally"
     );
 }
 
+const HandshakeWriteThreadContext = struct {
+    socket: *Socket,
+    provider: CryptoProvider,
+    version: tls.ProtocolVersion,
+    suite: tls.CipherSuite,
+    message: []const u8,
+    key: []const u8,
+    sequence: u64 = 7,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        defer self.socket.shutdownWrite() catch {};
+        self.send() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn send(self: *@This()) !void {
+        if (self.version == .tls_1_2)
+            try sendTLS12EncryptedHandshake(self.provider, self.socket, self.message, self.key, &test_write_iv, &self.sequence, self.suite)
+        else
+            try sendTLS13EncryptedHandshake(self.provider, self.socket, self.message, self.key, &test_write_iv, &self.sequence, self.suite);
+    }
+};
+
 test "TLS public handshake helpers fragment records and retain the selected provider" {
     const message: [max_plaintext_len + 97]u8 = @splat(0x61);
     inline for (.{ tls.ProtocolVersion.tls_1_2, tls.ProtocolVersion.tls_1_3 }) |version| {
@@ -3816,16 +3841,36 @@ test "TLS public handshake helpers fragment records and retain the selected prov
             defer sender.close();
             var receiver = sockets[1];
             defer receiver.close();
+            // A complete TLS record must not fit in the fixture's send queue.
+            // Its peer must drain concurrently instead of relying on OS defaults.
+            try sender.setSendBufferSize(4096);
+            try receiver.setRecvBufferSize(4096);
+            try sender.setSendTimeout(5000);
+            try receiver.setRecvTimeout(5000);
             const key = test_write_key[0..@as(usize, if (index == 0) 16 else 32)];
-            var write_seq: u64 = 7;
-            if (version == .tls_1_2)
-                try sendTLS12EncryptedHandshake(testProvider(), &sender, &message, key, &test_write_iv, &write_seq, suite)
-            else
-                try sendTLS13EncryptedHandshake(testProvider(), &sender, &message, key, &test_write_iv, &write_seq, suite);
-            try std.testing.expectEqual(@as(u64, 9), write_seq);
+            var write_context = HandshakeWriteThreadContext{
+                .socket = &sender,
+                .provider = testProvider(),
+                .version = version,
+                .suite = suite,
+                .message = &message,
+                .key = key,
+            };
             var read_seq: u64 = 7;
             var buffer: [max_record_len]u8 = undefined;
             var received: usize = 0;
+            var phase: []const u8 = "spawn";
+            errdefer std.debug.print(
+                "TLS helper fixture: version={s} suite={s} phase={s} received={d}/{d} read_sequence={d} write_sequence={d} writer_error={s}\n",
+                .{ @tagName(version), @tagName(suite), phase, received, message.len, read_seq, write_context.sequence, if (write_context.err) |err| @errorName(err) else "none" },
+            );
+            const thread = try std.Thread.spawn(.{}, HandshakeWriteThreadContext.run, .{&write_context});
+            var joined = false;
+            defer if (!joined) {
+                receiver.shutdownBoth() catch {};
+                thread.join();
+            };
+            phase = "receive";
             while (received < message.len) {
                 const part = if (version == .tls_1_2)
                     try readTLS12EncryptedRecord(testProvider(), &receiver, &buffer, key, &test_write_iv, &read_seq, suite)
@@ -3835,9 +3880,46 @@ test "TLS public handshake helpers fragment records and retain the selected prov
                 try std.testing.expectEqualSlices(u8, message[received..][0..part.len], part);
                 received += part.len;
             }
-            try std.testing.expectEqual(write_seq, read_seq);
+            phase = "join";
+            thread.join();
+            joined = true;
+            phase = "verify";
+            if (write_context.err) |err| return err;
+            try std.testing.expectEqual(@as(u64, 9), write_context.sequence);
+            try std.testing.expectEqual(write_context.sequence, read_seq);
         }
     }
+}
+
+test "TLS public handshake helper fixture joins its writer after peer closure" {
+    const message: [max_plaintext_len + 97]u8 = @splat(0x61);
+    const sockets = try testSocketPair();
+    var sender = sockets[0];
+    defer sender.close();
+    var receiver = sockets[1];
+    defer receiver.close();
+    try sender.setSendBufferSize(4096);
+    try receiver.setRecvBufferSize(4096);
+    try sender.setSendTimeout(5000);
+    var write_context = HandshakeWriteThreadContext{
+        .socket = &sender,
+        .provider = testProvider(),
+        .version = .tls_1_3,
+        .suite = .AES_128_GCM_SHA256,
+        .message = &message,
+        .key = test_write_key[0..16],
+    };
+    try receiver.shutdownBoth();
+    const thread = try std.Thread.spawn(.{}, HandshakeWriteThreadContext.run, .{&write_context});
+    var joined = false;
+    defer if (!joined) {
+        receiver.shutdownBoth() catch {};
+        thread.join();
+    };
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), write_context.err);
+    try std.testing.expectEqual(@as(u64, 8), write_context.sequence);
 }
 
 test "TLS public record helpers reject short buffers and exhausted sequences before I/O" {
