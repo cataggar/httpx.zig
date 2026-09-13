@@ -33,12 +33,20 @@ pub const CryptoCertificateVerifier = struct {
     }
 
     pub fn metadataHasher(self: *CryptoCertificateVerifier, options: metadata_digest.Options) metadata_digest.MetadataDigest {
-        return .{ .context = self, .digest_fn = digestMetadataCallback, .options = options };
+        return .{
+            .context = self,
+            .digest_fn = if (options.allow_sha1_identifiers) digestMetadataWithSha1 else digestMetadataCallback,
+            .options = options,
+        };
     }
 
     fn digestMetadataCallback(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
         const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
-        // MetadataDigest.hash enforces the per-binding permission before dispatch.
+        return self.digestMetadata(scratch, algorithm, input, out, .{});
+    }
+
+    fn digestMetadataWithSha1(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
+        const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
         return self.digestMetadata(scratch, algorithm, input, out, .{ .allow_sha1_identifiers = true });
     }
 
@@ -486,8 +494,9 @@ test "certificate metadata digest preserves hash callback failures and destroys 
     provider.vtable = &vtable;
     var adapter = CryptoCertificateVerifier.init(provider);
     const hasher = adapter.metadataHasher(.{ .allow_sha1_identifiers = true });
+    const Invocation = enum { method, descriptor, callback };
     for ([_]p.HashAlgorithm{ .sha1, .sha256 }) |algorithm| {
-        for ([_]bool{ false, true }) |descriptor| {
+        for (std.enums.values(Invocation)) |invocation| {
             for (std.enums.values(Observed.Failure)) |failure| {
                 observed.failure = failure;
                 observed.creates = 0;
@@ -495,10 +504,11 @@ test "certificate metadata digest preserves hash callback failures and destroys 
                 var out: [32]u8 = @splat(0xa5);
                 const output = out[0..algorithm.digestLength()];
                 const expected = if (failure == .unsupported) error.UnsupportedAlgorithm else error.InternalError;
-                const result = if (descriptor)
-                    hasher.hash(testing.allocator, algorithm, "abc", output)
-                else
-                    adapter.digestMetadata(testing.allocator, algorithm, "abc", output, .{ .allow_sha1_identifiers = true });
+                const result = switch (invocation) {
+                    .method => adapter.digestMetadata(testing.allocator, algorithm, "abc", output, .{ .allow_sha1_identifiers = true }),
+                    .descriptor => hasher.hash(testing.allocator, algorithm, "abc", output),
+                    .callback => hasher.digest_fn(hasher.context, testing.allocator, algorithm, "abc", output),
+                };
                 try testing.expectError(expected, result);
                 try testing.expectEqual(@as(usize, if (failure == .unsupported) 0 else 1), observed.creates);
                 try testing.expectEqual(@as(usize, if (failure == .update or failure == .snapshot) 1 else 0), observed.destroys);
@@ -552,6 +562,19 @@ test "certificate metadataHasher preserves adapter identity options and failure 
     try testing.expect(!disabled.options.allow_sha1_identifiers);
     try testing.expect(enabled.options.allow_sha1_identifiers);
     var output: [32]u8 = @splat(0xa5);
+    try testing.expectError(error.UnsupportedAlgorithm, disabled.digest_fn(disabled.context, testing.allocator, .sha1, "abc", output[0..20]));
+    try testing.expect(std.mem.allEqual(u8, output[0..20], 0));
+    try enabled.digest_fn(enabled.context, testing.allocator, .sha1, "abc", output[0..20]);
+    try testing.expectEqualSlices(u8, "\xa9\x99\x3e\x36\x47\x06\x81\x6a\xba\x3e\x25\x71\x78\x50\xc2\x6c\x9c\xd0\xd8\x9d", output[0..20]);
+    @memset(&output, 0xa5);
+    try testing.expectError(error.InvalidDigestLength, disabled.digest_fn(disabled.context, testing.allocator, .sha256, "abc", output[0..31]));
+    try testing.expect(std.mem.allEqual(u8, output[0..31], 0));
+    var relaxed = disabled;
+    relaxed.options.allow_sha1_identifiers = true;
+    @memset(&output, 0xa5);
+    try testing.expectError(error.UnsupportedAlgorithm, relaxed.hash(testing.allocator, .sha1, "abc", output[0..20]));
+    try testing.expect(std.mem.allEqual(u8, output[0..20], 0));
+    @memset(&output, 0xa5);
     try testing.expectError(error.UnsupportedAlgorithm, disabled.hash(testing.allocator, .sha1, "abc", output[0..20]));
     try testing.expect(std.mem.allEqual(u8, output[0..20], 0));
     try enabled.hash(testing.allocator, .sha1, "abc", output[0..20]);
@@ -559,10 +582,16 @@ test "certificate metadataHasher preserves adapter identity options and failure 
     @memset(&output, 0xa5);
     try testing.expectError(error.InvalidDigestLength, enabled.hash(testing.allocator, .sha1, "abc", &output));
     try testing.expect(std.mem.allEqual(u8, &output, 0));
-    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    @memset(&output, 0xa5);
-    try testing.expectError(error.OutOfMemory, enabled.hash(failing.allocator(), .sha256, "abc", &output));
-    try testing.expect(std.mem.allEqual(u8, &output, 0));
+    for ([_]bool{ false, true }) |direct| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        @memset(&output, 0xa5);
+        const result = if (direct)
+            enabled.digest_fn(enabled.context, failing.allocator(), .sha256, "abc", &output)
+        else
+            enabled.hash(failing.allocator(), .sha256, "abc", &output);
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expect(std.mem.allEqual(u8, &output, 0));
+    }
 }
 
 test "certificate metadataHasher binds signatures and rejects another adapter instance" {
