@@ -39,7 +39,14 @@ pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.K
         try x509.parseTime(try list.any())
     else
         null;
-    const algorithm = try hashAlgorithm((try list.take(0x30)).content);
+    const algorithm_bytes = (try list.take(0x30)).content;
+    const algorithm = hashAlgorithm(algorithm_bytes) catch |err| {
+        if (@import("builtin").is_test and @import("builtin").os.tag == .windows) {
+            const diagnostic = @import("ctl_subject_diagnostic.zig");
+            diagnostic.emit(diagnostic.inspect(expected, algorithm_bytes, list.inner.bytes[list.inner.offset..]));
+        }
+        return err;
+    };
     var entries: std.ArrayList(platform.FingerprintEntry) = .empty;
     defer entries.deinit(snapshot.allocator);
     if (list.peek() == 0x30) {

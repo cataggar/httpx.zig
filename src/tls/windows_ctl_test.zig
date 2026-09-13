@@ -8,9 +8,35 @@ const allocator = std.testing.allocator;
 
 test {
     _ = @import("windows_ctl_extensions_test.zig");
+    _ = @import("ctl_subject_diagnostic.zig");
 }
 
 const identifier: [20]u8 = @splat(1);
+
+test "CTL SubjectAlgorithm unsupported identities remain rejected without partial state" {
+    for ([_]platform.FingerprintList.Kind{ .authroot, .disallowed }) |kind| {
+        var snapshot = platform.Snapshot.init(allocator, .{});
+        defer snapshot.deinit();
+        const usage = if (kind == .authroot) ctl.authroot_usage else ctl.disallowed_usage;
+        const accepted = try fixtures.content(allocator, .{ .usage_oid = usage, .entries = &.{.{ .identifier = &identifier }} });
+        defer allocator.free(accepted);
+        try ctl.append(&snapshot, kind, accepted);
+        for ([_][]const u8{
+            "\x2a\x86\x48\x86\xf7\x0d\x02\x05",
+            "\x2b\x06\x01\x04\x01\x82\x37\x0a\x0b\x0f",
+            "\x2b\x06\x01\x04\x01\x82\x37\x0a\x0b\x6b",
+            "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x22",
+            "\x2a\x03\x04",
+        }) |oid| {
+            const rejected = try fixtures.content(allocator, .{ .usage_oid = usage, .algorithm_oid = oid, .entries = &.{.{ .identifier = &identifier }} });
+            defer allocator.free(rejected);
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, kind, rejected));
+            try std.testing.expectEqual(@as(usize, 1), snapshot.fingerprint_lists.items.len);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.fingerprint_entries);
+        }
+    }
+}
+
 const server_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
 const client_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x02";
 const use: platform.Use = .{ .role = .server, .identity = null, .now_seconds = 1_800_000_000, .issuer = true, .self_issued = true };
