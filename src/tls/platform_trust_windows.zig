@@ -10,6 +10,10 @@ const Error = @import("trust.zig").TrustError;
 const Allocator = std.mem.Allocator;
 const not_found: u32 = 0x80092004; // CRYPT_E_NOT_FOUND
 
+test {
+    _ = @import("windows_disallowed_conformance_test.zig");
+}
+
 extern "crypt32" fn CertGetEnhancedKeyUsage(*const crypt32.CERT_CONTEXT, u32, ?*anyopaque, *u32) callconv(.winapi) windows.BOOL;
 extern "crypt32" fn CertGetCertificateContextProperty(*const crypt32.CERT_CONTEXT, u32, ?*anyopaque, *u32) callconv(.winapi) windows.BOOL;
 const CtlContext = extern struct {
