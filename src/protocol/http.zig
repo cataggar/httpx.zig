@@ -405,6 +405,20 @@ pub const HTTP2Connection = struct {
 };
 
 pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, allocator: Allocator, out: *std.ArrayList(u8)) !void {
+    return encodeSettingsPayloadForRole(settings, allocator, out, .client);
+}
+
+pub const SettingsSenderRole = enum {
+    client,
+    server,
+};
+
+pub fn encodeSettingsPayloadForRole(
+    settings: HTTP2Connection.HTTP2ConnectionSettings,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    sender_role: SettingsSenderRole,
+) !void {
     // Each setting is 6 bytes: 16-bit ID + 32-bit value.
     var buf: [6]u8 = undefined;
 
@@ -413,10 +427,12 @@ pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, 
     writeU32BE(buf[2..6], settings.header_table_size);
     try out.appendSlice(allocator, &buf);
 
-    // ENABLE_PUSH (0x2)
-    writeU16BE(&buf, @intFromEnum(HTTP2Settings.enable_push));
-    writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
-    try out.appendSlice(allocator, &buf);
+    // ENABLE_PUSH (0x2) is sent only by clients.
+    if (sender_role == .client) {
+        writeU16BE(&buf, @intFromEnum(HTTP2Settings.enable_push));
+        writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
+        try out.appendSlice(allocator, &buf);
+    }
 
     // MAX_CONCURRENT_STREAMS (0x3)
     writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_concurrent_streams));
@@ -434,12 +450,30 @@ pub fn encodeSettingsPayload(settings: HTTP2Connection.HTTP2ConnectionSettings, 
     try out.appendSlice(allocator, &buf);
 
     // MAX_HEADER_LIST_SIZE (0x6)
-    writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_header_list_size));
-    writeU32BE(buf[2..6], settings.max_header_list_size);
-    try out.appendSlice(allocator, &buf);
+    // Library convention: zero means unlimited, represented by omitting the
+    // advisory setting rather than advertising a literal zero-byte limit.
+    if (settings.max_header_list_size != 0) {
+        writeU16BE(&buf, @intFromEnum(HTTP2Settings.max_header_list_size));
+        writeU32BE(buf[2..6], settings.max_header_list_size);
+        try out.appendSlice(allocator, &buf);
+    }
 }
 
 pub fn applySettingsPayload(settings: *HTTP2Connection.HTTP2ConnectionSettings, payload: []const u8) !void {
+    return applySettingsPayloadForPeer(settings, payload, .client);
+}
+
+pub const SettingsPeerRole = enum {
+    client,
+    server,
+};
+
+/// Applies peer settings while enforcing settings that are endpoint-specific.
+pub fn applySettingsPayloadForPeer(
+    settings: *HTTP2Connection.HTTP2ConnectionSettings,
+    payload: []const u8,
+    peer_role: SettingsPeerRole,
+) !void {
     if (payload.len % 6 != 0) return error.InvalidSettingsPayload;
 
     var i: usize = 0;
@@ -451,7 +485,12 @@ pub fn applySettingsPayload(settings: *HTTP2Connection.HTTP2ConnectionSettings, 
         // parameter with an identifier it does not understand.
         switch (@as(HTTP2Settings, @enumFromInt(id))) {
             .header_table_size => settings.header_table_size = value,
-            .enable_push => settings.enable_push = (value != 0),
+            .enable_push => {
+                // SETTINGS_ENABLE_PUSH is sent only by clients. A server that
+                // sends it commits a connection error.
+                if (peer_role == .server or value > 1) return error.ProtocolError;
+                settings.enable_push = value == 1;
+            },
             .max_concurrent_streams => settings.max_concurrent_streams = value,
             .initial_window_size => {
                 // RFC 7540 6.9.2: INITIAL_WINDOW_SIZE must not exceed 2^31-1.
@@ -711,19 +750,17 @@ fn containsCRLF(s: []const u8) bool {
 /// Validates that the request target and header values do not contain
 /// CRLF sequences to prevent HTTP request splitting attacks.
 pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
-    if (containsCRLF(req.uri.path)) return error.InvalidUri;
-    if (req.uri.query) |q| {
-        if (containsCRLF(q)) return error.InvalidUri;
-    }
+    try req.validateWireTarget();
     for (req.headers.entries.items) |h| {
         if (containsCRLF(h.name)) return error.InvalidHeaderName;
         if (containsCRLF(h.value)) return error.InvalidHeaderValue;
     }
 
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     const writer = list_writer.init(allocator, &buffer);
 
-    const method_str = req.method.toString();
+    const method_str = try req.validateMethod();
     try writer.print("{s} {s}", .{ method_str, req.uri.path });
     if (req.uri.query) |q| {
         try writer.print("?{s}", .{q});
@@ -1068,6 +1105,20 @@ test "HTTP/2 SETTINGS payload roundtrip with custom values" {
     try std.testing.expectEqual(@as(u32, 65535), decoded.max_header_list_size);
 }
 
+test "HTTP2 zero max header list size omits advisory setting" {
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(std.testing.allocator);
+    var settings = HTTP2Connection.HTTP2ConnectionSettings{};
+    settings.max_header_list_size = 0;
+    try encodeSettingsPayload(settings, std.testing.allocator, &payload);
+    try std.testing.expectEqual(@as(usize, 30), payload.items.len);
+    var offset: usize = 0;
+    while (offset < payload.items.len) : (offset += 6) {
+        const id = readU16BE(payload.items[offset..][0..2]);
+        try std.testing.expect(id != @intFromEnum(HTTP2Settings.max_header_list_size));
+    }
+}
+
 test "ChunkedWriter -- single chunk" {
     const allocator = std.testing.allocator;
     var buf = std.ArrayList(u8).empty;
@@ -1141,4 +1192,56 @@ test "writeChunkToWriter empty data is no-op" {
 
     try writeChunkToWriter(writer, "");
     try std.testing.expectEqualStrings("", buf.items);
+}
+
+test "formatRequest serializes the actual custom method token" {
+    var request = try Request.init(std.testing.allocator, .CUSTOM, "http://example.test/cache");
+    defer request.deinit();
+    try request.setCustomMethod("PURGE");
+    const formatted = try formatRequest(&request, std.testing.allocator);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expect(std.mem.startsWith(u8, formatted, "PURGE /cache HTTP/1.1\r\n"));
+}
+
+test "all request serializers reject unsafe request targets" {
+    const targets = [_][]const u8{
+        "http://example.test/has space",
+        "http://example.test/has\ttab",
+        "http://example.test/has\x00nul",
+        "http://example.test/has\x7fdel",
+    };
+    for (targets) |target| {
+        var request = try Request.init(std.testing.allocator, .GET, target);
+        defer request.deinit();
+        try std.testing.expectError(
+            error.InvalidRequestTarget,
+            formatRequest(&request, std.testing.allocator),
+        );
+        var bytes = std.ArrayList(u8).empty;
+        defer bytes.deinit(std.testing.allocator);
+        try std.testing.expectError(
+            error.InvalidRequestTarget,
+            request.serialize(list_writer.init(std.testing.allocator, &bytes)),
+        );
+    }
+}
+
+test "SETTINGS_ENABLE_PUSH is endpoint-role constrained" {
+    var payload: [6]u8 = undefined;
+    writeU16BE(&payload, @intFromEnum(HTTP2Settings.enable_push));
+    writeU32BE(payload[2..], 0);
+
+    var settings = HTTP2Connection.HTTP2ConnectionSettings{};
+    try applySettingsPayloadForPeer(&settings, &payload, .client);
+    try std.testing.expect(!settings.enable_push);
+    try std.testing.expectError(
+        error.ProtocolError,
+        applySettingsPayloadForPeer(&settings, &payload, .server),
+    );
+
+    writeU32BE(payload[2..], 2);
+    try std.testing.expectError(
+        error.ProtocolError,
+        applySettingsPayloadForPeer(&settings, &payload, .client),
+    );
 }

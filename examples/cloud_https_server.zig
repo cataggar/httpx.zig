@@ -6,7 +6,7 @@ fn indexHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         .status = "ok",
         .service = "cloud-https-api",
         .version = "1.0.0",
-        .protocols = .{ "HTTP/1.1", "HTTP/2", "HTTP/3" },
+        .protocols = .{ "HTTP/1.1", "HTTP/2" },
     });
 }
 
@@ -87,8 +87,8 @@ pub fn main() !void {
         .max_connections = 10000,
         .threads = 4,
         .http2_enabled = true,
-        .http3_enabled = true,
-        .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
+        .http3_enabled = false,
+        .tls_alpn_protocols = &.{ "h2", "http/1.1" },
         .keep_alive = true,
         .request_timeout_ms = 30_000,
         .keep_alive_timeout_ms = 60_000,
@@ -276,7 +276,7 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("\n  Protocol: HTTP/3 (QUIC)\n", .{});
+    std.debug.print("\n  Protocol: HTTP/3 (unsupported until authenticated QUIC)\n", .{});
     var h3_supported = true;
     for (endpoints) |ep| {
         const url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ port, ep.path }) catch break;
@@ -285,14 +285,14 @@ pub fn main() !void {
         var resp = switch (ep.method) {
             .GET => h3_client.get(url, .{}) catch |err| {
                 if (h3_supported) {
-                    std.debug.print("    HTTP/3 not available: {} (QUIC may be unavailable on this platform)\n", .{err});
+                    std.debug.print("    HTTP/3 rejected safely: {}\n", .{err});
                     h3_supported = false;
                 }
                 break;
             },
             else => h3_client.request(ep.method, url, .{}) catch |err| {
                 if (h3_supported) {
-                    std.debug.print("    HTTP/3 not available: {} (QUIC may be unavailable on this platform)\n", .{err});
+                    std.debug.print("    HTTP/3 rejected safely: {}\n", .{err});
                     h3_supported = false;
                 }
                 break;
@@ -325,7 +325,7 @@ pub fn main() !void {
     }
 
     if (all_ok) {
-        std.debug.print("\n=== All endpoints verified successfully across HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3! ===\n", .{});
+        std.debug.print("\n=== All endpoints verified across HTTP/1.0, HTTP/1.1, and HTTP/2; HTTP/3 rejection verified. ===\n", .{});
     } else {
         std.debug.print("\n!!! Some endpoints returned unexpected status codes !!!\n", .{});
         std.process.exit(1);

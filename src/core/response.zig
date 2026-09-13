@@ -63,8 +63,9 @@ pub const Response = struct {
         copy.status = self.status;
         copy.streaming_done = self.streaming_done;
 
+        const cloned_headers = try self.headers.clone(allocator);
         copy.headers.deinit();
-        copy.headers = try self.headers.clone(allocator);
+        copy.headers = cloned_headers;
         if (self.body) |body| {
             copy.body = try allocator.dupe(u8, body);
             copy.body_owned = true;
@@ -419,6 +420,27 @@ test "ResponseBuilder" {
 
     try std.testing.expectEqual(@as(u16, 201), response.status.code);
     try std.testing.expect(response.body != null);
+}
+
+test "Response clone with duplicate headers body and trailers is allocation failure safe" {
+    var source = Response.init(std.testing.allocator, 200);
+    defer source.deinit();
+    try source.headers.append("X-Dupe", "one");
+    try source.headers.append("X-Dupe", "two");
+    source.body = try std.testing.allocator.dupe(u8, "response-body");
+    source.body_owned = true;
+    source.trailers = Headers.init(std.testing.allocator);
+    try source.trailers.?.append("X-Trailer", "done");
+
+    const Case = struct {
+        fn run(allocator: Allocator, response: *const Response) !void {
+            var copy = try response.clone(allocator);
+            defer copy.deinit();
+            try std.testing.expectEqualStrings("response-body", copy.body.?);
+            try std.testing.expectEqualStrings("done", copy.trailers.?.get("X-Trailer").?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{&source});
 }
 
 test "ResponseBuilder json ownership transfer" {

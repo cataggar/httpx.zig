@@ -1,13 +1,13 @@
 # TLS HTTPS GET
 
-Simple HTTPS GET request via a local TLS server demonstrating HTTP/1.1, HTTP/2, and HTTP/3 support.
+Simple HTTPS GET request via a local TLS server demonstrating HTTP/1.1 and HTTP/2 support.
 
 ## Features Demonstrated
 
 - TLS server with self-signed certificates
 - TLS client handshake with ALPN negotiation
 - HTTP request/response over TLS
-- HTTP/1.1, HTTP/2, and HTTP/3 protocol support
+- HTTP/1.1 and HTTP/2 protocol support
 
 ## Demo Program
 
@@ -25,16 +25,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Start local TLS server with dummy certs (HTTP/1.1 + HTTP/2 + HTTP/3)
+    // Start local TLS server with dummy certs (HTTP/1.1 + HTTP/2)
     var server = httpx.Server.initWithConfig(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .tls_enabled = true,
         .tls_cert_path = "examples/certs/server_ec.crt",
         .tls_key_path = "examples/certs/server_ec.key",
-        .tls_alpn_protocols = &.{ "h3", "h2", "http/1.1" },
+        .tls_alpn_protocols = &.{ "h2", "http/1.1" },
         .http2_enabled = true,
-        .http3_enabled = true,
+        .http3_enabled = false,
         .keep_alive = true,
     });
     defer server.deinit();
@@ -52,7 +52,7 @@ pub fn main() !void {
     defer sock.close();
     try sock.connectHost("127.0.0.1", port);
 
-    const tls_config = tls.TlsConfig.insecureWithH2(allocator);
+    const tls_config = tls.TlsConfig.insecure(allocator);
     var session = tls.TlsSession.init(tls_config);
     session.socket = &sock;
     try session.handshake("127.0.0.1");

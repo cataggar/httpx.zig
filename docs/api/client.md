@@ -1,6 +1,6 @@
 # Client API
 
-The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3. HTTPS is supported via a fully custom TLS 1.2/1.3 implementation built on `std.crypto` primitives (AES-GCM, ChaCha20-Poly1305, X25519, HKDF, SHA-256/384/512) with ALPN negotiation for HTTP/2 and HTTP/3.
+The `httpx.zig` client provides high-level HTTP/1.0, HTTP/1.1, and HTTP/2 requests. HTTPS uses the library's TCP TLS implementation with HTTP/2 ALPN.
 
 ## Protocol Support
 
@@ -9,11 +9,9 @@ The `httpx.zig` client provides a high-level HTTP client for making requests ove
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
 | HTTP/2 | ✅ Client Runtime + Primitives | TCP/TLS | Keep-alive sessions are reused sequentially. Concurrent multiplexing is not exposed by `Client`; concurrent requests use separate pooled sessions. |
-| HTTP/3 | ✅ Client Runtime + Primitives | QUIC/UDP | High-level client runtime over UDP + QUIC/HTTP3/QPACK primitives (suitable for local/integration endpoints) |
+| HTTP/3 | ⚠️ Primitives only | none | Public requests return `error.UnsupportedHttpVersion`; authenticated QUIC is not implemented. |
 
-HTTP/3 runtime mode is available in the high-level client and uses QUIC packet/stream framing primitives directly. Interoperability with endpoints that require full TLS-in-QUIC handshake negotiation may vary depending on deployment expectations.
-
-The protocol module provides HTTP/2 and HTTP/3 building blocks (HPACK/QPACK, framing, and transport primitives). See [Protocol API](protocol.md) for details.
+The protocol module provides unauthenticated HTTP/3/QPACK/QUIC codec primitives for fixtures and protocol work. They are not a network transport.
 
 ## Proxy Modes
 
@@ -94,11 +92,11 @@ defer client.deinit();
 | `max_request_size` | `usize` | `10MB` | Maximum allowed outgoing request body size. Raises `RequestTooLarge` error when exceeded (excluded from retry logic). |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |
 | `http2_enabled` | `bool` | `false` | Enable high-level HTTP/2 execution path for client requests. |
-| `http3_enabled` | `bool` | `false` | Enable high-level HTTP/3 execution path over UDP/QUIC stream framing. |
+| `http3_enabled` | `bool` | `false` | Reserved. Setting it causes public requests to return `error.UnsupportedHttpVersion`. |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS values sent during connection setup (`header_table_size`, `max_frame_size`, etc.). |
-| `http3_settings` | `Http3Settings` | `{}` | HTTP/3/QPACK settings sent on the control stream (`max_field_section_size`, `qpack_max_table_capacity`, `qpack_blocked_streams`, etc.). |
+| `http3_settings` | `Http3Settings` | `{}` | Reserved settings for experimental protocol primitives; not sent by the public client. |
 | `keep_alive` | `bool` | `true` | Reuse TCP connections when possible. |
-| `allow_push` | `bool` | `true` | Accept HTTP/2 server push (PUSH_PROMISE) from the server. |
+| `allow_push` | `bool` | `false` | Deprecated and ignored. PUSH_PROMISE is rejected to preserve stream/HPACK synchronization. |
 | `pool_max_connections` | `u32` | `20` | Maximum connections in the pool. |
 | `pool_max_per_host` | `u32` | `5` | Maximum connections to a single host. |
 | `proxy` | `?Proxy` | `null` | Optional forward proxy configuration for client requests. Use `.kind = .socks5h` for SOCKS5h tunneling; the default kind is HTTP. |
@@ -210,7 +208,7 @@ defer res.deinit();
 | `withHttp3Settings(settings)` | Override HTTP/3 SETTINGS values. |
 | `withSslVerification(enabled)` | Toggle TLS certificate verification. |
 | `withKeepAlive(enabled)` | Toggle keep-alive connection reuse. |
-| `withAllowPush(enabled)` | Toggle HTTP/2 server push acceptance. |
+| `withAllowPush(enabled)` | Deprecated source-compatibility helper; push remains disabled. |
 | `withMaxResponseSize(bytes)` | Override maximum response body size. |
 | `withPoolLimits(max_connections, max_per_host)` | Override pool sizing limits. |
 | `withProxy(proxy_or_null)` | Configure or clear a forward proxy. Set `.kind = .socks5h` for SOCKS5h tunneling. |
@@ -365,6 +363,7 @@ Per-request overrides for configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `custom_method` | `?[]const u8` | `null` | Required validated HTTP token when the method argument is `.CUSTOM`; the request stores its own copy. |
 | `headers` | `?[]const [2][]const u8` | `null` | Additional headers for this request. |
 | `query_params` | `?[]const [2][]const u8` | `null` | Percent-encoded query params appended to the request URL. |
 | `body` | `?[]const u8` | `null` | Raw request body. |
@@ -377,6 +376,7 @@ Per-request overrides for configuration.
 | `read_timeout_ms` | `?u64` | `null` | Request-specific read phase timeout override (ms). |
 | `write_timeout_ms` | `?u64` | `null` | Request-specific write phase timeout override (ms). |
 | `timeouts` | `?Timeouts` | `null` | Explicit request-specific `Timeouts` struct override. |
+| `require_interruptible_dns` | `bool` | `false` | Reject hostname routes without a configured pure-Zig DNS resolver, on every platform. |
 | `policy` | `RequestPolicyOverrides` | `{}` | Nullable per-feature overrides resolved against `ClientConfig.policy`. |
 | `version` | `?Version` | `null` | Force a request over a specific protocol runtime (`.HTTP_1_1`, `.HTTP_2`, `.HTTP_3`). |
 | `proxy` | `?Proxy` | `null` | Per-request forward proxy override. |
@@ -385,6 +385,146 @@ Per-request overrides for configuration.
 | `unix_socket_path` | `?[]const u8` | `null` | Per-request Unix Domain Socket path routing override. |
 
 Unset request-option fields stay `null`, meaning client-level defaults are used implicitly.
+
+Streaming `Client.open` uses `OpenOptions`, which additionally accepts
+`custom_method`, `body_mode`, `response_limit`, `expect_100_continue`,
+`tls_handshake_ms`, and `header_ms`. The custom method is validated and copied.
+The TLS and header values bound their complete phases rather than
+each individual read. `null` uses `Timeouts.tls_handshake_ms`/`header_ms`
+(zero there falls back to connect/read); an explicit `OpenOptions` value of
+zero disables that phase timeout.
+
+### Streaming operation ownership and completion
+
+`Client.open(method, url, OpenOptions)` is the canonical streaming entry point.
+Buffered `request`/`get`/`post` calls collect through the same operation engine;
+streaming callers do not need to allocate an entire request or response body.
+
+| Operation method | Contract |
+| --- | --- |
+| `write(bytes)` / `writeAll(bytes)` | Incremental upload, enforcing the selected body framing and request limit. |
+| `writeFromReader(reader)` | Borrows a reader and uses a fixed 32 KiB transfer buffer. |
+| `waitForContinue()` | Returns `.send_body` or `.final_response` for the explicit Expect boundary. |
+| `finishRequest(trailers)` | Ends the upload and receives the final response head; pass `null` when not sending trailers. |
+| `read(buffer)` | Produces response bytes into caller storage; zero indicates completed response framing. |
+| `trailers()` | Borrows parsed response trailers when available. |
+| `finish(.{})` | Drains and validates any remaining response using the independent drain timeout, then releases the connection. |
+| `abort()` / `cancel()` | Aborts the owned operation or signals concurrent cancellation, respectively; incomplete connections are not reused. |
+| `deinit()` | Releases operation memory, aborting unfinished work. Repeated calls on the same handle are harmless. |
+
+The operation and public client handles may move between calls. Do not use two
+copies as independent owners. Operation internals, the returned `ResponseHead`,
+and its header storage remain heap-stable: a borrowed head survives such moves.
+Response trailers are separate from the head and are obtained with `trailers()`.
+All borrowed head/header/trailer pointers expire at operation `deinit`; do not
+deinitialize them separately. Clone headers if they must outlive the operation.
+
+The client must remain initialized until every operation is deinitialized and
+every buffered response is released, including operations already finished or
+aborted. The backing allocator and borrowed configuration objects must outlive
+the client. A configured DNS resolver, transport adapter, and callback contexts
+are borrowed, not transferred. A cancellation token must outlive its operation.
+Only `cancel()` may race owner-thread I/O; moves and `deinit()` must not race
+either I/O or cancellation.
+
+Framing, transport, allocation, and drain failures close the affected lease and
+remain errors on subsequent completion attempts. In particular, `finish()` does
+not turn a previously failed body read into successful completion. Successful
+`finish()` remains idempotent. Cancellation and current deadline checks retain
+precedence over a previously recorded failure.
+
+`ClientConfig.max_request_size` and `max_response_size` are `u64` limits; zero
+means unlimited, not an empty body. `OpenOptions.response_limit = .bytes` sets
+an exact per-operation limit, including `.bytes = 0` for no response payload;
+`.unlimited` explicitly removes it and `.inherit` uses the client limit.
+With decompression enabled, response limits count decoded bytes. HTTP/1 response
+metadata is bounded to 8 KiB and 100 fields by the shared parser; HTTP/2 uses
+`http2_settings.max_header_list_size` (8 KiB by default). Keep finite metadata
+and payload limits when accepting responses of unknown size.
+An explicit `.bytes = 0` also rejects payload from chunked and close-delimited
+HTTP/1 responses before accepting those bytes into the caller's buffer.
+For HTTP/2 HEAD, 204, and 304 responses, the response head can precede a separate
+empty DATA terminator or trailers. Continue reading or call `finish` to validate
+END_STREAM before reuse; actual representation bytes remain an error.
+
+Streaming `open` is a single attempt, without the buffered retry/redirect loop.
+It retains configured request interceptors and reports failures during `open`
+to error interceptors. Subsequent operation I/O returns errors directly; the
+buffered response/retry/redirect interceptor lifecycle is not invoked for those
+calls. `ClientPolicy.embeddingOwned()` disables automatic policy behavior but
+does not unregister application interceptors. For raw adapter responses it
+also disables automatic decompression and cookie handling.
+
+Custom `TransportAdapter` callbacks are synchronous; the embedding application
+must ensure their own blocking behavior is bounded. A context check around a
+callback does not interrupt the callback itself.
+
+### Strict DNS qualification
+
+Set `OpenOptions.require_interruptible_dns = true` for streaming operations or
+`RequestOptions.require_interruptible_dns = true` for buffered requests to require
+interruptible HTTPX-owned hostname resolution. Configure `ClientConfig.dns_resolver`
+with a pure-Zig `DNSResolver` using the embedding application's DNS servers. This
+requirement applies on **all platforms, including Linux**.
+
+The gate checks the final request URI after request interceptors and `no_proxy`
+handling. With an active proxy, its host is the local DNS target, not the origin
+host. Actual IP-literal targets and Unix endpoints need no resolver. Without a
+configured resolver, other strict routes return
+`error.SystemDnsCancellationUnsupported` before acquiring a connection or
+entering native resolution. Buffered redirects recheck their resulting routes.
+This conservative route requirement also applies to potentially pooled
+connections and custom transport adapters.
+
+```zig
+var resolver = httpx.DNSResolver.init(allocator, .{
+    .dns_servers = configured_dns_servers,
+});
+defer resolver.deinit();
+var client = httpx.Client.initWithConfig(allocator, .{
+    .dns_resolver = &resolver,
+    .policy = httpx.ClientPolicy.embeddingOwned(),
+});
+defer client.deinit();
+var op = try client.open(.GET, url, .{
+    .require_interruptible_dns = true,
+    .response_limit = .{ .bytes = 16 * 1024 * 1024 },
+    .timeouts = .{ .request_ms = 30_000 },
+});
+defer op.deinit();
+const head = try op.finishRequest(null);
+// Borrow head.headers and consume with op.read(caller_buffer).
+try op.finish(.{});
+```
+
+The resolver and its borrowed server configuration must outlive the client and
+all its operations. Configured DNS uses context-aware UDP and TCP fallback;
+expired deadlines and cancellation stop those exchanges without detached
+lookup workers.
+
+The default `require_interruptible_dns = false` preserves ordinary behavior.
+System resolution still uses a detached, self-owning worker. Cancellation stops
+the caller's wait, **not** the native lookup; that worker retains its resources
+until native completion. `httpx.system_dns_cancellation` is therefore
+`SystemDnsCancellation.completion_only` on every platform in this implementation.
+This reports cancellation capability, not system resolver availability. Do not
+treat prompt return from a detached lookup as bounded native work or cleanup.
+The strict DNS gate does not make arbitrary adapter callbacks, allocator locks,
+CPU-bound cryptography, or filesystem operations forcibly interruptible.
+
+Use `timeouts.request_ms` for the entire operation lifetime: `timeout_ms` only
+overrides phase timeouts. An adapter translating an absolute parent deadline
+must reject an already-expired deadline rather than convert it to zero, because
+zero disables the request timeout.
+
+### Unix endpoint and protocol selection
+
+An explicit Unix endpoint never falls back to TCP. Plain HTTP/1.x is supported;
+Unix with HTTP/2 enabled/selected or a TLS URI returns
+`error.UnsupportedStreamingTransport`, rather than silently downgrading the
+protocol. Disable client HTTP/2 selection when using a plain HTTP/1.x Unix
+endpoint. Public HTTP/3 remains rejected with `error.UnsupportedHttpVersion`
+before transport access, including when a Unix endpoint is configured.
 
 When multiple body-style fields are provided, precedence is:
 

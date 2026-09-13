@@ -11,6 +11,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const io_util = @import("../io/any_io.zig");
 const defaultIo = io_util.defaultIo;
+const Socket = @import("socket.zig").Socket;
+const IoContext = @import("../io/context.zig").IoContext;
 const is_windows = builtin.os.tag == .windows;
 
 const is_unix_available = switch (builtin.os.tag) {
@@ -351,7 +353,55 @@ pub const UnixClient = struct {
         try connectSocket(fd, &addr);
         return .{ .fd = fd };
     }
+
+    /// Connects using bounded nonblocking readiness waits.
+    pub fn connectWithContext(
+        path: []const u8,
+        timeout_ms: u64,
+        context: *const IoContext,
+    ) !UnixSocket {
+        try context.check();
+        if (!is_unix_available) return error.UnsupportedPlatform;
+        const resolved_path: []const u8 = if (is_windows)
+            try windowsShortPath(path)
+        else
+            path;
+        if (resolved_path.len >= MAX_PATH_LEN) return error.PathTooLong;
+
+        const fd = try createSocket();
+        errdefer closesocket(fd);
+        var addr = std.mem.zeroes(posix.sockaddr.un);
+        addr.family = @intCast(AF_UNIX);
+        @memcpy(addr.path[0..resolved_path.len], resolved_path);
+
+        var socket = Socket.fromHandle(fd);
+        try socket.connectSockaddrWithContext(
+            @ptrCast(&addr),
+            @sizeOf(posix.sockaddr.un),
+            timeout_ms,
+            context,
+        );
+        return .{ .fd = fd };
+    }
 };
+
+test "Unix client context observes cancellation and deadlines before connect" {
+    const types = @import("../core/types.zig");
+    const Deadline = @import("../io/context.zig").Deadline;
+    var token = types.CancellationToken.init();
+    token.cancel();
+    const cancelled = IoContext.init(.{ .external_cancel = &token });
+    try std.testing.expectError(
+        error.Cancelled,
+        UnixClient.connectWithContext("does-not-exist.sock", 5_000, &cancelled),
+    );
+
+    const expired = IoContext.init(.{ .phase_deadline = Deadline.at(0) });
+    try std.testing.expectError(
+        error.Timeout,
+        UnixClient.connectWithContext("does-not-exist.sock", 5_000, &expired),
+    );
+}
 
 test "Unix domain socket integration - Client & Server" {
     const allocator = std.testing.allocator;

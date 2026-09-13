@@ -62,6 +62,7 @@ pub const Error = error{
 /// Cancellation deterministically takes precedence over timeout. The earliest
 /// deadline wins; a request deadline wins an exact tie with a phase deadline.
 pub const IoContext = struct {
+    parent: ?*const IoContext = null,
     external_cancel: ?*const types.CancellationToken = null,
     local_cancel: types.CancellationToken = .{},
     request_deadline: ?Deadline = null,
@@ -70,6 +71,7 @@ pub const IoContext = struct {
     const Self = @This();
 
     pub const Options = struct {
+        parent: ?*const IoContext = null,
         external_cancel: ?*const types.CancellationToken = null,
         request_deadline: ?Deadline = null,
         phase_deadline: ?Deadline = null,
@@ -77,6 +79,7 @@ pub const IoContext = struct {
 
     pub fn init(options: Options) Self {
         return .{
+            .parent = options.parent,
             .external_cancel = options.external_cancel,
             .request_deadline = options.request_deadline,
             .phase_deadline = options.phase_deadline,
@@ -95,6 +98,7 @@ pub const IoContext = struct {
     pub fn isCancelled(self: *const Self) bool {
         if (self.local_cancel.isCancelled()) return true;
         if (self.external_cancel) |token| return token.isCancelled();
+        if (self.parent) |parent| return parent.isCancelled();
         return false;
     }
 
@@ -109,7 +113,7 @@ pub const IoContext = struct {
         self.phase_deadline = Deadline.afterMs(timeout_ms);
     }
 
-    pub fn selectedDeadline(self: *const Self) ?SelectedDeadline {
+    fn ownSelectedDeadline(self: *const Self) ?SelectedDeadline {
         if (self.request_deadline) |request| {
             if (self.phase_deadline) |phase| {
                 if (request.at_ns <= phase.at_ns) {
@@ -123,6 +127,17 @@ pub const IoContext = struct {
             return .{ .deadline = phase, .source = .phase };
         }
         return null;
+    }
+
+    pub fn selectedDeadline(self: *const Self) ?SelectedDeadline {
+        const own = self.ownSelectedDeadline();
+        const inherited = if (self.parent) |parent| parent.selectedDeadline() else null;
+        if (own == null) return inherited;
+        if (inherited == null) return own;
+        if (inherited.?.deadline.at_ns < own.?.deadline.at_ns) return inherited;
+        if (inherited.?.deadline.at_ns > own.?.deadline.at_ns) return own;
+        if (inherited.?.source == .request) return inherited;
+        return own;
     }
 
     pub fn remainingNsAt(self: *const Self, now_ns: u64) ?u64 {
@@ -346,6 +361,19 @@ test "IoContext cancel does not mutate borrowed external token" {
     context.cancel();
     try std.testing.expect(context.isLocallyCancelled());
     try std.testing.expect(!external.isCancelled());
+}
+
+test "IoContext child inherits cancellation and earliest deadline" {
+    var parent = IoContext.init(.{ .request_deadline = Deadline.at(20) });
+    var child = IoContext.init(.{
+        .parent = &parent,
+        .phase_deadline = Deadline.at(30),
+    });
+    try std.testing.expectEqual(@as(u64, 20), child.selectedDeadline().?.deadline.at_ns);
+    child.setPhaseDeadline(Deadline.at(10));
+    try std.testing.expectEqual(@as(u64, 10), child.selectedDeadline().?.deadline.at_ns);
+    parent.cancel();
+    try std.testing.expectError(error.Cancelled, child.checkAt(0));
 }
 
 test "bounded wait avoids busy-spin after a zero-progress sleep" {

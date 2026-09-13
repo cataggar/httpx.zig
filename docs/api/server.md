@@ -1,6 +1,6 @@
 # Server API
 
-The `httpx.zig` server module provides a robust HTTP server with middleware support, routing, and proper context handling. The high-level runtime supports HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3.
+The `httpx.zig` server module provides high-level HTTP/1.0, HTTP/1.1, and HTTP/2 serving with middleware and routing.
 
 ## Protocol Support
 
@@ -9,7 +9,7 @@ The `httpx.zig` server module provides a robust HTTP server with middleware supp
 | HTTP/1.0 | ✅ Full | Basic request/response |
 | HTTP/1.1 | ✅ Full | Keep-Alive, chunked transfer, pipelining |
 | HTTP/2 | ✅ Full | High-level server runtime over TCP plus full framing/HPACK/stream primitives |
-| HTTP/3 | ✅ Full | High-level server runtime over UDP plus full HTTP/3/QPACK/QUIC primitives |
+| HTTP/3 | ⚠️ Primitives only | `listen` and `listenInBackground` return `error.UnsupportedHttpVersion` when enabled. |
 
 ## Server
 
@@ -66,21 +66,21 @@ var server = httpx.Server.initWithConfig(allocator, .{
 | `max_connections` | `u32` | `1000` | Max concurrent connections. |
 | `threads` | `u32` | `0` | Number of worker threads. `0` runs requests sequentially (single-threaded). `> 0` routes accepted connections through a task `Executor` thread pool of the specified size. |
 | `http2_enabled` | `bool` | `false` | Enable HTTP/2 server runtime path. |
-| `http3_enabled` | `bool` | `false` | Enable HTTP/3 server runtime path (UDP transport). |
+| `http3_enabled` | `bool` | `false` | Reserved. Enabling it is rejected until authenticated QUIC exists. |
 | `http2_settings` | `Http2Settings` | `{}` | HTTP/2 SETTINGS frame defaults and limits. |
-| `http3_settings` | `Http3Settings` | `{}` | HTTP/3 SETTINGS defaults (QPACK/field section limits). |
+| `http3_settings` | `Http3Settings` | `{}` | Reserved for experimental protocol primitives. |
 | `log_fn` | `?LogFn` | `null` | Optional server log callback. Leave unset to use tint.zig colored output to stderr. |
 | `log_level` | `LogLevel` | `.info` | Minimum log level: `.debug`, `.info`, `.warn`, `.err`. Messages below this are silently dropped. |
 | `unix_path` | `?[]const u8` | `null` | Optional Unix Domain Socket (AF_UNIX) path to bind and listen on. |
 | `tls_enabled` | `bool` | `false` | Enable TLS for the server. Requires `tls_cert_path` and `tls_key_path`. |
 | `tls_cert_path` | `?[]const u8` | `null` | Path to the TLS certificate file (PEM format). Required when `tls_enabled = true`. |
 | `tls_key_path` | `?[]const u8` | `null` | Path to the TLS private key file (PEM format). Required when `tls_enabled = true`. |
-| `tls_alpn_protocols` | `[]const []const u8` | `&.{ "h3", "h2", "http/1.1" }` | ALPN protocol list for TLS negotiation (e.g., `&.{"h2", "http/1.1"}`). |
-| `enable_push` | `bool` | `true` | Enable HTTP/2 server push (PUSH_PROMISE) support. |
+| `tls_alpn_protocols` | `[]const []const u8` | `&.{ "h2", "http/1.1" }` | ALPN protocol list for TLS negotiation. |
+| `enable_push` | `bool` | `false` | Deprecated. `pushPromise` returns `error.PushDisabled`. |
 
 All `ServerConfig` fields are optional customizations. Omitted fields use the built-in defaults.
 
-### HTTP/2 and HTTP/3 Runtime Configuration
+### HTTP/2 Runtime Configuration
 
 ```zig
 var server = httpx.Server.initWithConfig(allocator, .{

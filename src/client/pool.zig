@@ -135,8 +135,11 @@ pub const EntryState = enum {
 pub const H2SessionState = struct {
     stream_manager: h2stream.StreamManager,
     initialized: bool = false,
+    received_initial_settings: bool = false,
     peer_max_frame_size: u32 = 16_384,
     draining: bool = false,
+    poisoned: bool = false,
+    reset_count: u64 = 0,
 
     pub fn init(allocator: Allocator) H2SessionState {
         return .{ .stream_manager = h2stream.StreamManager.init(allocator, true) };
@@ -475,23 +478,23 @@ pub const ConnectionPool = struct {
             if (result.addresses.len == 0) return error.DNSResolutionFailed;
             break :blk result.addresses[0];
         } else blk: {
-            try context.check();
-            const resolved = address_mod.resolve(self.allocator, connect_host, connect_port);
-            break :blk try context.unwrapAfterBlocking(address_mod.Address, resolved);
+            break :blk try address_mod.resolveWithContext(connect_host, connect_port, context);
         };
 
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
-        const timeout = if (connect_timeout_ms > 0) connect_timeout_ms else self.config.connect_timeout_ms;
-        try context.unwrapAfterBlocking(void, socket.connectWithTimeout(addr, timeout));
+        try socket.connectWithContext(addr, connect_timeout_ms, context);
         try socket.setNoDelay(true);
 
         if (key.proxy) |proxy| {
             if (proxy.kind == .socks5h) {
                 try context.check();
-                try context.unwrapAfterBlocking(
-                    void,
-                    proxy_mod.establishSocks5hTunnel(&socket, key.host, key.port, proxy),
+                try proxy_mod.establishSocks5hTunnelWithContext(
+                    &socket,
+                    key.host,
+                    key.port,
+                    proxy,
+                    context,
                 );
             }
         }
@@ -519,7 +522,8 @@ pub const ConnectionPool = struct {
             entry.socket != null and
             entry.socket.?.isValid() and
             entry.requests_made < self.config.max_requests_per_connection and
-            !(if (entry.h2_session) |h2| h2.draining else false);
+            !(if (entry.tls_session) |tls_session| tls_session.write_poisoned else false) and
+            !(if (entry.h2_session) |h2| h2.draining or h2.poisoned else false);
 
         if (can_reuse) {
             entry.state = .idle;
@@ -684,6 +688,7 @@ test "ConnectionPool growth keeps checked-out lease addresses stable" {
             defer {
                 for (sockets[0..accepted_count]) |*socket| socket.close();
             }
+
             while (accepted_count < connection_count) : (accepted_count += 1) {
                 const accepted = self.listener.accept() catch |err| {
                     self.failure = err;
@@ -734,4 +739,27 @@ test "ConnectionPool growth keeps checked-out lease addresses stable" {
     thread.join();
     joined = true;
     try std.testing.expect(server.failure == null);
+}
+
+test "pool key allocation is failure safe" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var key = try OwnedPoolKey.init(allocator, .{
+                .scheme = .tls,
+                .host = "example.test",
+                .port = 443,
+                .proxy = .{
+                    .kind = .http,
+                    .host = "proxy.test",
+                    .port = 8080,
+                    .username = "user",
+                    .password = "password",
+                },
+                .verify_tls = true,
+                .protocol = .http2,
+            });
+            defer key.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

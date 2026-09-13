@@ -79,6 +79,7 @@ pub const PercentEncoding = struct {
     /// Encodes a string for use in URLs.
     pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
         var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(allocator);
         const writer = list_writer.init(allocator, &result);
 
         for (input) |c| {
@@ -95,6 +96,7 @@ pub const PercentEncoding = struct {
     /// Decodes a percent-encoded string.
     pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
         var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(allocator);
 
         var i: usize = 0;
         while (i < input.len) {
@@ -121,6 +123,7 @@ pub const PercentEncoding = struct {
 /// Encodes key-value pairs as application/x-www-form-urlencoded.
 pub fn encodeFormData(allocator: Allocator, params: []const [2][]const u8) ![]u8 {
     var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
     const writer = list_writer.init(allocator, &result);
 
     for (params, 0..) |param, idx| {

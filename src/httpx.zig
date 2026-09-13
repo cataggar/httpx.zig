@@ -27,6 +27,8 @@ pub const socket = @import("net/socket.zig");
 const io_context = @import("io/context.zig");
 
 pub const address = @import("net/address.zig");
+pub const SystemDnsCancellation = address.SystemDnsCancellation;
+pub const system_dns_cancellation = address.system_dns_cancellation;
 
 pub const unix = @import("net/unix.zig");
 
@@ -200,7 +202,15 @@ pub const negotiateVersion = http.negotiateVersion;
 
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
+pub const TransportAdapter = client_mod.TransportAdapter;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const BodyMode = client_mod.BodyMode;
+pub const ResponseLimit = client_mod.ResponseLimit;
+pub const OpenOptions = client_mod.OpenOptions;
+pub const ResponseHead = client_mod.ResponseHead;
+pub const ContinueResult = client_mod.ContinueResult;
+pub const FinishOptions = client_mod.FinishOptions;
+pub const ClientOperation = client_mod.ClientOperation;
 pub const BasicAuth = client_mod.BasicAuth;
 pub const CookieEntry = client_mod.CookieEntry;
 pub const Interceptor = client_mod.Interceptor;
@@ -806,6 +816,16 @@ pub fn opts(url: []const u8, options_in: RequestOptions) !Response {
 /// Convenience alias for OPTIONS requests with an explicit allocator.
 pub fn optsWithAllocator(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
     return optionsWithAllocator(allocator, url, options_in);
+}
+
+test {
+    _ = client_mod;
+    _ = @import("client/dns_qualification_test.zig");
+    _ = socket;
+    _ = address;
+    _ = dns;
+    _ = server_mod;
+    _ = compression_stream;
 }
 
 test "top-level alias compile checks" {
