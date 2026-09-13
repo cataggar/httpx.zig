@@ -6,6 +6,10 @@ const digest = @import("metadata_digest.zig");
 const crypto = @import("crypto/provider.zig");
 const allocator = std.testing.allocator;
 
+test {
+    _ = @import("windows_ctl_extensions_test.zig");
+}
+
 const identifier: [20]u8 = @splat(1);
 const server_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
 const client_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x02";

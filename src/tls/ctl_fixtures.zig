@@ -76,7 +76,7 @@ pub fn envelope(allocator: Allocator, ctl_content: []const u8) ![]u8 {
     return allocator.dupe(u8, encoded);
 }
 
-fn element(allocator: Allocator, tag: u8, bytes: []const u8) ![]const u8 {
+pub fn element(allocator: Allocator, tag: u8, bytes: []const u8) ![]const u8 {
     var header: [10]u8 = undefined;
     header[0] = tag;
     var length: usize = 2;
@@ -94,7 +94,7 @@ fn element(allocator: Allocator, tag: u8, bytes: []const u8) ![]const u8 {
     return join(allocator, &.{ header[0..length], bytes });
 }
 
-fn join(allocator: Allocator, parts: []const []const u8) ![]const u8 {
+pub fn join(allocator: Allocator, parts: []const []const u8) ![]const u8 {
     var output: std.ArrayList(u8) = .empty;
     for (parts) |part| try output.appendSlice(allocator, part);
     return output.toOwnedSlice(allocator);

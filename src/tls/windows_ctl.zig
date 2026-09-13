@@ -5,6 +5,7 @@ const std = @import("std");
 const x509 = @import("x509_policy.zig");
 const platform = @import("platform_trust.zig");
 const crypto = @import("crypto/provider.zig");
+const extensions = @import("windows_ctl_extensions.zig");
 const Error = @import("trust.zig").TrustError;
 const Reader = x509.Reader;
 
@@ -50,9 +51,12 @@ pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.K
             try entries.append(snapshot.allocator, entry);
         }
     }
-    // No CTL-wide extension/policy is silently discarded, including one
-    // whose criticality could affect how individual subjects are interpreted.
-    if (list.peek() != null) return error.TlsTrustStoreLoadFailed;
+    if (list.peek() != null) {
+        if (expected != .authroot) return error.TlsTrustStoreLoadFailed;
+        try extensions.validate(list.inner.bytes[list.inner.offset..], snapshot.limits.max_property_bytes);
+        _ = try list.take(0xa0);
+    }
+    try list.finish();
     try snapshot.addFingerprintList(.{
         .kind = expected,
         .algorithm = algorithm,

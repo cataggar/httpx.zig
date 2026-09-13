@@ -202,11 +202,54 @@ and do not establish trust.
 The supported CTL profile uses whole-certificate SHA-1/256/384/512 identifiers,
 with additional SHA-256 consistency checks when present. SHA-1 requires the
 explicit binding and provider deployment opt-ins. MD5 identifiers, signature-
-or public-key-hash selectors, unknown attributes, multiple values, and CTL-wide
-extensions fail closed. AuthRoot's bounded friendly-name/key-ID/subject-name
+or public-key-hash selectors, unknown attributes, multiple values, and unsupported
+CTL-wide extensions fail closed. AuthRoot's bounded friendly-name/key-ID/subject-name
 locator fields are not alternate matching keys; no MD5 computation is enabled.
 Purpose, disable-time, and unsupported issuance/policy restrictions are
 retained rather than discarded.
+
+#### AuthRoot CT log catalog
+
+One noncritical AuthRoot extension is recognized:
+`szOID_CERT_LOG_LIST_EXT` (`1.3.6.1.4.1.311.10.3.52`). Microsoft's
+[public SDK header](https://github.com/microsoft/win32metadata/blob/1bfb76db1c360653bdcb56512af0fdf987aceab8/generation/WinSDK/RecompiledIdlHeaders/um/wincrypt.h#L3586-L3587)
+describes it as containing “the list of logging servers for CT”. The published
+[crt.sh AuthRoot parser](https://github.com/crtsh/root_programs/blob/4b23f373d0e4dad72a039719c889777a0698e63c/microsoft_authroot/microsoft_authroot.go#L113-L135)
+decodes an integer-sequence header followed by SubjectPublicKeyInfo sequences;
+its [extension handling](https://github.com/crtsh/root_programs/blob/4b23f373d0e4dad72a039719c889777a0698e63c/microsoft_authroot/microsoft_authroot.go#L280-L306)
+updates **CT-log inclusion**, separately from certificate/root-trust-purpose
+processing. These are log keys, not root certificates, CTL subject identifiers,
+or an alternate issuer/anchor source. They have no authority in this engine's
+certificate-path policy, which does not implement CT.
+
+The [native structural observation](https://github.com/cataggar/httpx.zig/actions/runs/34775212836)
+identified this OID and a complete 50-sequence catalog, with three single-byte
+INTEGER fields in its first sequence. It did not establish the fields' values
+or meanings. The public parser itself labels that header “Version?” rather than
+defining its semantics; this implementation does **not** claim a normative
+Microsoft ASN.1 specification or interpret those integers as version policy,
+permissions, dates, flags, or CT authorization.
+
+The supported, non-authorizing profile validates three canonical nonnegative
+INTEGERs no larger than `u32`, then zero to 256 structurally framed RSA PKCS#1,
+P-256, or P-384 SPKIs. A key is at most 4 KiB; the extension value obeys the
+64 KiB property bound. It consumes every byte of the catalog, Extension,
+Extensions sequence, explicit `[0]` wrapper, and enclosing CTL. Catalog keys and
+parameters are not retained, hashed, used to verify signatures/SCTs, installed,
+or consulted by path validation. Structural acceptance is not cryptographic
+validation of the log keys or a promise to enforce a CT-log policy.
+
+Only this exact AuthRoot profile is accepted, with the DER default `critical`
+field omitted. Duplicate extensions, explicit critical/false encodings, unknown
+extensions (including noncritical ones), other list kinds, unsupported keys or
+header shapes, malformed/trailing DER, and exhausted bounds fail closed.
+There is no blanket “ignore noncritical” rule. The catalog cannot erase list
+freshness, usage, membership, anchor provenance, subject restrictions, or the
+empty-104 exclusion below. A whole CTL is published only after global metadata
+validation succeeds; failures retain no partial list or borrowed input.
+Native Windows qualification of this new profile remains a separate gate.
+
+#### Per-certificate restrictions and provenance
 
 Native Windows runs have encountered an **explicit empty** AuthRoot attribute
 104. The [native conformance run](https://github.com/cataggar/httpx.zig/actions/runs/34769265281)
