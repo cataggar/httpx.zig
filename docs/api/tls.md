@@ -131,6 +131,12 @@ Restricted PSS key parameters are enforced before dispatch. SHA-1 certificate
 signatures, unsupported curve/hash combinations and unsupported parameters
 fail explicitly.
 
+The `metadataHasher(options)` callback captures identifier permission at
+construction. Even direct callback calls enforce that permission, exact digest
+sizes, provider capability checks, and output clearing on failure. Construct a
+new hasher to change the captured permission; changing descriptor options alone
+cannot enable a permission denied at construction.
+
 ### Same-provider certificate adapters
 
 `TLSConfig.certificate_crypto` and the raw TLS client's
