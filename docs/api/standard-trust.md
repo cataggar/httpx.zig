@@ -188,10 +188,24 @@ Hash-only CTLs are **not yet implemented**. CTLs found in logical stores, or
 cached AuthRoot/Disallowed CTL values detected through existing read-only Zig
 NT registry bindings, fail initialization. This can block ordinary provisioned
 Windows machines; general Windows system trust is not claimed complete.
-Completing it needs bounded CTL interpretation and an approved fingerprint
-matching seam: ABI-v1 currently exposes signatures, not hashes. Detection is
-not a permanent OS/API blocker and must not be removed to make CI green.
+Completing it needs bounded CTL interpretation and canonical binding
+integration. `metadata_digest.zig` and `policy_binding.zig` define the chosen
+separate identifier-hash/paired-view contract without changing ABI-v1 request
+or vtable layouts. The native CTL loader is still guarded at this checkpoint.
+Detection is not a permanent OS/API blocker and must not be removed merely
+to make CI green.
 The loader never downloads roots or invokes a native chain engine.
+
+The paired view accepts only its exact signature context/vtable, and rejects
+different signature/digest contexts. The runtime must obtain both operations
+from one selected-provider adapter and pass the binding's signature handle.
+Roots, adapter/provider, and the stable binding must outlive pooled sessions
+and active calls. Hash input/output/scratch are borrowed per call; temporary
+hash state must be destroyed on every exit. Outputs have exactly the selected
+digest length and are cleared on every failure. Binding
+`allow_sha1_identifiers` defaults false, independently of native-provider
+capability/deployment approval. Identifier hashing never enables SHA-1
+signatures, HMAC, HKDF or PRF, creates an anchor, or permits a primitive fallback.
 
 ### macOS snapshot and strict projection
 
