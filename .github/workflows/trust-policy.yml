@@ -1,38 +1,52 @@
-name: Native trust policy
+# Evidence branch only. These results do not qualify production trust policy.
+name: Windows disallowed identity evidence
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .gitattributes
-      - src/tls/**/*
-      - build.zig
-      - .github/workflows/trust-policy.yml
 
 permissions:
   contents: read
 
 jobs:
-  trust:
-    name: Trust (${{ matrix.os }}, ${{ matrix.optimize }})
+  evidence:
+    name: Disallowed identity (${{ matrix.target }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        optimize: [Debug, ReleaseSafe]
+        include:
+          - os: windows-2025
+            target: x86_64-windows
+            architecture: X64
+            optimize: Debug
+          - os: windows-2025
+            target: x86_64-windows
+            architecture: X64
+            optimize: ReleaseSafe
+          - os: windows-11-vs2026-arm
+            target: aarch64-windows
+            architecture: Arm64
+            optimize: Debug
+          - os: windows-11-vs2026-arm
+            target: aarch64-windows
+            architecture: Arm64
+            optimize: ReleaseSafe
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Synthetic metadata, ownership, and selected-signature tests
-        shell: bash
-        run: zig build test-tls-standard-trust -Doptimize=${{ matrix.optimize }} --summary all --cache-dir .zig-cache/trust-policy
-      - name: Read-only native trust snapshot
-        shell: bash
-        run: zig build test-tls-system-trust -Doptimize=${{ matrix.optimize }} --summary all --cache-dir .zig-cache/trust-policy
-      # No step installs certificates or modifies a keychain, trust setting,
-      # registry value, or user/machine certificate store. In-memory API fixtures
-      # are process-local. Unsupported platform metadata intentionally fails CI.
+      - name: Require the matching native Windows host
+        shell: pwsh
+        run: |
+          $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($actual -ne '${{ matrix.architecture }}') {
+            throw "Expected native ${{ matrix.architecture }} host, got $actual"
+          }
+          Write-Output "Synthetic metadata evidence: host=$actual target=${{ matrix.target }} mode=${{ matrix.optimize }}"
+      - name: Run bounded synthetic metadata comparisons
+        shell: pwsh
+        run: |
+          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --cache-dir .zig-cache/disallowed-conformance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
