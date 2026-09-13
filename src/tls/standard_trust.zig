@@ -36,6 +36,7 @@ pub const Options = struct {
 const Anchor = struct {
     bytes: []u8,
     certificate: x509.Certificate,
+    custom: bool,
 };
 
 /// Owns copied trust anchors, but never owns a `.source.provider` handle.
@@ -139,7 +140,7 @@ pub const TrustContext = struct {
         }
         try peers[0].checkPolicy(request.now_seconds, request.role, false, 0);
         if (request.expected_identity) |identity| try peers[0].checkIdentity(identity);
-        _ = try self.checkMetadata(peers[0], request, false, false, hasher);
+        _ = try self.checkMetadata(peers[0], request, false, false, false, hasher);
         if (request.limits.max_path_depth < 2) return error.TlsCertificatePathTooDeep;
 
         const visited = try allocator.alloc(bool, peers.len);
@@ -159,6 +160,7 @@ pub const TrustContext = struct {
             const below = current.ca_below + @intFromBool(current.peer_index != 0 and !child.selfIssued());
             var candidate: ?x509.Certificate = null;
             var candidate_peer: ?usize = null;
+            var custom_anchor = false;
             while (current.next_peer < peers.len) {
                 const index = current.next_peer;
                 current.next_peer += 1;
@@ -169,6 +171,7 @@ pub const TrustContext = struct {
             }
             if (candidate == null and current.next_anchor < current.anchor_end) {
                 candidate = self.anchors[current.next_anchor].certificate;
+                custom_anchor = self.anchors[current.next_anchor].custom;
                 current.next_anchor += 1;
             }
             const issuer = candidate orelse {
@@ -188,7 +191,7 @@ pub const TrustContext = struct {
                 failure = err;
                 continue;
             };
-            const self_signature_required = self.checkMetadata(issuer, request, true, is_anchor, hasher) catch |err| {
+            const self_signature_required = self.checkMetadata(issuer, request, true, is_anchor, custom_anchor, hasher) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 failure = err;
                 continue;
@@ -224,7 +227,7 @@ pub const TrustContext = struct {
         return if (depth_limited) error.TlsCertificatePathTooDeep else failure;
     }
 
-    fn checkMetadata(self: *const TrustContext, certificate: x509.Certificate, request: trust.VerifyPeerRequest, issuer: bool, anchor: bool, hasher: ?metadata_digest.MetadataDigest) Error!bool {
+    fn checkMetadata(self: *const TrustContext, certificate: x509.Certificate, request: trust.VerifyPeerRequest, issuer: bool, anchor: bool, custom_anchor: bool, hasher: ?metadata_digest.MetadataDigest) Error!bool {
         const snapshot = if (self.platform_snapshot) |*value| value else return false;
         return switch (try snapshot.check(certificate.der_bytes, .{
             .role = request.role,
@@ -232,6 +235,8 @@ pub const TrustContext = struct {
             .now_seconds = request.now_seconds,
             .issuer = issuer,
             .self_issued = certificate.selfIssued(),
+            .anchor = anchor,
+            .custom_anchor = custom_anchor,
         }, hasher, request.scratch_allocator)) {
             .deny => error.TlsCertificateConstraintViolation,
             .chain_only => if (anchor) error.TlsCertificateConstraintViolation else false,
@@ -305,10 +310,13 @@ const Builder = struct {
         if (self.platform_snapshot) |*snapshot| snapshot.deinit();
     }
 
-    fn add(self: *Builder, bytes: []const u8) Error!void {
+    fn add(self: *Builder, bytes: []const u8, custom_anchor: bool) Error!void {
         if (bytes.len > self.options.max_certificate_der_bytes) return error.TlsCertificateTooLarge;
-        for (self.anchors.items) |anchor| {
-            if (std.mem.eql(u8, anchor.bytes, bytes)) return;
+        for (self.anchors.items) |*anchor| {
+            if (std.mem.eql(u8, anchor.bytes, bytes)) {
+                anchor.custom = anchor.custom or custom_anchor;
+                return;
+            }
         }
         if (self.anchors.items.len == self.options.max_trust_anchors or
             bytes.len > self.options.max_trust_store_der_bytes - self.der_bytes)
@@ -319,7 +327,7 @@ const Builder = struct {
             return error.TlsCertificateConstraintViolation;
         const owned = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(owned);
-        try self.anchors.append(self.allocator, .{ .bytes = owned, .certificate = try x509.parse(owned) });
+        try self.anchors.append(self.allocator, .{ .bytes = owned, .certificate = try x509.parse(owned), .custom = custom_anchor });
         self.der_bytes += bytes.len;
     }
 
@@ -327,7 +335,7 @@ const Builder = struct {
         switch (source) {
             .der_certificates => |certificates| {
                 if (certificates.len > self.options.max_trust_anchors) return error.TlsTrustStoreLoadFailed;
-                for (certificates) |bytes| try self.add(bytes);
+                for (certificates) |bytes| try self.add(bytes, true);
             },
             .pem_bytes => |bytes| try self.pem(bytes),
             .pem_file_path => |path| {
@@ -369,7 +377,7 @@ const Builder = struct {
                 error.NoSpaceLeft => error.TlsCertificateTooLarge,
                 else => error.TlsTrustStoreLoadFailed,
             };
-            try self.add(buffer[0..length]);
+            try self.add(buffer[0..length], true);
             rest = rest[end_index + end.len ..];
         }
     }
@@ -391,7 +399,7 @@ const Builder = struct {
             self.platform_snapshot = snapshot;
             for (snapshot.entries.items) |entry| {
                 if (!entry.anchor_candidate) continue;
-                self.add(entry.der) catch |err| switch (err) {
+                self.add(entry.der, false) catch |err| switch (err) {
                     error.TlsMalformedCertificate, error.TlsCertificateUsageInvalid, error.TlsCertificateConstraintViolation => self.skipped += 1,
                     else => return err,
                 };
@@ -411,7 +419,7 @@ const Builder = struct {
         var certificates = x509.Reader.init(bundle.bytes.items);
         while (certificates.peek() != null) {
             const certificate = try certificates.take(0x30);
-            self.add(certificate.encoded) catch |err| switch (err) {
+            self.add(certificate.encoded, false) catch |err| switch (err) {
                 error.TlsMalformedCertificate, error.TlsCertificateUsageInvalid, error.TlsCertificateConstraintViolation => self.skipped += 1,
                 else => return err,
             };

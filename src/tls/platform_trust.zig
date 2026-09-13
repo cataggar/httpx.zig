@@ -14,6 +14,7 @@ pub const Limits = struct {
     max_property_bytes: usize = 64 * 1024,
     max_fingerprint_lists: usize = 8,
     max_fingerprint_entries: usize = 16384,
+    max_ctl_bytes: usize = 16 * 1024 * 1024,
 };
 
 pub const Use = struct {
@@ -22,6 +23,8 @@ pub const Use = struct {
     now_seconds: i64,
     issuer: bool,
     self_issued: bool,
+    anchor: bool = false,
+    custom_anchor: bool = false,
 };
 
 pub const Decision = enum { deny, chain_only, anchor, self_signed_anchor };
@@ -99,6 +102,7 @@ fn trimDot(name: []const u8) []const u8 {
 pub const Entry = struct {
     der: []u8,
     anchor_candidate: bool = false,
+    authroot_program: bool = false,
     windows: ?Windows = null,
     /// User, administrator, system. Null is absent; empty is unconditional trustRoot.
     domains: [3]?[]Rule = .{ null, null, null },
@@ -122,7 +126,7 @@ pub const Entry = struct {
             }
             return decision;
         }
-        return if (self.anchor_candidate) .anchor else .chain_only;
+        return if (self.anchor_candidate or self.windows != null or self.authroot_program) .anchor else .chain_only;
     }
 
     fn decideRules(rules: []const Rule, use: Use) Decision {
@@ -170,6 +174,8 @@ pub const FingerprintEntry = struct {
 };
 
 pub const FingerprintList = struct {
+    pub const Kind = enum { constraints, authroot, disallowed };
+    kind: Kind = .constraints,
     algorithm: crypto.HashAlgorithm,
     this_update: i64,
     next_update: ?i64 = null,
@@ -263,11 +269,24 @@ pub const Snapshot = struct {
             .scratch = scratch,
             .input = certificate_der,
         };
+        var requires_membership = false;
+        if (use.anchor and !use.custom_anchor) {
+            for (self.entries.items) |entry| {
+                if (entry.authroot_program and std.mem.eql(u8, entry.der, certificate_der))
+                    requires_membership = true;
+            }
+        }
+        var has_authroot = false;
         for (self.fingerprint_lists.items) |list| {
             if (use.now_seconds < list.this_update or
                 (list.next_update != null and use.now_seconds > list.next_update.?))
                 return error.TlsTrustStoreLoadFailed;
-            if (list.entries.len == 0) continue;
+            const authroot = list.kind == .authroot;
+            has_authroot = has_authroot or authroot;
+            if (list.entries.len == 0) {
+                if (authroot and requires_membership) return .deny;
+                continue;
+            }
             const digest = try digests.get(list.algorithm);
             var low: usize = 0;
             var high = list.entries.len;
@@ -278,14 +297,19 @@ pub const Snapshot = struct {
                 else
                     high = mid;
             }
+            var matched = false;
             while (low < list.entries.len and std.mem.eql(u8, list.entries[low].identifier[0..digest.len], digest)) : (low += 1) {
+                matched = true;
                 const entry = list.entries[low];
+                if (list.kind == .disallowed) return .deny;
                 if (!entry.policy.permits(use)) return .deny;
                 if (entry.sha256) |expected| {
                     if (!std.mem.eql(u8, &expected, try digests.get(.sha256))) return .deny;
                 }
             }
+            if (authroot and requires_membership and !matched) return .deny;
         }
+        if (requires_membership and !has_authroot) return error.TlsTrustStoreLoadFailed;
         return decision;
     }
 };

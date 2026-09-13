@@ -14,6 +14,7 @@ test {
     _ = @import("platform_trust_macos.zig");
     _ = @import("standard_trust_test.zig");
     _ = @import("policy_binding.zig");
+    _ = @import("windows_ctl_test.zig");
 }
 
 /// Conformance adapter for the agreed two-method contract. Shared production
@@ -259,6 +260,31 @@ test "paired fingerprint state and current time remain isolated across concurren
         }
     }
     try binding.provider().verifyPeer(harness.request(binding.signatureVerifier(), &chain));
+}
+
+test "program-root membership cannot be replaced by an unrelated AuthRoot list" {
+    for ([_]bool{ false, true }) |explicit_custom| {
+        var harness = try Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.owner.anchors[0].custom = explicit_custom;
+        const snapshot = &harness.owner.platform_snapshot.?;
+        const index = try snapshot.add(harness.chain.root, true);
+        snapshot.entries.items[index].authroot_program = true;
+        try snapshot.addFingerprintList(.{
+            .kind = .authroot,
+            .algorithm = .sha256,
+            .this_update = 1_700_000_000,
+            .entries = &.{},
+        });
+        var adapter = PairedAdapter{ .selected = harness.standard.provider() };
+        var binding = try harness.owner.bind(&adapter, .{});
+        const request = harness.request(binding.signatureVerifier(), &.{ harness.chain.leaf, harness.chain.intermediate });
+        if (explicit_custom) {
+            try binding.provider().verifyPeer(request);
+        } else {
+            try std.testing.expectError(error.TlsCertificateConstraintViolation, binding.provider().verifyPeer(request));
+        }
+    }
 }
 
 test "platform distrust checks leaf intermediate and custom duplicate root" {

@@ -1,0 +1,170 @@
+const std = @import("std");
+const ctl = @import("windows_ctl.zig");
+const fixtures = @import("ctl_fixtures.zig");
+const platform = @import("platform_trust.zig");
+const digest = @import("metadata_digest.zig");
+const crypto = @import("crypto/provider.zig");
+const allocator = std.testing.allocator;
+
+const identifier: [20]u8 = @splat(1);
+const server_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
+const client_eku = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x02";
+const use: platform.Use = .{ .role = .server, .identity = null, .now_seconds = 1_800_000_000, .issuer = true, .self_issued = true };
+
+fn hash(_: *anyopaque, _: std.mem.Allocator, _: crypto.HashAlgorithm, _: []const u8, output: []u8) crypto.ProviderError!void {
+    @memset(output, 1);
+}
+
+test "AuthRoot CTL decoding retains restrictions rather than installing anchors" {
+    const encoded = try fixtures.content(allocator, .{ .entries = &.{.{
+        .identifier = &identifier,
+        .attributes = &.{
+            .{ .id = 9, .value = server_eku },
+            .{ .id = 98, .value = &@as([32]u8, @splat(1)) },
+            .{ .id = 20, .value = "locator" },
+            .{ .id = 29, .value = &@as([16]u8, @splat(2)) },
+        },
+    }} });
+    defer allocator.free(encoded);
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    try ctl.append(&snapshot, .authroot, encoded);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.fingerprint_entries);
+    var context: u8 = 0;
+    const hasher = digest.MetadataDigest{ .context = &context, .digest_fn = hash, .options = .{ .allow_sha1_identifiers = true } };
+    try std.testing.expectEqual(platform.Decision.anchor, try snapshot.check("certificate", use, hasher, allocator));
+    var client = use;
+    client.role = .client;
+    try std.testing.expectEqual(platform.Decision.deny, try snapshot.check("certificate", client, hasher, allocator));
+}
+
+test "Disallowed CTL entries remain denied regardless of permission-like attributes" {
+    const encoded = try fixtures.content(allocator, .{
+        .usage_oid = ctl.disallowed_usage,
+        .entries = &.{.{ .identifier = &identifier, .attributes = &.{.{ .id = 9, .value = server_eku }} }},
+    });
+    defer allocator.free(encoded);
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    try ctl.append(&snapshot, .disallowed, encoded);
+    try std.testing.expectEqual(@as(u2, 0), snapshot.fingerprint_lists.items[0].entries[0].policy.roles);
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, encoded));
+}
+
+test "CTL purpose cutoff and unsupported issuance policies are not erased" {
+    var time: [8]u8 = undefined;
+    std.mem.writeInt(u64, &time, @as(u64, 1_800_000_000 + 11_644_473_600) * 10_000_000, .little);
+    inline for (.{ @as(u32, 104), 128, 126, 127, 83, 84, 105, 122 }) |id| {
+        const encoded = try fixtures.content(allocator, .{ .entries = &.{.{
+            .identifier = &identifier,
+            .attributes = &.{.{ .id = id, .value = if (id == 122) server_eku else &time }},
+        }} });
+        defer allocator.free(encoded);
+        var snapshot = platform.Snapshot.init(allocator, .{});
+        defer snapshot.deinit();
+        try ctl.append(&snapshot, .authroot, encoded);
+        try std.testing.expect(!snapshot.fingerprint_lists.items[0].entries[0].policy.permits(use));
+    }
+}
+
+test "CTL rejects MD5 and alternate unknown identifier forms before committing data" {
+    const md5 = try fixtures.content(allocator, .{
+        .algorithm_oid = "\x2a\x86\x48\x86\xf7\x0d\x02\x05",
+        .entries = &.{.{ .identifier = &@as([16]u8, @splat(1)) }},
+    });
+    defer allocator.free(md5);
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, md5));
+    for ([_]u32{ 4, 15, 25, 999 }) |id| {
+        const encoded = try fixtures.content(allocator, .{ .entries = &.{.{
+            .identifier = &identifier,
+            .attributes = &.{.{ .id = id, .value = &identifier }},
+        }} });
+        defer allocator.free(encoded);
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, encoded));
+    }
+    try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+}
+
+test "CTL duplicate properties unknown extensions and truncated DER fail atomically" {
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    const duplicate = try fixtures.content(allocator, .{ .entries = &.{.{
+        .identifier = &identifier,
+        .attributes = &.{ .{ .id = 9, .value = server_eku }, .{ .id = 9, .value = client_eku } },
+    }} });
+    defer allocator.free(duplicate);
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, duplicate));
+    const extension = try fixtures.content(allocator, .{ .extra_tail = "\xa0\x02\x30\x00" });
+    defer allocator.free(extension);
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, extension));
+    const late_failure = try fixtures.content(allocator, .{ .entries = &.{
+        .{ .identifier = &identifier },
+        .{ .identifier = &identifier, .attributes = &.{.{ .id = 999, .value = "unsupported" }} },
+    } });
+    defer allocator.free(late_failure);
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, late_failure));
+    try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+    const valid = try fixtures.content(allocator, .{ .entries = &.{.{ .identifier = &identifier }} });
+    defer allocator.free(valid);
+    for (0..valid.len) |length| {
+        if (ctl.append(&snapshot, .authroot, valid[0..length])) |_| {
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expect(err == error.TlsMalformedCertificate or err == error.TlsTrustStoreLoadFailed);
+        }
+        try std.testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
+    }
+}
+
+test "CTL input ownership allocation and record bounds are finite" {
+    const encoded = try fixtures.content(allocator, .{ .entries = &.{.{ .identifier = &identifier }} });
+    defer allocator.free(encoded);
+    const Test = struct {
+        fn run(backing: std.mem.Allocator, bytes: []const u8) !void {
+            var snapshot = platform.Snapshot.init(backing, .{});
+            defer snapshot.deinit();
+            try ctl.append(&snapshot, .authroot, bytes);
+            try std.testing.expectEqualSlices(u8, &identifier, snapshot.fingerprint_lists.items[0].entries[0].identifier[0..20]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Test.run, .{encoded});
+    for ([_]platform.Limits{ .{ .max_ctl_bytes = 1 }, .{ .max_fingerprint_entries = 0 }, .{ .max_fingerprint_lists = 0 } }) |limits| {
+        var snapshot = platform.Snapshot.init(allocator, limits);
+        defer snapshot.deinit();
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, ctl.append(&snapshot, .authroot, encoded));
+    }
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    const copied = try allocator.dupe(u8, encoded);
+    defer allocator.free(copied);
+    try ctl.append(&snapshot, .authroot, copied);
+    @memset(copied, 0);
+    try std.testing.expectEqualSlices(u8, &identifier, snapshot.fingerprint_lists.items[0].entries[0].identifier[0..20]);
+}
+
+test "program-root membership requires current AuthRoot metadata and never overrides distrust" {
+    var snapshot = platform.Snapshot.init(allocator, .{});
+    defer snapshot.deinit();
+    const index = try snapshot.add("program certificate", true);
+    snapshot.entries.items[index].authroot_program = true;
+    var request_use = use;
+    request_use.anchor = true;
+    var context: u8 = 0;
+    const hasher = digest.MetadataDigest{ .context = &context, .digest_fn = hash, .options = .{ .allow_sha1_identifiers = true } };
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.check("program certificate", request_use, hasher, allocator));
+    const encoded = try fixtures.content(allocator, .{ .entries = &.{.{ .identifier = &identifier }} });
+    defer allocator.free(encoded);
+    try ctl.append(&snapshot, .authroot, encoded);
+    try std.testing.expectEqual(platform.Decision.anchor, try snapshot.check("program certificate", request_use, hasher, allocator));
+    request_use.now_seconds = 2_100_000_000;
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, snapshot.check("program certificate", request_use, hasher, allocator));
+    request_use.now_seconds = use.now_seconds;
+    const denied = try fixtures.content(allocator, .{ .usage_oid = ctl.disallowed_usage, .entries = &.{.{ .identifier = &identifier }} });
+    defer allocator.free(denied);
+    try ctl.append(&snapshot, .disallowed, denied);
+    request_use.custom_anchor = true;
+    try std.testing.expectEqual(platform.Decision.deny, try snapshot.check("program certificate", request_use, hasher, allocator));
+}

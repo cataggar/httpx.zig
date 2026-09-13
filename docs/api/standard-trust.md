@@ -158,7 +158,7 @@ malformed/unsupported custom anchors fail initialization.
 | x86_64 Linux | Same implementation | DER/PEM/file | Source/type compilation; native runtime still requires CI |
 | FreeBSD/OpenBSD/NetBSD/DragonFly/illumos/Haiku/Serenity | Zig stdlib designated CA file | DER/PEM/file | Implemented file-store dispatch; not runtime-qualified here |
 | macOS desktop | Security/CoreFoundation anchor and trust-settings snapshot | DER/PEM/file or supplied provider | Implemented; source/type compilation here; native CI required |
-| Windows | Crypt32 ROOT/Disallowed metadata snapshot, **blocked when unsupported CTLs exist** | DER/PEM/file or supplied provider | Partial system profile; source/link compilation, not native runtime qualification |
+| Windows | Crypt32 ROOT/Disallowed plus bounded local CTL metadata; unsupported forms fail closed | DER/PEM/file or supplied provider | Strict profile implemented; source/link checks, native execution still pending |
 | Other targets, including Mac Catalyst | Explicit `TlsTrustStoreLoadFailed` | Where the target supports required Zig allocation/IO | Not qualified |
 
 Windows links Crypt32. macOS links Security and CoreFoundation. These are
@@ -174,7 +174,7 @@ architectures; it does not omit the framework links or vendor an SDK.
 Linux/custom policy remains pure Zig, with no added Linux native linkage.
 Downstream build integration must propagate the same platform links.
 
-### Windows snapshot and pending CTL support
+### Windows snapshot and CTL profile
 
 Read-only, existing logical ROOT and Disallowed stores are inspected in current
 user and local machine scope. Duplicate restrictions intersect; explicit
@@ -191,17 +191,37 @@ constraints, chain policies, and not-before issuance/purpose properties
 `CERT_NOT_BEFORE_ENHKEY_USAGE_PROP_ID` 127) exclude the affected certificate. Property
 errors, malformed values, and size races fail initialization.
 
-Hash-only CTLs are **not yet implemented**. CTLs found in logical stores, or
-cached AuthRoot/Disallowed CTL values detected through existing read-only Zig
-NT registry bindings, fail initialization. This can block ordinary provisioned
-Windows machines; general Windows system trust is not claimed complete.
-Completing it needs bounded CTL interpretation and canonical binding
-runtime integration. `metadata_digest.zig` and `policy_binding.zig` define the chosen
-separate identifier-hash/paired-view contract without changing ABI-v1 request
-or vtable layouts. The native CTL loader is still guarded at this checkpoint.
-Detection is not a permanent OS/API blocker and must not be removed merely
-to make CI green.
-The loader never downloads roots or invokes a native chain engine.
+The loader enumerates local CTLs and reads cached AuthRoot/Disallowed values
+using Zig's existing read-only NT registry APIs. `CertCreateCTLContext` decodes
+a copied, non-persisted CMS context; bounded pure-Zig policy parsing consumes
+its CTL_INFO content. No CMS signature/chain verification or root retrieval is
+requested. Metadata authority comes from the local OS store/cache, **not** an
+arbitrary downloaded CMS object. Test-only unsigned envelopes exercise decoding
+and do not establish trust.
+
+The supported CTL profile uses whole-certificate SHA-1/256/384/512 identifiers,
+with additional SHA-256 consistency checks when present. SHA-1 requires the
+explicit binding and provider deployment opt-ins. MD5 identifiers, signature-
+or public-key-hash selectors, unknown attributes, multiple values, and CTL-wide
+extensions fail closed. AuthRoot's bounded friendly-name/key-ID/subject-name
+locator fields are not alternate matching keys; no MD5 computation is enabled.
+Purpose, disable-time, and unsupported issuance/policy restrictions are
+retained rather than discarded.
+
+Certificates found in the local AuthRoot cache are marked as program material
+without adding anchors. System anchors marked this way must appear in every
+applicable current AuthRoot list. Missing/expired program metadata fails closed.
+Explicit custom anchors need not belong to Microsoft's root program, but
+applicable distrust and other restrictions still apply to custom duplicates.
+List times are evaluated against each request's current time, with no hidden
+cache refresh. This can reject stale or unsupported platform state; full OS
+chain-engine parity and general Windows native qualification are not claimed.
+
+`metadata_digest.zig` and `policy_binding.zig` carry identifier hashing without
+changing ABI-v1 request or existing vtable layouts. The trust implementation
+does not request or use identifier digests while loading roots: lookups occur
+only during bound verification, so
+immutable root ownership remains independent of the primitive backend.
 
 The paired view accepts only its exact signature context/vtable, and rejects
 different signature/digest contexts. The runtime must obtain both operations
@@ -231,11 +251,14 @@ restrictions, checks list times against the request's current time, and caches
 digests only on the verification stack. A secondary SHA-256 mismatch rejects
 the certificate rather than dropping its restriction. Hashes are evaluated on
 selected path certificates through the binding; they never add anchor entries.
-The current limits are eight lists and 16,384 total records. Missing digest
+The current limits are 16 MiB per encoded/decoded CTL, eight lists, 16,384 total
+records, and 64 attributes per record. Missing digest
 support fails closed; hash allocation failures remain `OutOfMemory`. Hermetic
 tests exercise this plumbing with real selected standard-provider hashes and
-signatures. Shared production adapter/runtime wiring and native CTL decoding
-have not yet been incorporated here.
+signatures, and verify CTL parsing/ownership/bounds. Shared production adapter
+and runtime wiring remain separate integration work. Direct native policy
+tests use a test-only adapter implementing the same contract, not a claim that
+production HTTPX TLS calls are already wired.
 
 ### macOS snapshot and strict projection
 

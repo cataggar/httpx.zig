@@ -506,7 +506,7 @@ fn decimal(bytes: []const u8) Error!i64 {
     return result;
 }
 
-fn parseTime(element: Element) Error!i64 {
+pub fn parseTime(element: Element) Error!i64 {
     const bytes = element.content;
     const year_len: usize = switch (element.tag) {
         0x17 => 2,

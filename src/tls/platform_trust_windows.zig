@@ -5,35 +5,46 @@ const windows = std.os.windows;
 const crypt32 = windows.crypt32;
 const metadata = @import("platform_trust.zig");
 const x509 = @import("x509_policy.zig");
+const ctl_policy = @import("windows_ctl.zig");
 const Error = @import("trust.zig").TrustError;
 const Allocator = std.mem.Allocator;
 const not_found: u32 = 0x80092004; // CRYPT_E_NOT_FOUND
 
 extern "crypt32" fn CertGetEnhancedKeyUsage(*const crypt32.CERT_CONTEXT, u32, ?*anyopaque, *u32) callconv(.winapi) windows.BOOL;
 extern "crypt32" fn CertGetCertificateContextProperty(*const crypt32.CERT_CONTEXT, u32, ?*anyopaque, *u32) callconv(.winapi) windows.BOOL;
-extern "crypt32" fn CertEnumCTLsInStore(crypt32.HCERTSTORE, ?*const anyopaque) callconv(.winapi) ?*const anyopaque;
-extern "crypt32" fn CertFreeCTLContext(?*const anyopaque) callconv(.winapi) windows.BOOL;
+const CtlContext = extern struct {
+    encoding: crypt32.ENCODING.TYPE,
+    encoded: [*]const u8,
+    encoded_length: u32,
+    info: *const anyopaque,
+    store: ?crypt32.HCERTSTORE,
+    message: ?*anyopaque,
+    content: [*]const u8,
+    content_length: u32,
+};
+extern "crypt32" fn CertEnumCTLsInStore(crypt32.HCERTSTORE, ?*const CtlContext) callconv(.winapi) ?*const CtlContext;
+extern "crypt32" fn CertFreeCTLContext(?*const CtlContext) callconv(.winapi) windows.BOOL;
+extern "crypt32" fn CertCreateCTLContext(crypt32.ENCODING.TYPE, [*]const u8, u32) callconv(.winapi) ?*const CtlContext;
 extern "crypt32" fn CertCreateCertificateContext(crypt32.ENCODING.TYPE, [*]const u8, u32) callconv(.winapi) ?*const crypt32.CERT_CONTEXT;
 
 pub fn load(allocator: Allocator, limits: metadata.Limits) Error!metadata.Snapshot {
     if (comptime builtin.os.tag != .windows) return error.TlsTrustStoreLoadFailed;
-    if (try hasUnsupportedCachedCtl()) return error.TlsTrustStoreLoadFailed;
     var snapshot = metadata.Snapshot.init(allocator, limits);
     errdefer snapshot.deinit();
+    try readCachedCtls(&snapshot);
     // CURRENT_USER's logical ROOT includes machine roots; explicitly read
     // machine scope too so restrictive duplicate properties intersect.
     for ([_]u16{ 1, 2 }) |scope| {
-        try readStore(&snapshot, scope, std.unicode.utf8ToUtf16LeStringLiteral("ROOT"), true);
-        try readStore(&snapshot, scope, std.unicode.utf8ToUtf16LeStringLiteral("Disallowed"), false);
+        try readStore(&snapshot, scope, std.unicode.utf8ToUtf16LeStringLiteral("ROOT"), .roots);
+        try readStore(&snapshot, scope, std.unicode.utf8ToUtf16LeStringLiteral("Disallowed"), .disallowed);
     }
+    // Cache membership marks program roots, but never imports additional
+    // anchors. Their current AuthRoot CTL membership is checked at verification.
+    try readStore(&snapshot, 2, std.unicode.utf8ToUtf16LeStringLiteral("AuthRoot"), .authroot_cache);
     return snapshot;
 }
 
-/// Cached AuthRoot/Disallowed CTLs live outside the logical certificate stores.
-/// Until their hash-only entries can be matched through an approved primitive
-/// seam, detecting them must block discovery rather than silently omit them.
-pub fn hasUnsupportedCachedCtl() Error!bool {
-    if (comptime builtin.os.tag != .windows) return false;
+fn readCachedCtls(snapshot: *metadata.Snapshot) Error!void {
     const path = std.unicode.utf8ToUtf16LeStringLiteral("\\Registry\\Machine\\SOFTWARE\\Microsoft\\SystemCertificates\\AuthRoot\\AutoUpdate");
     var name = windows.UNICODE_STRING.init(path);
     const attributes: windows.OBJECT.ATTRIBUTES = .{ .ObjectName = &name };
@@ -41,41 +52,84 @@ pub fn hasUnsupportedCachedCtl() Error!bool {
     // KEY_QUERY_VALUE | KEY_WOW64_64KEY, never write/create access.
     switch (windows.ntdll.NtOpenKey(&key, .{ .SPECIFIC = .{ .bits = 0x0101 } }, &attributes)) {
         .SUCCESS => {},
-        .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return false,
+        .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return,
         else => return error.TlsTrustStoreLoadFailed,
     }
     defer _ = windows.ntdll.NtClose(key);
-    inline for (.{ "EncodedCtl", "DisallowedCertEncodedCtl" }) |value| {
-        var value_name = windows.UNICODE_STRING.init(std.unicode.utf8ToUtf16LeStringLiteral(value));
-        var buffer: [16]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = undefined;
+    const values = [_]struct { name: [:0]const u16, kind: metadata.FingerprintList.Kind }{
+        .{ .name = std.unicode.utf8ToUtf16LeStringLiteral("EncodedCtl"), .kind = .authroot },
+        .{ .name = std.unicode.utf8ToUtf16LeStringLiteral("DisallowedCertEncodedCtl"), .kind = .disallowed },
+    };
+    for (values) |value| {
+        var value_name = windows.UNICODE_STRING.init(value.name);
+        const Header = windows.KEY.VALUE.PARTIAL_INFORMATION;
+        var header: [@sizeOf(Header)]u8 align(@alignOf(Header)) = undefined;
         var length: u32 = 0;
-        switch (windows.ntdll.NtQueryValueKey(key, &value_name, .Partial, &buffer, buffer.len, &length)) {
-            .SUCCESS, .BUFFER_OVERFLOW, .BUFFER_TOO_SMALL => return true,
-            .OBJECT_NAME_NOT_FOUND => {},
+        switch (windows.ntdll.NtQueryValueKey(key, &value_name, .Partial, &header, header.len, &length)) {
+            .SUCCESS, .BUFFER_OVERFLOW, .BUFFER_TOO_SMALL => {},
+            .OBJECT_NAME_NOT_FOUND => continue,
             else => return error.TlsTrustStoreLoadFailed,
         }
+        if (length <= @sizeOf(Header) or length - @sizeOf(Header) > snapshot.limits.max_ctl_bytes)
+            return error.TlsTrustStoreLoadFailed;
+        const buffer = try snapshot.allocator.alignedAlloc(u8, .of(Header), length);
+        defer snapshot.allocator.free(buffer);
+        var actual: u32 = 0;
+        if (windows.ntdll.NtQueryValueKey(key, &value_name, .Partial, buffer.ptr, length, &actual) != .SUCCESS or actual != length)
+            return error.TlsTrustStoreLoadFailed;
+        try appendEncodedCtl(snapshot, value.kind, try registryPayload(buffer));
     }
-    return false;
 }
 
-fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, roots: bool) Error!void {
-    const store = crypt32.CertOpenStore(.SYSTEM_W, .{}, .NULL, .{
+fn registryPayload(buffer: []align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) const u8) Error![]const u8 {
+    const Header = windows.KEY.VALUE.PARTIAL_INFORMATION;
+    if (buffer.len <= @sizeOf(Header)) return error.TlsTrustStoreLoadFailed;
+    const info: *const Header = @ptrCast(buffer.ptr);
+    if (info.Type != .BINARY or info.DataLength != buffer.len - @offsetOf(Header, "Data"))
+        return error.TlsTrustStoreLoadFailed;
+    return info.data();
+}
+
+fn appendEncodedCtl(snapshot: *metadata.Snapshot, kind: metadata.FingerprintList.Kind, encoded: []const u8) Error!void {
+    if (encoded.len == 0 or encoded.len > snapshot.limits.max_ctl_bytes or
+        snapshot.fingerprint_lists.items.len >= snapshot.limits.max_fingerprint_lists)
+        return error.TlsTrustStoreLoadFailed;
+    // This API decodes a copied, non-persisted context. No CMS/chain signature
+    // verification or root retrieval is requested. Provenance is the local OS
+    // store/cache, never an arbitrary downloaded CMS object.
+    const context = CertCreateCTLContext(.{ .CERT = .ASN, .CMSG = .ASN }, encoded.ptr, @intCast(encoded.len)) orelse
+        return error.TlsTrustStoreLoadFailed;
+    defer _ = CertFreeCTLContext(context);
+    try ctl_policy.append(snapshot, kind, context.content[0..context.content_length]);
+}
+
+const StoreKind = enum { roots, disallowed, authroot_cache };
+
+fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, kind: StoreKind) Error!void {
+    const provider: crypt32.CERT_STORE.PROV = if (kind == .authroot_cache) .SYSTEM_REGISTRY_W else .SYSTEM_W;
+    const store = crypt32.CertOpenStore(provider, .{}, .NULL, .{
         .OPEN_EXISTING = true,
         .READONLY = true,
         .Reserved16 = scope,
     }, name) orelse {
         // An absent disallowed store is distinct from an unreadable store.
         const code = @intFromEnum(windows.GetLastError());
-        if (!roots and (code == 2 or code == not_found)) return;
+        if (kind != .roots and (code == 2 or code == not_found)) return;
         return error.TlsTrustStoreLoadFailed;
     };
     defer _ = crypt32.CertCloseStore(store, .{});
-    if (CertEnumCTLsInStore(store, null)) |ctl| {
-        _ = CertFreeCTLContext(ctl);
-        // Hash-only CTL matching is not exposed by the signature-only ABI.
-        return error.TlsTrustStoreLoadFailed;
+    var ctl: ?*const CtlContext = null;
+    defer if (ctl) |current| {
+        _ = CertFreeCTLContext(current);
+    };
+    while (true) {
+        ctl = CertEnumCTLsInStore(store, ctl);
+        const current = ctl orelse {
+            if (@intFromEnum(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
+            break;
+        };
+        try ctl_policy.append(snapshot, if (kind == .disallowed) .disallowed else .authroot, current.content[0..current.content_length]);
     }
-    if (@intFromEnum(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
     var current: ?*crypt32.CERT_CONTEXT = null;
     defer if (current) |certificate| {
         _ = crypt32.CertFreeCertificateContext(certificate);
@@ -90,9 +144,10 @@ fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, roo
         };
         count += 1;
         if (count > snapshot.limits.max_certificates) return error.TlsTrustStoreLoadFailed;
-        const index = try snapshot.add(certificate.pbCertEncoded[0..certificate.cbCertEncoded], roots);
-        const policy = if (roots) try readPolicy(snapshot, certificate) else metadata.Windows{ .roles = 0 };
+        const index = try snapshot.add(certificate.pbCertEncoded[0..certificate.cbCertEncoded], kind == .roots);
+        const policy = if (kind != .disallowed) try readPolicy(snapshot, certificate) else metadata.Windows{ .roles = 0 };
         const entry = &snapshot.entries.items[index];
+        entry.authroot_program = entry.authroot_program or kind == .authroot_cache;
         if (entry.windows) |*prior| prior.merge(policy) else entry.windows = policy;
     }
 }
@@ -355,6 +410,19 @@ test "Windows time and disabled purpose metadata are strict" {
     try std.testing.expectError(error.TlsMalformedCertificate, deniedRoles("\x30\x03\x06\x02\x00"));
 }
 
+test "Windows registry CTL payload rejects wrong types and inconsistent sizes" {
+    var buffer: [16]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = @splat(0);
+    std.mem.writeInt(u32, buffer[4..8], 3, .little);
+    std.mem.writeInt(u32, buffer[8..12], 4, .little);
+    @memcpy(buffer[12..], "data");
+    try std.testing.expectEqualStrings("data", try registryPayload(&buffer));
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, registryPayload(buffer[0..8]));
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, registryPayload(buffer[0..12]));
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, registryPayload(buffer[0..15]));
+    std.mem.writeInt(u32, buffer[4..8], 1, .little);
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, registryPayload(&buffer));
+}
+
 test "native Windows reads effective EKU from an in-memory certificate without changing system stores" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const fixtures = @import("trust_fixtures.zig");
@@ -369,4 +437,23 @@ test "native Windows reads effective EKU from an in-memory certificate without c
         return error.TlsTrustStoreLoadFailed;
     defer _ = crypt32.CertFreeCertificateContext(root);
     try std.testing.expectEqual(@as(u2, 3), try effectiveRoles(std.testing.allocator, 4096, root));
+}
+
+test "native Windows CTL decoding owns restrictions after releasing process-local CMS data" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const fixtures = @import("ctl_fixtures.zig");
+    var snapshot = metadata.Snapshot.init(std.testing.allocator, .{});
+    defer snapshot.deinit();
+    {
+        const content = try fixtures.content(std.testing.allocator, .{
+            .entries = &.{.{ .identifier = &@as([20]u8, @splat(1)) }},
+        });
+        defer std.testing.allocator.free(content);
+        const encoded = try fixtures.envelope(std.testing.allocator, content);
+        defer std.testing.allocator.free(encoded);
+        try appendEncodedCtl(&snapshot, .authroot, encoded);
+    }
+    try std.testing.expectEqual(@as(usize, 0), snapshot.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.fingerprint_entries);
+    try std.testing.expectEqualSlices(u8, &@as([20]u8, @splat(1)), snapshot.fingerprint_lists.items[0].entries[0].identifier[0..20]);
 }
