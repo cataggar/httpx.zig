@@ -8,6 +8,9 @@ const Socket = @import("../net/socket.zig").Socket;
 const io_util = @import("../io/any_io.zig");
 const alpn = @import("alpn.zig");
 const Identity = @import("server_identity.zig").Identity;
+const io_context = @import("../io/context.zig");
+const IoContext = io_context.IoContext;
+const HandshakeIoOptions = @import("server.zig").HandshakeIoOptions;
 
 const max_plaintext = 16384;
 const max_message = max_plaintext + 4;
@@ -244,6 +247,7 @@ fn Wire(comptime Transport: type) type {
         const Self = @This();
         socket: *Transport,
         provider: p.CryptoProvider,
+        io_options: ?HandshakeIoOptions = null,
         version: tls.ProtocolVersion = .tls_1_2,
         suite: tls.CipherSuite = .AES_128_GCM_SHA256,
         read_epoch: ?Epoch = null,
@@ -255,24 +259,39 @@ fn Wire(comptime Transport: type) type {
         initial: bool = true,
         skipped_ccs: usize = 0,
 
-        fn receiveAll(self: *Self, out: []u8) !void {
+        fn operationContext(self: *const Self, comptime direction: enum { read, write }) ?IoContext {
+            const options = self.io_options orelse return null;
+            const budget = if (direction == .read) options.read_timeout_ms else options.write_timeout_ms;
+            return IoContext.init(.{
+                .parent = options.context,
+                .phase_deadline = if (budget) |ms| io_context.Deadline.afterMs(ms) else null,
+            });
+        }
+
+        fn receiveAll(self: *Self, out: []u8, context: ?*const IoContext) !void {
+            if (context) |ctx| try ctx.check();
             var offset: usize = 0;
             while (offset < out.len) {
-                const count = try self.socket.recv(out[offset..]);
+                if (context) |ctx| try ctx.check();
+                const result = if (context) |ctx|
+                    self.socket.recvWithContext(out[offset..], ctx)
+                else
+                    self.socket.recv(out[offset..]);
+                const count = if (context) |ctx| try ctx.unwrapAfterBlocking(usize, result) else try result;
                 if (count == 0) return error.UnexpectedEof;
                 offset += count;
             }
         }
 
-        fn receiveRecord(self: *Self) !struct { kind: u8, bytes: []const u8 } {
+        fn receiveRecord(self: *Self, context: ?*const IoContext) !struct { kind: u8, bytes: []const u8 } {
             var header: [5]u8 = undefined;
-            try self.receiveAll(&header);
+            try self.receiveAll(&header, context);
             if (header[1] != 3 or header[2] > 3 or header[2] < (if (self.initial) @as(u8, 1) else 3))
                 return error.TlsIllegalParameter;
             const length = std.mem.readInt(u16, header[3..5], .big);
             if (length > self.record_buffer.len) return error.TlsRecordOverflow;
             const body = self.record_buffer[0..length];
-            try self.receiveAll(body);
+            try self.receiveAll(body, context);
             if (self.read_epoch) |*epoch| {
                 if (self.version == .tls_1_3 and header[0] == 20) {
                     if (!std.mem.eql(u8, body, "\x01") or self.skipped_ccs == 8) return error.TlsUnexpectedMessage;
@@ -281,7 +300,8 @@ fn Wire(comptime Transport: type) type {
                 }
                 if (self.version == .tls_1_3 and header[0] != 23) return error.TlsUnexpectedMessage;
                 const next_sequence = std.math.add(u64, epoch.sequence, 1) catch return error.TlsSequenceOverflow;
-                var plaintext = try record.open(self.provider, self.version, self.suite, body, &header, &epoch.keys.key, &epoch.keys.iv, epoch.sequence);
+                const opened = record.open(self.provider, self.version, self.suite, body, &header, &epoch.keys.key, &epoch.keys.iv, epoch.sequence);
+                var plaintext = if (context) |ctx| try ctx.unwrapAfterBlocking([]u8, opened) else try opened;
                 epoch.sequence = next_sequence;
                 var kind = header[0];
                 if (self.version == .tls_1_3) {
@@ -298,8 +318,11 @@ fn Wire(comptime Transport: type) type {
         }
 
         fn next(self: *Self, expected: u8) ![]const u8 {
+            var phase = self.operationContext(.read);
+            const context = if (phase) |*ctx| ctx else null;
             var empty_records: usize = 0;
             while (true) {
+                if (context) |ctx| try ctx.check();
                 const available = self.end - self.start;
                 if (available >= 4) {
                     const length = 4 + @as(usize, std.mem.readInt(u24, self.pending[self.start + 1 ..][0..3], .big));
@@ -317,7 +340,7 @@ fn Wire(comptime Transport: type) type {
                     self.start = 0;
                     self.end = available;
                 }
-                const incoming = try self.receiveRecord();
+                const incoming = try self.receiveRecord(context);
                 if (incoming.kind == 20 and self.version == .tls_1_3 and self.read_epoch != null) continue;
                 if (incoming.kind == 21) return error.TlsAlert;
                 if (incoming.kind != 22) return error.TlsUnexpectedMessage;
@@ -339,8 +362,11 @@ fn Wire(comptime Transport: type) type {
         }
 
         fn expectCcs(self: *Self) !void {
+            var phase = self.operationContext(.read);
+            const context = if (phase) |*ctx| ctx else null;
+            if (context) |ctx| try ctx.check();
             try self.requireBoundary();
-            const incoming = try self.receiveRecord();
+            const incoming = try self.receiveRecord(context);
             if (incoming.kind != 20 or !std.mem.eql(u8, incoming.bytes, "\x01")) return error.TlsUnexpectedMessage;
         }
 
@@ -350,6 +376,21 @@ fn Wire(comptime Transport: type) type {
         }
 
         fn sendRecord(self: *Self, kind: u8, plaintext: []const u8) !void {
+            var phase = self.operationContext(.write);
+            return self.sendRecordWithContext(kind, plaintext, if (phase) |*ctx| ctx else null);
+        }
+
+        fn sendPacket(self: *Self, packet: []const u8, context: ?*const IoContext) !void {
+            if (context) |ctx| {
+                try ctx.check();
+                const result = self.socket.sendAllWithContext(packet, ctx);
+                return ctx.unwrapAfterBlocking(void, result);
+            }
+            return self.socket.sendAll(packet);
+        }
+
+        fn sendRecordWithContext(self: *Self, kind: u8, plaintext: []const u8, context: ?*const IoContext) !void {
+            if (context) |ctx| try ctx.check();
             if (plaintext.len > max_plaintext) return error.TlsRecordOverflow;
             var packet: [max_plaintext + 256 + 5]u8 = undefined;
             defer p.secureWipe(&packet);
@@ -369,22 +410,29 @@ fn Wire(comptime Transport: type) type {
                 const explicit_nonce: usize = if (self.version == .tls_1_2 and profile(self.suite).aead != .chacha20_poly1305) 8 else 0;
                 std.mem.writeInt(u16, packet[3..5], @intCast(inner_length + explicit_nonce + 16), .big);
                 const next_sequence = std.math.add(u64, epoch.sequence, 1) catch return error.TlsSequenceOverflow;
-                const sealed = try record.seal(self.provider, self.version, self.suite, packet[5..], inner[0..inner_length], packet[0..5], &epoch.keys.key, &epoch.keys.iv, epoch.sequence);
+                const sealed = record.seal(self.provider, self.version, self.suite, packet[5..], inner[0..inner_length], packet[0..5], &epoch.keys.key, &epoch.keys.iv, epoch.sequence) catch |err| {
+                    if (context) |ctx| try ctx.check();
+                    return err;
+                };
                 epoch.sequence = next_sequence;
-                try self.socket.sendAll(packet[0 .. 5 + sealed.len]);
+                try self.sendPacket(packet[0 .. 5 + sealed.len], context);
             } else {
                 std.mem.writeInt(u16, packet[3..5], @intCast(plaintext.len), .big);
                 @memcpy(packet[5..][0..plaintext.len], plaintext);
-                try self.socket.sendAll(packet[0 .. 5 + plaintext.len]);
+                try self.sendPacket(packet[0 .. 5 + plaintext.len], context);
             }
         }
 
         fn send(self: *Self, transcript: anytype, message: []const u8) !void {
-            try transcript.update(message);
+            var phase = self.operationContext(.write);
+            const context = if (phase) |*ctx| ctx else null;
+            if (context) |ctx| try ctx.check();
+            const updated = transcript.update(message);
+            if (context) |ctx| try ctx.unwrapAfterBlocking(void, updated) else try updated;
             var offset: usize = 0;
             while (offset < message.len) {
                 const length = @min(max_plaintext, message.len - offset);
-                try self.sendRecord(22, message[offset..][0..length]);
+                try self.sendRecordWithContext(22, message[offset..][0..length], context);
                 offset += length;
             }
         }
@@ -751,6 +799,21 @@ fn handshake12(comptime hash: p.HashAlgorithm, conn: *engine.Connection, wire: *
 }
 
 pub fn accept(allocator: std.mem.Allocator, socket: *Socket, protocols: []const []const u8, server_config: ?engine.ServerTLSConfig) !engine.Connection {
+    return acceptInternal(allocator, socket, protocols, server_config, null);
+}
+
+pub fn acceptWithIo(allocator: std.mem.Allocator, socket: *Socket, protocols: []const []const u8, server_config: ?engine.ServerTLSConfig, options: HandshakeIoOptions) !engine.Connection {
+    try options.context.check();
+    var connection = acceptInternal(allocator, socket, protocols, server_config, options) catch |err| {
+        try options.context.check();
+        return err;
+    };
+    errdefer connection.deinit();
+    try options.context.check();
+    return connection;
+}
+
+fn acceptInternal(allocator: std.mem.Allocator, socket: *Socket, protocols: []const []const u8, server_config: ?engine.ServerTLSConfig, options: ?HandshakeIoOptions) !engine.Connection {
     const config = server_config orelse return error.TlsInvalidPrivateKey;
     if (config.cert_chain_der.len == 0 or config.cert_chain_der.len > 16) return error.TlsNoCertificates;
     var total: usize = 0;
@@ -790,7 +853,7 @@ pub fn accept(allocator: std.mem.Allocator, socket: *Socket, protocols: []const 
     const provider = conn.cryptoProvider();
     const capabilities = try provider.capabilities();
     if (!capabilities.random or !capabilities.constant_time_equal) return error.UnsupportedAlgorithm;
-    var wire: Wire(Socket) = .{ .socket = socket, .provider = provider };
+    var wire: Wire(Socket) = .{ .socket = socket, .provider = provider, .io_options = options };
     defer p.secureWipeValue(&wire);
     const client_message = try wire.next(1);
     const hello = try parseHello(client_message);
@@ -948,6 +1011,16 @@ const MemoryTransport = struct {
         try self.outgoing.appendSlice(std.testing.allocator, bytes);
     }
 
+    fn recvWithContext(self: *MemoryTransport, out: []u8, context: *const IoContext) !usize {
+        try context.check();
+        return self.recv(out);
+    }
+
+    fn sendAllWithContext(self: *MemoryTransport, bytes: []const u8, context: *const IoContext) !void {
+        try context.check();
+        return self.sendAll(bytes);
+    }
+
     fn deinit(self: *MemoryTransport) void {
         self.outgoing.deinit(std.testing.allocator);
     }
@@ -997,7 +1070,7 @@ test "server runtime fragments complete large certificate messages without trunc
     };
     var offset: usize = 0;
     for (0..2) |_| {
-        const incoming = try receiver.receiveRecord();
+        const incoming = try receiver.receiveRecord(null);
         try std.testing.expectEqual(22, incoming.kind);
         try std.testing.expect(incoming.bytes.len <= max_plaintext);
         try std.testing.expectEqualSlices(u8, message[offset..][0..incoming.bytes.len], incoming.bytes);
@@ -1033,7 +1106,7 @@ test "server runtime never substitutes a rejected record provider" {
     try std.testing.expectEqual(0, wire.write_epoch.?.sequence);
     const invalid = "\x17\x03\x03\x00\x11".* ++ @as([17]u8, @splat(0));
     transport.incoming = &invalid;
-    try std.testing.expectError(error.TlsDecryptError, wire.receiveRecord());
+    try std.testing.expectError(error.TlsDecryptError, wire.receiveRecord(null));
     try std.testing.expectEqual(0, wire.read_epoch.?.sequence);
 }
 
@@ -1046,21 +1119,237 @@ test "server runtime advances encrypted record sequence before partial transport
             self.written += @min(bytes.len, 7);
             return self.failure;
         }
+
+        fn sendAllWithContext(self: *@This(), bytes: []const u8, context: *const IoContext) !void {
+            try context.check();
+            return self.sendAll(bytes);
+        }
     };
     var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
     for ([_]tls.ProtocolVersion{ .tls_1_2, .tls_1_3 }) |version| {
         for ([_]anyerror{ error.WriteFailed, error.Cancelled, error.Timeout }) |failure| {
-            var transport = PartialTransport{ .failure = failure };
-            var wire: Wire(PartialTransport) = .{
+            for ([_]bool{ false, true }) |with_context| {
+                const context = IoContext.init(.{});
+                var transport = PartialTransport{ .failure = failure };
+                var wire: Wire(PartialTransport) = .{
+                    .socket = &transport,
+                    .provider = standard.provider(),
+                    .version = version,
+                    .suite = if (version == .tls_1_3) .AES_128_GCM_SHA256 else .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                    .write_epoch = .{ .keys = .{} },
+                    .io_options = if (with_context) .{ .context = &context } else null,
+                };
+                try std.testing.expectError(failure, wire.sendRecord(22, "\x0e\x00\x00\x00"));
+                try std.testing.expectEqual(@as(usize, 7), transport.written);
+                try std.testing.expectEqual(@as(u64, 1), wire.write_epoch.?.sequence);
+            }
+        }
+    }
+}
+
+test "TLS server context preserves fatal alerts malformed records and unauthenticated EOF errors" {
+    var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    const context = IoContext.init(.{});
+    const cases = .{
+        .{ "\x15\x03\x03\x00\x02\x02\x50", error.TlsAlert },
+        .{ "\x16\x03\x00\x00\x00", error.TlsIllegalParameter },
+        .{ "\x16\x03", error.UnexpectedEof },
+    };
+    inline for (cases) |case| {
+        var transport = MemoryTransport{ .incoming = case[0] };
+        defer transport.deinit();
+        var wire: Wire(MemoryTransport) = .{
+            .socket = &transport,
+            .provider = standard.provider(),
+            .io_options = .{ .context = &context },
+        };
+        try std.testing.expectError(case[1], wire.next(1));
+    }
+    const invalid = "\x17\x03\x03\x00\x11".* ++ @as([17]u8, @splat(0));
+    var transport = MemoryTransport{ .incoming = &invalid };
+    defer transport.deinit();
+    var wire: Wire(MemoryTransport) = .{
+        .socket = &transport,
+        .provider = standard.provider(),
+        .version = .tls_1_3,
+        .read_epoch = .{ .keys = .{} },
+        .io_options = .{ .context = &context },
+    };
+    try std.testing.expectError(error.TlsDecryptError, wire.next(1));
+    try std.testing.expectEqual(@as(u64, 0), wire.read_epoch.?.sequence);
+    try std.testing.expect(std.mem.allEqual(u8, wire.record_buffer[0..1], 0));
+}
+
+const DeadlineTransport = struct {
+    memory: MemoryTransport = .{ .chunk = 1 },
+    deadline: ?io_context.Deadline = null,
+    read_calls: usize = 0,
+    write_calls: usize = 0,
+
+    fn observe(self: *@This(), context: *const IoContext) !void {
+        const deadline = context.selectedDeadline().?.deadline;
+        if (self.deadline) |original| {
+            try std.testing.expectEqual(original.at_ns, deadline.at_ns);
+        } else self.deadline = deadline;
+    }
+
+    fn recv(self: *@This(), out: []u8) !usize {
+        return self.memory.recv(out);
+    }
+
+    fn recvWithContext(self: *@This(), out: []u8, context: *const IoContext) !usize {
+        self.read_calls += 1;
+        try self.observe(context);
+        if (self.memory.offset == 9) {
+            // Advance the observation time, not the context's actual deadline.
+            try context.checkAt(self.deadline.?.at_ns);
+            return error.FixtureDeadlineWasReset;
+        }
+        return self.recv(out);
+    }
+
+    fn sendAll(self: *@This(), bytes: []const u8) !void {
+        return self.memory.sendAll(bytes);
+    }
+
+    fn sendAllWithContext(self: *@This(), bytes: []const u8, context: *const IoContext) !void {
+        self.write_calls += 1;
+        try self.observe(context);
+        if (self.write_calls == 2) {
+            try self.memory.sendAll(bytes[0..@min(bytes.len, 7)]);
+            try context.checkAt(self.deadline.?.at_ns);
+            return error.FixtureDeadlineWasReset;
+        }
+        return self.sendAll(bytes);
+    }
+};
+
+test "TLS server context read deadline spans partial headers bodies and handshake records" {
+    var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var transport = DeadlineTransport{};
+    defer transport.memory.deinit();
+    var writer: Wire(DeadlineTransport) = .{ .socket = &transport, .provider = standard.provider() };
+    try writer.sendRecord(22, "\x0e\x00");
+    try writer.sendRecord(22, "\x00\x00");
+    transport.memory.incoming = transport.memory.outgoing.items;
+    var parent = IoContext.init(.{ .request_deadline = io_context.Deadline.afterMs(10_000), .phase_deadline = io_context.Deadline.afterMs(5_000) });
+    const original_request = parent.request_deadline;
+    const original_phase = parent.phase_deadline;
+    var reader: Wire(DeadlineTransport) = .{
+        .socket = &transport,
+        .provider = standard.provider(),
+        .io_options = .{ .context = &parent, .read_timeout_ms = 2_000 },
+    };
+    try std.testing.expectError(error.Timeout, reader.next(14));
+    try std.testing.expectEqual(@as(usize, 9), transport.memory.offset);
+    try std.testing.expectEqual(@as(usize, 10), transport.read_calls);
+    try std.testing.expect(transport.deadline.?.at_ns < original_phase.?.at_ns);
+    try std.testing.expectEqual(original_request, parent.request_deadline);
+    try std.testing.expectEqual(original_phase, parent.phase_deadline);
+}
+
+test "TLS server context write deadline spans record fragments and retains consumed nonces" {
+    const Transcript = struct {
+        fn update(_: *@This(), _: []const u8) !void {}
+    };
+    var transcript = Transcript{};
+    var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var transport = DeadlineTransport{};
+    defer transport.memory.deinit();
+    var parent = IoContext.init(.{ .request_deadline = io_context.Deadline.afterMs(10_000) });
+    const original = parent.request_deadline;
+    var writer: Wire(DeadlineTransport) = .{
+        .socket = &transport,
+        .provider = standard.provider(),
+        .version = .tls_1_3,
+        .write_epoch = .{ .keys = .{} },
+        .io_options = .{ .context = &parent, .write_timeout_ms = 2_000 },
+    };
+    const message: [max_plaintext + 1]u8 = @splat(0x42);
+    try std.testing.expectError(error.Timeout, writer.send(&transcript, &message));
+    try std.testing.expectEqual(@as(usize, 2), transport.write_calls);
+    try std.testing.expectEqual(@as(usize, max_plaintext + 1 + 16 + 5 + 7), transport.memory.outgoing.items.len);
+    try std.testing.expectEqual(@as(u64, 2), writer.write_epoch.?.sequence);
+    try std.testing.expectEqual(original, parent.request_deadline);
+}
+
+test "TLS server context zero budgets and earliest inherited deadlines precede transport" {
+    var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    var transport = DeadlineTransport{};
+    defer transport.memory.deinit();
+    var token: @import("../core/types.zig").CancellationToken = .{};
+    var parent = IoContext.init(.{ .external_cancel = &token });
+    var wire: Wire(DeadlineTransport) = .{
+        .socket = &transport,
+        .provider = standard.provider(),
+        .io_options = .{ .context = &parent, .read_timeout_ms = 0, .write_timeout_ms = 0 },
+    };
+    try std.testing.expectError(error.Timeout, wire.next(1));
+    try std.testing.expectError(error.Timeout, wire.sendRecord(20, "\x01"));
+    wire.io_options.?.read_timeout_ms = 2_000;
+    wire.io_options.?.write_timeout_ms = 2_000;
+    parent.request_deadline = io_context.Deadline.at(0);
+    try std.testing.expectError(error.Timeout, wire.next(1));
+    try std.testing.expectError(error.Timeout, wire.sendRecord(20, "\x01"));
+    token.cancel();
+    try std.testing.expectError(error.Cancelled, wire.next(1));
+    try std.testing.expectError(error.Cancelled, wire.sendRecord(20, "\x01"));
+    try std.testing.expectEqual(@as(usize, 0), transport.read_calls);
+    try std.testing.expectEqual(@as(usize, 0), transport.write_calls);
+}
+
+test "TLS server context checks win over read and partial write failures after blocking" {
+    const Boundary = struct {
+        parent: *IoContext,
+        cancel: bool,
+        calls: usize = 0,
+        written: usize = 0,
+
+        fn boundary(self: *@This(), context: *const IoContext) !void {
+            self.calls += 1;
+            context.waitForMs(2_000) catch |err| {
+                if (err != error.Timeout) return err;
+                if (self.cancel) self.parent.cancel();
+                return;
+            };
+            return error.FixtureDeadlineMissing;
+        }
+        fn recv(_: *@This(), _: []u8) !usize {
+            return error.ReadFailed;
+        }
+        fn recvWithContext(self: *@This(), _: []u8, context: *const IoContext) !usize {
+            try self.boundary(context);
+            return error.ReadFailed;
+        }
+        fn sendAll(_: *@This(), _: []const u8) !void {
+            return error.WriteFailed;
+        }
+        fn sendAllWithContext(self: *@This(), bytes: []const u8, context: *const IoContext) !void {
+            self.written += @min(bytes.len, 7);
+            try self.boundary(context);
+            return error.WriteFailed;
+        }
+    };
+    var standard = engine.StandardCryptoProvider.init(std.testing.io, std.testing.allocator);
+    for ([_]bool{ false, true }) |cancel| {
+        for ([_]bool{ false, true }) |write| {
+            var parent = IoContext.init(.{});
+            var transport = Boundary{ .parent = &parent, .cancel = cancel };
+            var wire: Wire(Boundary) = .{
                 .socket = &transport,
                 .provider = standard.provider(),
-                .version = version,
-                .suite = if (version == .tls_1_3) .AES_128_GCM_SHA256 else .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                .version = .tls_1_3,
                 .write_epoch = .{ .keys = .{} },
+                .io_options = .{ .context = &parent, .read_timeout_ms = 20, .write_timeout_ms = 20 },
             };
-            try std.testing.expectError(failure, wire.sendRecord(22, "\x0e\x00\x00\x00"));
-            try std.testing.expectEqual(@as(usize, 7), transport.written);
-            try std.testing.expectEqual(@as(u64, 1), wire.write_epoch.?.sequence);
+            const expected = if (cancel) error.Cancelled else error.Timeout;
+            if (write) {
+                try std.testing.expectError(expected, wire.sendRecord(22, "\x0e\x00\x00\x00"));
+                try std.testing.expectEqual(@as(u64, 1), wire.write_epoch.?.sequence);
+                try std.testing.expectEqual(@as(usize, 7), transport.written);
+            } else try std.testing.expectError(expected, wire.next(1));
+            try std.testing.expectEqual(@as(usize, 1), transport.calls);
+            try std.testing.expectEqual(@as(?io_context.Deadline, null), parent.phase_deadline);
         }
     }
 }

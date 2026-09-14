@@ -60,6 +60,8 @@ const server_identity = @import("server_identity.zig");
 
 pub const server = @import("server.zig");
 pub const acceptServer = server.acceptServer;
+pub const acceptServerWithIo = server.acceptServerWithIo;
+pub const ServerHandshakeIoOptions = server.HandshakeIoOptions;
 
 pub const record_header_len = 5;
 const max_plaintext_len = 1 << 14;
@@ -1909,6 +1911,12 @@ test "TLS server ABI1 and ABI2 admission preserves exact identity before callbac
                 .identity = identity,
             };
             try testing.expectError(error.TlsCryptoProviderMismatch, @import("server_runtime.zig").accept(testing.allocator, &socket, &.{}, config));
+            const context = IoContext.init(.{});
+            try testing.expectError(error.TlsCryptoProviderMismatch, acceptServerWithIo(testing.allocator, &socket, &.{}, config, .{
+                .context = &context,
+                .read_timeout_ms = 2_000,
+                .write_timeout_ms = 2_000,
+            }));
         }
         try testing.expectEqual(@as(usize, 0), first.calls);
         try testing.expectEqual(@as(usize, 0), second.calls);
