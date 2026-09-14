@@ -279,9 +279,11 @@ MD5 is never available for HMAC, HKDF, TLS PRF, or signatures. Keyed support
 queries, wrappers, and direct standard-provider callbacks reject it, including
 empty requests; fabricated capability bits cannot authorize it. The standard
 provider also checks its deployment gate in direct raw `hashCreate` calls.
-This identifier primitive does **not** enable Windows CTL MD5 or property
-15/25 matching. Those production acceptance rules remain unchanged and require
-a separate matching-domain contract and native qualification.
+The primitive alone does not define CTL matching. The separate
+[documented Disallowed profile](./standard-trust.md#documented-disallowed-deny-identities)
+uses selected-provider P15/TBS and P25/raw-key identities under these gates;
+it does not enable bare-MD5 CTL selectors or claim full Windows chain-policy
+equivalence. Native production qualification remains a separate gate.
 
 Output must be exactly the algorithm's digest length. Every error clears the
 provided output, including invalid length, disabled/unsupported algorithms,

@@ -199,14 +199,90 @@ requested. Metadata authority comes from the local OS store/cache, **not** an
 arbitrary downloaded CMS object. Test-only unsigned envelopes exercise decoding
 and do not establish trust.
 
-The supported CTL profile uses whole-certificate SHA-1/256/384/512 identifiers,
-with additional SHA-256 consistency checks when present. SHA-1 requires the
-explicit binding and provider deployment opt-ins. MD5 identifiers, signature-
-or public-key-hash selectors, unknown attributes, multiple values, and unsupported
-CTL-wide extensions fail closed. AuthRoot's bounded friendly-name/key-ID/subject-name
-locator fields are not alternate matching keys; no MD5 computation is enabled.
+The existing whole-certificate CTL profile uses SHA-1/256/384/512 identifiers,
+with additional SHA-256 consistency checks when present. SHA-1 requires explicit
+binding permission and selected-provider capability/deployment approval.
+The dedicated Disallowed identity family below is separate from that profile.
+Bare MD5, other property selectors, unknown attributes, multiple values, and
+unsupported CTL-wide extensions still fail closed. AuthRoot's bounded
+friendly-name/key-ID/subject-name locator fields are not alternate matching keys.
 Purpose, disable-time, and unsupported issuance/policy restrictions are
 retained rather than discarded.
+
+#### Documented Disallowed deny identities
+
+Only a **Disallowed** CTL whose SubjectAlgorithm is
+`szOID_DISALLOWED_HASH` (`1.3.6.1.4.1.311.10.11.15`, absent or NULL parameters)
+uses this additional family. The
+[pinned Microsoft SDK](https://github.com/microsoft/win32metadata/blob/1bfb76db1c360653bdcb56512af0fdf987aceab8/generation/WinSDK/RecompiledIdlHeaders/um/wincrypt.h#L9440-L9482)
+aliases this identifier to property 15 and names properties 15 and 25 as
+Disallowed hashes. The
+[property contract](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatecontextproperty)
+and [`CryptHashToBeSigned`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-crypthashtobesigned)
+define the two identities:
+
+- **P15:** the signature-algorithm-selected hash of the **exact encoded
+  TBSCertificate**, including its SEQUENCE tag and length.
+- **P25:** **MD5 of raw subjectPublicKey BIT STRING payload bytes**, excluding
+  the unused-bit-count octet, BIT STRING framing, and SPKI AlgorithmIdentifier.
+  It is not MD5 of the certificate, encoded SPKI, or signature bytes.
+
+An exact full-byte **and length** match to **either** identity denies use.
+Every required identity must be calculated successfully before a nonmatch can
+allow use, including for an empty list. An already established deny may return
+early. A failed hash, denied permission, unsupported algorithm/parameter/key
+encoding, malformed DER, or allocation failure is never a nonmatch.
+Identifier widths are only bounded to supported digest output lengths
+(16/20/32/48/64); they do **not** select algorithms or domains. Identifiers are
+not truncated, split, concatenated, or silently dropped. All data is copied and
+a CTL is published only after its entire metadata validates.
+
+Inner and outer signature AlgorithmIdentifiers must have identical canonical
+DER. Supported metadata mappings are:
+
+| Signature AlgorithmIdentifier | Parameters | P15 hash |
+| --- | --- | --- |
+| RSA PKCS#1 MD5 / SHA-1 | Required NULL | MD5 / SHA-1 |
+| RSA PKCS#1 SHA-256/384/512 | NULL or absent | Corresponding SHA-2 |
+| ECDSA SHA-256 / SHA-384 | Absent | SHA-256 / SHA-384 |
+| RSA-PSS | Present empty SEQUENCE | SHA-1 defaults |
+| RSA-PSS SHA-256/384/512 | Explicit matching hash and MGF1 hash, digest-sized salt; omitted default trailer | Corresponding SHA-2 |
+
+This intentionally narrow PSS subset rejects absent parameters, mismatched
+MGF/hash, other salts/trailers, and explicit default-field encodings outside
+the table. It is not full RFC-PSS acceptance. These are **metadata mappings**:
+they do not enable MD5/SHA-1 signatures or expand the certificate-edge signature
+profile (which still rejects RSA-PSS edges).
+[RFC 3279 §2.2.1](https://www.rfc-editor.org/rfc/rfc3279#section-2.2.1)
+defines the legacy RSA mappings/NULL parameters;
+[RFC 4055 §§3.1 and 5](https://www.rfc-editor.org/rfc/rfc4055#section-3.1)
+defines PSS hash selection and the SHA-2 RSA mappings.
+[RFC 5758 §3.2](https://www.rfc-editor.org/rfc/rfc5758#section-3.2)
+defines the ECDSA SHA-2 mappings and absent parameters.
+
+Existing strict RSA (at least 2048 bits), P-256, P-384, and Ed25519 **subject-key**
+framing is reused without normalizing the key bytes; the native
+[`CRYPT_BIT_BLOB`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/ns-wincrypt-crypt_bit_blob)
+contract represents the key bits as bytes, separately from the unused-bit
+count. Other key profiles and
+nonzero unused bits reject. Ed25519 **issuer signatures** have no supported P15
+mapping: with these Windows system restrictions, an Ed25519-signed selected
+certificate fails closed even if P25 did not match. `custom_only` neither loads
+nor applies system restrictions and retains its separate Ed25519 support.
+`system_plus_custom` does not exempt custom anchors or duplicate certificates.
+
+The [bounded synthetic native comparisons](https://github.com/cataggar/httpx.zig/actions/runs/34790621907)
+and [supplemental ARM64 runtime execution](https://github.com/cataggar/httpx.zig/actions/runs/34792012714)
+established the byte domains for P-256/RSA subject encodings, ECDSA SHA-256/384,
+explicit SHA-256 PSS, empty-default PSS, and the MD5 AlgorithmIdentifier control.
+RSA SHA-1/SHA-2 and SHA-384/512 PSS mappings are justified by the contracts above,
+not additional native fixtures. P-384/Ed25519 subject framing is covered by the
+existing DER/key parsers, not a claim of additional native property comparisons.
+Generic `CertFindSubjectInCTL` ANY lookup only establishes opaque equality;
+its concatenation controls do **not** establish compound identifiers. This
+profile claims neither undocumented compound-format support nor full private
+Windows chain-policy equivalence. It uses no native hashing or verification
+fallback and does not broaden AuthRoot or any trust-grant profile.
 
 #### AuthRoot CT log catalog
 
@@ -304,14 +380,20 @@ digest length and are cleared on every failure. Binding
 capability/deployment approval. Identifier hashing never enables SHA-1
 signatures, HMAC, HKDF or PRF, creates an anchor, or permits a primitive fallback.
 
-The ABI-2 metadata foundation also exposes default-off
+The ABI-2 metadata foundation exposes default-off
 `allow_md5_identifiers`, independently gated by the selected backend's MD5
 deployment permission. MD5 remains unavailable to keyed operations and
-signatures. This does not extend the canonical Windows CTL acceptance profile:
-MD5 CTL identifiers remain rejected, and property 15/25 do not become matching
-keys.
-The per-certificate digest cache includes the new tag but retains its single,
-fixed certificate-DER input. See [metadata-only digests](./tls.md#metadata-only-certificate-digests).
+signatures. The documented Disallowed family requires this opt-in even when
+P15 uses SHA-2, because P25 is also required before allowing. With the standard
+backend, use `StandardProvider.initWithOptions(...,
+.{ .allow_md5_identifier_hash = true })` and bind with
+`.{ .allow_md5_identifiers = true, .allow_sha1_identifiers = true }` when the
+snapshot requires both legacy identifiers. Neither permission enables the
+other; primitive ABI-1 providers cannot satisfy required MD5 and are rejected
+before raw MD5 dispatch. The per-certificate cache keys on **algorithm and
+byte domain** (whole DER, TBS DER, raw key), including separate MD5 values,
+and is discarded between operations.
+See [metadata-only digests](./tls.md#metadata-only-certificate-digests).
 
 The canonical owner now exposes
 `roots.bind(adapter_pointer, metadata_digest.Options) !PolicyBinding`.

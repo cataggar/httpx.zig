@@ -62,7 +62,11 @@ const Harness = struct {
     standard: StandardProvider,
 
     fn init(allocator: std.mem.Allocator) !Harness {
-        var chain = try fixtures.Chain.init(allocator, .ed25519);
+        return initScheme(allocator, .ed25519);
+    }
+
+    fn initScheme(allocator: std.mem.Allocator, scheme: fixtures.Scheme) !Harness {
+        var chain = try fixtures.Chain.init(allocator, scheme);
         errdefer chain.deinit();
         var owner = try policy.TrustContext.init(allocator, std.testing.io, .{
             .source = .{ .custom_only = .{ .der_certificates = &.{chain.root} } },
@@ -109,6 +113,69 @@ const Harness = struct {
         });
     }
 };
+
+test "canonical Disallowed P15 and P25 deny every path position including custom duplicates" {
+    const disallowed = @import("windows_disallowed.zig");
+    const ctl = @import("windows_ctl.zig");
+    const ctlf = @import("ctl_fixtures.zig");
+    for ([_]bool{ false, true }) |key_identity| {
+        for ([_]bool{ false, true }) |matches| {
+            for (0..3) |position| {
+                var harness = try Harness.initScheme(std.testing.allocator, .ecdsa_p256);
+                defer harness.deinit();
+                harness.standard.options.allow_md5_identifier_hash = true;
+                var adapter = CryptoCertificateVerifier.init(harness.standard.provider());
+                const certificates = [_][]const u8{ harness.chain.leaf, harness.chain.intermediate, harness.chain.root };
+                const inputs = try disallowed.parse(certificates[position]);
+                const hash: crypto.HashAlgorithm = if (key_identity) .md5 else inputs.signature_hash;
+                var identifier: [64]u8 = undefined;
+                const options: digest.Options = .{ .allow_md5_identifiers = true };
+                try adapter.metadataHasher(options).hash(harness.allocator, hash, if (key_identity) inputs.public_key_bits else inputs.tbs_der, identifier[0..hash.digestLength()]);
+                if (!matches) identifier[0] ^= 1;
+                const encoded = try ctlf.content(harness.allocator, .{
+                    .usage_oid = ctl.disallowed_usage,
+                    .algorithm_oid = ctl.disallowed_hash,
+                    .algorithm_parameters = "\x05\x00",
+                    .entries = &.{.{
+                        .identifier = identifier[0..hash.digestLength()],
+                        .attributes = &.{.{ .id = 9, .value = "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01" }},
+                    }},
+                });
+                defer harness.allocator.free(encoded);
+                try ctl.append(&harness.owner.platform_snapshot.?, .disallowed, encoded);
+                var binding = try harness.owner.bind(&adapter, options);
+                const result = binding.provider().verifyPeer(harness.request(binding.signatureVerifier(), &.{ harness.chain.leaf, harness.chain.intermediate }));
+                if (matches)
+                    try std.testing.expectError(error.TlsCertificateConstraintViolation, result)
+                else
+                    try result;
+            }
+        }
+    }
+}
+
+test "canonical Disallowed rejects unavailable Ed25519 P15 without changing custom-only trust" {
+    var harness = try Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    // Real custom-only construction has no platform snapshot; the harness adds
+    // one explicitly to exercise Windows restrictions without reading the OS.
+    harness.owner.platform_snapshot.?.deinit();
+    harness.owner.platform_snapshot = null;
+    try harness.verify();
+    harness.owner.platform_snapshot = metadata.Snapshot.init(harness.allocator, .{});
+    try harness.owner.platform_snapshot.?.addFingerprintList(.{
+        .kind = .disallowed,
+        .identity = .windows_disallowed,
+        .this_update = 1_700_000_000,
+        .entries = &.{},
+    });
+    harness.standard.options.allow_md5_identifier_hash = true;
+    var adapter = CryptoCertificateVerifier.init(harness.standard.provider());
+    var binding = try harness.owner.bind(&adapter, .{ .allow_md5_identifiers = true });
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, binding.provider().verifyPeer(
+        harness.request(binding.signatureVerifier(), &.{ harness.chain.leaf, harness.chain.intermediate }),
+    ));
+}
 
 test "canonical binding enforces fingerprint restrictions at every selected path position" {
     for ([_]crypto.HashAlgorithm{ .sha1, .sha256 }) |algorithm| {

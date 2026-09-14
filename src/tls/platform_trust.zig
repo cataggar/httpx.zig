@@ -3,6 +3,7 @@ const std = @import("std");
 const trust = @import("trust.zig");
 const crypto = @import("crypto/provider.zig");
 const metadata_digest = @import("metadata_digest.zig");
+const disallowed = @import("windows_disallowed.zig");
 const Error = trust.TrustError;
 const Allocator = std.mem.Allocator;
 
@@ -162,25 +163,66 @@ pub const Entry = struct {
 /// decoding must reject unsupported identifier forms before constructing it.
 pub const FingerprintEntry = struct {
     identifier: [64]u8 = @splat(0),
+    identifier_length: u8 = 0,
     policy: Windows,
     sha256: ?[32]u8 = null,
 
     pub fn init(algorithm: crypto.HashAlgorithm, identifier: []const u8, policy: Windows) Error!FingerprintEntry {
         if (identifier.len != algorithm.digestLength()) return error.TlsTrustStoreLoadFailed;
-        var result = FingerprintEntry{ .policy = policy };
+        var result = FingerprintEntry{ .policy = policy, .identifier_length = @intCast(identifier.len) };
         @memcpy(result.identifier[0..identifier.len], identifier);
         return result;
+    }
+
+    pub fn initDisallowed(identifier: []const u8) Error!FingerprintEntry {
+        if (!validDisallowedLength(identifier.len)) return error.TlsTrustStoreLoadFailed;
+        var result = FingerprintEntry{ .policy = .{ .roles = 0 }, .identifier_length = @intCast(identifier.len) };
+        @memcpy(result.identifier[0..identifier.len], identifier);
+        return result;
+    }
+
+    pub fn bytes(self: *const FingerprintEntry) []const u8 {
+        return self.identifier[0..self.identifier_length];
     }
 };
 
 pub const FingerprintList = struct {
     pub const Kind = enum { constraints, authroot, disallowed };
+    pub const Identity = enum { certificate_der, windows_disallowed };
     kind: Kind = .constraints,
-    algorithm: crypto.HashAlgorithm,
+    identity: Identity = .certificate_der,
+    algorithm: ?crypto.HashAlgorithm = null,
     this_update: i64,
     next_update: ?i64 = null,
     entries: []const FingerprintEntry,
 };
+
+fn validDisallowedLength(length: usize) bool {
+    // Validate possible digest widths without assigning an algorithm/domain to
+    // any identifier. In particular, 16 and 48 are not identity selectors.
+    return switch (length) {
+        16, 20, 32, 48, 64 => true,
+        else => false,
+    };
+}
+
+fn lowerBound(entries: []const FingerprintEntry, digest: []const u8) usize {
+    var low: usize = 0;
+    var high = entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (std.mem.order(u8, entries[mid].bytes(), digest) == .lt)
+            low = mid + 1
+        else
+            high = mid;
+    }
+    return low;
+}
+
+fn contains(entries: []const FingerprintEntry, digest: []const u8) bool {
+    const index = lowerBound(entries, digest);
+    return index < entries.len and std.mem.eql(u8, entries[index].bytes(), digest);
+}
 
 pub const Snapshot = struct {
     allocator: Allocator,
@@ -242,11 +284,25 @@ pub const Snapshot = struct {
             list.entries.len > self.limits.max_fingerprint_entries - self.fingerprint_entries or
             (list.next_update != null and list.next_update.? < list.this_update))
             return error.TlsTrustStoreLoadFailed;
+        switch (list.identity) {
+            .certificate_der => if (list.algorithm == null) return error.TlsTrustStoreLoadFailed,
+            .windows_disallowed => if (list.kind != .disallowed or list.algorithm != null)
+                return error.TlsTrustStoreLoadFailed,
+        }
+        for (list.entries) |entry| {
+            if (entry.identifier_length > entry.identifier.len) return error.TlsTrustStoreLoadFailed;
+            switch (list.identity) {
+                .certificate_der => if (entry.identifier_length != list.algorithm.?.digestLength())
+                    return error.TlsTrustStoreLoadFailed,
+                .windows_disallowed => if (!validDisallowedLength(entry.identifier_length))
+                    return error.TlsTrustStoreLoadFailed,
+            }
+        }
         const entries = try self.allocator.dupe(FingerprintEntry, list.entries);
         errdefer self.allocator.free(entries);
-        std.mem.sort(FingerprintEntry, entries, list.algorithm.digestLength(), struct {
-            fn lessThan(length: usize, a: FingerprintEntry, b: FingerprintEntry) bool {
-                return std.mem.order(u8, a.identifier[0..length], b.identifier[0..length]) == .lt;
+        std.mem.sort(FingerprintEntry, entries, {}, struct {
+            fn lessThan(_: void, a: FingerprintEntry, b: FingerprintEntry) bool {
+                return std.mem.order(u8, a.bytes(), b.bytes()) == .lt;
             }
         }.lessThan);
         var owned = list;
@@ -268,7 +324,9 @@ pub const Snapshot = struct {
             .hasher = hasher,
             .scratch = scratch,
             .input = certificate_der,
+            .certificate_limit = self.limits.max_certificate_bytes,
         };
+        defer crypto.secureWipeValue(&digests.values);
         var requires_membership = false;
         if (use.anchor and !use.custom_anchor) {
             for (self.entries.items) |entry| {
@@ -283,22 +341,21 @@ pub const Snapshot = struct {
                 return error.TlsTrustStoreLoadFailed;
             const authroot = list.kind == .authroot;
             has_authroot = has_authroot or authroot;
+            if (list.identity == .windows_disallowed) {
+                const inputs = try digests.identityInputs();
+                if (contains(list.entries, try digests.getDomain(.md5, .public_key_bits))) return .deny;
+                if (contains(list.entries, try digests.getDomain(inputs.signature_hash, .tbs_der))) return .deny;
+                // Even an empty list requires both identities before allowing.
+                continue;
+            }
             if (list.entries.len == 0) {
                 if (authroot and requires_membership) return .deny;
                 continue;
             }
-            const digest = try digests.get(list.algorithm);
-            var low: usize = 0;
-            var high = list.entries.len;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                if (std.mem.order(u8, list.entries[mid].identifier[0..digest.len], digest) == .lt)
-                    low = mid + 1
-                else
-                    high = mid;
-            }
+            const digest = try digests.get(list.algorithm.?);
+            var low = lowerBound(list.entries, digest);
             var matched = false;
-            while (low < list.entries.len and std.mem.eql(u8, list.entries[low].identifier[0..digest.len], digest)) : (low += 1) {
+            while (low < list.entries.len and std.mem.eql(u8, list.entries[low].bytes(), digest)) : (low += 1) {
                 matched = true;
                 const entry = list.entries[low];
                 if (list.kind == .disallowed) return .deny;
@@ -315,6 +372,7 @@ pub const Snapshot = struct {
 };
 
 const Digests = struct {
+    const Domain = enum { certificate_der, tbs_der, public_key_bits };
     const capacity = blk: {
         var count: usize = 0;
         for (std.enums.values(crypto.HashAlgorithm)) |algorithm|
@@ -325,19 +383,39 @@ const Digests = struct {
     hasher: ?metadata_digest.MetadataDigest,
     scratch: Allocator,
     input: []const u8,
-    values: [capacity][64]u8 = undefined,
-    ready: [capacity]bool = @splat(false),
+    certificate_limit: usize = 256 * 1024,
+    inputs: ?disallowed.Inputs = null,
+    values: [std.enums.values(Domain).len][capacity][64]u8 = undefined,
+    ready: [std.enums.values(Domain).len][capacity]bool = @splat(@splat(false)),
 
     fn get(self: *Digests, algorithm: crypto.HashAlgorithm) Error![]const u8 {
+        return self.getDomain(algorithm, .certificate_der);
+    }
+
+    fn identityInputs(self: *Digests) Error!disallowed.Inputs {
+        if (self.inputs == null) {
+            if (self.input.len == 0 or self.input.len > self.certificate_limit) return error.TlsTrustStoreLoadFailed;
+            self.inputs = try disallowed.parse(self.input);
+        }
+        return self.inputs.?;
+    }
+
+    fn getDomain(self: *Digests, algorithm: crypto.HashAlgorithm, domain: Domain) Error![]const u8 {
         const index = @intFromEnum(algorithm);
-        const output = self.values[index][0..algorithm.digestLength()];
-        if (!self.ready[index]) {
+        const domain_index = @intFromEnum(domain);
+        const output = self.values[domain_index][index][0..algorithm.digestLength()];
+        if (!self.ready[domain_index][index]) {
+            const input = switch (domain) {
+                .certificate_der => self.input,
+                .tbs_der => (try self.identityInputs()).tbs_der,
+                .public_key_bits => (try self.identityInputs()).public_key_bits,
+            };
             const hasher = self.hasher orelse return error.TlsInvalidTrustConfiguration;
-            hasher.hash(self.scratch, algorithm, self.input, output) catch |err| return switch (err) {
+            hasher.hash(self.scratch, algorithm, input, output) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.TlsTrustStoreLoadFailed,
             };
-            self.ready[index] = true;
+            self.ready[domain_index][index] = true;
         }
         return output;
     }
@@ -368,6 +446,47 @@ test "platform digest cache covers ABI2 tags for one fixed certificate DER input
         try std.testing.expect(std.mem.allEqual(u8, second, @intFromEnum(algorithm)));
         try std.testing.expectEqual(@as(usize, 1), fake.calls[@intFromEnum(algorithm)]);
     }
+}
+
+test "Disallowed cache separates algorithm and byte domain even when MD5 outputs collide" {
+    const Fake = struct {
+        calls: [3]usize = @splat(0),
+        failure: bool = false,
+
+        fn hash(context: *anyopaque, _: Allocator, _: crypto.HashAlgorithm, input: []const u8, output: []u8) crypto.ProviderError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const index: usize = if (std.mem.eql(u8, input, "certificate DER")) 0 else if (std.mem.eql(u8, input, "TBS DER")) 1 else if (std.mem.eql(u8, input, "raw key")) 2 else return error.InvalidInput;
+            self.calls[index] += 1;
+            @memset(output, 0x42);
+            if (self.failure) return error.InternalError;
+        }
+    };
+    var fake = Fake{};
+    var digests = Digests{
+        .hasher = .{ .context = &fake, .digest_fn = Fake.hash, .options = .{ .allow_md5_identifiers = true } },
+        .scratch = std.testing.allocator,
+        .input = "certificate DER",
+        .inputs = .{ .tbs_der = "TBS DER", .public_key_bits = "raw key", .signature_hash = .md5 },
+    };
+    var outputs: [3][]const u8 = undefined;
+    for (std.enums.values(Digests.Domain), &outputs, 0..) |domain, *output, i| {
+        output.* = try digests.getDomain(.md5, domain);
+        try std.testing.expectEqualSlices(u8, "\x42" ** 16, output.*);
+        try std.testing.expect(output.ptr == (try digests.getDomain(.md5, domain)).ptr);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls[i]);
+        for (outputs[0..i]) |previous| try std.testing.expect(output.ptr != previous.ptr);
+    }
+    _ = try digests.getDomain(.sha256, .tbs_der);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls[1]);
+    fake.failure = true;
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, digests.getDomain(.sha384, .tbs_der));
+    const domain = @intFromEnum(Digests.Domain.tbs_der);
+    const algorithm = @intFromEnum(crypto.HashAlgorithm.sha384);
+    try std.testing.expect(!digests.ready[domain][algorithm]);
+    try std.testing.expect(std.mem.allEqual(u8, digests.values[domain][algorithm][0..48], 0));
+    fake.failure = false;
+    _ = try digests.getDomain(.sha384, .tbs_der);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls[1]);
 }
 
 test "platform metadata ownership and allocation failure" {
