@@ -603,6 +603,70 @@ var connection = try tls.acceptServer(allocator, socket, alpn_protocols, server_
 defer connection.closeNotify();
 ```
 
+The four-argument `acceptServer` keeps its existing blocking behavior and
+socket-timeout policy, as does the high-level server's existing call path.
+Opt in to cancellation-aware **handshake** I/O with
+`tls.acceptServerWithIo(allocator, socket, protocols, config, options)`.
+`tls.ServerHandshakeIoOptions` borrows the canonical context exposed by
+`httpx.io_context`:
+
+| Option | Meaning |
+| --- | --- |
+| `context: *const IoContext` | Required borrowed parent; cancellation and the earliest parent deadline propagate to every handshake I/O operation. |
+| `read_timeout_ms: ?u64 = null` | Budget for one complete incoming handshake message, including partial TLS headers, payloads, authentication and all record fragments. |
+| `write_timeout_ms: ?u64 = null` | Budget for one complete outgoing handshake message, including transcript update, record encryption and all partial sends/fragments. |
+
+A standalone ChangeCipherSpec read/write has its own budget. Interleaved TLS
+1.3 compatibility CCS records share the enclosing message-read budget.
+Each operation creates a child context once; progress and the socket's 10 ms
+readiness slices do not restart its deadline. `null` adds no deadline and zero
+expires before that operation performs I/O. These are logical context budgets,
+not inherited `SO_RCVTIMEO`/`SO_SNDTIMEO` values. Set the parent's request deadline
+to additionally bound the entire handshake. Parent deadlines are never mutated.
+
+Pre-cancellation/expiry is checked before work, and context checks after
+blocking boundaries take precedence over the completed I/O result. Concrete
+TLS/provider/transport errors otherwise propagate unchanged. Configuration,
+identity and provider-capability checks still precede transport access.
+Providers remain synchronous: context checks do not forcibly interrupt an
+arbitrarily blocking provider callback. On any handshake failure, discard the
+connection/socket rather than retrying the same TLS stream.
+
+The options/context are **not retained by the returned `Connection`**.
+Embedders must explicitly use its existing context-aware application methods:
+
+```zig
+const io_context = httpx.io_context;
+var shutdown: httpx.types.CancellationToken = .{};
+var lifetime = io_context.IoContext.init(.{
+    .external_cancel = &shutdown,
+    .request_deadline = io_context.Deadline.afterMs(15_000),
+});
+var connection = try httpx.tls.acceptServerWithIo(
+    allocator, socket, alpn_protocols, server_tls_config,
+    .{ .context = &lifetime, .read_timeout_ms = 2_000, .write_timeout_ms = 2_000 },
+);
+defer connection.deinit();
+
+var read_context = io_context.IoContext.init(.{
+    .parent = &lifetime,
+    .phase_deadline = io_context.Deadline.afterMs(2_000),
+});
+var bytes: [4096]u8 = undefined;
+const n = try connection.readWithContext(&bytes, &read_context);
+var write_context = io_context.IoContext.init(.{
+    .parent = &lifetime,
+    .phase_deadline = io_context.Deadline.afterMs(2_000),
+});
+try connection.writeAllWithContext(bytes[0..n], &write_context);
+```
+
+Reuse the same application child context across a logical read/write loop;
+do not recreate deadlines per fragment. Keep the parent and external token
+alive for active calls. Only cancellation signaling may race owner-thread I/O:
+do not mutate parent deadlines, close/reuse its socket off-thread, or destroy
+the configuration/provider until the operation has quiesced.
+
 ## ALPN Negotiation
 
 The ALPN module provides protocol negotiation between client and server:
