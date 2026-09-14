@@ -167,7 +167,7 @@ const cert_not_before_enhkey_usage_prop_id: u32 = 127;
 fn readPolicyProperties(allocator: Allocator, limit: usize, query: Query, roles: u2) Error!metadata.Windows {
     var result = metadata.Windows{ .roles = roles };
     // These properties encode additional policies that this offline profile
-    // does not implement. Presence is restrictive, never unrestricted trust.
+    // does not implement. Presence, including empty126, is restrictive.
     for ([_]u32{ 83, 84, 105, cert_not_before_filetime_prop_id, cert_not_before_enhkey_usage_prop_id }) |property_id| {
         if (try readProperty(allocator, limit, query, property_id)) |bytes| {
             defer allocator.free(bytes);
@@ -215,7 +215,8 @@ fn readProperty(allocator: Allocator, limit: usize, query: Query, id: u32) Error
         error.Missing => null,
         error.Failure => error.TlsTrustStoreLoadFailed,
     };
-    if (limit == 0 or (needed == 0 and id != cert_disallowed_filetime_prop_id) or needed > limit or needed > std.math.maxInt(u32))
+    const known_empty_restriction = id == cert_disallowed_filetime_prop_id or id == cert_not_before_filetime_prop_id;
+    if (limit == 0 or (needed == 0 and !known_empty_restriction) or needed > limit or needed > std.math.maxInt(u32))
         return error.TlsTrustStoreLoadFailed;
     const bytes = try allocator.alloc(u8, needed);
     errdefer allocator.free(bytes);
@@ -388,9 +389,12 @@ test "Windows present empty104 is unsupported rather than absent or a cutoff" {
 
 const IssuancePropertyQuery = struct {
     present: u2,
+    empty126: bool = false,
     queried: u2 = 0,
     read: u2 = 0,
-    failure: enum { none, size_query, read_query, size_changed } = .none,
+    calls: usize = 0,
+    reads: usize = 0,
+    failure: enum { none, size_query, read_query, missing_read, size_changed, size_cleared } = .none,
 
     fn query(context: *const anyopaque, id: u32, buffer: ?[]u8) QueryError!usize {
         const self: *@This() = @ptrCast(@alignCast(@constCast(context)));
@@ -399,17 +403,26 @@ const IssuancePropertyQuery = struct {
             cert_not_before_enhkey_usage_prop_id => 2,
             else => return error.Missing,
         };
+        self.calls += 1;
         self.queried |= bit;
         if (self.present & bit == 0) return error.Missing;
-        const value: []const u8 = if (bit == 1)
+        const value: []const u8 = if (bit == 1 and self.empty126)
+            ""
+        else if (bit == 1)
             "\x00\x00\x00\x00\x00\x00\x00\x00"
         else
             "\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
         if (buffer) |bytes| {
+            self.reads += 1;
             if (self.failure == .read_query) return error.Failure;
+            if (self.failure == .missing_read) return error.Missing;
             @memcpy(bytes, value);
             self.read |= bit;
-            return if (self.failure == .size_changed) bytes.len - 1 else bytes.len;
+            if (self.failure == .size_cleared) return 0;
+            return if (self.failure == .size_changed)
+                (if (bytes.len == 0) 1 else bytes.len - 1)
+            else
+                bytes.len;
         }
         if (self.failure == .size_query) return error.Failure;
         return value.len;
@@ -419,6 +432,154 @@ const IssuancePropertyQuery = struct {
         return .{ .context = self, .function = query };
     }
 };
+
+test "Windows empty126 remains a present unsupported restriction at every time and role" {
+    for ([_]bool{ false, true }) |empty| {
+        for ([_]u2{ 0, 1 }) |present| {
+            var fixture = IssuancePropertyQuery{ .present = present, .empty126 = empty };
+            const result = try readPolicyProperties(std.testing.allocator, 16, fixture.descriptor(), 3);
+            try std.testing.expectEqual(present != 0, result.unsupported);
+            try std.testing.expectEqual(@as(?i64, null), result.disallow_at);
+            try std.testing.expectEqual(@as(u2, 3), result.roles);
+            try std.testing.expectEqual(@as(u2, 0), result.denied_roles);
+            for ([_]@import("trust.zig").PeerRole{ .server, .client }) |role| {
+                for ([_]i64{ std.math.minInt(i64), 0, 1_800_000_000, std.math.maxInt(i64) }) |now| {
+                    try std.testing.expectEqual(present == 0, result.permits(.{
+                        .role = role,
+                        .identity = null,
+                        .now_seconds = now,
+                        .issuer = true,
+                        .self_issued = true,
+                        .anchor = true,
+                        .custom_anchor = true,
+                    }));
+                }
+            }
+            var merged = result;
+            merged.merge(.{});
+            try std.testing.expectEqual(result.unsupported, merged.unsupported);
+        }
+    }
+}
+
+test "Windows empty126 preserves exact two-query ownership errors and unchanged empty rejections" {
+    for ([_]bool{ false, true }) |empty| {
+        var fixture = IssuancePropertyQuery{ .present = 1, .empty126 = empty };
+        const bytes = (try readProperty(std.testing.allocator, 8, fixture.descriptor(), 126)).?;
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(@as(usize, if (empty) 0 else 8), bytes.len);
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+        try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+        inline for (.{ .size_query, .read_query, .missing_read, .size_changed }) |failure| {
+            fixture = .{ .present = 1, .empty126 = empty, .failure = failure };
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 16, fixture.descriptor(), 126));
+            try std.testing.expectEqual(@as(usize, if (failure == .size_query) 1 else 2), fixture.calls);
+            try std.testing.expectEqual(@as(usize, if (failure == .size_query) 0 else 1), fixture.reads);
+        }
+        fixture = .{ .present = 1, .empty126 = empty };
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 0, fixture.descriptor(), 126));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.reads);
+    }
+    var cleared = IssuancePropertyQuery{ .present = 1, .failure = .size_cleared };
+    try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 8, cleared.descriptor(), 126));
+    try std.testing.expectEqual(@as(usize, 2), cleared.calls);
+    try std.testing.expectEqual(@as(usize, 1), cleared.reads);
+    var absent = IssuancePropertyQuery{ .present = 0, .empty126 = true };
+    try std.testing.expectEqual(@as(?[]u8, null), try readProperty(std.testing.allocator, 16, absent.descriptor(), 126));
+    try std.testing.expectEqual(@as(usize, 1), absent.calls);
+    try std.testing.expectEqual(@as(usize, 0), absent.reads);
+    const Empty = struct {
+        fn query(_: *const anyopaque, _: u32, _: ?[]u8) QueryError!usize {
+            return 0;
+        }
+    };
+    var context: u8 = 0;
+    for ([_]u32{ 0, 9, 83, 84, 105, 122, 127, 128, std.math.maxInt(u32) }) |id| {
+        try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 16, .{
+            .context = &context,
+            .function = Empty.query,
+        }, id));
+    }
+    const Sized = struct {
+        needed: usize,
+        calls: usize = 0,
+        fn query(raw: *const anyopaque, _: u32, buffer: ?[]u8) QueryError!usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (buffer != null) return error.Failure;
+            return self.needed;
+        }
+        fn check(needed: usize, limit: usize, expected: anyerror) !void {
+            var self = @This(){ .needed = needed };
+            var no_storage = std.heap.FixedBufferAllocator.init(&.{});
+            try std.testing.expectError(expected, readProperty(no_storage.allocator(), limit, .{
+                .context = &self,
+                .function = query,
+            }, 126));
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+        }
+    };
+    try Sized.check(9, 8, error.TlsTrustStoreLoadFailed);
+    if (comptime @bitSizeOf(usize) > 32) {
+        try Sized.check(@as(usize, std.math.maxInt(u32)) + 1, std.math.maxInt(usize), error.TlsTrustStoreLoadFailed);
+        try Sized.check(std.math.maxInt(u32), std.math.maxInt(u32), error.OutOfMemory);
+    }
+    const Probe = struct {
+        fn run(allocator: Allocator) !void {
+            // The second property allocates after empty126 has been observed.
+            // An error must still abort, not publish the partial policy.
+            var fixture = IssuancePropertyQuery{ .present = 3, .empty126 = true };
+            try std.testing.expect((try readPolicyProperties(allocator, 16, fixture.descriptor(), 3)).unsupported);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "Windows empty126 denies canonical path positions and custom duplicates without losing unrelated roots" {
+    const fixtures = @import("trust_fixtures.zig");
+    const policy = @import("standard_trust.zig");
+    const Standard = @import("crypto/standard.zig").StandardProvider;
+    const Adapter = @import("cert_crypto.zig").CryptoCertificateVerifier;
+    const allocator = std.testing.allocator;
+    var chain = try fixtures.Chain.init(allocator, .ed25519);
+    defer chain.deinit();
+    const other_key = try fixtures.Key.init(.ed25519, 42);
+    var other_options = fixtures.rootOptions();
+    other_options.subject = "Unrelated Root";
+    other_options.issuer = other_options.subject;
+    const other_root = try fixtures.certificate(allocator, other_key, other_key, other_options);
+    defer allocator.free(other_root);
+    const affected = [_][]const u8{ chain.leaf, chain.intermediate, chain.root, other_root };
+    for (affected, 0..) |der, position| {
+        var owner = try policy.TrustContext.init(allocator, std.testing.io, .{
+            .source = .{ .custom_only = .{ .der_certificates = &.{ chain.root, other_root } } },
+        });
+        defer owner.deinit();
+        // Model the owned native ROOT metadata without accessing an OS store.
+        owner.platform_snapshot = metadata.Snapshot.init(allocator, .{});
+        const index = try owner.platform_snapshot.?.add(der, position >= 2);
+        var fixture = IssuancePropertyQuery{ .present = 1, .empty126 = true };
+        owner.platform_snapshot.?.entries.items[index].windows = try readPolicyProperties(allocator, 16, fixture.descriptor(), 3);
+        fixture.present = 0;
+        try std.testing.expect(owner.platform_snapshot.?.entries.items[index].windows.?.unsupported);
+        try std.testing.expectEqual(@as(usize, 2), owner.anchorCount());
+        var standard = Standard.init(std.testing.io, allocator);
+        var adapter = Adapter.init(standard.provider());
+        const result = owner.provider().verifyPeer(.{
+            .role = .server,
+            .chain_der = &.{ chain.leaf, chain.intermediate },
+            .expected_identity = .{ .dns_name = "api.example.test" },
+            .now_seconds = 1_800_000_000,
+            .signature_verifier = adapter.verifier(),
+            .scratch_allocator = allocator,
+        });
+        if (position < 3)
+            try std.testing.expectError(error.TlsCertificateConstraintViolation, result)
+        else
+            try result;
+    }
+}
 
 test "Windows policy dispatch detects both issuance restriction properties without a CTL" {
     for ([_]u2{ 0, 1, 2, 3 }) |present| {

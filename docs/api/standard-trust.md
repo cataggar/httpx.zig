@@ -345,14 +345,39 @@ timestamp, deletion marker, or permission to remove other native/CTL
 restrictions. Disallowed-list membership remains independently prohibitive.
 Absent 104 adds no such restriction; an eight-byte zero FILETIME remains an
 actual encoded cutoff. Nonempty 104 and all 128 values still require exactly
-eight bytes; other empty, malformed, and unsupported forms retain their
-existing fail-closed behavior.
+eight bytes; apart from the explicit empty-126 containment below, other empty,
+malformed, and unsupported forms retain their existing fail-closed behavior.
 
 The native fixture asserts these structural observations without opening a
 store, installing certificates, modifying roots, or verifying a chain. This
 conservative exclusion can reject certificates that Windows accepts: full
 Windows authorization semantics for empty 104 remain unimplemented, and a
 successful snapshot load does not establish platform or public-TLS equivalence.
+
+The [bounded native property observation](https://github.com/cataggar/httpx.zig/actions/runs/34815807373)
+also found a successful initial query for property **126** with zero required
+bytes and a 65,536-byte bound. The
+[pinned SDK definition](https://github.com/microsoft/win32metadata/blob/1bfb76db1c360653bdcb56512af0fdf987aceab8/generation/WinSDK/RecompiledIdlHeaders/um/wincrypt.h#L9370)
+names this property `CERT_NOT_BEFORE_FILETIME_PROP_ID`, not a root-program
+certificate-policy property. The observation alone does not establish native
+authorization semantics.
+
+This profile conservatively retains **present-empty 126 as an unsupported
+certificate restriction**, just like nonempty 126. It is not absence, a cleared
+restriction, FILETIME zero, an interpreted timestamp, or unrestricted trust.
+The affected certificate is ineligible at every path position and time, for
+either TLS role, including when it duplicates a custom anchor; unrelated roots
+remain available. Absence remains distinct. No timestamp is synthesized from
+either empty or nonempty 126, and an absent duplicate does not erase an
+already retained restriction.
+
+An empty initial result is accepted only for the explicitly supported 104 and
+126 cases, with a nonzero bound. The second query must still succeed and return
+exactly the original size, including zero; disappearance, query failure, size
+changes, exceeded bounds, and allocation failure abort loading. Empty 128, 83,
+84, 105, 127, other unknown empty properties, and malformed values retain their
+previous rejection rules. This change does not generalize empty-property
+acceptance, modify CTL selectors, or claim Windows chain-engine equivalence.
 
 Certificates found in the local AuthRoot cache are marked as program material
 without adding anchors. System anchors marked this way must appear in every
