@@ -315,11 +315,18 @@ pub const Snapshot = struct {
 };
 
 const Digests = struct {
+    const capacity = blk: {
+        var count: usize = 0;
+        for (std.enums.values(crypto.HashAlgorithm)) |algorithm|
+            count = @max(count, @as(usize, @intFromEnum(algorithm)) + 1);
+        break :blk count;
+    };
+
     hasher: ?metadata_digest.MetadataDigest,
     scratch: Allocator,
     input: []const u8,
-    values: [4][64]u8 = undefined,
-    ready: [4]bool = @splat(false),
+    values: [capacity][64]u8 = undefined,
+    ready: [capacity]bool = @splat(false),
 
     fn get(self: *Digests, algorithm: crypto.HashAlgorithm) Error![]const u8 {
         const index = @intFromEnum(algorithm);
@@ -335,6 +342,33 @@ const Digests = struct {
         return output;
     }
 };
+
+test "platform digest cache covers ABI2 tags for one fixed certificate DER input" {
+    const Fake = struct {
+        calls: [5]usize = @splat(0),
+
+        fn hash(context: *anyopaque, _: Allocator, algorithm: crypto.HashAlgorithm, input: []const u8, output: []u8) crypto.ProviderError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!std.mem.eql(u8, input, "fixed certificate DER")) return error.InvalidInput;
+            self.calls[@intFromEnum(algorithm)] += 1;
+            @memset(output, @intFromEnum(algorithm));
+        }
+    };
+    var fake = Fake{};
+    var digests = Digests{
+        .hasher = .{ .context = &fake, .digest_fn = Fake.hash, .options = .{ .allow_sha1_identifiers = true, .allow_md5_identifiers = true } },
+        .scratch = std.testing.allocator,
+        .input = "fixed certificate DER",
+    };
+    for (std.enums.values(crypto.HashAlgorithm)) |algorithm| {
+        const first = try digests.get(algorithm);
+        const second = try digests.get(algorithm);
+        try std.testing.expectEqual(algorithm.digestLength(), first.len);
+        try std.testing.expect(first.ptr == second.ptr);
+        try std.testing.expect(std.mem.allEqual(u8, second, @intFromEnum(algorithm)));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls[@intFromEnum(algorithm)]);
+    }
+}
 
 test "platform metadata ownership and allocation failure" {
     const Test = struct {

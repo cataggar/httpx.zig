@@ -115,7 +115,7 @@ pub const Key = struct {
         };
         switch (hash) {
             inline .sha256, .sha384, .sha512 => |algorithm| try encode(algorithm, io, pkcs1, parts, encoded[0..self.length]),
-            .sha1 => return error.UnsupportedAlgorithm,
+            .sha1, .md5 => return error.UnsupportedAlgorithm,
         }
         try self.privateOperation(io, encoded[0..self.length], out[0..self.length]);
         return self.length;
@@ -278,7 +278,7 @@ fn Hash(comptime algorithm: p.HashAlgorithm) type {
         .sha256 => std.crypto.hash.sha2.Sha256,
         .sha384 => std.crypto.hash.sha2.Sha384,
         .sha512 => std.crypto.hash.sha2.Sha512,
-        .sha1 => unreachable,
+        .sha1, .md5 => @compileError("Unsupported RSA signature hash"),
     };
 }
 
@@ -296,7 +296,7 @@ fn encode(comptime algorithm: p.HashAlgorithm, io: std.Io, pkcs1: bool, parts: [
             .sha256 => "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20",
             .sha384 => "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30",
             .sha512 => "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40",
-            .sha1 => unreachable,
+            .sha1, .md5 => @compileError("Unsupported RSA signature hash"),
         };
         const separator = out.len - prefix.len - digest_length - 1;
         out[0] = 0;

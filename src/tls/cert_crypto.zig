@@ -9,8 +9,13 @@ const metadata_digest = @import("metadata_digest.zig");
 const Error = signature.CertificateSignatureError;
 const Certificate = std.crypto.Certificate;
 
+test {
+    _ = @import("metadata_md5_test.zig");
+}
+
 pub const MetadataDigestOptions = struct {
     allow_sha1_identifiers: bool = false,
+    allow_md5_identifiers: bool = false,
 };
 
 /// Borrowed adapter. Keep this object at a stable address and keep the
@@ -35,7 +40,10 @@ pub const CryptoCertificateVerifier = struct {
     pub fn metadataHasher(self: *CryptoCertificateVerifier, options: metadata_digest.Options) metadata_digest.MetadataDigest {
         return .{
             .context = self,
-            .digest_fn = if (options.allow_sha1_identifiers) digestMetadataWithSha1 else digestMetadataCallback,
+            .digest_fn = if (options.allow_md5_identifiers)
+                (if (options.allow_sha1_identifiers) digestMetadataWithSha1AndMd5 else digestMetadataWithMd5)
+            else
+                (if (options.allow_sha1_identifiers) digestMetadataWithSha1 else digestMetadataCallback),
             .options = options,
         };
     }
@@ -48,6 +56,16 @@ pub const CryptoCertificateVerifier = struct {
     fn digestMetadataWithSha1(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
         const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
         return self.digestMetadata(scratch, algorithm, input, out, .{ .allow_sha1_identifiers = true });
+    }
+
+    fn digestMetadataWithMd5(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
+        const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
+        return self.digestMetadata(scratch, algorithm, input, out, .{ .allow_md5_identifiers = true });
+    }
+
+    fn digestMetadataWithSha1AndMd5(context: *anyopaque, scratch: std.mem.Allocator, algorithm: p.HashAlgorithm, input: []const u8, out: []u8) p.ProviderError!void {
+        const self: *const CryptoCertificateVerifier = @ptrCast(@alignCast(context));
+        return self.digestMetadata(scratch, algorithm, input, out, .{ .allow_sha1_identifiers = true, .allow_md5_identifiers = true });
     }
 
     /// Hashes public trust-store identifiers, not certificate signatures.
@@ -63,6 +81,7 @@ pub const CryptoCertificateVerifier = struct {
         errdefer p.secureWipe(out);
         if (out.len != algorithm.digestLength()) return error.InvalidDigestLength;
         if (algorithm == .sha1 and !options.allow_sha1_identifiers) return error.UnsupportedAlgorithm;
+        if (algorithm == .md5 and !options.allow_md5_identifiers) return error.UnsupportedAlgorithm;
         var hash = try self.crypto.hashCreate(scratch, algorithm);
         defer hash.deinit();
         try hash.update(input);
@@ -108,7 +127,7 @@ fn signatureScheme(algorithm: signature.AlgorithmIdentifier) Error!p.SignatureSc
             .sha256 => .rsa_pss_rsae_sha256,
             .sha384 => .rsa_pss_rsae_sha384,
             .sha512 => .rsa_pss_rsae_sha512,
-            .sha1 => error.UnsupportedAlgorithm,
+            .sha1, .md5 => error.UnsupportedAlgorithm,
         };
     }
     const id = Certificate.Algorithm.map.get(algorithm.oid) orelse return error.UnsupportedAlgorithm;
@@ -438,7 +457,7 @@ test "certificate metadata digest preserves hash callback failures and destroys 
     const Observed = struct {
         const Self = @This();
         const Standard = @import("crypto/standard.zig").StandardProvider;
-        const Failure = enum { create, update, snapshot, unsupported };
+        const Failure = enum { create, partial_create, update, snapshot, unsupported };
         standard: Standard,
         failure: Failure = .create,
         creates: usize = 0,
@@ -454,6 +473,7 @@ test "certificate metadata digest preserves hash callback failures and destroys 
             if (owner(context).failure == .unsupported) {
                 caps.setHash(.sha1, false);
                 caps.setHash(.sha256, false);
+                caps.setHash(.md5, false);
             }
             return caps;
         }
@@ -462,7 +482,8 @@ test "certificate metadata digest preserves hash callback failures and destroys 
             const self = owner(context);
             self.creates += 1;
             if (self.failure == .create) return error.InternalError;
-            return self.standard.provider().vtable.hashCreate(context, allocator, algorithm, out);
+            try self.standard.provider().vtable.hashCreate(context, allocator, algorithm, out);
+            if (self.failure == .partial_create) return error.InternalError;
         }
 
         fn update(context: *anyopaque, handle: *anyopaque, bytes: []const u8) p.ProviderError!void {
@@ -473,7 +494,10 @@ test "certificate metadata digest preserves hash callback failures and destroys 
 
         fn snapshot(context: *anyopaque, handle: *anyopaque, out: []u8) p.ProviderError!void {
             const self = owner(context);
-            if (self.failure == .snapshot) return error.InternalError;
+            if (self.failure == .snapshot) {
+                @memset(out, 0xa5);
+                return error.InternalError;
+            }
             return self.standard.provider().vtable.hashSnapshot(context, handle, out);
         }
 
@@ -483,7 +507,7 @@ test "certificate metadata digest preserves hash callback failures and destroys 
             self.standard.provider().vtable.hashDestroy(context, allocator, handle);
         }
     };
-    var observed: Observed = .{ .standard = .init(testing.io, testing.allocator) };
+    var observed: Observed = .{ .standard = .initWithOptions(testing.io, testing.allocator, .{ .allow_md5_identifier_hash = true }) };
     var provider = observed.standard.provider();
     var vtable = provider.vtable.*;
     vtable.capabilities = Observed.capabilities;
@@ -493,9 +517,9 @@ test "certificate metadata digest preserves hash callback failures and destroys 
     vtable.hashDestroy = Observed.destroy;
     provider.vtable = &vtable;
     var adapter = CryptoCertificateVerifier.init(provider);
-    const hasher = adapter.metadataHasher(.{ .allow_sha1_identifiers = true });
+    const hasher = adapter.metadataHasher(.{ .allow_sha1_identifiers = true, .allow_md5_identifiers = true });
     const Invocation = enum { method, descriptor, callback };
-    for ([_]p.HashAlgorithm{ .sha1, .sha256 }) |algorithm| {
+    for ([_]p.HashAlgorithm{ .sha1, .sha256, .md5 }) |algorithm| {
         for (std.enums.values(Invocation)) |invocation| {
             for (std.enums.values(Observed.Failure)) |failure| {
                 observed.failure = failure;
@@ -505,13 +529,13 @@ test "certificate metadata digest preserves hash callback failures and destroys 
                 const output = out[0..algorithm.digestLength()];
                 const expected = if (failure == .unsupported) error.UnsupportedAlgorithm else error.InternalError;
                 const result = switch (invocation) {
-                    .method => adapter.digestMetadata(testing.allocator, algorithm, "abc", output, .{ .allow_sha1_identifiers = true }),
+                    .method => adapter.digestMetadata(testing.allocator, algorithm, "abc", output, .{ .allow_sha1_identifiers = true, .allow_md5_identifiers = true }),
                     .descriptor => hasher.hash(testing.allocator, algorithm, "abc", output),
                     .callback => hasher.digest_fn(hasher.context, testing.allocator, algorithm, "abc", output),
                 };
                 try testing.expectError(expected, result);
                 try testing.expectEqual(@as(usize, if (failure == .unsupported) 0 else 1), observed.creates);
-                try testing.expectEqual(@as(usize, if (failure == .update or failure == .snapshot) 1 else 0), observed.destroys);
+                try testing.expectEqual(@as(usize, if (failure == .partial_create or failure == .update or failure == .snapshot) 1 else 0), observed.destroys);
                 try testing.expect(std.mem.allEqual(u8, output, 0));
             }
         }

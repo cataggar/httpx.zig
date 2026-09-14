@@ -81,6 +81,17 @@ Shared use requires a concurrent `Io` and thread-safe scratch allocator.
 Hash/key handles are individually owned; use `clone` for transcript copies
 and `take` for ownership transfer, and destroy each handle exactly once.
 
+The primitive semantic ABI is **2**. `CryptoProvider`, `VTable`, and
+`Capabilities` retain their ABI-1 byte layouts. Existing hash tags 0–3 remain
+unchanged; raw identifier-only `HashAlgorithm.md5` appends tag 4, bit `0x10`.
+The consumer admits ABI 1 and 2 without relabeling descriptors. Unknown
+versions fail with `IncompatibleAbiVersion` before provider callbacks. ABI-1
+MD5 creation fails before even the capability callback; raw hash masks are
+limited to `0x0f` for ABI 1 and `0x1f` for ABI 2. Compatibility is directional:
+an old consumer may reject a new ABI-2 provider, including a standard provider
+with MD5 disabled. Admission of both versions does not make their identities
+equivalent: the exact `(abi_version, context, vtable)` must still match.
+
 ### Standalone helper migration
 
 Public TLS encryption, decryption, PRF, HKDF, traffic-key and encrypted-handshake
@@ -88,8 +99,8 @@ helpers require a `CryptoProvider` argument and propagate failures. AEAD helpers
 take a provider algorithm such as `.aes_128_gcm`, not a `std.crypto` type;
 `deriveHandshakeSecret13` also takes a scratch allocator. Callers must handle
 the error union with `try`/`catch`. This intentional signature change prevents
-standalone helpers from silently bypassing the selected backend. Provider
-ABI-v1 enums, requests and vtables are unchanged.
+standalone helpers from silently bypassing the selected backend. Existing
+provider vtable layouts and trust requests are unchanged.
 
 Implemented operations:
 
@@ -239,7 +250,38 @@ option is named `allow_sha1_identifiers`; neither opt-in substitutes for the
 other.
 This permission changes no signature, HMAC, HKDF, or PRF capability. The
 certificate-signature adapter rejects SHA-1 signatures even when metadata
-hashing is enabled. MD5 is not an available algorithm.
+hashing is enabled.
+
+ABI-2 raw MD5 identifier hashing requires two independent, default-off gates:
+`StandardCryptoProvider.Options.allow_md5_identifier_hash` and metadata
+`Options.allow_md5_identifiers`. `StandardCryptoProvider.init(io, allocator)`
+and `Capabilities.all()` keep MD5 disabled. Use `initWithOptions` to opt in:
+
+```zig
+var selected_md5 = httpx.StandardCryptoProvider.initWithOptions(io, allocator, .{
+    .allow_md5_identifier_hash = true,
+});
+var adapter_md5 = httpx.CryptoCertificateVerifier.init(selected_md5.provider());
+const hasher_md5 = adapter_md5.metadataHasher(.{ .allow_md5_identifiers = true });
+var identifier_md5: [16]u8 = undefined;
+try hasher_md5.hash(allocator, .md5, public_identifier_bytes, &identifier_md5);
+```
+
+The one-shot `digestMetadata` options expose the same independent MD5 gate.
+Neither MD5 gate enables SHA-1 identifiers. The factory captures one of four
+callback permissions: neither legacy hash, SHA-1 only, MD5 only, or both.
+All use the original adapter context. Direct callback invocation and later
+descriptor-option mutation cannot exceed the captured permission.
+Keep provider deployment options immutable while borrowed descriptors or
+handles are in use.
+
+MD5 is never available for HMAC, HKDF, TLS PRF, or signatures. Keyed support
+queries, wrappers, and direct standard-provider callbacks reject it, including
+empty requests; fabricated capability bits cannot authorize it. The standard
+provider also checks its deployment gate in direct raw `hashCreate` calls.
+This identifier primitive does **not** enable Windows CTL MD5 or property
+15/25 matching. Those production acceptance rules remain unchanged and require
+a separate matching-domain contract and native qualification.
 
 Output must be exactly the algorithm's digest length. Every error clears the
 provided output, including invalid length, disabled/unsupported algorithms,
@@ -252,8 +294,8 @@ provider owners to remain at stable addresses and alive.
 A fingerprint match alone does not establish a trust anchor. A `PolicyBinding`
 rejects a different signature context or vtable before private policy dispatch;
 the canonical policy still owns anchor selection and certificate validation.
-This primitive adapter does not change `VerifyPeerRequest`, either existing
-verifier/provider vtable, or the primitive ABI version. The canonical
+This primitive adapter does not change `VerifyPeerRequest` or existing
+verifier/provider vtable layouts. Raw MD5 requires primitive ABI 2. The canonical
 `roots.bind` factory uses this production adapter directly. Platform CTL
 interpretation and native qualification retain their separate release gates.
 

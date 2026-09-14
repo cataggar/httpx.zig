@@ -1825,13 +1825,16 @@ test "TLS certificate adapter mismatches fail before entropy trust or socket I/O
     var different_vtable = provider;
     different_vtable.vtable = &copied_vtable;
     var different_abi = provider;
-    different_abi.abi_version += 1;
+    different_abi.abi_version = 1;
+    try different_abi.validate();
+    var unknown_abi = provider;
+    unknown_abi.abi_version = crypto_provider.current_abi_version + 1;
     var different_context = provider;
     different_context.context = other.provider().context;
     var socket = try Socket.create();
     defer socket.close();
     var trust_context: u8 = 0;
-    for ([_]?CryptoProvider{ null, different_context, different_vtable, different_abi }) |selected| {
+    for ([_]?CryptoProvider{ null, different_context, different_vtable, different_abi, unknown_abi }) |selected| {
         var session = TLSSession.init(.{
             .allocator = std.testing.allocator,
             .crypto_provider = selected,
@@ -1857,6 +1860,64 @@ test "TLS certificate adapter mismatches fail before entropy trust or socket I/O
     try std.testing.expectError(error.TlsInvalidTrustConfiguration, insecure.handshake("localhost"));
     try std.testing.expectEqual(@as(usize, 0), Reject.entropy_calls);
     try std.testing.expectEqual(@as(usize, 0), Reject.trust_calls);
+}
+
+test "TLS server ABI1 and ABI2 admission preserves exact identity before callbacks or I/O" {
+    const Observed = struct {
+        standard: StandardCryptoProvider,
+        calls: usize = 0,
+
+        fn capabilities(context: *anyopaque) crypto_provider.Capabilities {
+            const implementation: *StandardCryptoProvider = @ptrCast(@alignCast(context));
+            const self: *@This() = @fieldParentPtr("standard", implementation);
+            self.calls += 1;
+            return self.standard.provider().vtable.capabilities(context);
+        }
+    };
+    const testing = std.testing;
+    var first = Observed{ .standard = .init(testing.io, testing.allocator) };
+    var second = Observed{ .standard = .init(testing.io, testing.allocator) };
+    var provider = first.standard.provider();
+    var vtable = provider.vtable.*;
+    vtable.capabilities = Observed.capabilities;
+    provider.vtable = &vtable;
+    const pair = try crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x42));
+    const public: crypto_provider.PublicKey = .{ .algorithm = .ed25519, .encoding = .ed25519_raw, .bytes = &pair.public_key.toBytes() };
+    const private: crypto_provider.PrivateKey = .{ .algorithm = .ed25519, .encoding = .raw_secret, .bytes = &pair.secret_key.seed() };
+    var socket = try Socket.create();
+    defer socket.close();
+    socket.close();
+    for ([_]u32{ 1, 2 }) |version| {
+        provider.abi_version = version;
+        const identity = try server_identity.Identity.create(testing.allocator, testing.io, provider, public, null, private);
+        defer identity.destroy();
+        try testing.expect(first.calls > 0);
+        try testing.expectEqual(version, identity.crypto.abi_version);
+        first.calls = 0;
+        var changed_version = provider;
+        changed_version.abi_version = if (version == 1) 2 else 1;
+        try changed_version.validate();
+        var changed_context = provider;
+        changed_context.context = &second.standard;
+        var copied_vtable = vtable;
+        var changed_vtable = provider;
+        changed_vtable.vtable = &copied_vtable;
+        for ([_]CryptoProvider{ changed_version, changed_context, changed_vtable }) |selected| {
+            const config = ServerTLSConfig{
+                .cert_chain_der = &.{"fixture for pre-I/O identity admission"},
+                .crypto_provider = selected,
+                .identity = identity,
+            };
+            try testing.expectError(error.TlsCryptoProviderMismatch, @import("server_runtime.zig").accept(testing.allocator, &socket, &.{}, config));
+        }
+        try testing.expectEqual(@as(usize, 0), first.calls);
+        try testing.expectEqual(@as(usize, 0), second.calls);
+    }
+    for ([_]u32{ 0, 3 }) |version| {
+        provider.abi_version = version;
+        try testing.expectError(error.IncompatibleAbiVersion, server_identity.Identity.create(testing.allocator, testing.io, provider, public, null, private));
+        try testing.expectEqual(@as(usize, 0), first.calls);
+    }
 }
 
 test "TLS record transport error mapping preserves cancellation and deadline" {

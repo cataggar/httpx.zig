@@ -304,6 +304,15 @@ digest length and are cleared on every failure. Binding
 capability/deployment approval. Identifier hashing never enables SHA-1
 signatures, HMAC, HKDF or PRF, creates an anchor, or permits a primitive fallback.
 
+The ABI-2 metadata foundation also exposes default-off
+`allow_md5_identifiers`, independently gated by the selected backend's MD5
+deployment permission. MD5 remains unavailable to keyed operations and
+signatures. This does not extend the canonical Windows CTL acceptance profile:
+MD5 CTL identifiers remain rejected, and property 15/25 do not become matching
+keys.
+The per-certificate digest cache includes the new tag but retains its single,
+fixed certificate-DER input. See [metadata-only digests](./tls.md#metadata-only-certificate-digests).
+
 The canonical owner now exposes
 `roots.bind(adapter_pointer, metadata_digest.Options) !PolicyBinding`.
 The adapter supplies `verifier()` and `metadataHasher(options)` from the same

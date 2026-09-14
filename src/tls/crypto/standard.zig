@@ -4,6 +4,7 @@
 //! every borrowed descriptor and handle. Concurrent calls require a concurrent
 //! Io implementation and thread-safe scratch allocator. Individual mutable
 //! handles must not be used concurrently.
+//! Keep deployment options immutable while descriptors or handles are in use.
 const std = @import("std");
 const p = @import("provider.zig");
 const der = @import("der.zig");
@@ -21,9 +22,19 @@ const MLKem768 = crypto.kem.ml_kem.MLKem768;
 pub const StandardProvider = struct {
     io: std.Io,
     scratch_allocator: Allocator,
+    options: Options = .{},
+
+    pub const Options = struct {
+        /// Raw identifier hashing only; never enables keyed MD5 or signatures.
+        allow_md5_identifier_hash: bool = false,
+    };
 
     pub fn init(io: std.Io, scratch_allocator: Allocator) StandardProvider {
-        return .{ .io = io, .scratch_allocator = scratch_allocator };
+        return initWithOptions(io, scratch_allocator, .{});
+    }
+
+    pub fn initWithOptions(io: std.Io, scratch_allocator: Allocator, options: Options) StandardProvider {
+        return .{ .io = io, .scratch_allocator = scratch_allocator, .options = options };
     }
 
     pub fn provider(self: *StandardProvider) p.CryptoProvider {
@@ -51,6 +62,7 @@ fn Hash(comptime algorithm: p.HashAlgorithm) type {
         .sha256 => crypto.hash.sha2.Sha256,
         .sha384 => crypto.hash.sha2.Sha384,
         .sha512 => crypto.hash.sha2.Sha512,
+        .md5 => crypto.hash.Md5,
     };
 }
 
@@ -59,10 +71,12 @@ const HashState = union(p.HashAlgorithm) {
     sha256: Hash(.sha256),
     sha384: Hash(.sha384),
     sha512: Hash(.sha512),
+    md5: Hash(.md5),
 };
 
-fn capabilities(_: *anyopaque) p.Capabilities {
+fn capabilities(context: *anyopaque) p.Capabilities {
     var result = p.Capabilities.all();
+    result.setHash(.md5, owner(context).options.allow_md5_identifier_hash);
     result.setSign(.rsa_pkcs1_sha1, false);
     return result;
 }
@@ -71,7 +85,8 @@ fn random(context: *anyopaque, out: []u8) Error!void {
     owner(context).io.randomSecure(out) catch return error.EntropyUnavailable;
 }
 
-fn hashCreate(_: *anyopaque, allocator: Allocator, algorithm: p.HashAlgorithm, out: *?*anyopaque) Error!void {
+fn hashCreate(context: *anyopaque, allocator: Allocator, algorithm: p.HashAlgorithm, out: *?*anyopaque) Error!void {
+    if (algorithm == .md5 and !owner(context).options.allow_md5_identifier_hash) return error.UnsupportedAlgorithm;
     const state = try allocator.create(HashState);
     state.* = switch (algorithm) {
         inline else => |a| @unionInit(HashState, @tagName(a), Hash(a).init(.{})),
@@ -88,6 +103,7 @@ fn hashUpdate(_: *anyopaque, raw: *anyopaque, data: []const u8) Error!void {
 fn hashSnapshot(_: *anyopaque, raw: *anyopaque, out: []u8) Error!void {
     var snapshot = cast(HashState, raw).*;
     defer p.secureWipeValue(&snapshot);
+    if (out.len != std.meta.activeTag(snapshot).digestLength()) return error.InvalidDigestLength;
     switch (snapshot) {
         inline else => |*state, a| state.final(out[0..Hash(a).digest_length]),
     }
@@ -105,6 +121,7 @@ fn hashDestroy(_: *anyopaque, allocator: Allocator, raw: *anyopaque) void {
 
 fn hmac(_: *anyopaque, algorithm: p.HashAlgorithm, key: []const u8, parts: []const []const u8, out: []u8) Error!void {
     switch (algorithm) {
+        .md5 => return error.UnsupportedAlgorithm,
         inline else => |a| {
             const Hmac = crypto.auth.hmac.Hmac(Hash(a));
             var state = Hmac.init(key);
@@ -121,6 +138,7 @@ fn hkdfExtract(context: *anyopaque, algorithm: p.HashAlgorithm, salt: []const u8
 
 fn hkdfExpand(_: *anyopaque, algorithm: p.HashAlgorithm, prk: []const u8, info_parts: []const []const u8, out: []u8) Error!void {
     switch (algorithm) {
+        .md5 => return error.UnsupportedAlgorithm,
         inline else => |a| {
             const Hmac = crypto.auth.hmac.Hmac(Hash(a));
             var block: [Hmac.mac_length]u8 = undefined;
@@ -144,6 +162,7 @@ fn hkdfExpand(_: *anyopaque, algorithm: p.HashAlgorithm, prk: []const u8, info_p
 
 fn tls12Prf(_: *anyopaque, algorithm: p.HashAlgorithm, secret: []const u8, label: []const u8, seed_parts: []const []const u8, out: []u8) Error!void {
     switch (algorithm) {
+        .md5 => return error.UnsupportedAlgorithm,
         inline else => |a| {
             const Hmac = crypto.auth.hmac.Hmac(Hash(a));
             var a_block: [Hmac.mac_length]u8 = undefined;

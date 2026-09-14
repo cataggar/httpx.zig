@@ -11,6 +11,86 @@ fn hex(comptime value: []const u8) [value.len / 2]u8 {
     };
 }
 
+test "standard MD5 owner option gates advertisement and direct creation independently" {
+    const Fabricated = struct {
+        fn capabilities(_: *anyopaque) p.Capabilities {
+            var caps = p.Capabilities.all();
+            caps.hashes = 0xff;
+            return caps;
+        }
+    };
+    var owner = StandardProvider.init(testing.io, testing.allocator);
+    var provider = owner.provider();
+    try testing.expect(!owner.options.allow_md5_identifier_hash);
+    try testing.expect(!(try provider.capabilities()).supportsHash(.md5));
+    try testing.expect(!provider.vtable.capabilities(provider.context).supportsHash(.md5));
+    try testing.expectError(error.UnsupportedAlgorithm, provider.hashCreate(testing.failing_allocator, .md5));
+    var raw: ?*anyopaque = null;
+    try testing.expectError(error.UnsupportedAlgorithm, provider.vtable.hashCreate(provider.context, testing.failing_allocator, .md5, &raw));
+    try testing.expectEqual(@as(?*anyopaque, null), raw);
+    var vtable = provider.vtable.*;
+    vtable.capabilities = Fabricated.capabilities;
+    provider.vtable = &vtable;
+    try testing.expect((try provider.capabilities()).supportsHash(.md5));
+    try testing.expectError(error.UnsupportedAlgorithm, provider.hashCreate(testing.failing_allocator, .md5));
+}
+
+test "standard MD5 known answers exact snapshots clone OOM and wiped destruction" {
+    var owner = StandardProvider.initWithOptions(testing.io, testing.allocator, .{ .allow_md5_identifier_hash = true });
+    const provider = owner.provider();
+    try testing.expect((try provider.capabilities()).supportsHash(.md5));
+    var checked = WipeCheckedAllocator{};
+    const allocator = checked.allocator();
+    var hash = try provider.hashCreate(allocator, .md5);
+    defer hash.deinit();
+    var output: [16]u8 = undefined;
+    try hash.snapshot(&output);
+    try testing.expectEqualSlices(u8, &hex("d41d8cd98f00b204e9800998ecf8427e"), &output);
+    try hash.update("a");
+    var clone = try hash.clone(allocator);
+    defer clone.deinit();
+    try testing.expectError(error.OutOfMemory, hash.clone(testing.failing_allocator));
+    try testing.expectError(error.OutOfMemory, provider.hashCreate(testing.failing_allocator, .md5));
+    try hash.update("bc");
+    for (0..2) |_| {
+        try hash.snapshot(&output);
+        try testing.expectEqualSlices(u8, &hex("900150983cd24fb0d6963f7d28e17f72"), &output);
+    }
+    try clone.snapshot(&output);
+    try testing.expectEqualSlices(u8, &hex("0cc175b9c0f1b6a831c399e269772661"), &output);
+    var wrong: [17]u8 = @splat(0xa5);
+    for ([_]usize{ 0, 15, 17 }) |length| {
+        try testing.expectError(error.InvalidDigestLength, hash.snapshot(wrong[0..length]));
+        try testing.expectError(error.InvalidDigestLength, provider.vtable.hashSnapshot(provider.context, hash.raw_handle.?, wrong[0..length]));
+    }
+    clone.deinit();
+    hash.deinit();
+    try testing.expectEqual(@as(usize, 2), checked.frees);
+}
+
+test "standard direct and wrapped keyed MD5 always reject including empty requests" {
+    for ([_]bool{ false, true }) |allow_md5| {
+        var owner = StandardProvider.initWithOptions(testing.io, testing.allocator, .{ .allow_md5_identifier_hash = allow_md5 });
+        const provider = owner.provider();
+        const caps = provider.vtable.capabilities(provider.context);
+        try testing.expect(!caps.supportsHmac(.md5));
+        try testing.expect(!caps.supportsHkdf(.md5));
+        try testing.expect(!caps.supportsTls12Prf(.md5));
+        var output: [16]u8 = @splat(0xa5);
+        for ([_]usize{ 0, 16 }) |length| {
+            const out = output[0..length];
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hmac(.md5, "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hkdfExtract(.md5, "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hkdfExpand(.md5, &output, &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.tls12Prf(.md5, "", "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.vtable.hmac(provider.context, .md5, "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.vtable.hkdfExtract(provider.context, .md5, "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.vtable.hkdfExpand(provider.context, .md5, "", &.{}, out));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.vtable.tls12Prf(provider.context, .md5, "", "", &.{}, out));
+        }
+    }
+}
+
 test "standard provider SHA transcript snapshots and independent clones" {
     var owner = StandardProvider.init(testing.io, testing.allocator);
     const provider = owner.provider();
