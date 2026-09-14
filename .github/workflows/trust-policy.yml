@@ -1,38 +1,120 @@
-name: Native trust policy
+# Runtime qualification only; the native ARM64 compiler remains a separate gate.
+name: Cross-built Windows ARM64 production trust policy
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .gitattributes
-      - src/tls/**/*
-      - build.zig
-      - .github/workflows/trust-policy.yml
 
 permissions:
   contents: read
 
 jobs:
-  trust:
-    name: Trust (${{ matrix.os }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+  cross_compile:
+    name: Cross-compile ARM64 policy (${{ matrix.optimize }})
+    runs-on: windows-2025
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         optimize: [Debug, ReleaseSafe]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Synthetic metadata, ownership, and selected-signature tests
-        shell: bash
-        run: zig build test-tls-standard-trust -Doptimize=${{ matrix.optimize }} --summary all --cache-dir .zig-cache/trust-policy
-      - name: Read-only native trust snapshot
-        shell: bash
-        run: zig build test-tls-system-trust -Doptimize=${{ matrix.optimize }} --summary all --cache-dir .zig-cache/trust-policy
-      # No step installs certificates or modifies a keychain, trust setting,
-      # registry value, or user/machine certificate store. In-memory API fixtures
-      # are process-local. Unsupported platform metadata intentionally fails CI.
+      - name: Compile unchanged production policy targets for ARM64
+        shell: pwsh
+        run: |
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw "Source SHA mismatch" }
+          $changes = git status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $changes) { throw "Evidence checkout is not clean" }
+          $hostArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($hostArchitecture -ne 'X64') { throw "Expected x64 compilation host" }
+          zig build test-tls-standard-trust test-tls-system-trust "-Dtarget=aarch64-windows" "-Doptimize=${{ matrix.optimize }}" --cache-dir .zig-cache/policy-cross --prefix evidence --summary all
+          $code = $LASTEXITCODE
+          Write-Output "Cross-compiler exit=$code"
+          if ($code -ne 0) { exit $code }
+          $binaries = @(
+            foreach ($name in @('test-tls-standard-trust.exe', 'test-tls-system-trust.exe')) {
+              $binary = (Resolve-Path "evidence/bin/$name").Path
+              @{
+                name = $name
+                sha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash
+              }
+            }
+          )
+          @{
+            source_sha = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            target = 'aarch64-windows'
+            optimize = '${{ matrix.optimize }}'
+            compiler_host = $hostArchitecture
+            binaries = $binaries
+          } | ConvertTo-Json -Depth 4 -Compress | Set-Content evidence/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: policy-arm64-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/bin/test-tls-standard-trust.exe
+            evidence/bin/test-tls-system-trust.exe
+            evidence/manifest.json
+          if-no-files-found: error
+          retention-days: 3
+
+  execute_native:
+    name: Execute ARM64 policy (${{ matrix.optimize }})
+    needs: cross_compile
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: policy-arm64-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+      - name: Require source-bound ARM64 binaries and execute both policy targets
+        shell: pwsh
+        run: |
+          $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($actual -ne 'Arm64') { throw "Expected native ARM64 Windows host, got $actual" }
+          $manifest = Get-Content -Raw evidence/manifest.json | ConvertFrom-Json
+          if ($manifest.source_sha -ne $env:GITHUB_SHA -or
+              $manifest.run_id -ne $env:GITHUB_RUN_ID -or
+              $manifest.run_attempt -ne $env:GITHUB_RUN_ATTEMPT -or
+              $manifest.target -ne 'aarch64-windows' -or
+              $manifest.optimize -ne '${{ matrix.optimize }}' -or
+              $manifest.compiler_host -ne 'X64') { throw "Policy provenance mismatch" }
+          $names = @('test-tls-standard-trust.exe', 'test-tls-system-trust.exe')
+          if (@($manifest.binaries).Count -ne $names.Count) { throw "Incomplete policy target set" }
+          $verified = @(
+            for ($index = 0; $index -lt $names.Count; $index++) {
+              $entry = $manifest.binaries[$index]
+              if ($entry.name -ne $names[$index]) { throw "Unexpected policy target" }
+              $binary = (Resolve-Path "evidence/bin/$($entry.name)").Path
+              $digest = (Get-FileHash -Algorithm SHA256 $binary).Hash
+              if ($digest -ne $entry.sha256) { throw "Policy binary digest mismatch" }
+              $bytes = [System.IO.File]::ReadAllBytes($binary)
+              if ($bytes.Length -lt 64 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) {
+                throw "Missing DOS executable header"
+              }
+              $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+              if ($peOffset -lt 64 -or $peOffset -gt $bytes.Length - 26) { throw "Invalid PE header offset" }
+              if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550 -or
+                  [BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0xaa64 -or
+                  [BitConverter]::ToUInt16($bytes, $peOffset + 24) -ne 0x20b) { throw "Expected ARM64 PE32+ policy executable" }
+              @{ name = $entry.name; path = $binary; sha256 = $digest }
+            }
+          )
+          foreach ($binary in $verified) {
+            Write-Output "Native policy execution: target=$($binary.name) host=$actual mode=${{ matrix.optimize }} source=$env:GITHUB_SHA binary_sha256=$($binary.sha256)"
+            & $binary.path
+            $code = $LASTEXITCODE
+            Write-Output "Native policy exit=$code target=$($binary.name)"
+            if ($code -ne 0) { exit $code }
+          }
