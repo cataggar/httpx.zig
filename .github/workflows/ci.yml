@@ -92,7 +92,7 @@ jobs:
 
   cross-check:
     name: Cross Check (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ contains(matrix.target, 'macos') && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -152,6 +152,16 @@ jobs:
           key: zig-${{ matrix.name }}-${{ hashFiles('src/**', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-${{ matrix.name }}-
 
+      - name: Locate macOS SDK
+        id: macos-sdk
+        if: contains(matrix.target, 'macos')
+        shell: bash
+        run: |
+          sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          test -d "$sdk_path/System/Library/Frameworks"
+          test -d "$sdk_path/usr/lib"
+          printf 'path=%s\n' "$sdk_path" >> "$GITHUB_OUTPUT"
+
       - name: Install cross-compilation deps
         if: contains(matrix.target, 'linux') && !startsWith(matrix.target, 'x86')
         run: |
@@ -166,13 +176,29 @@ jobs:
           esac
 
       - name: Build (Debug)
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug
+        shell: bash
+        run: |
+          sdk_args=()
+          if [[ "${{ matrix.target }}" == *-macos ]]; then
+            test -n "$MACOS_SDK_ROOT"
+            sdk_args=(--sysroot "$MACOS_SDK_ROOT")
+          fi
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug "${sdk_args[@]}"
         env:
+          MACOS_SDK_ROOT: ${{ steps.macos-sdk.outputs.path }}
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Build (ReleaseFast)
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+        shell: bash
+        run: |
+          sdk_args=()
+          if [[ "${{ matrix.target }}" == *-macos ]]; then
+            test -n "$MACOS_SDK_ROOT"
+            sdk_args=(--sysroot "$MACOS_SDK_ROOT")
+          fi
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast "${sdk_args[@]}"
         env:
+          MACOS_SDK_ROOT: ${{ steps.macos-sdk.outputs.path }}
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache

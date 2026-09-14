@@ -1,6 +1,12 @@
 const std = @import("std");
 const p = @import("provider.zig");
 
+test {
+    _ = @import("abi_layout_test.zig");
+    _ = @import("standard_test.zig");
+    _ = @import("tls_state_test.zig");
+}
+
 const operation_count = @typeInfo(p.Operation).@"enum".fields.len;
 
 const FakeHandle = struct {
@@ -400,6 +406,125 @@ const FakeProvider = struct {
         .constantTimeEqual = constantTimeEqual,
     };
 };
+
+test "ABI2 raw MD5 admission masks ABI1 allbits before any callback" {
+    const testing = std.testing;
+    var fake = FakeProvider{};
+    fake.caps.hashes = 0xff;
+    fake.caps.hmac_hashes = 0xff;
+    fake.caps.hkdf_hashes = 0xff;
+    fake.caps.tls12_prf_hashes = 0xff;
+    var legacy = fake.descriptor();
+    legacy.abi_version = 1;
+    try legacy.validate();
+    try testing.expectError(error.UnsupportedAlgorithm, legacy.hashCreate(testing.allocator, .md5));
+    for (fake.calls) |count| try testing.expectEqual(@as(usize, 0), count);
+    const legacy_caps = try legacy.capabilities();
+    try testing.expectEqual(@as(u8, 0x0f), legacy_caps.hashes);
+    try testing.expect(!legacy_caps.supportsHash(.md5));
+    for ([_]p.HashAlgorithm{ .sha1, .sha256, .sha384, .sha512 }) |algorithm| {
+        var hash = try legacy.hashCreate(testing.allocator, algorithm);
+        defer hash.deinit();
+        try hash.update("legacy");
+        var output: [64]u8 = undefined;
+        try hash.snapshot(output[0..algorithm.digestLength()]);
+        try legacy.hmac(algorithm, "", &.{}, output[0..algorithm.digestLength()]);
+        try legacy.hkdfExtract(algorithm, "", &.{}, output[0..algorithm.digestLength()]);
+        try legacy.hkdfExpand(algorithm, output[0..algorithm.digestLength()], &.{}, &.{});
+        try legacy.tls12Prf(algorithm, "", "", &.{}, &.{});
+    }
+    try testing.expectEqual(@as(u32, 1), legacy.abi_version);
+    const current = fake.descriptor();
+    try testing.expectEqual(@as(u32, 2), current.abi_version);
+    const caps = try current.capabilities();
+    try testing.expectEqual(@as(u8, 0x1f), caps.hashes);
+    try testing.expectEqual(@as(u8, 0x0f), caps.hmac_hashes);
+    try testing.expectEqual(@as(u8, 0x0f), caps.hkdf_hashes);
+    try testing.expectEqual(@as(u8, 0x0f), caps.tls12_prf_hashes);
+    var hash = try current.hashCreate(testing.allocator, .md5);
+    defer hash.deinit();
+    try testing.expectEqual(p.HashAlgorithm.md5, hash.algorithm);
+}
+
+test "ABI zero and unknown versions reject hash and keyed operations before all callbacks" {
+    const testing = std.testing;
+    for ([_]u32{ 0, 3, std.math.maxInt(u32) }) |version| {
+        var fake = FakeProvider{};
+        fake.caps.hashes = 0xff;
+        var provider = fake.descriptor();
+        provider.abi_version = version;
+        try testing.expectError(error.IncompatibleAbiVersion, provider.capabilities());
+        for ([_]p.HashAlgorithm{ .sha256, .md5 }) |algorithm| {
+            try testing.expectError(error.IncompatibleAbiVersion, provider.hashCreate(testing.allocator, algorithm));
+            try testing.expectError(error.IncompatibleAbiVersion, provider.hmac(algorithm, "", &.{}, &.{}));
+            try testing.expectError(error.IncompatibleAbiVersion, provider.hkdfExtract(algorithm, "", &.{}, &.{}));
+            try testing.expectError(error.IncompatibleAbiVersion, provider.hkdfExpand(algorithm, "", &.{}, &.{}));
+            try testing.expectError(error.IncompatibleAbiVersion, provider.tls12Prf(algorithm, "", "", &.{}, &.{}));
+        }
+        for (fake.calls) |count| try testing.expectEqual(@as(usize, 0), count);
+    }
+}
+
+test "ABI2 never advertises or dispatches keyed MD5 even with fabricated allbits" {
+    const testing = std.testing;
+    try testing.expect(!p.Capabilities.all().supportsHash(.md5));
+    var caps = p.Capabilities.all();
+    caps.hmac_hashes = 0xff;
+    caps.hkdf_hashes = 0xff;
+    caps.tls12_prf_hashes = 0xff;
+    try testing.expect(!caps.supportsHmac(.md5));
+    try testing.expect(!caps.supportsHkdf(.md5));
+    try testing.expect(!caps.supportsTls12Prf(.md5));
+    caps.setHmac(.md5, true);
+    caps.setHkdf(.md5, true);
+    caps.setTls12Prf(.md5, true);
+    try testing.expectEqual(@as(u8, 0), (caps.hmac_hashes | caps.hkdf_hashes | caps.tls12_prf_hashes) & 0x10);
+    for ([_]u32{ 1, 2 }) |version| {
+        var fake = FakeProvider{};
+        fake.caps.hmac_hashes = 0xff;
+        fake.caps.hkdf_hashes = 0xff;
+        fake.caps.tls12_prf_hashes = 0xff;
+        var provider = fake.descriptor();
+        provider.abi_version = version;
+        var output: [16]u8 = @splat(0xa5);
+        for ([_]usize{ 0, 16 }) |length| {
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hmac(.md5, "", &.{}, output[0..length]));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hkdfExtract(.md5, "", &.{}, output[0..length]));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.hkdfExpand(.md5, &output, &.{}, output[0..length]));
+            try testing.expectError(error.UnsupportedAlgorithm, provider.tls12Prf(.md5, "", "", &.{}, output[0..length]));
+        }
+        for (fake.calls) |count| try testing.expectEqual(@as(usize, 0), count);
+    }
+}
+
+test "ABI2 MD5 partial creation clone and snapshot failures retain cleanup ownership" {
+    const testing = std.testing;
+    var fake = FakeProvider{};
+    fake.caps.setHash(.md5, true);
+    const provider = fake.descriptor();
+    fake.partial_fail = .hash_create;
+    try testing.expectError(error.InternalError, provider.hashCreate(testing.allocator, .md5));
+    try testing.expectEqual(@as(usize, 1), fake.count(.hash_destroy));
+    fake.partial_fail = null;
+    var hash = try provider.hashCreate(testing.allocator, .md5);
+    defer hash.deinit();
+    fake.partial_fail = .hash_clone;
+    try testing.expectError(error.InternalError, hash.clone(testing.allocator));
+    try testing.expectEqual(@as(usize, 2), fake.count(.hash_destroy));
+    fake.partial_fail = null;
+    var clone = try hash.clone(testing.allocator);
+    defer clone.deinit();
+    fake.fail = .hash_snapshot;
+    var output: [16]u8 = @splat(0xa5);
+    try testing.expectError(error.InternalError, clone.snapshot(&output));
+    try testing.expect(std.mem.allEqual(u8, &output, 0));
+    fake.fail = null;
+    try testing.expectError(error.OutOfMemory, hash.clone(testing.failing_allocator));
+    clone.deinit();
+    hash.deinit();
+    try testing.expectEqual(@as(usize, 4), fake.count(.hash_destroy));
+    try testing.expectEqual(@as(usize, 4), fake.destroy_wipes);
+}
 
 test "algorithm metadata has exact TLS encodings and sizes" {
     try std.testing.expectEqual(@as(usize, 20), p.HashAlgorithm.sha1.digestLength());

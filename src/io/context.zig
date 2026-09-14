@@ -59,6 +59,7 @@ pub const Error = error{
 /// Combines borrowed external cancellation, owned local cancellation, and
 /// optional request/phase deadlines measured against a monotonic clock.
 ///
+/// Local, external, and all ancestor cancellation states are OR-composed.
 /// Cancellation deterministically takes precedence over timeout. The earliest
 /// deadline wins; a request deadline wins an exact tie with a phase deadline.
 pub const IoContext = struct {
@@ -97,7 +98,9 @@ pub const IoContext = struct {
 
     pub fn isCancelled(self: *const Self) bool {
         if (self.local_cancel.isCancelled()) return true;
-        if (self.external_cancel) |token| return token.isCancelled();
+        if (self.external_cancel) |token| {
+            if (token.isCancelled()) return true;
+        }
         if (self.parent) |parent| return parent.isCancelled();
         return false;
     }
@@ -374,6 +377,57 @@ test "IoContext child inherits cancellation and earliest deadline" {
     try std.testing.expectEqual(@as(u64, 10), child.selectedDeadline().?.deadline.at_ns);
     parent.cancel();
     try std.testing.expectError(error.Cancelled, child.checkAt(0));
+}
+
+test "IoContext OR-composes local external and ancestor cancellation throughout a hierarchy" {
+    for (0..64) |mask| {
+        var tokens: [3]types.CancellationToken = .{ .{}, .{}, .{} };
+        var root = IoContext.init(.{ .external_cancel = &tokens[0], .request_deadline = Deadline.at(100) });
+        var parent = IoContext.init(.{ .parent = &root, .external_cancel = &tokens[1] });
+        var child = IoContext.init(.{ .parent = &parent, .external_cancel = &tokens[2] });
+        const phase = IoContext.init(.{ .parent = &child, .phase_deadline = Deadline.at(200) });
+        if (mask & 0x01 != 0) root.cancel();
+        if (mask & 0x02 != 0) tokens[0].cancel();
+        if (mask & 0x04 != 0) parent.cancel();
+        if (mask & 0x08 != 0) tokens[1].cancel();
+        if (mask & 0x10 != 0) child.cancel();
+        if (mask & 0x20 != 0) tokens[2].cancel();
+        try std.testing.expectEqual(mask & 0x03 != 0, root.isCancelled());
+        try std.testing.expectEqual(mask & 0x0f != 0, parent.isCancelled());
+        try std.testing.expectEqual(mask != 0, child.isCancelled());
+        try std.testing.expectEqual(mask != 0, phase.isCancelled());
+        try std.testing.expectEqual(mask & 0x01 != 0, root.isLocallyCancelled());
+        try std.testing.expectEqual(mask & 0x04 != 0, parent.isLocallyCancelled());
+        try std.testing.expectEqual(mask & 0x10 != 0, child.isLocallyCancelled());
+        try std.testing.expect(!phase.isLocallyCancelled());
+        try std.testing.expectEqual(mask & 0x02 != 0, tokens[0].isCancelled());
+        try std.testing.expectEqual(mask & 0x08 != 0, tokens[1].isCancelled());
+        try std.testing.expectEqual(mask & 0x20 != 0, tokens[2].isCancelled());
+        if (mask == 0) {
+            try phase.checkAt(99);
+            try std.testing.expectError(error.Timeout, phase.checkAt(100));
+        } else {
+            try std.testing.expectError(error.Cancelled, phase.checkAt(99));
+            try std.testing.expectError(error.Cancelled, phase.checkAt(100));
+        }
+        try std.testing.expectEqual(@as(u64, 100), root.request_deadline.?.at_ns);
+        try std.testing.expectEqual(@as(u64, 100), phase.selectedDeadline().?.deadline.at_ns);
+        try std.testing.expectEqual(@as(u64, 200), phase.phase_deadline.?.at_ns);
+    }
+}
+
+test "IoContext uncancelled external tokens do not mask ancestor cancellation during a bounded wait" {
+    var external = types.CancellationToken.init();
+    var root = IoContext.init(.{ .request_deadline = Deadline.at(2 * max_wait_slice_ns) });
+    const child = IoContext.init(.{ .parent = &root, .external_cancel = &external });
+    const phase = IoContext.init(.{ .parent = &child });
+    var clock = FakeClock{ .cancel_on_first_sleep = &root };
+    try std.testing.expectError(error.Cancelled, phase.waitForNsWithClock(2 * max_wait_slice_ns, &clock));
+    try std.testing.expectEqual(@as(usize, 1), clock.sleep_calls);
+    try std.testing.expect(root.isLocallyCancelled());
+    try std.testing.expect(!child.isLocallyCancelled());
+    try std.testing.expect(!external.isCancelled());
+    try std.testing.expectEqual(@as(u64, 2 * max_wait_slice_ns), root.request_deadline.?.at_ns);
 }
 
 test "bounded wait avoids busy-spin after a zero-progress sleep" {

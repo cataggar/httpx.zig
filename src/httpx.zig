@@ -24,7 +24,7 @@ pub const websocket = @import("protocol/websocket.zig");
 pub const ftp = @import("protocol/ftp.zig");
 pub const transfer = @import("io/transfer.zig");
 pub const socket = @import("net/socket.zig");
-const io_context = @import("io/context.zig");
+pub const io_context = @import("io/context.zig");
 
 pub const address = @import("net/address.zig");
 pub const SystemDnsCancellation = address.SystemDnsCancellation;
@@ -382,6 +382,8 @@ pub const CryptoProviderVTable = tls.CryptoProviderVTable;
 pub const CryptoProviderCapabilities = tls.CryptoProviderCapabilities;
 pub const CryptoCapabilities = tls.CryptoCapabilities;
 pub const CryptoProviderError = tls.CryptoProviderError;
+pub const StandardCryptoProvider = tls.StandardCryptoProvider;
+pub const CryptoCertificateVerifier = tls.CryptoCertificateVerifier;
 
 // Transfer exports
 pub const Progress = transfer.Progress;
@@ -1026,6 +1028,15 @@ test "dns" {
     _ = DNSStats;
     _ = AddressFamily;
     _ = AddressOrder;
+}
+
+test "tls server provider runtime" {
+    _ = @import("tls/server_runtime.zig");
+    _ = @import("tls/server_identity.zig");
+}
+
+test "tls connectClient provider transfer" {
+    _ = @import("tls/connect_client_test.zig");
 }
 
 test "tls trust contract exports" {

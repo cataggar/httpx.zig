@@ -35,13 +35,15 @@ pub const secureWipe = secure_wipe.bytes;
 pub const secureWipeValue = secure_wipe.value;
 
 /// Increment for every incompatible vtable or semantic contract change.
-pub const current_abi_version: u32 = 1;
+pub const current_abi_version: u32 = 2;
 
 pub const HashAlgorithm = enum(u8) {
     sha1,
     sha256,
     sha384,
     sha512,
+    /// ABI 2 raw identifier hashing only, never a keyed or signature hash.
+    md5 = 4,
 
     pub fn digestLength(self: HashAlgorithm) usize {
         return switch (self) {
@@ -49,12 +51,13 @@ pub const HashAlgorithm = enum(u8) {
             .sha256 => 32,
             .sha384 => 48,
             .sha512 => 64,
+            .md5 => 16,
         };
     }
 
     pub fn blockLength(self: HashAlgorithm) usize {
         return switch (self) {
-            .sha1, .sha256 => 64,
+            .sha1, .sha256, .md5 => 64,
             .sha384, .sha512 => 128,
         };
     }
@@ -390,6 +393,7 @@ pub const Capabilities = struct {
     signature_verify: u16 = 0,
     constant_time_equal: bool = false,
 
+    /// Baseline capabilities; raw MD5 always requires explicit opt-in.
     pub fn all() Capabilities {
         return .{
             .random = true,
@@ -415,27 +419,27 @@ pub const Capabilities = struct {
     }
 
     pub fn supportsHmac(self: Capabilities, algorithm: HashAlgorithm) bool {
-        return self.hmac_hashes & hashBit(algorithm) != 0;
+        return algorithm != .md5 and self.hmac_hashes & hashBit(algorithm) != 0;
     }
 
     pub fn setHmac(self: *Capabilities, algorithm: HashAlgorithm, supported: bool) void {
-        setCapabilityBit(u8, &self.hmac_hashes, hashBit(algorithm), supported);
+        setCapabilityBit(u8, &self.hmac_hashes, hashBit(algorithm), supported and algorithm != .md5);
     }
 
     pub fn supportsHkdf(self: Capabilities, algorithm: HashAlgorithm) bool {
-        return self.hkdf_hashes & hashBit(algorithm) != 0;
+        return algorithm != .md5 and self.hkdf_hashes & hashBit(algorithm) != 0;
     }
 
     pub fn setHkdf(self: *Capabilities, algorithm: HashAlgorithm, supported: bool) void {
-        setCapabilityBit(u8, &self.hkdf_hashes, hashBit(algorithm), supported);
+        setCapabilityBit(u8, &self.hkdf_hashes, hashBit(algorithm), supported and algorithm != .md5);
     }
 
     pub fn supportsTls12Prf(self: Capabilities, algorithm: HashAlgorithm) bool {
-        return self.tls12_prf_hashes & hashBit(algorithm) != 0;
+        return algorithm != .md5 and self.tls12_prf_hashes & hashBit(algorithm) != 0;
     }
 
     pub fn setTls12Prf(self: *Capabilities, algorithm: HashAlgorithm, supported: bool) void {
-        setCapabilityBit(u8, &self.tls12_prf_hashes, hashBit(algorithm), supported);
+        setCapabilityBit(u8, &self.tls12_prf_hashes, hashBit(algorithm), supported and algorithm != .md5);
     }
 
     pub fn supportsAead(self: Capabilities, algorithm: AeadAlgorithm) bool {
@@ -716,12 +720,17 @@ pub const CryptoProvider = extern struct {
     }
 
     pub fn validate(self: CryptoProvider) ProviderError!void {
-        if (self.abi_version != current_abi_version) return error.IncompatibleAbiVersion;
+        if (self.abi_version != 1 and self.abi_version != 2) return error.IncompatibleAbiVersion;
     }
 
     pub fn capabilities(self: CryptoProvider) ProviderError!Capabilities {
         try self.validate();
-        return self.vtable.capabilities(self.context);
+        var caps = self.vtable.capabilities(self.context);
+        caps.hashes &= if (self.abi_version == 1) @as(u8, 0x0f) else @as(u8, 0x1f);
+        caps.hmac_hashes &= 0x0f;
+        caps.hkdf_hashes &= 0x0f;
+        caps.tls12_prf_hashes &= 0x0f;
+        return caps;
     }
 
     pub fn random(self: CryptoProvider, out: []u8) ProviderError!void {
@@ -738,6 +747,9 @@ pub const CryptoProvider = extern struct {
         allocator: Allocator,
         algorithm: HashAlgorithm,
     ) ProviderError!HashHandle {
+        try self.validate();
+        // ABI 1 must not see the new tag, even through a capability callback.
+        if (self.abi_version == 1 and algorithm == .md5) return error.UnsupportedAlgorithm;
         const caps = try self.capabilities();
         if (!caps.supportsHash(algorithm)) return error.UnsupportedAlgorithm;
 
@@ -760,6 +772,8 @@ pub const CryptoProvider = extern struct {
         parts: []const []const u8,
         out: []u8,
     ) ProviderError!void {
+        try self.validate();
+        if (algorithm == .md5) return error.UnsupportedAlgorithm;
         const caps = try self.capabilities();
         if (!caps.supportsHmac(algorithm)) return error.UnsupportedAlgorithm;
         if (out.len != algorithm.digestLength()) return error.InvalidDigestLength;
@@ -776,6 +790,8 @@ pub const CryptoProvider = extern struct {
         ikm_parts: []const []const u8,
         out_prk: []u8,
     ) ProviderError!void {
+        try self.validate();
+        if (algorithm == .md5) return error.UnsupportedAlgorithm;
         const caps = try self.capabilities();
         if (!caps.supportsHkdf(algorithm)) return error.UnsupportedAlgorithm;
         if (out_prk.len != algorithm.digestLength()) return error.InvalidDigestLength;
@@ -792,6 +808,8 @@ pub const CryptoProvider = extern struct {
         info_parts: []const []const u8,
         out: []u8,
     ) ProviderError!void {
+        try self.validate();
+        if (algorithm == .md5) return error.UnsupportedAlgorithm;
         const caps = try self.capabilities();
         if (!caps.supportsHkdf(algorithm)) return error.UnsupportedAlgorithm;
         const digest_len = algorithm.digestLength();
@@ -811,6 +829,8 @@ pub const CryptoProvider = extern struct {
         seed_parts: []const []const u8,
         out: []u8,
     ) ProviderError!void {
+        try self.validate();
+        if (algorithm == .md5) return error.UnsupportedAlgorithm;
         const caps = try self.capabilities();
         if (!caps.supportsTls12Prf(algorithm)) return error.UnsupportedAlgorithm;
         self.vtable.tls12Prf(self.context, algorithm, secret, label, seed_parts, out) catch |err| {

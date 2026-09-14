@@ -108,6 +108,7 @@ pub const ServerConfig = struct {
     unix_path: ?[]const u8 = null,
     tls_enabled: bool = false,
     tls_cert_path: ?[]const u8 = null,
+    tls_crypto_provider: ?tls_mod.CryptoProvider = null,
     tls_key_path: ?[]const u8 = null,
     tls_alpn_protocols: []const []const u8 = &.{ "h2", "http/1.1" },
     on_starting: ?LifecycleHook = null,
@@ -1493,22 +1494,22 @@ pub const Server = struct {
             else
                 &.{"http/1.1"};
 
-            // Load TLS cert/key if not already loaded (with mutex to prevent double-init)
-            if (self.server_tls_config == null) {
+            const server_tls_config = blk: {
                 const io = defaultIo();
-                self.tls_init_mutex.lock(io) catch unreachable;
+                try self.tls_init_mutex.lock(io);
                 defer self.tls_init_mutex.unlock(io);
                 if (self.server_tls_config == null) {
                     if (self.config.tls_cert_path) |cert_path| {
                         if (self.config.tls_key_path) |key_path| {
-                            self.server_tls_config = tls_mod.loadServerTLSConfig(self.allocator, cert_path, key_path) catch |err| {
+                            self.server_tls_config = tls_mod.loadServerTLSConfigWithProvider(self.allocator, io, cert_path, key_path, self.config.tls_crypto_provider) catch |err| {
                                 self.log(.err, "Failed to load TLS cert/key: {}\n", .{err});
                                 return;
                             };
                         }
                     }
                 }
-            }
+                break :blk self.server_tls_config;
+            };
 
             // Set send/recv timeouts so TLS operations (including closeNotify)
             // don't block indefinitely on Linux when the peer has disconnected.
@@ -1523,7 +1524,7 @@ pub const Server = struct {
                 sock.setRecvTimeout(5000) catch {};
             }
 
-            var tls_conn = tls_mod.acceptServer(self.allocator, &sock, alpn_protos, self.server_tls_config) catch |err| {
+            var tls_conn = tls_mod.acceptServer(self.allocator, &sock, alpn_protos, server_tls_config) catch |err| {
                 self.log(.err, "TLS accept failed: {}\n", .{err});
                 return;
             };
