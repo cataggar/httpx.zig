@@ -1,5 +1,5 @@
-# Evidence branch only. These results do not qualify production trust policy.
-name: Windows disallowed identity evidence
+# Supplemental runtime evidence, not qualification of the failing ARM64 compiler.
+name: Cross-built Windows ARM64 disallowed identity evidence
 
 on:
   workflow_dispatch:
@@ -8,56 +8,96 @@ permissions:
   contents: read
 
 jobs:
-  evidence:
-    name: Disallowed identity (${{ matrix.target }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+  cross_compile:
+    name: Cross-compile ARM64 evidence (${{ matrix.optimize }})
+    runs-on: windows-2025
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-windows
-            architecture: X64
-            optimize: Debug
-          - os: windows-2025
-            target: x86_64-windows
-            architecture: X64
-            optimize: ReleaseSafe
-          - os: windows-11-vs2026-arm
-            target: aarch64-windows
-            architecture: Arm64
-            optimize: Debug
-          - os: windows-11-vs2026-arm
-            target: aarch64-windows
-            architecture: Arm64
-            optimize: ReleaseSafe
+        optimize:
+          - Debug
+          - ReleaseSafe
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Require the matching native Windows host
+      - name: Cross-compile unchanged synthetic comparisons
+        shell: pwsh
+        run: |
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw "Source SHA mismatch" }
+          $changes = git status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $changes) { throw "Evidence checkout is not clean" }
+          $hostArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($hostArchitecture -ne 'X64') { throw "Expected x64 compilation host" }
+          New-Item -ItemType Directory -Path evidence | Out-Null
+          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target aarch64-windows -O "${{ matrix.optimize }}" -lcrypt32 --test-no-exec --cache-dir .zig-cache/disallowed-conformance "-femit-bin=evidence/disallowed-evidence.exe"
+          $code = $LASTEXITCODE
+          Write-Output "Cross-compiler exit=$code binary_present=$(Test-Path evidence/disallowed-evidence.exe)"
+          if ($code -ne 0) { exit $code }
+          $manifest = @{
+            source_sha = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            target = 'aarch64-windows'
+            optimize = '${{ matrix.optimize }}'
+            compiler_host = $hostArchitecture
+            binary_sha256 = (Get-FileHash -Algorithm SHA256 evidence/disallowed-evidence.exe).Hash
+          }
+          $manifest | ConvertTo-Json -Compress | Set-Content evidence/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: disallowed-arm64-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/disallowed-evidence.exe
+            evidence/manifest.json
+          if-no-files-found: error
+          retention-days: 3
+
+  execute_native:
+    name: Execute cross-built ARM64 evidence (${{ matrix.optimize }})
+    needs: cross_compile
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize:
+          - Debug
+          - ReleaseSafe
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: disallowed-arm64-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+      - name: Require source-bound ARM64 binary and execute on native ARM64
         shell: pwsh
         run: |
           $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-          if ($actual -ne '${{ matrix.architecture }}') {
-            throw "Expected native ${{ matrix.architecture }} host, got $actual"
-          }
-          Write-Output "Synthetic metadata evidence: host=$actual target=${{ matrix.target }} mode=${{ matrix.optimize }}"
-      - name: Compile bounded synthetic metadata comparisons
-        shell: pwsh
-        run: |
-          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --test-no-exec --cache-dir .zig-cache/disallowed-conformance "-femit-bin=.zig-cache/disallowed-evidence.exe"
-          $code = $LASTEXITCODE
-          Write-Output "Evidence compiler exit=$code binary_present=$(Test-Path .zig-cache/disallowed-evidence.exe)"
-          if ($code -ne 0) { exit $code }
-      - name: Execute the bounded native evidence binary
-        shell: pwsh
-        run: |
-          $binary = (Resolve-Path .zig-cache/disallowed-evidence.exe).Path
+          if ($actual -ne 'Arm64') { throw "Expected native ARM64 Windows host, got $actual" }
+          $manifest = Get-Content -Raw evidence/manifest.json | ConvertFrom-Json
+          if ($manifest.source_sha -ne $env:GITHUB_SHA -or
+              $manifest.run_id -ne $env:GITHUB_RUN_ID -or
+              $manifest.run_attempt -ne $env:GITHUB_RUN_ATTEMPT -or
+              $manifest.target -ne 'aarch64-windows' -or
+              $manifest.optimize -ne '${{ matrix.optimize }}' -or
+              $manifest.compiler_host -ne 'X64') { throw "Evidence provenance mismatch" }
+          $binary = (Resolve-Path evidence/disallowed-evidence.exe).Path
           $digest = (Get-FileHash -Algorithm SHA256 $binary).Hash
-          Write-Output "Native evidence execution target=${{ matrix.target }} mode=${{ matrix.optimize }} binary_sha256=$digest"
+          if ($digest -ne $manifest.binary_sha256) { throw "Evidence binary digest mismatch" }
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) {
+            throw "Missing DOS executable header"
+          }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 64 -or $peOffset -gt $bytes.Length - 6) { throw "Invalid PE header offset" }
+          if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550 -or
+              [BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0xaa64) { throw "Expected ARM64 PE executable" }
+          Write-Output "Supplemental native evidence: compiler_host=X64 execution_host=$actual target=aarch64-windows mode=${{ matrix.optimize }} source=$env:GITHUB_SHA binary_sha256=$digest"
           & $binary
           $code = $LASTEXITCODE
           Write-Output "Native evidence exit=$code"
