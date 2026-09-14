@@ -8,6 +8,7 @@ pub const Entry = struct { identifier: []const u8, attributes: []const Attribute
 pub const Options = struct {
     usage_oid: []const u8 = ctl.authroot_usage,
     algorithm_oid: []const u8 = "\x2b\x0e\x03\x02\x1a",
+    algorithm_parameters: []const u8 = "",
     this_update: []const u8 = "250101000000Z",
     next_update: ?[]const u8 = "350101000000Z",
     entries: []const Entry = &.{},
@@ -48,7 +49,10 @@ pub fn content(allocator: Allocator, options: Options) ![]u8 {
         "\x02\x01\x01",
         try element(scratch, 0x17, options.this_update),
         if (options.next_update) |time| try element(scratch, 0x17, time) else "",
-        try element(scratch, 0x30, try element(scratch, 0x06, options.algorithm_oid)),
+        try element(scratch, 0x30, try join(scratch, &.{
+            try element(scratch, 0x06, options.algorithm_oid),
+            options.algorithm_parameters,
+        })),
         try element(scratch, 0x30, try join(scratch, entries.items)),
         options.extra_tail,
     }));

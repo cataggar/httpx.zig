@@ -12,6 +12,8 @@ const Reader = x509.Reader;
 pub const authroot_usage = "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x09";
 pub const disallowed_usage = "\x2b\x06\x01\x04\x01\x82\x37\x0a\x03\x1e";
 const property_prefix = "\x2b\x06\x01\x04\x01\x82\x37\x0a\x0b";
+pub const disallowed_hash = property_prefix ++ "\x0f";
+const SubjectAlgorithm = union(enum) { certificate_der: crypto.HashAlgorithm, windows_disallowed };
 
 pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.Kind, bytes: []const u8) Error!void {
     if (bytes.len == 0 or bytes.len > snapshot.limits.max_ctl_bytes or
@@ -39,7 +41,7 @@ pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.K
         try x509.parseTime(try list.any())
     else
         null;
-    const algorithm = try hashAlgorithm((try list.take(0x30)).content);
+    const algorithm = try subjectAlgorithm(expected, (try list.take(0x30)).content);
     var entries: std.ArrayList(platform.FingerprintEntry) = .empty;
     defer entries.deinit(snapshot.allocator);
     if (list.peek() == 0x30) {
@@ -59,7 +61,8 @@ pub fn append(snapshot: *platform.Snapshot, expected: platform.FingerprintList.K
     try list.finish();
     try snapshot.addFingerprintList(.{
         .kind = expected,
-        .algorithm = algorithm,
+        .identity = if (algorithm == .windows_disallowed) .windows_disallowed else .certificate_der,
+        .algorithm = if (algorithm == .certificate_der) algorithm.certificate_der else null,
         .this_update = this_update,
         .next_update = next_update,
         .entries = entries.items,
@@ -79,26 +82,34 @@ fn sequenceNumber(bytes: []const u8) Error!void {
         return error.TlsTrustStoreLoadFailed;
 }
 
-fn hashAlgorithm(bytes: []const u8) Error!crypto.HashAlgorithm {
+fn subjectAlgorithm(kind: platform.FingerprintList.Kind, bytes: []const u8) Error!SubjectAlgorithm {
     var algorithm = Reader.init(bytes);
     const oid = (try algorithm.take(0x06)).content;
     if (algorithm.peek() != null) {
         if ((try algorithm.take(0x05)).content.len != 0) return error.TlsTrustStoreLoadFailed;
     }
     try algorithm.finish();
-    if (std.mem.eql(u8, oid, "\x2b\x0e\x03\x02\x1a")) return .sha1;
-    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x01")) return .sha256;
-    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x02")) return .sha384;
-    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x03")) return .sha512;
+    if (std.mem.eql(u8, oid, disallowed_hash)) {
+        if (kind != .disallowed) return error.TlsTrustStoreLoadFailed;
+        return .windows_disallowed;
+    }
+    if (std.mem.eql(u8, oid, "\x2b\x0e\x03\x02\x1a")) return .{ .certificate_der = .sha1 };
+    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x01")) return .{ .certificate_der = .sha256 };
+    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x02")) return .{ .certificate_der = .sha384 };
+    if (std.mem.eql(u8, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x03")) return .{ .certificate_der = .sha512 };
     // In particular, MD5 identifiers do not acquire a fallback implementation.
     return error.TlsTrustStoreLoadFailed;
 }
 
-fn readEntry(bytes: []const u8, kind: platform.FingerprintList.Kind, algorithm: crypto.HashAlgorithm, property_limit: usize) Error!platform.FingerprintEntry {
+fn readEntry(bytes: []const u8, kind: platform.FingerprintList.Kind, algorithm: SubjectAlgorithm, property_limit: usize) Error!platform.FingerprintEntry {
     var subject = Reader.init(bytes);
-    var result = try platform.FingerprintEntry.init(algorithm, (try subject.take(0x04)).content, .{
-        .roles = if (kind == .disallowed) 0 else 3,
-    });
+    const identifier = (try subject.take(0x04)).content;
+    var result = switch (algorithm) {
+        .certificate_der => |hash| try platform.FingerprintEntry.init(hash, identifier, .{
+            .roles = if (kind == .disallowed) 0 else 3,
+        }),
+        .windows_disallowed => try platform.FingerprintEntry.initDisallowed(identifier),
+    };
     if (subject.peek() != null) {
         var attributes = Reader.init((try subject.take(0x31)).content);
         var seen: [64]u32 = undefined;

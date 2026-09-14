@@ -8,6 +8,7 @@ const allocator = std.testing.allocator;
 
 test {
     _ = @import("windows_ctl_extensions_test.zig");
+    _ = @import("windows_disallowed_test.zig");
 }
 
 const identifier: [20]u8 = @splat(1);
