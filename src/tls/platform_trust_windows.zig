@@ -215,13 +215,44 @@ fn readProperty(allocator: Allocator, limit: usize, query: Query, id: u32) Error
         error.Missing => null,
         error.Failure => error.TlsTrustStoreLoadFailed,
     };
-    if (limit == 0 or (needed == 0 and id != cert_disallowed_filetime_prop_id) or needed > limit or needed > std.math.maxInt(u32))
+    if (limit == 0 or (needed == 0 and id != cert_disallowed_filetime_prop_id) or needed > limit or needed > std.math.maxInt(u32)) {
+        if (comptime builtin.is_test and builtin.os.tag == .windows) {
+            if (query.function == queryProperty) reportPropertySizeGuard(id, needed, limit);
+        }
         return error.TlsTrustStoreLoadFailed;
+    }
     const bytes = try allocator.alloc(u8, needed);
     errdefer allocator.free(bytes);
     const actual = query.function(query.context, id, bytes) catch return error.TlsTrustStoreLoadFailed;
     if (actual != needed) return error.TlsTrustStoreLoadFailed;
     return bytes;
+}
+
+fn reportPropertySizeGuard(id: u32, needed: usize, limit: usize) void {
+    // Static labels only; injected queries cannot emit native observations.
+    const property_id: []const u8 = switch (id) {
+        83 => "83",
+        84 => "84",
+        104 => "104",
+        105 => "105",
+        122 => "122",
+        126 => "126",
+        127 => "127",
+        128 => "128",
+        else => "outside_policy_profile",
+    };
+    std.debug.print(
+        "windows_property_size_evidence source=native boundary=initial_size_guard property_id={s} required_length={d} bound={d} zero_bound={} empty_non104={} over_bound={} over_u32={}\n",
+        .{
+            property_id,
+            needed,
+            limit,
+            limit == 0,
+            needed == 0 and id != cert_disallowed_filetime_prop_id,
+            needed > limit,
+            needed > std.math.maxInt(u32),
+        },
+    );
 }
 
 fn effectiveRoles(allocator: Allocator, limit: usize, certificate: *const crypt32.CERT_CONTEXT) Error!u2 {
@@ -330,6 +361,59 @@ test "Windows property query failure size races and allocation ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.allocated, .{});
     for ([_]Fake{ .{ .size = 0 }, .{ .size = 9 }, .{ .fail_read = true }, .{ .changed_size = true } }) |fake| {
         try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(std.testing.allocator, 8, .{ .context = &fake, .function = Fake.query }, 9));
+    }
+}
+
+test "Windows property size evidence preserves guard boundaries and exact query counts" {
+    const Fake = struct {
+        needed: usize,
+        calls: usize = 0,
+        reads: usize = 0,
+
+        fn query(context: *const anyopaque, _: u32, buffer: ?[]u8) QueryError!usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context)));
+            self.calls += 1;
+            if (buffer) |bytes| {
+                self.reads += 1;
+                @memset(bytes, 0);
+            }
+            return self.needed;
+        }
+
+        fn descriptor(self: *@This()) Query {
+            return .{ .context = self, .function = query };
+        }
+
+        fn reject(id: u32, needed: usize, limit: usize) !void {
+            var fake = @This(){ .needed = needed };
+            var no_storage = std.heap.FixedBufferAllocator.init(&.{});
+            try std.testing.expectError(error.TlsTrustStoreLoadFailed, readProperty(no_storage.allocator(), limit, fake.descriptor(), id));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqual(@as(usize, 0), fake.reads);
+        }
+    };
+    for ([_]u32{ 0, 83, 84, 105, 122, 126, 127, 128, std.math.maxInt(u32) }) |id|
+        try Fake.reject(id, 0, 8);
+    try Fake.reject(104, 0, 0);
+    try Fake.reject(83, 1, 0);
+    try Fake.reject(83, 9, 8);
+    if (comptime @bitSizeOf(usize) > 32) {
+        const over_u32: usize = @as(usize, std.math.maxInt(u32)) + 1;
+        try Fake.reject(83, over_u32, std.math.maxInt(usize));
+        try Fake.reject(83, over_u32, 8);
+        var at_u32 = Fake{ .needed = std.math.maxInt(u32) };
+        var no_storage = std.heap.FixedBufferAllocator.init(&.{});
+        try std.testing.expectError(error.OutOfMemory, readProperty(no_storage.allocator(), std.math.maxInt(u32), at_u32.descriptor(), 83));
+        try std.testing.expectEqual(@as(usize, 1), at_u32.calls);
+        try std.testing.expectEqual(@as(usize, 0), at_u32.reads);
+    }
+    for ([_]struct { id: u32, needed: usize }{ .{ .id = 104, .needed = 0 }, .{ .id = 83, .needed = 8 } }) |allowed| {
+        var fake = Fake{ .needed = allowed.needed };
+        const bytes = (try readProperty(std.testing.allocator, 8, fake.descriptor(), allowed.id)).?;
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(allowed.needed, bytes.len);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expectEqual(@as(usize, 1), fake.reads);
     }
 }
 
