@@ -623,6 +623,8 @@ readiness slices do not restart its deadline. `null` adds no deadline and zero
 expires before that operation performs I/O. These are logical context budgets,
 not inherited `SO_RCVTIMEO`/`SO_SNDTIMEO` values. Set the parent's request deadline
 to additionally bound the entire handshake. Parent deadlines are never mutated.
+Local, external-token and all ancestor cancellation states are OR-composed;
+an uncancelled external token never masks cancellation from an ancestor.
 
 Pre-cancellation/expiry is checked before work, and context checks after
 blocking boundaries take precedence over the completed I/O result. Concrete

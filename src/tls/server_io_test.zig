@@ -164,16 +164,46 @@ test "TLS server context pre-cancellation and expired parent precede all I/O" {
     try testing.expectError(error.TlsInvalidPrivateKey, engine.acceptServer(testing.allocator, &socket, &.{}, null));
 }
 
+fn preCancelledAncestor(expired: bool) !void {
+    var socket: net.Socket = undefined;
+    var external: @import("../core/types.zig").CancellationToken = .{};
+    var ancestor = IoContext.init(.{ .request_deadline = if (expired) Deadline.at(0) else null });
+    ancestor.cancel();
+    const child = IoContext.init(.{ .parent = &ancestor, .external_cancel = &external });
+    try testing.expectError(error.Cancelled, engine.acceptServerWithIo(testing.failing_allocator, &socket, &.{}, null, .{
+        .context = &child,
+        .read_timeout_ms = 2_000,
+        .write_timeout_ms = 2_000,
+    }));
+    try testing.expect(!external.isCancelled());
+    try testing.expect(!child.isLocallyCancelled());
+}
+
+test "TLS server context cancelled ancestor precedes configuration and I/O despite an uncancelled external token" {
+    try preCancelledAncestor(false);
+}
+
+test "TLS server context cancelled ancestor beats an expired request deadline despite an uncancelled external token" {
+    try preCancelledAncestor(true);
+}
+
 test "TLS server context cancels blocked initial and partial records within the shutdown bound" {
     var chain = try fixtures.Chain.init(testing.allocator, .ecdsa_p256);
     defer chain.deinit();
     const prefixes = [_][]const u8{ "", "\x16\x03", "\x16\x03\x03\x00\x09\x01\x00" };
+    const Cancellation = enum { local, external, ancestor_local, ancestor_external };
     for (prefixes) |prefix| {
-        for ([_]bool{ false, true }) |external| {
+        for (std.enums.values(Cancellation)) |source| {
             var pair = try Pair.init();
             defer pair.deinit();
             var token: @import("../core/types.zig").CancellationToken = .{};
-            var parent = IoContext.init(.{ .external_cancel = if (external) &token else null });
+            var ancestor_token: @import("../core/types.zig").CancellationToken = .{};
+            var ancestor = IoContext.init(.{ .external_cancel = &ancestor_token });
+            const nested = source == .ancestor_local or source == .ancestor_external;
+            var parent = IoContext.init(.{
+                .external_cancel = if (source == .local) null else &token,
+                .parent = if (nested) &ancestor else null,
+            });
             var observed = Observed{ .standard = .init(testing.io, testing.allocator), .parent = &parent };
             var selected = observed.standard.provider();
             var vtable = selected.vtable.*;
@@ -203,17 +233,26 @@ test "TLS server context cancels blocked initial and partial records within the 
             }
             try expectPending(&worker);
             const start = context_mod.monotonicNowNs();
-            if (external) token.cancel() else parent.cancel();
+            switch (source) {
+                .local => parent.cancel(),
+                .external => token.cancel(),
+                .ancestor_local => ancestor.cancel(),
+                .ancestor_external => ancestor_token.cancel(),
+            }
             // The two-second logical/socket budgets remain intact. The peer
             // stays open throughout cancellation; watchdog cleanup cannot pass.
             waitFor(&worker.done, 3_000) catch return error.FixtureCancellationWatchdog;
             thread.join();
             joined = true;
             const elapsed_us = (worker.finished_ns - start) / std.time.ns_per_us;
-            errdefer std.debug.print("TLS server cancellation: prefix_len={d} external={} elapsed_us={d}\n", .{ prefix.len, external, elapsed_us });
+            errdefer std.debug.print("TLS server cancellation: prefix_len={d} source={s} elapsed_us={d}\n", .{ prefix.len, @tagName(source), elapsed_us });
             try testing.expectEqual(@as(?anyerror, error.Cancelled), worker.failure);
             try testing.expectEqual(@as(usize, 0), worker.handshakes);
             try testing.expect(elapsed_us < 1_000_000);
+            try testing.expectEqual(source == .local, parent.isLocallyCancelled());
+            try testing.expectEqual(source == .external, token.isCancelled());
+            try testing.expectEqual(source == .ancestor_local, ancestor.isLocallyCancelled());
+            try testing.expectEqual(source == .ancestor_external, ancestor_token.isCancelled());
         }
     }
 }
