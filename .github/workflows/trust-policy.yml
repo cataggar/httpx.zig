@@ -74,6 +74,19 @@ jobs:
       matrix:
         optimize: [Debug, ReleaseSafe]
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Require exact source and named runtime fixtures
+        shell: pwsh
+        run: |
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw "Runtime fixture source SHA mismatch" }
+          $changes = git status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $changes) { throw "Runtime fixture checkout is not clean" }
+          if (-not (Test-Path -LiteralPath 'src/tls/fixtures/trust/root_ed25519.pem' -PathType Leaf)) {
+            throw "Missing named PEM runtime fixture"
+          }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: policy-arm64-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
