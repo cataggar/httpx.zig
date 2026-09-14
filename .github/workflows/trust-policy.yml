@@ -48,7 +48,7 @@ jobs:
       - name: Compile bounded synthetic metadata comparisons
         shell: pwsh
         run: |
-          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --test-no-exec --cache-dir .zig-cache/disallowed-conformance -femit-bin=.zig-cache/disallowed-evidence.exe
+          zig test src/tls/platform_trust_windows.zig --test-filter "disallowed conformance" -target "${{ matrix.target }}" -O "${{ matrix.optimize }}" -lcrypt32 --test-no-exec --cache-dir .zig-cache/disallowed-conformance "-femit-bin=.zig-cache/disallowed-evidence.exe"
           $code = $LASTEXITCODE
           Write-Output "Evidence compiler exit=$code binary_present=$(Test-Path .zig-cache/disallowed-evidence.exe)"
           if ($code -ne 0) { exit $code }
