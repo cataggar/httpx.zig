@@ -23,7 +23,7 @@ test "ABI2 retains ABI1 byte layouts offsets and legacy enum tags" {
     comptime {
         require(@sizeOf(p.HashAlgorithm) == 1, "hash tag width changed");
         for (.{ p.HashAlgorithm.sha1, p.HashAlgorithm.sha256, p.HashAlgorithm.sha384, p.HashAlgorithm.sha512, p.HashAlgorithm.md5 }, 0..) |algorithm, tag|
-            require(@intFromEnum(algorithm) == tag, "hash tag changed");
+            require(@backingInt(algorithm) == tag, "hash tag changed");
         const pointer_size = @sizeOf(*anyopaque);
         require(@sizeOf(p.CryptoProvider) == 3 * pointer_size, "provider descriptor size changed");
         require(@alignOf(p.CryptoProvider) == @alignOf(*anyopaque), "provider descriptor alignment changed");
@@ -32,12 +32,12 @@ test "ABI2 retains ABI1 byte layouts offsets and legacy enum tags" {
         require(@offsetOf(p.CryptoProvider, "vtable") == 2 * pointer_size, "vtable field moved");
         require(@sizeOf(p.Capabilities) == @sizeOf(LegacyCapabilities), "capability size changed");
         require(@alignOf(p.Capabilities) == @alignOf(LegacyCapabilities), "capability alignment changed");
-        const fields = @typeInfo(p.Capabilities).@"struct".fields;
-        const old_fields = @typeInfo(LegacyCapabilities).@"struct".fields;
-        require(fields.len == old_fields.len, "capability field count changed");
-        for (old_fields, fields) |old, field| {
-            require(old.type == field.type, "capability field type changed");
-            require(@offsetOf(p.Capabilities, old.name) == @offsetOf(LegacyCapabilities, old.name), "capability field moved");
+        const info = @typeInfo(p.Capabilities).@"struct";
+        const old_info = @typeInfo(LegacyCapabilities).@"struct";
+        require(info.field_names.len == old_info.field_names.len, "capability field count changed");
+        for (old_info.field_names, old_info.field_types, info.field_types) |old_name, old_type, field_type| {
+            require(old_type == field_type, "capability field type changed");
+            require(@offsetOf(p.Capabilities, old_name) == @offsetOf(LegacyCapabilities, old_name), "capability field moved");
         }
         const names = .{
             "capabilities",          "random",            "hashCreate",          "hashUpdate",        "hashSnapshot", "hashClone",         "hashDestroy",
@@ -45,7 +45,7 @@ test "ABI2 retains ABI1 byte layouts offsets and legacy enum tags" {
             "keyAgreementPublicKey", "keyAgreementAgree", "keyAgreementDestroy", "kemGenerate",       "kemPublicKey", "kemEncapsulate",    "kemDecapsulate",
             "kemDestroy",            "signingKeyImport",  "sign",                "signingKeyDestroy", "verify",       "constantTimeEqual",
         };
-        require(@typeInfo(p.VTable).@"struct".fields.len == names.len, "vtable slot count changed");
+        require(@typeInfo(p.VTable).@"struct".field_names.len == names.len, "vtable slot count changed");
         require(@sizeOf(p.VTable) == names.len * pointer_size, "vtable size changed");
         require(@alignOf(p.VTable) == @alignOf(*anyopaque), "vtable alignment changed");
         for (names, 0..) |name, index|

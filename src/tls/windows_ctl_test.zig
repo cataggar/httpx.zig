@@ -81,7 +81,7 @@ test "CTL absent empty104 and zero FILETIME remain distinct" {
     }{
         .{ .attributes = &.{}, .unsupported = false, .cutoff = null },
         .{ .attributes = &.{.{ .id = 104, .value = "" }}, .unsupported = true, .cutoff = null },
-        .{ .attributes = &.{.{ .id = 104, .value = "\x00" ** 8 }}, .unsupported = false, .cutoff = -11_644_473_600 },
+        .{ .attributes = &.{.{ .id = 104, .value = &@as([8]u8, @splat(0)) }}, .unsupported = false, .cutoff = -11_644_473_600 },
     };
     for (cases) |case| {
         const encoded = try fixtures.content(allocator, .{ .entries = &.{.{ .identifier = &identifier, .attributes = case.attributes }} });
@@ -150,8 +150,8 @@ test "CTL malformed time encodings still fail atomically" {
         for ([_]u32{ 104, 128 }) |id| {
             for ([_][]const u8{
                 "",
-                "\x00" ** 7,
-                "\x00" ** 9,
+                &@as([7]u8, @splat(0)),
+                &@as([9]u8, @splat(0)),
                 "250101000000Z",
                 "\x17\x0d250101000000Z",
                 "\x18\x0f20250101000000Z",

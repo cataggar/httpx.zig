@@ -73,7 +73,7 @@ pub fn isHttp1x(protocol: ?[]const u8) bool {
 /// A maximum of 64 bytes covers all well-known protocol identifiers with
 /// room for future custom protocols.
 pub const NegotiatedAlpn = struct {
-    buf: [64]u8 = [1]u8{0} ** 64,
+    buf: [64]u8 = @splat(0),
     len: usize = 0,
 
     /// Stores `proto` into this `NegotiatedAlpn`.  Truncates silently if

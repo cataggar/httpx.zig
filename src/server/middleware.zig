@@ -166,35 +166,36 @@ pub fn loggerWithConfig(comptime config: LoggerConfig) Middleware {
                     }) catch "[Logger format failed or message too long]";
                     f(.info, msg);
                 } else {
-                    const method_style = switch (ctx.request.method) {
-                        .GET => tint.style(.{ .fg = .{ .ansi4 = .bright_green } }),
-                        .POST => tint.style(.{ .fg = .{ .ansi4 = .bright_blue } }),
-                        .PUT, .PATCH => tint.style(.{ .fg = .{ .ansi4 = .bright_yellow } }),
-                        .DELETE => tint.style(.{ .fg = .{ .ansi4 = .bright_red } }),
-                        else => tint.style(.{ .fg = .{ .ansi4 = .white } }),
+                    const method_style: tint.style.Style = switch (ctx.request.method) {
+                        .GET => .{ .foreground = .{ .ansi4 = .brightGreen } },
+                        .POST => .{ .foreground = .{ .ansi4 = .brightBlue } },
+                        .PUT, .PATCH => .{ .foreground = .{ .ansi4 = .brightYellow } },
+                        .DELETE => .{ .foreground = .{ .ansi4 = .brightRed } },
+                        else => .{ .foreground = .{ .ansi4 = .white } },
                     };
-                    const dur_style = if (duration > 1000)
-                        tint.style(.{ .fg = .{ .ansi4 = .bright_red }, .bold = true })
+                    const dur_style: tint.style.Style = if (duration > 1000)
+                        .{ .foreground = .{ .ansi4 = .brightRed }, .bold = true }
                     else if (duration > 500)
-                        tint.style(.{ .fg = .{ .ansi4 = .bright_yellow } })
+                        .{ .foreground = .{ .ansi4 = .brightYellow } }
                     else
-                        tint.style(.{ .fg = .{ .ansi4 = .bright_black }, .dim = true });
+                        .{ .foreground = .{ .ansi4 = .brightBlack }, .dim = true };
 
-                    const app_style = tint.style(.{ .fg = .{ .ansi4 = .bright_cyan }, .bold = true });
+                    const app_style: tint.style.Style = .{ .foreground = .{ .ansi4 = .brightCyan }, .bold = true };
+                    const empty_style: tint.style.Style = .{};
                     std.debug.print(
                         "{s}HTTPX{s} {s}{s}{s} {s}{s}{s} - {s}{d}ms{s}\n",
                         .{
-                            app_style.toAnsi(),
-                            tint.reset,
-                            method_style.toAnsi(),
+                            app_style.toAnsi().slice(),
+                            tint.ansi.reset.all,
+                            method_style.toAnsi().slice(),
                             ctx.request.method.toString(),
-                            tint.reset,
-                            tint.style(.{}).toAnsi(),
+                            tint.ansi.reset.all,
+                            empty_style.toAnsi().slice(),
                             ctx.request.uri.path,
-                            tint.reset,
-                            dur_style.toAnsi(),
+                            tint.ansi.reset.all,
+                            dur_style.toAnsi().slice(),
                             duration,
-                            tint.reset,
+                            tint.ansi.reset.all,
                         },
                     );
                 }

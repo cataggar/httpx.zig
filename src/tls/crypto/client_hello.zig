@@ -4,7 +4,7 @@ const p = @import("provider.zig");
 const KeyShare = @import("key_share.zig").KeyShare;
 
 pub const Error = error{ TlsRecordOverflow, TlsIllegalParameter, UnsupportedAlgorithm };
-pub const extended_master_secret: tls.ExtensionType = @enumFromInt(23);
+pub const extended_master_secret: tls.ExtensionType = @fromBackingInt(@intCast(23));
 pub const signature_schemes = [_]p.SignatureScheme{
     .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384,
     .rsa_pss_rsae_sha256,    .rsa_pss_rsae_sha384,
@@ -110,7 +110,7 @@ const Builder = struct {
     }
 
     fn extension(self: *Builder, kind: tls.ExtensionType) Error!usize {
-        try self.integer(@intFromEnum(kind));
+        try self.integer(@backingInt(kind));
         return self.vector();
     }
 };
@@ -126,7 +126,7 @@ pub fn build(out: []u8, caps: p.Capabilities, shares: *const KeyShare, entropy: 
     var tls12 = false;
     for (suites) |suite| {
         if (!offered(caps, suite.tag, suite.version)) continue;
-        try b.integer(@intFromEnum(suite.tag));
+        try b.integer(@backingInt(suite.tag));
         if (suite.version == .tls_1_3) tls13 = true else tls12 = true;
     }
     if (!tls13 and !tls12) return error.UnsupportedAlgorithm;
@@ -144,7 +144,7 @@ pub fn build(out: []u8, caps: p.Capabilities, shares: *const KeyShare, entropy: 
         const ext = try b.extension(.signature_algorithms);
         const list = try b.vector();
         for (signature_schemes) |scheme| {
-            if (caps.supportsVerify(scheme)) try b.integer(@intFromEnum(scheme));
+            if (caps.supportsVerify(scheme)) try b.integer(@backingInt(scheme));
         }
         try b.finish(list);
         try b.finish(ext);
@@ -153,8 +153,8 @@ pub fn build(out: []u8, caps: p.Capabilities, shares: *const KeyShare, entropy: 
         const ext = try b.extension(.supported_groups);
         const list = try b.vector();
         for (KeyShare.algorithms) |algorithm| {
-            if (shares.publicKey(@enumFromInt(@intFromEnum(algorithm))) != null)
-                try b.integer(@intFromEnum(algorithm));
+            if (shares.publicKey(@fromBackingInt(@intCast(@backingInt(algorithm)))) != null)
+                try b.integer(@backingInt(algorithm));
         }
         if (b.len == list + 2) return error.UnsupportedAlgorithm;
         try b.finish(list);
@@ -164,8 +164,8 @@ pub fn build(out: []u8, caps: p.Capabilities, shares: *const KeyShare, entropy: 
         const ext = try b.extension(.key_share);
         const list = try b.vector();
         for (KeyShare.algorithms) |algorithm| {
-            const public_key = shares.publicKey(@enumFromInt(@intFromEnum(algorithm))) orelse continue;
-            try b.integer(@intFromEnum(algorithm));
+            const public_key = shares.publicKey(@fromBackingInt(@intCast(@backingInt(algorithm)))) orelse continue;
+            try b.integer(@backingInt(algorithm));
             try b.integer(@intCast(public_key.len));
             try b.append(public_key);
         }

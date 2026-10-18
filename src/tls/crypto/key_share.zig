@@ -4,7 +4,7 @@ const tls = std.crypto.tls;
 
 pub const KeyShare = struct {
     pub const algorithms = [_]p.KeyAgreementAlgorithm{ .x25519, .secp256r1, .secp384r1 };
-    keys: [algorithms.len]?p.KeyAgreementKey = .{null} ** algorithms.len,
+    keys: [algorithms.len]?p.KeyAgreementKey = @splat(null),
     public_keys: [algorithms.len][97]u8 = undefined,
     shared_secret: [48]u8 = undefined,
     shared_secret_len: usize = 0,
@@ -26,7 +26,7 @@ pub const KeyShare = struct {
 
     pub fn publicKey(self: *const KeyShare, group: tls.NamedGroup) ?[]const u8 {
         for (algorithms, 0..) |algorithm, i| {
-            if (@intFromEnum(group) == @intFromEnum(algorithm) and self.keys[i] != null)
+            if (@backingInt(group) == @backingInt(algorithm) and self.keys[i] != null)
                 return self.public_keys[i][0..algorithm.publicKeyLength()];
         }
         return null;
@@ -34,7 +34,7 @@ pub const KeyShare = struct {
 
     pub fn exchange(self: *KeyShare, group: tls.NamedGroup, peer_public_key: []const u8) (p.ProviderError || error{TlsIllegalParameter})!void {
         for (algorithms, 0..) |algorithm, i| {
-            if (@intFromEnum(group) != @intFromEnum(algorithm)) continue;
+            if (@backingInt(group) != @backingInt(algorithm)) continue;
             const key = if (self.keys[i]) |*key| key else return error.TlsIllegalParameter;
             try key.agree(peer_public_key, self.shared_secret[0..algorithm.sharedSecretLength()]);
             self.shared_secret_len = algorithm.sharedSecretLength();

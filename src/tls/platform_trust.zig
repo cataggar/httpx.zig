@@ -376,7 +376,7 @@ const Digests = struct {
     const capacity = blk: {
         var count: usize = 0;
         for (std.enums.values(crypto.HashAlgorithm)) |algorithm|
-            count = @max(count, @as(usize, @intFromEnum(algorithm)) + 1);
+            count = @max(count, @as(usize, @backingInt(algorithm)) + 1);
         break :blk count;
     };
 
@@ -401,8 +401,8 @@ const Digests = struct {
     }
 
     fn getDomain(self: *Digests, algorithm: crypto.HashAlgorithm, domain: Domain) Error![]const u8 {
-        const index = @intFromEnum(algorithm);
-        const domain_index = @intFromEnum(domain);
+        const index = @backingInt(algorithm);
+        const domain_index = @backingInt(domain);
         const output = self.values[domain_index][index][0..algorithm.digestLength()];
         if (!self.ready[domain_index][index]) {
             const input = switch (domain) {
@@ -428,8 +428,8 @@ test "platform digest cache covers ABI2 tags for one fixed certificate DER input
         fn hash(context: *anyopaque, _: Allocator, algorithm: crypto.HashAlgorithm, input: []const u8, output: []u8) crypto.ProviderError!void {
             const self: *@This() = @ptrCast(@alignCast(context));
             if (!std.mem.eql(u8, input, "fixed certificate DER")) return error.InvalidInput;
-            self.calls[@intFromEnum(algorithm)] += 1;
-            @memset(output, @intFromEnum(algorithm));
+            self.calls[@backingInt(algorithm)] += 1;
+            @memset(output, @backingInt(algorithm));
         }
     };
     var fake = Fake{};
@@ -443,8 +443,8 @@ test "platform digest cache covers ABI2 tags for one fixed certificate DER input
         const second = try digests.get(algorithm);
         try std.testing.expectEqual(algorithm.digestLength(), first.len);
         try std.testing.expect(first.ptr == second.ptr);
-        try std.testing.expect(std.mem.allEqual(u8, second, @intFromEnum(algorithm)));
-        try std.testing.expectEqual(@as(usize, 1), fake.calls[@intFromEnum(algorithm)]);
+        try std.testing.expect(std.mem.allEqual(u8, second, @backingInt(algorithm)));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls[@backingInt(algorithm)]);
     }
 }
 
@@ -471,7 +471,7 @@ test "Disallowed cache separates algorithm and byte domain even when MD5 outputs
     var outputs: [3][]const u8 = undefined;
     for (std.enums.values(Digests.Domain), &outputs, 0..) |domain, *output, i| {
         output.* = try digests.getDomain(.md5, domain);
-        try std.testing.expectEqualSlices(u8, "\x42" ** 16, output.*);
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x42)), output.*);
         try std.testing.expect(output.ptr == (try digests.getDomain(.md5, domain)).ptr);
         try std.testing.expectEqual(@as(usize, 1), fake.calls[i]);
         for (outputs[0..i]) |previous| try std.testing.expect(output.ptr != previous.ptr);
@@ -480,8 +480,8 @@ test "Disallowed cache separates algorithm and byte domain even when MD5 outputs
     try std.testing.expectEqual(@as(usize, 2), fake.calls[1]);
     fake.failure = true;
     try std.testing.expectError(error.TlsTrustStoreLoadFailed, digests.getDomain(.sha384, .tbs_der));
-    const domain = @intFromEnum(Digests.Domain.tbs_der);
-    const algorithm = @intFromEnum(crypto.HashAlgorithm.sha384);
+    const domain = @backingInt(Digests.Domain.tbs_der);
+    const algorithm = @backingInt(crypto.HashAlgorithm.sha384);
     try std.testing.expect(!digests.ready[domain][algorithm]);
     try std.testing.expect(std.mem.allEqual(u8, digests.values[domain][algorithm][0..48], 0));
     fake.failure = false;

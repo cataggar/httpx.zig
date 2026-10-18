@@ -125,7 +125,7 @@ const Keys = struct {
     }
 
     fn get(self: Keys, dictionary: Ref, key: Key) ?Ref {
-        return CFDictionaryGetValue(dictionary, self.values[@intFromEnum(key)]);
+        return CFDictionaryGetValue(dictionary, self.values[@backingInt(key)]);
     }
 };
 
@@ -247,8 +247,8 @@ test "native macOS in-memory settings parse deny and reject a malformed value wi
     const deny: i64 = 3;
     const number = CFNumberCreate(null, 4, &deny) orelse return error.OutOfMemory;
     defer CFRelease(number);
-    CFDictionarySetValue(dictionary, keys.values[@intFromEnum(Key.result)], number);
+    CFDictionarySetValue(dictionary, keys.values[@backingInt(Key.result)], number);
     try std.testing.expectEqual(metadata.Result.deny, (try readRule(keys, dictionary)).result);
-    CFDictionarySetValue(dictionary, keys.values[@intFromEnum(Key.result)], keys.values[0]);
+    CFDictionarySetValue(dictionary, keys.values[@backingInt(Key.result)], keys.values[0]);
     try std.testing.expectError(error.TlsTrustStoreLoadFailed, readRule(keys, dictionary));
 }

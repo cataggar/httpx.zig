@@ -120,11 +120,11 @@ test "Disallowed owns exact mixed identifiers without width classification or an
 test "Disallowed rejects wrong lengths unknown selectors parameters attributes and global data atomically" {
     var snapshot = platform.Snapshot.init(a, .{});
     defer snapshot.deinit();
-    try add(&snapshot, &.{.{ .identifier = "\x42" ** 16 }});
+    try add(&snapshot, &.{.{ .identifier = &@as([16]u8, @splat(0x42)) }});
     for ([_]usize{ 0, 1, 15, 17, 28, 31, 33, 47, 49, 65 }) |length| {
         const bytes: [65]u8 = @splat(0x42);
         try testing.expectError(error.TlsTrustStoreLoadFailed, add(&snapshot, &.{
-            .{ .identifier = "\x42" ** 16 }, .{ .identifier = bytes[0..length] },
+            .{ .identifier = &@as([16]u8, @splat(0x42)) }, .{ .identifier = bytes[0..length] },
         }));
         try testing.expectEqual(@as(usize, 1), snapshot.fingerprint_lists.items.len);
         try testing.expectEqual(@as(usize, 1), snapshot.fingerprint_entries);
@@ -137,7 +137,7 @@ test "Disallowed rejects wrong lengths unknown selectors parameters attributes a
         .{ .usage_oid = ctl.disallowed_usage, .algorithm_oid = "\x2a\x86\x48\x86\xf7\x0d\x02\x05" },
         .{ .usage_oid = ctl.disallowed_usage, .algorithm_oid = ctl.disallowed_hash, .extra_tail = "\xa0\x02\x30\x00" },
         .{ .usage_oid = ctl.disallowed_usage, .algorithm_oid = ctl.disallowed_hash, .entries = &.{
-            .{ .identifier = "\x42" ** 16, .attributes = &.{.{ .id = 25, .value = "\x42" ** 16 }} },
+            .{ .identifier = &@as([16]u8, @splat(0x42)), .attributes = &.{.{ .id = 25, .value = &@as([16]u8, @splat(0x42)) }} },
         } },
     };
     for (invalid, 0..) |options, index| {
@@ -283,7 +283,7 @@ test "Disallowed requires both identities even for empty lists and caches repeat
     var snapshot = platform.Snapshot.init(a, .{});
     defer snapshot.deinit();
     try add(&snapshot, &.{});
-    try add(&snapshot, &.{.{ .identifier = "\x42" ** 48 }});
+    try add(&snapshot, &.{.{ .identifier = &@as([48]u8, @splat(0x42)) }});
     var standard = Standard.initWithOptions(testing.io, a, .{ .allow_md5_identifier_hash = true });
     var spy = Spy{ .selected = standard.provider(), .inputs = try disallowed.parse(der) };
     for (1..3) |operation| {
@@ -366,7 +366,7 @@ test "Disallowed list staging and both selected-provider hash allocations fail w
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
             var snapshot = platform.Snapshot.init(allocator, .{});
             defer snapshot.deinit();
-            add(&snapshot, &.{.{ .identifier = "\x42" ** 16 }}) catch |err| {
+            add(&snapshot, &.{.{ .identifier = &@as([16]u8, @splat(0x42)) }}) catch |err| {
                 try testing.expectEqual(@as(usize, 0), snapshot.fingerprint_entries);
                 try testing.expectEqual(@as(usize, 0), snapshot.fingerprint_lists.items.len);
                 return err;

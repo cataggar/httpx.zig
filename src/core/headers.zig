@@ -296,15 +296,15 @@ pub const Headers = struct {
     /// Returns true if Transfer-Encoding includes chunked.
     pub fn isChunked(self: *const Self) bool {
         const value = self.get(HeaderName.TRANSFER_ENCODING) orelse return false;
-        return std.ascii.indexOfIgnoreCase(value, "chunked") != null;
+        return std.ascii.findIgnoreCase(value, "chunked") != null;
     }
 
     /// Determines if connection should be kept alive based on headers and version.
     pub fn isKeepAlive(self: *const Self, version: types.Version) bool {
         const conn = self.get(HeaderName.CONNECTION);
         if (conn) |c| {
-            if (std.ascii.indexOfIgnoreCase(c, "close") != null) return false;
-            if (std.ascii.indexOfIgnoreCase(c, "keep-alive") != null) return true;
+            if (std.ascii.findIgnoreCase(c, "close") != null) return false;
+            if (std.ascii.findIgnoreCase(c, "keep-alive") != null) return true;
         }
         return version == .HTTP_1_1 or version == .HTTP_2 or version == .HTTP_3;
     }

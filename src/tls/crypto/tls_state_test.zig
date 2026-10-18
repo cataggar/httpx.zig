@@ -42,7 +42,7 @@ test "provider key shares exchange only advertised groups and clean up handles" 
     var right = try KeyShare.init(standard.provider(), testing.allocator);
     defer right.deinit();
     for (KeyShare.algorithms) |algorithm| {
-        const group: tls.NamedGroup = @enumFromInt(@intFromEnum(algorithm));
+        const group: tls.NamedGroup = @fromBackingInt(@intCast(@backingInt(algorithm)));
         try left.exchange(group, right.publicKey(group).?);
         try right.exchange(group, left.publicKey(group).?);
         try testing.expectEqualSlices(u8, left.getSharedSecret().?, right.getSharedSecret().?);

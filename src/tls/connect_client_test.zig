@@ -226,7 +226,7 @@ const Peer = struct {
         var bytes: [32]u8 = undefined;
         try testing.expectEqualStrings("ping", bytes[0..try connection.read(&bytes)]);
         if (connection.tls_version == .tls_1_3 and (self.scenario == .round_trip or self.scenario == .key_update_denied)) {
-            const update = [_]u8{ @intFromEnum(tls.HandshakeType.key_update), 0, 0, 1, 1 };
+            const update = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, 1 };
             try connection.writeEncryptedRecord(&update, .handshake);
             try record.updateTrafficKeys(connection.cryptoProvider(), connection.cipher_suite.?, &connection.app_write_secret.?, &connection.app_write_key.?, &connection.app_write_iv.?);
             connection.write_seq = 0;

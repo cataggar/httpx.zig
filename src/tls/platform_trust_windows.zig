@@ -113,7 +113,7 @@ fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, kin
         .Reserved16 = scope,
     }, name) orelse {
         // An absent disallowed store is distinct from an unreadable store.
-        const code = @intFromEnum(windows.GetLastError());
+        const code = @backingInt(windows.GetLastError());
         if (kind != .roots and (code == 2 or code == not_found)) return;
         return error.TlsTrustStoreLoadFailed;
     };
@@ -125,7 +125,7 @@ fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, kin
     while (true) {
         ctl = CertEnumCTLsInStore(store, ctl);
         const current = ctl orelse {
-            if (@intFromEnum(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
+            if (@backingInt(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
             break;
         };
         try ctl_policy.append(snapshot, if (kind == .disallowed) .disallowed else .authroot, current.content[0..current.content_length]);
@@ -139,7 +139,7 @@ fn readStore(snapshot: *metadata.Snapshot, scope: u16, name: [*:0]const u16, kin
         // Enumeration consumes the previous context, including on failure.
         current = crypt32.CertEnumCertificatesInStore(store, current);
         const certificate = current orelse {
-            if (@intFromEnum(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
+            if (@backingInt(windows.GetLastError()) != not_found) return error.TlsTrustStoreLoadFailed;
             break;
         };
         count += 1;
@@ -205,7 +205,7 @@ fn queryProperty(context: *const anyopaque, id: u32, buffer: ?[]u8) QueryError!u
     const certificate: *const crypt32.CERT_CONTEXT = @ptrCast(@alignCast(context));
     var size: u32 = if (buffer) |bytes| @intCast(bytes.len) else 0;
     if (!CertGetCertificateContextProperty(certificate, id, if (buffer) |bytes| (if (bytes.len == 0) null else bytes.ptr) else null, &size).toBool()) {
-        return if (@intFromEnum(windows.GetLastError()) == not_found) error.Missing else error.Failure;
+        return if (@backingInt(windows.GetLastError()) == not_found) error.Missing else error.Failure;
     }
     return size;
 }
@@ -234,7 +234,7 @@ fn effectiveRoles(allocator: Allocator, limit: usize, certificate: *const crypt3
     windows.teb().LastErrorValue = .SUCCESS;
     if (!CertGetEnhancedKeyUsage(certificate, 0, buffer.ptr, &size).toBool() or size != buffer.len)
         return error.TlsTrustStoreLoadFailed;
-    const last_error = @intFromEnum(windows.GetLastError());
+    const last_error = @backingInt(windows.GetLastError());
     const usage: *const crypt32.CERT_ENHKEY_USAGE = @ptrCast(buffer.ptr);
     if (usage.cUsageIdentifier == 0) return emptyRoles(last_error);
     if (usage.cUsageIdentifier > 256) return error.TlsTrustStoreLoadFailed;
@@ -705,14 +705,14 @@ test "native Windows CTL empty104 stays present and preserves an independent res
         fn observe(certificate: *const crypt32.CERT_CONTEXT, id: u32, expected: *const [8]u8) Observation {
             var length: u32 = 0;
             if (!CertGetCertificateContextProperty(certificate, id, null, &length).toBool()) {
-                const code = @intFromEnum(windows.GetLastError());
+                const code = @backingInt(windows.GetLastError());
                 return .{ .state = if (code == not_found) .absent else .query_error, .code = code };
             }
             if (length == 0) return .{ .state = .empty };
             if (length != 8) return .{ .state = .other_length, .length = length };
             var bytes: [8]u8 = undefined;
             if (!CertGetCertificateContextProperty(certificate, id, &bytes, &length).toBool())
-                return .{ .state = .query_error, .code = @intFromEnum(windows.GetLastError()) };
+                return .{ .state = .query_error, .code = @backingInt(windows.GetLastError()) };
             if (length != 8) return .{ .state = .other_length, .length = length };
             return .{ .state = if (std.mem.eql(u8, &bytes, expected)) .known_fixture_value else .other_value, .length = length };
         }

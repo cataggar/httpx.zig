@@ -111,7 +111,7 @@ pub const ContentCoding = struct {
     pub fn lessThan(self: ContentCoding, other: ContentCoding) bool {
         if (self.q > other.q) return true;
         if (self.q < other.q) return false;
-        return @intFromEnum(self.encoding) < @intFromEnum(other.encoding);
+        return @backingInt(self.encoding) < @backingInt(other.encoding);
     }
 };
 
@@ -770,31 +770,41 @@ test "brotli binary payload round trip" {
 
 test "zstd compression levels round trip" {
     const allocator = std.testing.allocator;
-    const sample = "Level sensitivity test payload for zstd codec. " ** 20;
+    const sample = comptime blk: {
+        const unit = "Level sensitivity test payload for zstd codec. ";
+        var buf: [unit.len * 20]u8 = undefined;
+        for (0..20) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+        break :blk buf;
+    };
 
     inline for ([_]CompressionLevel{ .fast, .default, .best }) |level| {
-        const compressed = try compressWithLevel(allocator, .zstd, sample, .{ .level = level });
+        const compressed = try compressWithLevel(allocator, .zstd, &sample, .{ .level = level });
         defer allocator.free(compressed);
 
         const decompressed = try decompress(allocator, .zstd, compressed);
         defer allocator.free(decompressed);
 
-        try std.testing.expectEqualStrings(sample, decompressed);
+        try std.testing.expectEqualStrings(&sample, decompressed);
     }
 }
 
 test "brotli compression levels accepted" {
     const allocator = std.testing.allocator;
-    const sample = "Brotli level acceptance payload for httpx.zig. " ** 10;
+    const sample = comptime blk: {
+        const unit = "Brotli level acceptance payload for httpx.zig. ";
+        var buf: [unit.len * 10]u8 = undefined;
+        for (0..10) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+        break :blk buf;
+    };
 
     inline for ([_]CompressionLevel{ .fast, .default, .best }) |level| {
-        const compressed = try compressWithLevel(allocator, .br, sample, .{ .level = level });
+        const compressed = try compressWithLevel(allocator, .br, &sample, .{ .level = level });
         defer allocator.free(compressed);
 
         const decompressed = try decompress(allocator, .br, compressed);
         defer allocator.free(decompressed);
 
-        try std.testing.expectEqualStrings(sample, decompressed);
+        try std.testing.expectEqualStrings(&sample, decompressed);
     }
 }
 

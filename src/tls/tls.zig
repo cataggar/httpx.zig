@@ -81,7 +81,7 @@ const RecordHeader = struct {
     length: u16,
 
     fn format(self: RecordHeader, buf: *[record_header_len]u8) void {
-        buf[0] = @intFromEnum(self.content_type);
+        buf[0] = @backingInt(self.content_type);
         buf[1] = 0x03;
         buf[2] = 0x03;
         mem.writeInt(u16, buf[3..5], self.length, .big);
@@ -89,7 +89,7 @@ const RecordHeader = struct {
 
     fn parse(buf: *[record_header_len]u8) RecordHeader {
         return .{
-            .content_type = @enumFromInt(buf[0]),
+            .content_type = @fromBackingInt(@intCast(buf[0])),
             .version = .tls_1_2,
             .length = mem.readInt(u16, buf[3..5], .big),
         };
@@ -200,7 +200,7 @@ fn writeBoundedEncryptedRecordWithProvider(
             var inner_buf: [max_plaintext_len + 1]u8 = undefined;
             defer crypto_provider.secureWipe(&inner_buf);
             @memcpy(inner_buf[0..plaintext.len], plaintext);
-            inner_buf[plaintext.len] = @intFromEnum(content_type);
+            inner_buf[plaintext.len] = @backingInt(content_type);
             const inner = inner_buf[0 .. plaintext.len + 1];
 
             var hdr: [record_header_len]u8 = undefined;
@@ -365,7 +365,7 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
     var standard = StandardCryptoProvider.init(any_io.threadIo(), std.heap.page_allocator);
     const provider = state.crypto_provider orelse standard.provider();
     if (body.len != 1) return error.TlsDecodeError;
-    const request: tls.KeyUpdateRequest = @enumFromInt(body[0]);
+    const request: tls.KeyUpdateRequest = @fromBackingInt(@intCast(body[0]));
     switch (request) {
         .update_not_requested, .update_requested => {},
         _ => return error.TlsIllegalParameter,
@@ -407,11 +407,11 @@ fn handleKeyUpdate(state: *ApplicationReadState, body: []const u8) !void {
 
     if (request == .update_requested) {
         const response = [_]u8{
-            @intFromEnum(tls.HandshakeType.key_update),
+            @backingInt(tls.HandshakeType.key_update),
             0,
             0,
             1,
-            @intFromEnum(tls.KeyUpdateRequest.update_not_requested),
+            @backingInt(tls.KeyUpdateRequest.update_not_requested),
         };
         if (state.context) |context| {
             var sender = ContextSocketSender{ .socket = state.socket, .context = context };
@@ -466,11 +466,11 @@ fn processPostHandshake(state: *ApplicationReadState, fragment: []const u8) !voi
         const body_len: usize = mem.readInt(u24, state.post_handshake_buf[1..4], .big);
 
         switch (handshake_type) {
-            @intFromEnum(tls.HandshakeType.new_session_ticket) => {
+            @backingInt(tls.HandshakeType.new_session_ticket) => {
                 if (state.is_server) return error.TlsUnexpectedMessage;
                 if (body_len > max_new_session_ticket_body_len) return error.TlsRecordOverflow;
             },
-            @intFromEnum(tls.HandshakeType.key_update) => {
+            @backingInt(tls.HandshakeType.key_update) => {
                 if (body_len != 1) return error.TlsDecodeError;
             },
             else => return error.TlsUnexpectedMessage,
@@ -482,10 +482,10 @@ fn processPostHandshake(state: *ApplicationReadState, fragment: []const u8) !voi
 
         const body = state.post_handshake_buf[4..message_len];
         switch (handshake_type) {
-            @intFromEnum(tls.HandshakeType.new_session_ticket) => {
+            @backingInt(tls.HandshakeType.new_session_ticket) => {
                 try validateNewSessionTicket(body);
             },
-            @intFromEnum(tls.HandshakeType.key_update) => {
+            @backingInt(tls.HandshakeType.key_update) => {
                 if (state.post_handshake_len.* != message_len) {
                     return error.TlsUnexpectedMessage;
                 }
@@ -512,20 +512,20 @@ fn dispatchApplicationRecord(
     record: ApplicationRecord,
 ) !?[]u8 {
     return switch (record.content_type) {
-        @intFromEnum(ContentType.application_data) => {
+        @backingInt(ContentType.application_data) => {
             if (state.post_handshake_len.* != 0) return error.TlsUnexpectedMessage;
             return record.content;
         },
-        @intFromEnum(ContentType.alert) => {
+        @backingInt(ContentType.alert) => {
             if (record.content.len != 2) return error.TlsDecodeError;
-            const description: tls.Alert.Description = @enumFromInt(record.content[1]);
+            const description: tls.Alert.Description = @fromBackingInt(@intCast(record.content[1]));
             if (state.received_close_notify) |received| {
-                received.* = record.content[0] == @intFromEnum(tls.Alert.Level.warning) and
+                received.* = record.content[0] == @backingInt(tls.Alert.Level.warning) and
                     description == .close_notify and state.post_handshake_len.* == 0;
             }
             return errors.fromAlert(description);
         },
-        @intFromEnum(ContentType.handshake) => {
+        @backingInt(ContentType.handshake) => {
             if (state.version != .tls_1_3) return error.TlsUnexpectedMessage;
             try processPostHandshake(state, record.content);
             return null;
@@ -602,7 +602,7 @@ fn readApplicationData(state: *ApplicationReadState, output: []u8) !usize {
         const next_seq = std.math.add(u64, state.read_seq.*, 1) catch return error.TlsSequenceOverflow;
         const record = switch (state.version) {
             .tls_1_3 => blk: {
-                if (header[0] != @intFromEnum(ContentType.application_data)) {
+                if (header[0] != @backingInt(ContentType.application_data)) {
                     return error.TlsUnexpectedMessage;
                 }
                 const plaintext = try provider_record.open(
@@ -679,7 +679,7 @@ pub fn readTLSRecord(socket: *Socket, buf: []u8) ![]const u8 {
         total += n;
     }
     const length = mem.readInt(u16, buf[3..5], .big);
-    const legacy_hello = buf[0] == @intFromEnum(ContentType.handshake) and buf[2] == 1;
+    const legacy_hello = buf[0] == @backingInt(ContentType.handshake) and buf[2] == 1;
     if (buf[1] != 3 or (buf[2] != 3 and !legacy_hello)) return error.TlsIllegalParameter;
     if (length > max_ciphertext_len or length > buf.len - record_header_len) return error.TlsRecordOverflow;
     while (total < 5 + length) {
@@ -696,15 +696,15 @@ pub fn readTLSRecord(socket: *Socket, buf: []u8) ![]const u8 {
 fn readHandshakeRecord(socket: *Socket, buf: *[4096]u8) ![]const u8 {
     const data = try readTLSRecord(socket, buf);
     switch (buf[0]) {
-        @intFromEnum(ContentType.handshake) => return data,
-        @intFromEnum(ContentType.alert) => {
+        @backingInt(ContentType.handshake) => return data,
+        @backingInt(ContentType.alert) => {
             if (data.len >= 2) {
-                const alert_desc: tls.Alert.Description = @enumFromInt(data[1]);
+                const alert_desc: tls.Alert.Description = @fromBackingInt(@intCast(data[1]));
                 return errors.fromAlert(alert_desc);
             }
             return error.TlsHandshakeFailure;
         },
-        @intFromEnum(ContentType.change_cipher_spec) => return data,
+        @backingInt(ContentType.change_cipher_spec) => return data,
         else => return error.TlsUnexpectedMessage,
     }
 }
@@ -712,7 +712,7 @@ fn readHandshakeRecord(socket: *Socket, buf: *[4096]u8) ![]const u8 {
 pub fn sendTLSHandshakeRecord(socket: *Socket, msg: []const u8) !void {
     var buf: [5 + max_plaintext_len]u8 = undefined;
     if (msg.len > max_plaintext_len) return error.TlsRecordOverflow;
-    buf[0] = @intFromEnum(ContentType.handshake);
+    buf[0] = @backingInt(ContentType.handshake);
     buf[1] = 0x03;
     buf[2] = 0x03;
     mem.writeInt(u16, buf[3..5], @intCast(msg.len), .big);
@@ -724,7 +724,7 @@ pub fn sendTLSChangeCipherSpec(socket: *Socket) !void {
     // RFC 5246 §6.2.1: every TLS 1.2 record — including CCS — carries
     // legacy_version 0x0303.
     const ccs = [_]u8{
-        @intFromEnum(ContentType.change_cipher_spec),
+        @backingInt(ContentType.change_cipher_spec),
         0x03,
         0x03,
         0x00,
@@ -765,14 +765,14 @@ pub fn readTLS12EncryptedRecord(
     const data = try readTLSRecord(socket, buf);
     if (buf[2] != 3) return error.TlsIllegalParameter;
     switch (buf[0]) {
-        @intFromEnum(ContentType.alert), @intFromEnum(ContentType.handshake), @intFromEnum(ContentType.application_data) => {},
+        @backingInt(ContentType.alert), @backingInt(ContentType.handshake), @backingInt(ContentType.application_data) => {},
         else => return error.TlsUnexpectedMessage,
     }
     const plain = try decryptTLS12ForSuite(provider, @constCast(data), buf[0..5], seq.*, iv, &key_buf, cs);
     seq.* = next_seq;
-    if (buf[0] == @intFromEnum(ContentType.alert)) {
+    if (buf[0] == @backingInt(ContentType.alert)) {
         if (plain.len != 2) return error.TlsDecodeError;
-        return errors.fromAlert(@enumFromInt(plain[1]));
+        return errors.fromAlert(@fromBackingInt(@intCast(plain[1])));
     }
     return plain;
 }
@@ -804,16 +804,16 @@ pub fn readTLS13EncryptedHandshake(
     defer crypto_provider.secureWipe(&key_buf);
     const next_seq = std.math.add(u64, seq.*, 1) catch return error.TlsSequenceOverflow;
     const record_data = try readTLSRecord(socket, buf);
-    if (buf[0] != @intFromEnum(ContentType.application_data)) return error.TlsUnexpectedMessage;
+    if (buf[0] != @backingInt(ContentType.application_data)) return error.TlsUnexpectedMessage;
     if (buf[2] != 3) return error.TlsIllegalParameter;
     const decrypted = try decryptTLS13ForSuite(provider, @constCast(record_data), buf[0..5], seq.*, iv[0..12], &key_buf, cs);
     const inner = try parseTLS13InnerPlaintext(decrypted);
     seq.* = next_seq;
-    if (inner.content_type == @intFromEnum(ContentType.alert)) {
+    if (inner.content_type == @backingInt(ContentType.alert)) {
         if (inner.content.len != 2) return error.TlsDecodeError;
-        return errors.fromAlert(@enumFromInt(inner.content[1]));
+        return errors.fromAlert(@fromBackingInt(@intCast(inner.content[1])));
     }
-    if (inner.content_type != @intFromEnum(ContentType.handshake)) return error.TlsUnexpectedMessage;
+    if (inner.content_type != @backingInt(ContentType.handshake)) return error.TlsUnexpectedMessage;
     return inner.content;
 }
 
@@ -1099,7 +1099,7 @@ pub const Connection = struct {
 
     pub fn sendAlert(self: *Connection, level: tls.Alert.Level, desc: tls.Alert.Description) void {
         if (self.failed) return;
-        const payload = [_]u8{ @intFromEnum(level), @intFromEnum(desc) };
+        const payload = [_]u8{ @backingInt(level), @backingInt(desc) };
         // After the handshake completes, alerts MUST be encrypted under the
         // negotiated keys (RFC 5246 §7.2 / RFC 8446 §6).
         if (self.app_write_key != null and self.cipher_suite != null) {
@@ -1107,7 +1107,7 @@ pub const Connection = struct {
             return;
         }
         var buf: [7]u8 = undefined;
-        buf[0] = @intFromEnum(ContentType.alert);
+        buf[0] = @backingInt(ContentType.alert);
         buf[1] = 0x03;
         buf[2] = 0x03;
         buf[3] = 0;
@@ -1538,12 +1538,12 @@ pub const TLSSession = struct {
                 switch (self.stored_client.?.application_cipher) {
                     inline else => |*p| {
                         const pv = &p.tls_1_3;
-                        self.app_write_key = .{0} ** 32;
-                        self.app_write_iv = .{0} ** 12;
-                        self.app_write_secret = .{0} ** 48;
-                        self.app_read_key = .{0} ** 32;
-                        self.app_read_iv = .{0} ** 12;
-                        self.app_read_secret = .{0} ** 48;
+                        self.app_write_key = @splat(0);
+                        self.app_write_iv = @splat(0);
+                        self.app_write_secret = @splat(0);
+                        self.app_read_key = @splat(0);
+                        self.app_read_iv = @splat(0);
+                        self.app_read_secret = @splat(0);
                         const wk = &self.app_write_key.?;
                         const wi = &self.app_write_iv.?;
                         const ws = &self.app_write_secret.?;
@@ -1572,10 +1572,10 @@ pub const TLSSession = struct {
                 switch (self.stored_client.?.application_cipher) {
                     inline else => |*p| {
                         const pv = &p.tls_1_2;
-                        self.app_write_key = .{0} ** 32;
-                        self.app_write_iv = .{0} ** 12;
-                        self.app_read_key = .{0} ** 32;
-                        self.app_read_iv = .{0} ** 12;
+                        self.app_write_key = @splat(0);
+                        self.app_write_iv = @splat(0);
+                        self.app_read_key = @splat(0);
+                        self.app_read_iv = @splat(0);
                         const wk = &self.app_write_key.?;
                         const wi = &self.app_write_iv.?;
                         const rk = &self.app_read_key.?;
@@ -1995,14 +1995,14 @@ fn detectTLS13(client_hello: []const u8) bool {
         const ext_type = mem.readInt(u16, client_hello[off..][0..2], .big);
         const ext_data_len = mem.readInt(u16, client_hello[off + 2 ..][0..2], .big);
         off += 4;
-        if (ext_type == @intFromEnum(tls.ExtensionType.supported_versions)) {
+        if (ext_type == @backingInt(tls.ExtensionType.supported_versions)) {
             var voff: usize = off;
             if (voff + 1 <= ext_end) {
                 _ = client_hello[voff];
                 voff += 1;
                 while (voff + 2 <= off + ext_data_len) {
                     const ver = mem.readInt(u16, client_hello[voff..][0..2], .big);
-                    if (ver == @intFromEnum(tls.ProtocolVersion.tls_1_3)) return true;
+                    if (ver == @backingInt(tls.ProtocolVersion.tls_1_3)) return true;
                     voff += 2;
                 }
             }
@@ -2063,7 +2063,7 @@ test "detectTLS13 returns false for short data" {
 }
 
 test "detectTLS13 returns false for no supported_versions extension" {
-    var buf: [50]u8 = [_]u8{0} ** 50;
+    var buf: [50]u8 = @splat(0);
     buf[0] = 1;
     buf[1] = 0x33;
     try std.testing.expect(!detectTLS13(&buf));
@@ -2093,10 +2093,10 @@ test "TLSSession negotiatedProtocol returns protocol after set" {
 
 test "TLSSession deinit zeros key material" {
     var session = TLSSession.init(TLSConfig.init(std.testing.allocator));
-    session.app_write_key = [_]u8{0xAB} ** 32;
-    session.app_read_key = [_]u8{0xCD} ** 32;
-    session.app_write_secret = [_]u8{0x12} ** 48;
-    session.app_read_secret = [_]u8{0x34} ** 48;
+    session.app_write_key = @splat(0xAB);
+    session.app_read_key = @splat(0xCD);
+    session.app_write_secret = @splat(0x12);
+    session.app_read_secret = @splat(0x34);
     session.post_handshake_len = 7;
     session.deinit();
     if (session.app_write_key) |k| {
@@ -2154,7 +2154,7 @@ test "TLSConfig wantsHTTP2" {
 }
 
 test "nonceTLS13 XORs IV correctly" {
-    const iv = [_]u8{0} ** 12;
+    const iv: [12]u8 = @splat(0);
     const nonce_val = nonceTLS13(&iv, 1);
     try std.testing.expectEqual(@as(u8, 0), nonce_val[0]);
     try std.testing.expectEqual(@as(u8, 0), nonce_val[7]);
@@ -2169,7 +2169,7 @@ test "RecordHeader format/parse round-trip" {
         .length = 256,
     };
     hdr.format(&hdr_buf);
-    try std.testing.expectEqual(@intFromEnum(ContentType.handshake), hdr_buf[0]);
+    try std.testing.expectEqual(@backingInt(ContentType.handshake), hdr_buf[0]);
     try std.testing.expectEqual(@as(u16, 256), mem.readInt(u16, hdr_buf[3..5], .big));
 }
 
@@ -2262,7 +2262,7 @@ fn expectApplicationRecords(
 
         switch (version) {
             .tls_1_3 => {
-                try std.testing.expectEqual(@intFromEnum(ContentType.application_data), header[0]);
+                try std.testing.expectEqual(@backingInt(ContentType.application_data), header[0]);
                 const nonce = nonceTLS13(&test_write_iv, seq);
                 const plaintext = try decryptTLS13(
                     testProvider(),
@@ -2273,11 +2273,11 @@ fn expectApplicationRecords(
                     &key,
                 );
                 try std.testing.expectEqual(chunk_len + 1, plaintext.len);
-                try std.testing.expectEqual(@intFromEnum(ContentType.application_data), plaintext[plaintext.len - 1]);
+                try std.testing.expectEqual(@backingInt(ContentType.application_data), plaintext[plaintext.len - 1]);
                 try reconstructed.appendSlice(std.testing.allocator, plaintext[0 .. plaintext.len - 1]);
             },
             .tls_1_2 => {
-                try std.testing.expectEqual(@intFromEnum(ContentType.application_data), header[0]);
+                try std.testing.expectEqual(@backingInt(ContentType.application_data), header[0]);
                 const plaintext = try decryptTLS12(
                     testProvider(),
                     .aes_128_gcm,
@@ -2488,7 +2488,7 @@ fn testTrafficKeys(
         else => unreachable,
     };
     const keys = try deriveTrafficKeys13(testProvider(), secret_slice);
-    var key: [32]u8 = .{0} ** 32;
+    var key: [32]u8 = @splat(0);
     if (cipher_suite == .AES_128_GCM_SHA256) {
         @memcpy(key[0..keys.key16.len], &keys.key16);
     } else {
@@ -2530,7 +2530,7 @@ fn appendTestProtectedRecordWithKeys(
             }
             @memset(inner[inner_pos..inner_len], 0);
 
-            header[0] = @intFromEnum(ContentType.application_data);
+            header[0] = @backingInt(ContentType.application_data);
             mem.writeInt(u16, header[3..5], @intCast(inner_len + crypto.aead.aes_gcm.Aes128Gcm.tag_length), .big);
             const nonce = nonceTLS13(&iv_bytes, sequence);
             break :blk switch (cipher_suite) {
@@ -2627,7 +2627,7 @@ fn appendTestHandshakeMessage(
     body: []const u8,
 ) !void {
     var header: [4]u8 = undefined;
-    header[0] = @intFromEnum(handshake_type);
+    header[0] = @backingInt(handshake_type);
     mem.writeInt(u24, header[1..4], @intCast(body.len), .big);
     try message.appendSlice(std.testing.allocator, &header);
     try message.appendSlice(std.testing.allocator, body);
@@ -2642,7 +2642,7 @@ fn readTestTLS13Record(
     record_buf: *[4096]u8,
 ) !ApplicationRecord {
     const ciphertext = try readTLSRecord(socket, record_buf);
-    if (record_buf[0] != @intFromEnum(ContentType.application_data)) {
+    if (record_buf[0] != @backingInt(ContentType.application_data)) {
         return error.TlsUnexpectedMessage;
     }
     const plaintext = try decryptTLS13ForSuite(
@@ -2664,7 +2664,7 @@ fn makeTestTrafficSecret(cipher_suite: tls.CipherSuite, seed: u8) [48]u8 {
         .AES_256_GCM_SHA384 => 48,
         else => unreachable,
     };
-    var secret: [48]u8 = .{0} ** 48;
+    var secret: [48]u8 = @splat(0);
     for (secret[0..secret_len], 0..) |*byte, i| {
         byte.* = seed +% @as(u8, @truncate(i * 13));
     }
@@ -2675,7 +2675,7 @@ fn testUpdatedTrafficSecret(
     cipher_suite: tls.CipherSuite,
     secret: *const [48]u8,
 ) ![48]u8 {
-    var updated: [48]u8 = .{0} ** 48;
+    var updated: [48]u8 = @splat(0);
     switch (cipher_suite) {
         .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 => {
             updated[0..32].* = try hkdfExpandLabel(testProvider(), secret[0..32], "traffic upd", "", 32);
@@ -3244,7 +3244,7 @@ test "TLS 1.3 application reads strip padding and preserve buffered plaintext" {
             cipher_suite,
             0,
             messages[0],
-            @intFromEnum(ContentType.application_data),
+            @backingInt(ContentType.application_data),
             7,
             true,
         );
@@ -3254,7 +3254,7 @@ test "TLS 1.3 application reads strip padding and preserve buffered plaintext" {
             cipher_suite,
             1,
             messages[1],
-            @intFromEnum(ContentType.application_data),
+            @backingInt(ContentType.application_data),
             31,
             true,
         );
@@ -3283,16 +3283,16 @@ test "TLS 1.3 application reads strip padding and preserve buffered plaintext" {
 
 test "TLS application reads dispatch authenticated alerts and unexpected content" {
     const paths = [_]TestWritePath{ .connection, .session };
-    const alert_close_notify = [_]u8{ 1, @intFromEnum(tls.Alert.Description.close_notify) };
-    const alert_handshake_failure = [_]u8{ 2, @intFromEnum(tls.Alert.Description.handshake_failure) };
-    const unexpected_handshake = [_]u8{ @intFromEnum(tls.HandshakeType.finished), 0, 0, 0 };
+    const alert_close_notify = [_]u8{ 1, @backingInt(tls.Alert.Description.close_notify) };
+    const alert_handshake_failure = [_]u8{ 2, @backingInt(tls.Alert.Description.handshake_failure) };
+    const unexpected_handshake = [_]u8{ @backingInt(tls.HandshakeType.finished), 0, 0, 0 };
 
     for (paths) |path| {
         try expectProtectedRecordError(
             path,
             .tls_1_3,
             &alert_close_notify,
-            @intFromEnum(ContentType.alert),
+            @backingInt(ContentType.alert),
             5,
             true,
             error.TlsCloseNotify,
@@ -3301,7 +3301,7 @@ test "TLS application reads dispatch authenticated alerts and unexpected content
             path,
             .tls_1_3,
             &alert_handshake_failure,
-            @intFromEnum(ContentType.alert),
+            @backingInt(ContentType.alert),
             0,
             true,
             error.TlsHandshakeFailure,
@@ -3310,7 +3310,7 @@ test "TLS application reads dispatch authenticated alerts and unexpected content
             path,
             .tls_1_3,
             &unexpected_handshake,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             3,
             true,
             error.TlsUnexpectedMessage,
@@ -3329,7 +3329,7 @@ test "TLS application reads dispatch authenticated alerts and unexpected content
             path,
             .tls_1_2,
             &alert_close_notify,
-            @intFromEnum(ContentType.alert),
+            @backingInt(ContentType.alert),
             0,
             true,
             error.TlsCloseNotify,
@@ -3338,7 +3338,7 @@ test "TLS application reads dispatch authenticated alerts and unexpected content
             path,
             .tls_1_2,
             &alert_handshake_failure,
-            @intFromEnum(ContentType.alert),
+            @backingInt(ContentType.alert),
             0,
             true,
             error.TlsHandshakeFailure,
@@ -3347,7 +3347,7 @@ test "TLS application reads dispatch authenticated alerts and unexpected content
             path,
             .tls_1_2,
             &unexpected_handshake,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
             error.TlsUnexpectedMessage,
@@ -3386,7 +3386,7 @@ test "TLS 1.3 clients ignore fragmented and coalesced NewSessionTicket messages"
             cipher_suite,
             0,
             first_ticket.items[0..2],
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
         );
@@ -3396,7 +3396,7 @@ test "TLS 1.3 clients ignore fragmented and coalesced NewSessionTicket messages"
             cipher_suite,
             1,
             second_fragment.items,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             3,
             true,
         );
@@ -3406,7 +3406,7 @@ test "TLS 1.3 clients ignore fragmented and coalesced NewSessionTicket messages"
             cipher_suite,
             2,
             application_data,
-            @intFromEnum(ContentType.application_data),
+            @backingInt(ContentType.application_data),
             5,
             true,
         );
@@ -3456,7 +3456,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
     defer invalid_key_update.deinit(std.testing.allocator);
     try appendTestHandshakeMessage(&invalid_key_update, .key_update, &invalid_key_update_body);
 
-    const valid_key_update_body = [_]u8{@intFromEnum(tls.KeyUpdateRequest.update_not_requested)};
+    const valid_key_update_body = [_]u8{@backingInt(tls.KeyUpdateRequest.update_not_requested)};
     var key_update_without_secret = std.ArrayList(u8).empty;
     defer key_update_without_secret.deinit(std.testing.allocator);
     try appendTestHandshakeMessage(&key_update_without_secret, .key_update, &valid_key_update_body);
@@ -3466,7 +3466,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
             path,
             .tls_1_3,
             malformed_ticket.items,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
             error.TlsDecodeError,
@@ -3475,7 +3475,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
             path,
             .tls_1_3,
             empty_key_update.items,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
             error.TlsDecodeError,
@@ -3484,7 +3484,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
             path,
             .tls_1_3,
             invalid_key_update.items,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
             error.TlsIllegalParameter,
@@ -3493,7 +3493,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
             path,
             .tls_1_3,
             key_update_without_secret.items,
-            @intFromEnum(ContentType.handshake),
+            @backingInt(ContentType.handshake),
             0,
             true,
             error.TlsHandshakeNotComplete,
@@ -3519,7 +3519,7 @@ test "TLS 1.3 post-handshake messages enforce role and framing" {
         cipher_suite,
         0,
         valid_ticket.items,
-        @intFromEnum(ContentType.handshake),
+        @backingInt(ContentType.handshake),
         0,
         true,
     );
@@ -3575,7 +3575,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
 
             var key_update = std.ArrayList(u8).empty;
             defer key_update.deinit(std.testing.allocator);
-            const request_body = [_]u8{@intFromEnum(request)};
+            const request_body = [_]u8{@backingInt(request)};
             try appendTestHandshakeMessage(&key_update, .key_update, &request_body);
 
             var wire = std.ArrayList(u8).empty;
@@ -3590,7 +3590,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     initial_read_keys.iv,
                     0,
                     key_update.items[0..2],
-                    @intFromEnum(ContentType.handshake),
+                    @backingInt(ContentType.handshake),
                     0,
                     true,
                 );
@@ -3602,7 +3602,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     initial_read_keys.iv,
                     1,
                     key_update.items[2..],
-                    @intFromEnum(ContentType.handshake),
+                    @backingInt(ContentType.handshake),
                     0,
                     true,
                 );
@@ -3615,7 +3615,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     initial_read_keys.iv,
                     0,
                     key_update.items,
-                    @intFromEnum(ContentType.handshake),
+                    @backingInt(ContentType.handshake),
                     0,
                     true,
                 );
@@ -3628,7 +3628,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                 updated_read_keys.iv,
                 0,
                 inbound_application_data,
-                @intFromEnum(ContentType.application_data),
+                @backingInt(ContentType.application_data),
                 2,
                 true,
             );
@@ -3673,15 +3673,15 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     &record_buf,
                 );
                 try std.testing.expectEqual(
-                    @intFromEnum(ContentType.handshake),
+                    @backingInt(ContentType.handshake),
                     response.content_type,
                 );
                 const expected_response = [_]u8{
-                    @intFromEnum(tls.HandshakeType.key_update),
+                    @backingInt(tls.HandshakeType.key_update),
                     0,
                     0,
                     1,
-                    @intFromEnum(tls.KeyUpdateRequest.update_not_requested),
+                    @backingInt(tls.KeyUpdateRequest.update_not_requested),
                 };
                 try std.testing.expectEqualSlices(u8, &expected_response, response.content);
 
@@ -3709,7 +3709,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     &record_buf,
                 );
                 try std.testing.expectEqual(
-                    @intFromEnum(ContentType.application_data),
+                    @backingInt(ContentType.application_data),
                     outbound.content_type,
                 );
                 try std.testing.expectEqualStrings(outbound_application_data, outbound.content);
@@ -3734,7 +3734,7 @@ test "TLS 1.3 KeyUpdate rotates traffic state and preserves application data" {
                     &record_buf,
                 );
                 try std.testing.expectEqual(
-                    @intFromEnum(ContentType.application_data),
+                    @backingInt(ContentType.application_data),
                     outbound.content_type,
                 );
                 try std.testing.expectEqualStrings(outbound_application_data, outbound.content);
@@ -3760,7 +3760,7 @@ test "TLS application reads skip empty records before returning data" {
                 cipher_suite,
                 0,
                 "",
-                @intFromEnum(ContentType.application_data),
+                @backingInt(ContentType.application_data),
                 if (version == .tls_1_3) 4 else 0,
                 true,
             );
@@ -3770,7 +3770,7 @@ test "TLS application reads skip empty records before returning data" {
                 cipher_suite,
                 1,
                 message,
-                @intFromEnum(ContentType.application_data),
+                @backingInt(ContentType.application_data),
                 if (version == .tls_1_3) 9 else 0,
                 true,
             );
@@ -3809,7 +3809,7 @@ test "TLS application reads bound consecutive empty record processing" {
             cipher_suite,
             sequence,
             "",
-            @intFromEnum(ContentType.application_data),
+            @backingInt(ContentType.application_data),
             0,
             true,
         );

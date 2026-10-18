@@ -962,7 +962,7 @@ pub const Server = struct {
     /// Otherwise, prints to stderr with tint.zig coloring based on log level.
     /// Messages below config.log_level are silently dropped.
     pub fn log(self: *const Self, level: LogLevel, comptime format: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.config.log_level)) return;
+        if (@backingInt(level) < @backingInt(self.config.log_level)) return;
         if (self.config.log_fn) |log_fn| {
             var buf: [1024]u8 = undefined;
             if (std.fmt.bufPrint(&buf, format, args)) |msg| {
@@ -971,11 +971,11 @@ pub const Server = struct {
                 log_fn(level, "[Log format failed or message too long]");
             }
         } else {
-            const level_style = switch (level) {
-                .debug => tint.style(.{ .fg = .{ .ansi4 = .bright_black }, .dim = true }),
-                .info => tint.style(.{ .fg = .{ .ansi4 = .bright_green } }),
-                .warn => tint.style(.{ .fg = .{ .ansi4 = .bright_yellow }, .bold = true }),
-                .err => tint.style(.{ .fg = .{ .ansi4 = .bright_red }, .bold = true }),
+            const level_style: tint.style.Style = switch (level) {
+                .debug => .{ .foreground = .{ .ansi4 = .brightBlack }, .dim = true },
+                .info => .{ .foreground = .{ .ansi4 = .brightGreen } },
+                .warn => .{ .foreground = .{ .ansi4 = .brightYellow }, .bold = true },
+                .err => .{ .foreground = .{ .ansi4 = .brightRed }, .bold = true },
             };
             const prefix = switch (level) {
                 .debug => "DEBUG",
@@ -983,10 +983,10 @@ pub const Server = struct {
                 .warn => "WARN",
                 .err => "ERROR",
             };
-            const app_style = tint.style(.{ .fg = .{ .ansi4 = .bright_cyan }, .bold = true });
+            const app_style: tint.style.Style = .{ .foreground = .{ .ansi4 = .brightCyan }, .bold = true };
             std.debug.print(
                 "{s}HTTPX{s} {s}[{s}]{s} " ++ format ++ "\n",
-                .{ app_style.toAnsi(), tint.reset, level_style.toAnsi(), prefix, tint.reset } ++ args,
+                .{ app_style.toAnsi().slice(), tint.ansi.reset.all, level_style.toAnsi().slice(), prefix, tint.ansi.reset.all } ++ args,
             );
         }
     }
@@ -3061,15 +3061,15 @@ pub const Server = struct {
                 const payload = control_stream_payload.items[cs_offset .. cs_offset + plen];
                 cs_offset += plen;
 
-                if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.settings)) {
+                if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.settings)) {
                     _ = try http.parseHTTP3SettingsPayload(payload);
                     saw_settings = true;
-                } else if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.max_data)) {
+                } else if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.max_data)) {
                     if (payload.len > 0) {
                         const val = try http.decodeVarInt(payload);
                         conn_max_data = val.value;
                     }
-                } else if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.max_stream_data)) {
+                } else if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.max_stream_data)) {
                     if (payload.len > 0) {
                         const sid = try http.decodeVarInt(payload);
                         const data_limit = try http.decodeVarInt(payload[sid.len..]);
@@ -3121,7 +3121,7 @@ pub const Server = struct {
             const frame_payload = request_stream_payload.items[offset .. offset + payload_len];
             offset += payload_len;
 
-            if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.headers)) {
+            if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.headers)) {
                 const decoded_headers = try qpack.decodeHeaders(&qpack_ctx, frame_payload, self.allocator);
                 defer {
                     for (decoded_headers) |header| {
@@ -3144,7 +3144,7 @@ pub const Server = struct {
                     &authority_raw,
                     &authority_owned,
                 );
-            } else if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.data)) {
+            } else if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.data)) {
                 if (request_body.items.len + frame_payload.len > self.config.max_body_size) {
                     return error.RequestTooLarge;
                 }
@@ -3181,7 +3181,7 @@ pub const Server = struct {
 
         var response = self.executeServerRequest(&req, null, null) catch {
             // Send CONNECTION_CLOSE (application) on unrecoverable handler error
-            self.sendHTTP3ConnectionCloseApp(peer_addr, dst_cid, @intFromEnum(http.HTTP3ErrorCode.internal_error), "handler error") catch {};
+            self.sendHTTP3ConnectionCloseApp(peer_addr, dst_cid, @backingInt(http.HTTP3ErrorCode.internal_error), "handler error") catch {};
             var internal = Response.init(self.allocator, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             defer internal.deinit();
             internal.version = .HTTP_3;
@@ -3251,7 +3251,7 @@ pub const Server = struct {
 
         var control_stream_payload = std.ArrayList(u8).empty;
         defer control_stream_payload.deinit(self.allocator);
-        try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.HTTP3StreamType.control));
+        try http.appendVarInt(&control_stream_payload, self.allocator, @backingInt(quic.HTTP3StreamType.control));
         try http.appendHTTP3Frame(&control_stream_payload, self.allocator, .settings, settings_payload.items);
 
         // Send MAX_DATA and MAX_STREAM_DATA to advertise our flow control limits
@@ -3313,7 +3313,7 @@ pub const Server = struct {
 
         var control_stream_payload = std.ArrayList(u8).empty;
         defer control_stream_payload.deinit(self.allocator);
-        try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.HTTP3StreamType.control));
+        try http.appendVarInt(&control_stream_payload, self.allocator, @backingInt(quic.HTTP3StreamType.control));
         try http.appendHTTP3Frame(&control_stream_payload, self.allocator, .goaway, goaway_payload.items);
 
         const server_cid = quic.ConnectionId.random();
@@ -4716,7 +4716,7 @@ test "HTTP2 server refuses only excess stream after decoding its headers" {
     while (!saw_refused or !saw_first_response) {
         const frame = try Helpers.readFrame(&socket, &payload);
         if (frame.frame_type == .rst_stream and frame.stream_id == 3) {
-            try std.testing.expectEqual(@as(u32, @intFromEnum(http.HTTP2ErrorCode.refused_stream)), std.mem.readInt(u32, payload[0..4], .big));
+            try std.testing.expectEqual(@as(u32, @backingInt(http.HTTP2ErrorCode.refused_stream)), std.mem.readInt(u32, payload[0..4], .big));
             saw_refused = true;
         }
         if (frame.stream_id == 1 and (frame.flags & 0x01) != 0) {
@@ -4757,8 +4757,8 @@ fn streamingTestSocketPair() ![2]Socket {
 test "TLS streaming headers preserve values larger than one record" {
     const Mode = enum { chunked, raw };
     const modes = [_]Mode{ .chunked, .raw };
-    const key = [_]u8{0x5a} ** 32;
-    const iv = [_]u8{0xa5} ** 12;
+    const key: [32]u8 = @splat(0x5a);
+    const iv: [12]u8 = @splat(0xa5);
 
     for (modes) |mode| {
         const large_value = try std.testing.allocator.alloc(u8, 20 * 1024 + 37);
@@ -5026,9 +5026,9 @@ test "HTTP2 server response obeys stream and connection send windows" {
     });
     defer server.deinit();
     try server.get("/large", &struct {
-        const body = "x" ** 70_000;
+        const body: [70_000]u8 = @splat('x');
         fn handler(ctx: *Context) anyerror!Response {
-            return ctx.text(body);
+            return ctx.text(&body);
         }
     }.handler);
     const server_thread = try server.listenInBackground();

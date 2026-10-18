@@ -388,33 +388,33 @@ pub fn StreamingDecompressor(comptime ReaderType: type) type {
             const decoder = &self.zstd_decoder.?;
             while (true) {
                 const input = try self.nextZstdUnit() orelse {
-                    if (self.zstd_framer.frames_completed == 0 or decoder.in_buffer.items.len != 0) {
+                    if (self.zstd_framer.frames_completed == 0 or decoder.inBuffer.items.len != 0) {
                         return error.TruncatedStream;
                     }
                     self.zstd_finalized = true;
                     return null;
                 };
                 const result = try decoder.decompressStream(&self.zstd_output, input);
-                if (result.in_consumed != input.len) return error.DecompressionFailed;
+                if (result.inConsumed != input.len) return error.DecompressionFailed;
                 const remaining = self.zstd_wire.items.len - input.len;
                 @memmove(self.zstd_wire.items[0..remaining], self.zstd_wire.items[input.len..]);
                 self.zstd_wire.shrinkRetainingCapacity(remaining);
-                if (decoder.frame_header) |frame_header| {
-                    const window = std.math.cast(usize, frame_header.window_size) orelse
+                if (decoder.frameHeader) |frame_header| {
+                    const window = std.math.cast(usize, frame_header.windowSize) orelse
                         return error.DecompressionBombDetected;
                     if (@as(u64, window) > self.limits.max_decompressed_size) {
                         return error.DecompressionBombDetected;
                     }
-                    if (decoder.out_buffer.items.len > window) {
-                        const retained = decoder.out_buffer.items[decoder.out_buffer.items.len - window ..];
-                        @memmove(decoder.out_buffer.items[0..window], retained);
-                        decoder.out_buffer.shrinkRetainingCapacity(window);
+                    if (decoder.outBuffer.items.len > window) {
+                        const retained = decoder.outBuffer.items[decoder.outBuffer.items.len - window ..];
+                        @memmove(decoder.outBuffer.items[0..window], retained);
+                        decoder.outBuffer.shrinkRetainingCapacity(window);
                     }
                 }
-                if (result.out_produced > 0) {
+                if (result.outProduced > 0) {
                     self.zstd_output_pos = 0;
-                    self.zstd_output_len = result.out_produced;
-                    const amount = @min(self.output_buf.len, result.out_produced);
+                    self.zstd_output_len = result.outProduced;
+                    const amount = @min(self.output_buf.len, result.outProduced);
                     @memcpy(self.output_buf[0..amount], self.zstd_output[0..amount]);
                     self.zstd_output_pos = amount;
                     try self.recordOutput(amount);
@@ -525,7 +525,7 @@ pub const StreamingCompressor = struct {
                 };
                 self.brotli_compressor = brotli.StreamingCompressor.init(self.allocator, .{
                     .quality = quality,
-                    .lgwin = 22,
+                    .lgWin = 22,
                 });
             },
             .zstd => {},
@@ -582,7 +582,7 @@ pub const StreamingCompressor = struct {
             },
             .br => {
                 if (self.brotli_compressor) |*bc| {
-                    const tail = bc.finish() catch return error.CompressionFailed;
+                    const tail = bc.finishAlloc() catch return error.CompressionFailed;
                     defer self.allocator.free(tail);
                     _ = self.aw.writer.writeAll(tail) catch return error.IoFailed;
                     bc.deinit();
@@ -936,8 +936,8 @@ test "streaming zstd accepts combined blocks concatenated frames and split input
                 try std.testing.expectEqualSlices(u8, input[offset..][0..chunk.len], chunk);
                 offset += chunk.len;
                 try std.testing.expect(decoder.zstd_wire.items.len <= zstd_pkg.BLOCKSIZE_MAX + 3 + 16 * 1024);
-                if (decoder.zstd_decoder.?.frame_header) |header| {
-                    try std.testing.expect(decoder.zstd_decoder.?.out_buffer.items.len <= header.window_size);
+                if (decoder.zstd_decoder.?.frameHeader) |header| {
+                    try std.testing.expect(decoder.zstd_decoder.?.outBuffer.items.len <= header.windowSize);
                 }
             }
             try std.testing.expectEqual(input.len, offset);
