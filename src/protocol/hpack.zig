@@ -849,7 +849,7 @@ test "HPACK malformed arithmetic returns errors without panics" {
     try std.testing.expectError(error.InvalidPrefixBits, encodeInteger(1, 0, &output));
     try std.testing.expectError(error.InvalidPrefixBits, decodeInteger(&.{0}, 9));
 
-    var continuation: [16]u8 = [_]u8{0xff} ** 16;
+    var continuation: [16]u8 = @splat(0xff);
     continuation[0] = 0x7f;
     try std.testing.expectError(error.IntegerOverflow, decodeInteger(&continuation, 7));
 

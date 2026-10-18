@@ -7,17 +7,17 @@ test {
     _ = @import("tls_state_test.zig");
 }
 
-const operation_count = @typeInfo(p.Operation).@"enum".fields.len;
+const operation_count = @typeInfo(p.Operation).@"enum".field_names.len;
 
 const FakeHandle = struct {
     algorithm_tag: u16,
     state: u64 = 0,
-    secret: [32]u8 = [_]u8{0xa5} ** 32,
+    secret: [32]u8 = @splat(0xa5),
 };
 
 const FakeProvider = struct {
     caps: p.Capabilities = p.Capabilities.all(),
-    calls: [operation_count]usize = [_]usize{0} ** operation_count,
+    calls: [operation_count]usize = @splat(0),
     fail: ?p.Operation = null,
     partial_fail: ?p.Operation = null,
     authentication_failure: bool = false,
@@ -37,11 +37,11 @@ const FakeProvider = struct {
     }
 
     fn bump(self: *FakeProvider, operation: p.Operation) void {
-        self.calls[@intFromEnum(operation)] += 1;
+        self.calls[@backingInt(operation)] += 1;
     }
 
     fn count(self: *const FakeProvider, operation: p.Operation) usize {
-        return self.calls[@intFromEnum(operation)];
+        return self.calls[@backingInt(operation)];
     }
 
     fn failIfRequested(self: *FakeProvider, operation: p.Operation) p.ProviderError!void {
@@ -96,7 +96,7 @@ const FakeProvider = struct {
         out_handle: *?*anyopaque,
     ) p.ProviderError!void {
         const self = fromContext(context);
-        try self.createHandle(allocator, .hash_create, @intFromEnum(algorithm), out_handle);
+        try self.createHandle(allocator, .hash_create, @backingInt(algorithm), out_handle);
     }
 
     fn hashUpdate(context: *anyopaque, raw: *anyopaque, data: []const u8) p.ProviderError!void {
@@ -234,7 +234,7 @@ const FakeProvider = struct {
         out_handle: *?*anyopaque,
     ) p.ProviderError!void {
         const self = fromContext(context);
-        try self.createHandle(allocator, .key_agreement_generate, @intFromEnum(algorithm), out_handle);
+        try self.createHandle(allocator, .key_agreement_generate, @backingInt(algorithm), out_handle);
     }
 
     fn keyAgreementPublicKey(context: *anyopaque, _: *anyopaque, out: []u8) p.ProviderError!void {
@@ -268,7 +268,7 @@ const FakeProvider = struct {
         out_handle: *?*anyopaque,
     ) p.ProviderError!void {
         const self = fromContext(context);
-        try self.createHandle(allocator, .kem_generate, @intFromEnum(algorithm), out_handle);
+        try self.createHandle(allocator, .kem_generate, @backingInt(algorithm), out_handle);
     }
 
     fn kemPublicKey(context: *anyopaque, _: *anyopaque, out: []u8) p.ProviderError!void {
@@ -315,7 +315,7 @@ const FakeProvider = struct {
         out_handle: *?*anyopaque,
     ) p.ProviderError!void {
         const self = fromContext(context);
-        try self.createHandle(allocator, .signing_key_import, @intFromEnum(key.algorithm), out_handle);
+        try self.createHandle(allocator, .signing_key_import, @backingInt(key.algorithm), out_handle);
     }
 
     fn sign(
@@ -540,7 +540,7 @@ test "algorithm metadata has exact TLS encodings and sizes" {
     try std.testing.expectEqual(@as(usize, 12), p.AeadAlgorithm.nonce_length);
     try std.testing.expectEqual(@as(usize, 16), p.AeadAlgorithm.tag_length);
 
-    try std.testing.expectEqual(@as(u16, 0x001d), @intFromEnum(p.KeyAgreementAlgorithm.x25519));
+    try std.testing.expectEqual(@as(u16, 0x001d), @backingInt(p.KeyAgreementAlgorithm.x25519));
     try std.testing.expectEqual(@as(usize, 32), p.KeyAgreementAlgorithm.x25519.publicKeyLength());
     try std.testing.expectEqual(@as(usize, 65), p.KeyAgreementAlgorithm.secp256r1.publicKeyLength());
     try std.testing.expectEqual(@as(usize, 97), p.KeyAgreementAlgorithm.secp384r1.publicKeyLength());
@@ -550,16 +550,16 @@ test "algorithm metadata has exact TLS encodings and sizes" {
     try std.testing.expectEqual(@as(usize, 1088), p.KemAlgorithm.ml_kem_768.ciphertextLength());
     try std.testing.expectEqual(@as(usize, 32), p.KemAlgorithm.ml_kem_768.sharedSecretLength());
 
-    try std.testing.expectEqual(@as(u16, 0x0403), @intFromEnum(p.SignatureScheme.ecdsa_secp256r1_sha256));
-    try std.testing.expectEqual(@as(u16, 0x080b), @intFromEnum(p.SignatureScheme.rsa_pss_pss_sha512));
+    try std.testing.expectEqual(@as(u16, 0x0403), @backingInt(p.SignatureScheme.ecdsa_secp256r1_sha256));
+    try std.testing.expectEqual(@as(u16, 0x080b), @backingInt(p.SignatureScheme.rsa_pss_pss_sha512));
     try std.testing.expectEqual(@as(usize, 72), p.SignatureScheme.ecdsa_secp256r1_sha256.signatureCapacity().?);
     try std.testing.expectEqual(@as(usize, 104), p.SignatureScheme.ecdsa_secp384r1_sha384.signatureCapacity().?);
     try std.testing.expectEqual(@as(usize, 64), p.SignatureScheme.ed25519.fixedSignatureLength().?);
     try std.testing.expectEqual(p.SignatureEncoding.rsa_raw, p.SignatureScheme.rsa_pss_rsae_sha384.signatureEncoding());
 
     const all = p.Capabilities.all();
-    inline for (std.meta.fields(p.SignatureScheme)) |field| {
-        const scheme: p.SignatureScheme = @enumFromInt(field.value);
+    inline for (@typeInfo(p.SignatureScheme).@"enum".field_values) |value| {
+        const scheme: p.SignatureScheme = @fromBackingInt(value);
         try std.testing.expect(all.supportsSign(scheme));
         try std.testing.expect(all.supportsVerify(scheme));
     }
@@ -618,8 +618,8 @@ test "fake provider dispatches every contract operation" {
     var prf: [48]u8 = undefined;
     try provider.tls12Prf(.sha256, "secret", "label", parts, &prf);
 
-    const aead_key = [_]u8{0x01} ** 16;
-    const nonce = [_]u8{0x02} ** 12;
+    const aead_key: [16]u8 = @splat(0x01);
+    const nonce: [12]u8 = @splat(0x02);
     const plaintext = "payload";
     var ciphertext: [plaintext.len]u8 = undefined;
     var tag: [16]u8 = undefined;
@@ -646,7 +646,7 @@ test "fake provider dispatches every contract operation" {
     try kem.decapsulate(&kem_ciphertext, &decapsulated);
     try std.testing.expectEqualSlices(u8, &kem_secret, &decapsulated);
 
-    const private_bytes = [_]u8{0x77} ** 32;
+    const private_bytes: [32]u8 = @splat(0x77);
     var signing_key = try provider.signingKeyImport(allocator, .{
         .algorithm = .ecdsa_p256,
         .encoding = .raw_secret,
@@ -655,7 +655,7 @@ test "fake provider dispatches every contract operation" {
     defer signing_key.deinit();
     var signature_buf: [72]u8 = undefined;
     const signature = try signing_key.sign(.ecdsa_secp256r1_sha256, parts, &signature_buf);
-    const public_bytes = [_]u8{0x04} ++ [_]u8{0x88} ** 64;
+    const public_bytes = [_]u8{0x04} ++ @as([64]u8, @splat(0x88));
     try provider.verify(.ecdsa_secp256r1_sha256, .{
         .algorithm = .ecdsa_p256,
         .encoding = .sec1_uncompressed,
@@ -674,8 +674,8 @@ test "fake provider dispatches every contract operation" {
     try std.testing.expectEqual(@as(usize, 1), fake.count(.kem_destroy));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.signing_key_destroy));
     try std.testing.expectEqual(@as(usize, 5), fake.destroy_wipes);
-    inline for (std.meta.fields(p.Operation)) |field| {
-        const operation: p.Operation = @enumFromInt(field.value);
+    inline for (@typeInfo(p.Operation).@"enum".field_values) |value| {
+        const operation: p.Operation = @fromBackingInt(value);
         try std.testing.expect(fake.count(operation) > 0);
     }
 }
@@ -725,7 +725,7 @@ test "take invalidates source and destroy is idempotent" {
 
 test "partial handle construction is cleaned through matching destroy paths" {
     const allocator = std.testing.allocator;
-    const private_bytes = [_]u8{0x11} ** 32;
+    const private_bytes: [32]u8 = @splat(0x11);
 
     var fake: FakeProvider = .{ .partial_fail = .hash_create };
     try std.testing.expectError(error.InternalError, fake.descriptor().hashCreate(allocator, .sha256));
@@ -759,8 +759,8 @@ test "partial handle construction is cleaned through matching destroy paths" {
 test "AEAD failure wiping and overlap contract are enforced" {
     var fake: FakeProvider = .{};
     const provider = fake.descriptor();
-    const key = [_]u8{0x01} ** 16;
-    const nonce = [_]u8{0x02} ** 12;
+    const key: [16]u8 = @splat(0x01);
+    const nonce: [12]u8 = @splat(0x02);
     const aad = &[_][]const u8{"aad"};
     const message = "secret";
     var ciphertext: [message.len]u8 = undefined;
@@ -773,7 +773,7 @@ test "AEAD failure wiping and overlap contract are enforced" {
     try std.testing.expectEqualStrings(message, &in_place_success);
 
     fake.authentication_failure = true;
-    var destination = [_]u8{0xcc} ** message.len;
+    var destination: [message.len]u8 = @splat(0xcc);
     try std.testing.expectError(
         error.AuthenticationFailed,
         provider.aeadOpen(.aes_128_gcm, &key, &nonce, aad, &ciphertext, &tag, &destination),
@@ -789,8 +789,8 @@ test "AEAD failure wiping and overlap contract are enforced" {
 
     fake.authentication_failure = false;
     fake.fail = .aead_seal;
-    ciphertext = [_]u8{0xdd} ** message.len;
-    tag = [_]u8{0xee} ** 16;
+    ciphertext = @splat(0xdd);
+    tag = @splat(0xee);
     try std.testing.expectError(
         error.InternalError,
         provider.aeadSeal(.aes_128_gcm, &key, &nonce, aad, message, &ciphertext, &tag),
@@ -799,8 +799,8 @@ test "AEAD failure wiping and overlap contract are enforced" {
     try std.testing.expect(std.mem.allEqual(u8, &tag, 0));
 
     fake.fail = null;
-    var untouched = [_]u8{0x7a} ** message.len;
-    var untouched_tag = [_]u8{0x7b} ** 16;
+    var untouched: [message.len]u8 = @splat(0x7a);
+    var untouched_tag: [16]u8 = @splat(0x7b);
     try std.testing.expectError(
         error.InvalidKeyLength,
         provider.aeadSeal(.aes_128_gcm, key[0..15], &nonce, aad, message, &untouched, &untouched_tag),
@@ -808,7 +808,7 @@ test "AEAD failure wiping and overlap contract are enforced" {
     try std.testing.expect(std.mem.allEqual(u8, &untouched, 0x7a));
     try std.testing.expect(std.mem.allEqual(u8, &untouched_tag, 0x7b));
 
-    var overlap_buf = [_]u8{0x41} ** 12;
+    var overlap_buf: [12]u8 = @splat(0x41);
     try std.testing.expectError(
         error.InvalidOverlap,
         provider.aeadSeal(
@@ -827,7 +827,7 @@ test "unsupported capabilities never dispatch an operation" {
     var fake: FakeProvider = .{ .caps = .{} };
     const provider = fake.descriptor();
 
-    var random = [_]u8{0x6a} ** 4;
+    var random: [4]u8 = @splat(0x6a);
     try std.testing.expectError(error.UnsupportedOperation, provider.random(&random));
     try std.testing.expect(std.mem.allEqual(u8, &random, 0x6a));
     try std.testing.expectEqual(@as(usize, 0), fake.count(.random));
@@ -838,10 +838,10 @@ test "unsupported capabilities never dispatch an operation" {
     );
     try std.testing.expectEqual(@as(usize, 0), fake.count(.hash_create));
 
-    const key = [_]u8{0} ** 16;
-    const nonce = [_]u8{0} ** 12;
+    const key: [16]u8 = @splat(0);
+    const nonce: [12]u8 = @splat(0);
     var ciphertext: [1]u8 = .{0x55};
-    var tag: [16]u8 = [_]u8{0x66} ** 16;
+    var tag: [16]u8 = @splat(0x66);
     try std.testing.expectError(
         error.UnsupportedAlgorithm,
         provider.aeadSeal(.aes_128_gcm, &key, &nonce, &.{}, "x", &ciphertext, &tag),
@@ -854,22 +854,22 @@ test "unsupported capabilities never dispatch an operation" {
 test "operation errors propagate and secret outputs are wiped" {
     var fake: FakeProvider = .{ .fail = .hmac };
     const provider = fake.descriptor();
-    var mac = [_]u8{0x99} ** 32;
+    var mac: [32]u8 = @splat(0x99);
     try std.testing.expectError(error.InternalError, provider.hmac(.sha256, "key", &.{"message"}, &mac));
     try std.testing.expect(std.mem.allEqual(u8, &mac, 0));
 
     fake.fail = .key_agreement_agree;
     var agreement = try provider.keyAgreementGenerate(std.testing.allocator, .x25519);
     defer agreement.deinit();
-    const peer = [_]u8{0x44} ** 32;
-    var shared = [_]u8{0x88} ** 32;
+    const peer: [32]u8 = @splat(0x44);
+    var shared: [32]u8 = @splat(0x88);
     try std.testing.expectError(error.InternalError, agreement.agree(&peer, &shared));
     try std.testing.expect(std.mem.allEqual(u8, &shared, 0));
 }
 
 test "signature capabilities, encodings, and errors are explicit" {
-    const private_bytes = [_]u8{0x12} ** 32;
-    const public_bytes = [_]u8{0x04} ++ [_]u8{0x34} ** 64;
+    const private_bytes: [32]u8 = @splat(0x12);
+    const public_bytes = [_]u8{0x04} ++ @as([64]u8, @splat(0x34));
     var fake: FakeProvider = .{};
     const provider = fake.descriptor();
     var key = try provider.signingKeyImport(std.testing.allocator, .{
@@ -927,7 +927,7 @@ test "ABI and error categories are stable and explicit" {
 }
 
 test "engine secure wipe clears owned secrets" {
-    var bytes = [_]u8{0xfe} ** 64;
+    var bytes: [64]u8 = @splat(0xfe);
     p.secureWipe(&bytes);
     try std.testing.expect(std.mem.allEqual(u8, &bytes, 0));
 

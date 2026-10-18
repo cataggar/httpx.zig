@@ -26,10 +26,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.7.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Format check
         run: zig fmt --check src/ examples/ bench/ build.zig
@@ -52,10 +55,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.7.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Cache Zig build
         uses: actions/cache@v6
@@ -79,13 +85,13 @@ jobs:
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Build (Debug)
-        run: zig build -Doptimize=Debug
+        run: zig build -Doptimize=debug
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
       - name: Build (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=fast
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
@@ -140,10 +146,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.7.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Cache Zig build
         uses: actions/cache@v6
@@ -183,7 +192,7 @@ jobs:
             test -n "$MACOS_SDK_ROOT"
             sdk_args=(--sysroot "$MACOS_SDK_ROOT")
           fi
-          zig build -Dtarget=${{ matrix.target }} -Doptimize=Debug "${sdk_args[@]}"
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=debug "${sdk_args[@]}"
         env:
           MACOS_SDK_ROOT: ${{ steps.macos-sdk.outputs.path }}
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
@@ -197,7 +206,7 @@ jobs:
             test -n "$MACOS_SDK_ROOT"
             sdk_args=(--sysroot "$MACOS_SDK_ROOT")
           fi
-          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast "${sdk_args[@]}"
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=fast "${sdk_args[@]}"
         env:
           MACOS_SDK_ROOT: ${{ steps.macos-sdk.outputs.path }}
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache

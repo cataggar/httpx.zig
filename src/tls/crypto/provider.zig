@@ -511,11 +511,11 @@ fn setCapabilityBit(comptime T: type, mask: *T, bit: T, supported: bool) void {
 }
 
 fn hashBit(algorithm: HashAlgorithm) u8 {
-    return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(algorithm)));
+    return @as(u8, 1) << @as(u3, @intCast(@backingInt(algorithm)));
 }
 
 fn aeadBit(algorithm: AeadAlgorithm) u8 {
-    return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(algorithm)));
+    return @as(u8, 1) << @as(u3, @intCast(@backingInt(algorithm)));
 }
 
 fn keyAgreementBit(algorithm: KeyAgreementAlgorithm) u8 {
@@ -528,7 +528,7 @@ fn keyAgreementBit(algorithm: KeyAgreementAlgorithm) u8 {
 }
 
 fn kemBit(algorithm: KemAlgorithm) u8 {
-    return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(algorithm)));
+    return @as(u8, 1) << @as(u3, @intCast(@backingInt(algorithm)));
 }
 
 fn signatureBit(scheme: SignatureScheme) u16 {

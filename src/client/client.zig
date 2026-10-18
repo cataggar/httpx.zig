@@ -1070,7 +1070,7 @@ pub const Client = struct {
     /// Logs a formatted message. If config.log_fn is provided, delegates to it.
     /// Otherwise, silently drops the message. Client does not print internally.
     pub fn log(self: *const Self, level: server_mod.LogLevel, comptime format: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.shared.config.log_level)) return;
+        if (@backingInt(level) < @backingInt(self.shared.config.log_level)) return;
         if (self.shared.config.log_fn) |log_fn| {
             var buf: [1024]u8 = undefined;
             if (std.fmt.bufPrint(&buf, format, args)) |msg| {
@@ -2413,7 +2413,7 @@ pub const Client = struct {
 
         var control_stream_payload = std.ArrayList(u8).empty;
         defer control_stream_payload.deinit(self.allocator);
-        try http.appendVarInt(&control_stream_payload, self.allocator, @intFromEnum(quic.HTTP3StreamType.control));
+        try http.appendVarInt(&control_stream_payload, self.allocator, @backingInt(quic.HTTP3StreamType.control));
         try http.appendHTTP3Frame(&control_stream_payload, self.allocator, .settings, settings_payload.items);
 
         // Send MAX_DATA and MAX_STREAM_DATA to advertise our flow control limits
@@ -2600,7 +2600,7 @@ pub const Client = struct {
             offset += frame_len;
 
             switch (header_decoded.header.frame_type) {
-                @intFromEnum(http.HTTP3FrameType.headers) => {
+                @backingInt(http.HTTP3FrameType.headers) => {
                     const decoded_headers = try qpack.decodeHeaders(qpack_decoder, frame_payload, self.allocator);
                     defer {
                         for (decoded_headers) |h| {
@@ -2622,28 +2622,28 @@ pub const Client = struct {
                         try response_headers.append(h.name, h.value);
                     }
                 },
-                @intFromEnum(http.HTTP3FrameType.data) => {
+                @backingInt(http.HTTP3FrameType.data) => {
                     if (@as(u64, response_body.items.len) + frame_payload.len > self.shared.config.max_response_size) {
                         return error.ResponseTooLarge;
                     }
                     try response_body.appendSlice(self.allocator, frame_payload);
                 },
-                @intFromEnum(http.HTTP3FrameType.settings) => {
+                @backingInt(http.HTTP3FrameType.settings) => {
                     _ = try http.parseHTTP3SettingsPayload(frame_payload);
                 },
-                @intFromEnum(http.HTTP3FrameType.goaway) => {
+                @backingInt(http.HTTP3FrameType.goaway) => {
                     // Gracefully handle GOAWAY: finish current stream processing
                     if (status_code.* != null) {
                         got_response_fin.* = true;
                     }
                 },
-                @intFromEnum(http.HTTP3FrameType.max_data) => {
+                @backingInt(http.HTTP3FrameType.max_data) => {
                     if (frame_payload.len > 0) {
                         const val = try http.decodeVarInt(frame_payload);
                         conn_max_data.* = val.value;
                     }
                 },
-                @intFromEnum(http.HTTP3FrameType.max_stream_data) => {
+                @backingInt(http.HTTP3FrameType.max_stream_data) => {
                     if (frame_payload.len > 0) {
                         // stream_id varint + data_limit varint; update the relevant stream
                         const sid = try http.decodeVarInt(frame_payload);
@@ -5309,28 +5309,28 @@ const OperationImpl = struct {
         while (true) {
             const unit = try self.nextZstdUnit() orelse {
                 if (self.zstd_framer.frames_completed == 0) return error.TruncatedCompressedBody;
-                if (decoder.in_buffer.items.len != 0) return error.TruncatedCompressedBody;
+                if (decoder.inBuffer.items.len != 0) return error.TruncatedCompressedBody;
                 self.decoded_body_complete = true;
                 return 0;
             };
             const result = decoder.decompressStream(&self.decoder_output, unit) catch
                 return error.DecompressionFailed;
-            if (result.in_consumed != unit.len) return error.DecompressionFailed;
+            if (result.inConsumed != unit.len) return error.DecompressionFailed;
             self.consumeZstdWire(unit.len);
-            if (decoder.frame_header) |frame_header| {
-                const window_size = std.math.cast(usize, frame_header.window_size) orelse
+            if (decoder.frameHeader) |frame_header| {
+                const window_size = std.math.cast(usize, frame_header.windowSize) orelse
                     return error.DecompressionWindowTooLarge;
                 if (window_size > 32 * 1024 * 1024) return error.DecompressionWindowTooLarge;
-                if (decoder.out_buffer.items.len > window_size) {
-                    const retained = decoder.out_buffer.items[decoder.out_buffer.items.len - window_size ..];
-                    @memmove(decoder.out_buffer.items[0..window_size], retained);
-                    decoder.out_buffer.shrinkRetainingCapacity(window_size);
+                if (decoder.outBuffer.items.len > window_size) {
+                    const retained = decoder.outBuffer.items[decoder.outBuffer.items.len - window_size ..];
+                    @memmove(decoder.outBuffer.items[0..window_size], retained);
+                    decoder.outBuffer.shrinkRetainingCapacity(window_size);
                 }
             }
-            if (result.out_produced > 0) {
+            if (result.outProduced > 0) {
                 self.decoder_output_pos = 0;
-                self.decoder_output_len = result.out_produced;
-                const amount = @min(output.len, result.out_produced);
+                self.decoder_output_len = result.outProduced;
+                const amount = @min(output.len, result.outProduced);
                 @memcpy(output[0..amount], self.decoder_output[0..amount]);
                 self.decoder_output_pos = amount;
                 return amount;
@@ -5699,7 +5699,7 @@ const OperationImpl = struct {
         try http.appendVarInt(
             &control_payload,
             self.allocator,
-            @intFromEnum(quic.HTTP3StreamType.control),
+            @backingInt(quic.HTTP3StreamType.control),
         );
         try http.appendHTTP3Frame(
             &control_payload,
@@ -5790,7 +5790,7 @@ const OperationImpl = struct {
     fn sendHttp3FrameHeader(self: *Self, frame_type: http.HTTP3FrameType, length: usize) !void {
         var header_buffer: [16]u8 = undefined;
         const header_len = try (http.HTTP3FrameHeader{
-            .frame_type = @intFromEnum(frame_type),
+            .frame_type = @backingInt(frame_type),
             .length = length,
         }).encode(&header_buffer);
         try self.sendHttp3StreamBytes(0, header_buffer[0..header_len], false);
@@ -5846,7 +5846,7 @@ const OperationImpl = struct {
             &transport,
             &self.h3_session,
             0,
-            @intFromEnum(http.HTTP3ErrorCode.request_cancelled),
+            @backingInt(http.HTTP3ErrorCode.request_cancelled),
             self.h3_request_offset,
             self.allocator,
         ) catch {};
@@ -5854,7 +5854,7 @@ const OperationImpl = struct {
             &transport,
             &self.h3_session,
             0,
-            @intFromEnum(http.HTTP3ErrorCode.request_cancelled),
+            @backingInt(http.HTTP3ErrorCode.request_cancelled),
             self.allocator,
         ) catch {};
     }
@@ -6007,7 +6007,7 @@ const OperationImpl = struct {
         self.response_head_ready = false;
         while (try self.startNextHttp3Frame()) {
             const frame_type = self.h3_frame_type.?;
-            if (frame_type == @intFromEnum(http.HTTP3FrameType.headers)) {
+            if (frame_type == @backingInt(http.HTTP3FrameType.headers)) {
                 _ = try self.collectHttp3Frame();
                 const status_code = try self.parseHttp3HeaderBlock(&self.response_headers, true);
                 self.h3_frame_type = null;
@@ -6023,7 +6023,7 @@ const OperationImpl = struct {
                 try self.configureHttp3Response();
                 return status_code;
             }
-            if (frame_type == @intFromEnum(http.HTTP3FrameType.data)) return error.ProtocolError;
+            if (frame_type == @backingInt(http.HTTP3FrameType.data)) return error.ProtocolError;
             while (self.h3_frame_remaining > 0) {
                 var discard: [1024]u8 = undefined;
                 if (try self.readHttp3FrameBytes(&discard) == 0) return error.InvalidResponse;
@@ -6041,7 +6041,7 @@ const OperationImpl = struct {
                 return 0;
             }
             const frame_type = self.h3_frame_type.?;
-            if (frame_type == @intFromEnum(http.HTTP3FrameType.data)) {
+            if (frame_type == @backingInt(http.HTTP3FrameType.data)) {
                 const amount = try self.readHttp3FrameBytes(output);
                 if (self.h3_expected_length) |remaining| {
                     if (amount > remaining) return error.ResponseBodyOverrun;
@@ -6057,7 +6057,7 @@ const OperationImpl = struct {
                 if (amount > 0) return amount;
                 continue;
             }
-            if (frame_type == @intFromEnum(http.HTTP3FrameType.headers)) {
+            if (frame_type == @backingInt(http.HTTP3FrameType.headers)) {
                 _ = try self.collectHttp3Frame();
                 _ = try self.parseHttp3HeaderBlock(&self.response_trailers, false);
                 self.h3_frame_type = null;
@@ -6931,7 +6931,7 @@ fn parseHTTP3ControlStream(stream_data: []const u8) !void {
     const stream_type = try http.decodeVarInt(stream_data[offset..]);
     offset += stream_type.len;
 
-    if (stream_type.value != @intFromEnum(quic.HTTP3StreamType.control)) {
+    if (stream_type.value != @backingInt(quic.HTTP3StreamType.control)) {
         return error.ProtocolError;
     }
 
@@ -6947,7 +6947,7 @@ fn parseHTTP3ControlStream(stream_data: []const u8) !void {
         const payload = stream_data[offset .. offset + payload_len];
         offset += payload_len;
 
-        if (frame.header.frame_type == @intFromEnum(http.HTTP3FrameType.settings)) {
+        if (frame.header.frame_type == @backingInt(http.HTTP3FrameType.settings)) {
             _ = try http.parseHTTP3SettingsPayload(payload);
             saw_settings = true;
         }
@@ -7201,7 +7201,7 @@ const PolicyTestServer = struct {
     listener: *TcpListener,
     responses: []const []const u8,
     requests: [8][8192]u8 = undefined,
-    request_lengths: [8]usize = [_]usize{0} ** 8,
+    request_lengths: [8]usize = @splat(0),
     request_count: usize = 0,
     failure: ?anyerror = null,
 
@@ -8731,7 +8731,7 @@ test "Client supports concurrent requests cookie updates and interceptor callbac
 
     var listener = try TcpListener.init(try address_mod.Address.parseIp("127.0.0.1", 0));
     defer listener.deinit();
-    const responses = [_][]const u8{response_bytes} ** request_count;
+    const responses: [request_count][]const u8 = @splat(response_bytes);
     var server = PolicyTestServer{ .listener = &listener, .responses = &responses };
     const server_thread = try std.Thread.spawn(.{}, PolicyTestServer.run, .{&server});
     var server_joined = false;
@@ -8806,7 +8806,7 @@ test "Client supports concurrent requests cookie updates and interceptor callbac
         }
     };
 
-    var failures = [_]?anyerror{null} ** request_count;
+    var failures: [request_count]?anyerror = @splat(null);
     var threads: [request_count]std.Thread = undefined;
     for (&threads, 0..) |*thread, index| {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{
@@ -9331,7 +9331,7 @@ test "cancellation during HTTP2 flow-control wait closes the session" {
                 payload_read += n;
             }
             var settings: [6]u8 = undefined;
-            mem.writeInt(u16, settings[0..2], @intFromEnum(http.HTTP2Settings.initial_window_size), .big);
+            mem.writeInt(u16, settings[0..2], @backingInt(http.HTTP2Settings.initial_window_size), .big);
             mem.writeInt(u32, settings[2..6], 0, .big);
             writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &settings) catch return;
 
@@ -9444,7 +9444,7 @@ test "HTTP2 WINDOW_UPDATE persists connection credit and rejects invalid increme
     try std.testing.expectEqual(@as(i32, 15), manager.connection_send_window);
     try std.testing.expectEqual(@as(i32, 25), stream.send_window);
 
-    const zero = [_]u8{0} ** 4;
+    const zero: [4]u8 = @splat(0);
     try std.testing.expectError(
         error.ProtocolError,
         Client.applyHTTP2WindowUpdate(&manager, stream, connection_header, &zero),
@@ -9486,7 +9486,7 @@ test "HTTP2 partial SETTINGS update retained peer settings" {
     defer capture.bytes.deinit(std.testing.allocator);
 
     var payload: [6]u8 = undefined;
-    mem.writeInt(u16, payload[0..2], @intFromEnum(http.HTTP2Settings.max_frame_size), .big);
+    mem.writeInt(u16, payload[0..2], @backingInt(http.HTTP2Settings.max_frame_size), .big);
     mem.writeInt(u32, payload[2..6], 32_768, .big);
     const header = http.HTTP2FrameHeader{
         .length = payload.len,
@@ -9575,10 +9575,10 @@ test "streaming early HTTP2 headers enforce encoded limits before append" {
     defer client.deinit();
     var block = std.ArrayList(u8).empty;
     defer block.deinit(std.testing.allocator);
-    try std.testing.expectError(error.HeaderTooLarge, client.appendEarlyHeaderFragment(&block, "x" ** 33, 0, 1, 0));
+    try std.testing.expectError(error.HeaderTooLarge, client.appendEarlyHeaderFragment(&block, &@as([33]u8, @splat('x')), 0, 1, 0));
     try std.testing.expectEqual(@as(usize, 0), block.items.len);
     try client.appendEarlyHeaderFragment(&block, &.{0x88}, 0, 1, 0);
-    try client.appendEarlyHeaderBytes(&block, "x" ** 31, 0);
+    try client.appendEarlyHeaderBytes(&block, &@as([31]u8, @splat('x')), 0);
     try std.testing.expectError(error.HeaderTooLarge, client.appendEarlyHeaderBytes(&block, "x", 0));
     try std.testing.expectEqual(@as(usize, 32), block.items.len);
 
@@ -9597,7 +9597,7 @@ test "streaming early HTTP2 replay fragments valid headers and rolls back alloca
     const encoded = try hpack.encodeHeaders(&encoder, &.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "x-retained", .value = "stable" },
-        .{ .name = "x-large", .value = "q" ** (24 * 1024), .representation = .without_indexing },
+        .{ .name = "x-large", .value = &@as([24 * 1024]u8, @splat('q')), .representation = .without_indexing },
     }, std.testing.allocator);
     defer std.testing.allocator.free(encoded);
     const Case = struct {
@@ -9638,11 +9638,13 @@ test "streaming early HTTP2 replay fragments valid headers and rolls back alloca
                 allocator.free(decoded);
             }
             try std.testing.expectEqual(@as(usize, 3), decoded.len);
-            try std.testing.expectEqualStrings("q" ** (24 * 1024), decoded[2].value);
+            try std.testing.expectEqualStrings(&@as([24 * 1024]u8, @splat('q')), decoded[2].value);
             try std.testing.expectEqual(table_count, manager.hpack_decoder.dynamic_table.entries.items.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{encoded});
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    try std.testing.checkAllAllocationFailures(debug_allocator.allocator(), Case.run, .{encoded});
 }
 
 test "HTTP2 upload pump resumes informational and stops on final headers" {
@@ -9805,7 +9807,7 @@ fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
 
         fn sendSetting(connection: *TLSConnection, setting: http.HTTP2Settings, value: u32) !void {
             var payload: [6]u8 = undefined;
-            mem.writeInt(u16, payload[0..2], @intFromEnum(setting), .big);
+            mem.writeInt(u16, payload[0..2], @backingInt(setting), .big);
             mem.writeInt(u32, payload[2..6], value, .big);
             try writeHTTP2Frame(connection, .settings, 0, 0, &payload);
         }
@@ -9840,7 +9842,7 @@ fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
             try connection.writeAll(header_frames);
 
             if (response_goaway_code) |raw_error_code| {
-                const error_code: http.HTTP2ErrorCode = @enumFromInt(raw_error_code);
+                const error_code: http.HTTP2ErrorCode = @fromBackingInt(@intCast(raw_error_code));
                 const goaway_payload = try h2stream.buildGoawayPayload(stream_id, error_code, null, std.heap.page_allocator);
                 defer std.heap.page_allocator.free(goaway_payload);
                 try writeHTTP2Frame(connection, .goaway, 0, 0, goaway_payload);
@@ -10012,11 +10014,11 @@ fn runPublicClientH2GoAwayTest(goaway_error_code: u32) !void {
 }
 
 test "public Client completes allowed H2 stream after GOAWAY no_error" {
-    try runPublicClientH2GoAwayTest(@intFromEnum(http.HTTP2ErrorCode.no_error));
+    try runPublicClientH2GoAwayTest(@backingInt(http.HTTP2ErrorCode.no_error));
 }
 
 test "public Client completes allowed H2 stream after known nonzero GOAWAY" {
-    try runPublicClientH2GoAwayTest(@intFromEnum(http.HTTP2ErrorCode.protocol_error));
+    try runPublicClientH2GoAwayTest(@backingInt(http.HTTP2ErrorCode.protocol_error));
 }
 
 test "public Client completes allowed H2 stream after unknown GOAWAY" {
@@ -10488,7 +10490,7 @@ test "streaming HTTP1 response enforces aggregate header byte limit" {
         const header = try std.fmt.bufPrint(
             &line,
             "X-Aggregate-{d}: {s}\r\n",
-            .{ index, "a" ** 80 },
+            .{ index, &@as([80]u8, @splat('a')) },
         );
         try response.appendSlice(allocator, header);
     }
@@ -11526,7 +11528,7 @@ test "HTTP2 operation decodes padded HEADERS followed by CONTINUATION" {
             try first.appendNTimes(std.heap.page_allocator, 0, 3);
             try writeHTTP2Frame(
                 &accepted.socket,
-                @enumFromInt(0x0a),
+                @fromBackingInt(@intCast(0x0a)),
                 0,
                 0,
                 "ext",
@@ -11602,7 +11604,7 @@ test "HTTP2 operation classifies connection failures as non-reusable" {
     );
     const extension = http.HTTP2FrameHeader{
         .length = 16,
-        .frame_type = @enumFromInt(0x0a),
+        .frame_type = @fromBackingInt(@intCast(0x0a)),
         .flags = 0,
         .stream_id = 0,
     };
@@ -11814,7 +11816,7 @@ test "HTTP2 flow-control wait honors write deadline and sends bounded reset" {
             _ = try readFrame(&accepted.socket, &payload);
 
             var settings_payload: [6]u8 = undefined;
-            mem.writeInt(u16, settings_payload[0..2], @intFromEnum(http.HTTP2Settings.initial_window_size), .big);
+            mem.writeInt(u16, settings_payload[0..2], @backingInt(http.HTTP2Settings.initial_window_size), .big);
             mem.writeInt(u32, settings_payload[2..6], 0, .big);
             try writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &settings_payload);
 
@@ -11911,10 +11913,16 @@ test "HTTP2 failed stream reset poisons and closes the session" {
 
             var stream_id: u31 = 0;
             var request_done = false;
-            while (!request_done) {
+            var settings_acked = false;
+            while (!request_done or !settings_acked) {
                 const header = try readFrame(&accepted.socket, &payload);
+                if (header.frame_type == .settings and (header.flags & 0x01) != 0) {
+                    settings_acked = true;
+                }
                 if (header.stream_id != 0) stream_id = header.stream_id;
-                request_done = header.stream_id == stream_id and (header.flags & 0x01) != 0;
+                if (header.stream_id == stream_id and stream_id != 0 and (header.flags & 0x01) != 0) {
+                    request_done = true;
+                }
             }
 
             var manager = h2stream.StreamManager.init(std.heap.page_allocator, false);
@@ -12171,7 +12179,7 @@ test "HTTP2 peer max concurrent streams zero prevents new stream emission" {
             var payload: [64 * 1024]u8 = undefined;
             _ = readFrame(&accepted.socket, &payload) catch return;
             var setting: [6]u8 = undefined;
-            mem.writeInt(u16, setting[0..2], @intFromEnum(http.HTTP2Settings.max_concurrent_streams), .big);
+            mem.writeInt(u16, setting[0..2], @backingInt(http.HTTP2Settings.max_concurrent_streams), .big);
             mem.writeInt(u32, setting[2..6], 0, .big);
             writeHTTP2Frame(&accepted.socket, .settings, 0, 0, &setting) catch return;
 

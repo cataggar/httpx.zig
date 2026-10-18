@@ -47,7 +47,7 @@ test "noncritical CT catalog has an integer header and SPKIs without adding anch
     var chain = try certificates.Chain.init(allocator, .ecdsa_p256);
     defer chain.deinit();
     const spki = (try x509.parse(chain.root)).spki;
-    const keys = [_][]const u8{spki} ** 49;
+    const keys: [49][]const u8 = @splat(spki);
     const value = try catalog(allocator, header, &keys);
     defer allocator.free(value);
     // Same public schema dimensions as the observed native catalog, not
@@ -176,7 +176,7 @@ test "catalog rejects malformed SPKIs unsupported key profiles and excessive inp
     const wrong_tail = try catalogTail(allocator, wrong_key);
     defer allocator.free(wrong_tail);
     try std.testing.expectError(error.TlsTrustStoreLoadFailed, extensions.validate(wrong_tail, 64 * 1024));
-    const keys = [_][]const u8{spki} ** (extensions.max_log_keys + 1);
+    const keys: [extensions.max_log_keys + 1][]const u8 = @splat(spki);
     const too_many = try catalog(allocator, header, &keys);
     defer allocator.free(too_many);
     const too_many_tail = try catalogTail(allocator, too_many);
@@ -242,7 +242,7 @@ test "catalog validates bounded RSA and P384 SPKI framing without using the keys
     defer arena.deinit();
     const a = arena.allocator();
     const rsa_key = try fixture.element(a, 0x30, try fixture.join(a, &.{
-        try fixture.element(a, 0x02, "\x00\x80" ++ ("\x01" ** 255)),
+        try fixture.element(a, 0x02, &("\x00\x80".* ++ @as([255]u8, @splat(0x01)))),
         "\x02\x03\x01\x00\x01",
     }));
     const rsa_spki = try fixture.element(a, 0x30, try fixture.join(a, &.{

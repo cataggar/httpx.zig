@@ -270,7 +270,7 @@ fn keyAgreementGenerate(context: *anyopaque, allocator: Allocator, algorithm: p.
             var seed: [X25519.seed_length]u8 = undefined;
             defer p.secureWipe(&seed);
             try random(context, &seed);
-            break :blk .{ .x25519 = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyGenerationFailed };
+            break :blk .{ .x25519 = X25519.KeyPair.generateDeterministic(seed) };
         },
         inline .secp256r1, .secp384r1 => |a| blk: {
             const Ecdsa = if (a == .secp256r1) Ecdsa256 else Ecdsa384;
@@ -463,7 +463,7 @@ fn verify(_: *anyopaque, scheme: p.SignatureScheme, public_key: p.PublicKey, par
             switch (components.modulus.len) {
                 inline 256, 384, 512 => |length| {
                     const sig = Signature.fromBytes(length, signature);
-                    Signature.concatVerify(length, sig, parts, key, Hash(s.hashAlgorithm().?)) catch return error.SignatureInvalid;
+                    Signature.concatVerify(length, &sig, parts, key, Hash(s.hashAlgorithm().?)) catch return error.SignatureInvalid;
                 },
                 else => return error.UnsupportedAlgorithm,
             }

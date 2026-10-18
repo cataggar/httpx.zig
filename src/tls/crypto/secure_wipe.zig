@@ -13,9 +13,9 @@ pub fn value(value_ptr: anytype) void {
 }
 
 test "secure wipe clears bytes and values" {
-    var buf = [_]u8{0xa5} ** 32;
+    var buf: [32]u8 = @splat(0xa5);
     bytes(&buf);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &buf);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &buf);
 
     var secret: u64 = std.math.maxInt(u64);
     value(&secret);

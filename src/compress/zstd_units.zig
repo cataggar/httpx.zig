@@ -31,10 +31,10 @@ pub const Framer = struct {
                 size += if (content_code == 0 and single_segment) 1 else content_sizes[content_code];
                 if (input.len < size) return .{ .need = size };
                 const header = zstd.getFrameHeader(input[0..size]) catch return error.DecompressionFailed;
-                if (header.window_size > max_window_size or header.window_size > std.math.maxInt(usize)) {
+                if (header.windowSize > max_window_size or header.windowSize > std.math.maxInt(usize)) {
                     return error.DecompressionWindowTooLarge;
                 }
-                self.frame_checksum = header.checksum_flag;
+                self.frame_checksum = header.checksumFlag;
                 self.stage = .block;
                 return .{ .bytes = size };
             },
@@ -43,7 +43,7 @@ pub const Framer = struct {
                 const raw = @as(u32, input[0]) | (@as(u32, input[1]) << 8) | (@as(u32, input[2]) << 16);
                 const encoded_size: usize = @intCast(raw >> 3);
                 if (encoded_size > zstd.BLOCKSIZE_MAX) return error.DecompressionFailed;
-                const block_type: zstd.BlockType = @enumFromInt((raw >> 1) & 0x03);
+                const block_type: zstd.BlockType = @fromBackingInt(@intCast((raw >> 1) & 0x03));
                 const payload_size = switch (block_type) {
                     .raw, .compressed => encoded_size,
                     .rle => 1,

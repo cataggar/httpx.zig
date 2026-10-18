@@ -258,8 +258,8 @@ fn encodeQuestion(q: DnsQuestion, buf: []u8) !usize {
     var pos = name_result.len;
 
     if (pos + 4 > buf.len) return error.BufferTooSmall;
-    putU16(buf[pos..], @intFromEnum(q.qtype));
-    putU16(buf[pos + 2 ..], @intFromEnum(q.qclass));
+    putU16(buf[pos..], @backingInt(q.qtype));
+    putU16(buf[pos + 2 ..], @backingInt(q.qclass));
     pos += 4;
 
     return pos;
@@ -298,8 +298,8 @@ fn parseDnsMessage(data: []const u8, allocator: Allocator) !DnsMessage {
         const name_len = try decodeDnsName(data, &offset, &name_buf);
         if (offset > data.len or data.len - offset < 4) return error.DnsMessageTruncated;
         q.name = try allocator.dupe(u8, name_buf[0..name_len]);
-        q.qtype = @enumFromInt(getU16(data[offset..]));
-        q.qclass = @enumFromInt(getU16(data[offset + 2 ..]));
+        q.qtype = @fromBackingInt(@intCast(getU16(data[offset..])));
+        q.qclass = @fromBackingInt(@intCast(getU16(data[offset + 2 ..])));
         offset += 4;
         questions_initialized += 1;
     }
@@ -317,8 +317,8 @@ fn parseDnsMessage(data: []const u8, allocator: Allocator) !DnsMessage {
     for (answers) |*a| {
         const name_len = try decodeDnsName(data, &offset, &name_buf);
         if (offset > data.len or data.len - offset < 10) return error.DnsMessageTruncated;
-        const record_type: DnsRecordType = @enumFromInt(getU16(data[offset..]));
-        const record_class: DnsRecordClass = @enumFromInt(getU16(data[offset + 2 ..]));
+        const record_type: DnsRecordType = @fromBackingInt(@intCast(getU16(data[offset..])));
+        const record_class: DnsRecordClass = @fromBackingInt(@intCast(getU16(data[offset + 2 ..])));
         const ttl: i32 = @bitCast(getU32(data[offset + 4 ..]));
         const rdlength = getU16(data[offset + 8 ..]);
         offset += 10;
@@ -438,9 +438,9 @@ fn buildDnsQuery(name: []const u8, qtype: DnsRecordType, use_edns: bool, buf: []
     pos += name_result.len;
 
     if (pos + 4 > buf.len) return error.BufferTooSmall;
-    putU16(buf[pos..], @intFromEnum(qtype));
+    putU16(buf[pos..], @backingInt(qtype));
     pos += 2;
-    putU16(buf[pos..], @intFromEnum(DnsRecordClass.IN));
+    putU16(buf[pos..], @backingInt(DnsRecordClass.IN));
     pos += 2;
 
     if (use_edns) {
@@ -715,7 +715,7 @@ pub const DNSCache = struct {
     allocator: Allocator,
     entries: std.StringHashMapUnmanaged(CacheEntry) = .{},
     negative: std.StringHashMapUnmanaged(NegativeEntry) = .{},
-    lru_order: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
+    lru_order: std.ArrayListUnmanaged([]const u8) = .empty,
     in_flight: std.StringHashMapUnmanaged(*InFlight) = .{},
     lock: std.Io.Mutex = .init,
     config: DNSConfig,
@@ -969,7 +969,7 @@ pub const DNSCache = struct {
         self.removeEntry(hostname);
         self.removeNegative(hostname);
         var family_value: u8 = 0;
-        while (family_value <= @intFromEnum(AddressFamily.ipv6_only)) : (family_value += 1) {
+        while (family_value <= @backingInt(AddressFamily.ipv6_only)) : (family_value += 1) {
             var key_buf = std.ArrayList(u8).empty;
             defer key_buf.deinit(self.allocator);
             key_buf.appendSlice(self.allocator, hostname) catch continue;
@@ -1038,7 +1038,7 @@ pub const DNSResolver = struct {
         const key = try self.allocator.alloc(u8, hostname.len + 2);
         @memcpy(key[0..hostname.len], hostname);
         key[hostname.len] = 0;
-        key[hostname.len + 1] = @intFromEnum(family);
+        key[hostname.len + 1] = @backingInt(family);
         return key;
     }
 
@@ -1993,8 +1993,8 @@ test "DNS wire query initializes QCLASS and EDNS RDLEN" {
     var offset: usize = 12;
     var name: [256]u8 = undefined;
     _ = try decodeDnsName(buffer[0..len], &offset, &name);
-    try std.testing.expectEqual(@intFromEnum(DnsRecordType.A), getU16(buffer[offset..][0..2]));
-    try std.testing.expectEqual(@intFromEnum(DnsRecordClass.IN), getU16(buffer[offset + 2 ..][0..2]));
+    try std.testing.expectEqual(@backingInt(DnsRecordType.A), getU16(buffer[offset..][0..2]));
+    try std.testing.expectEqual(@backingInt(DnsRecordClass.IN), getU16(buffer[offset + 2 ..][0..2]));
     offset += 4;
     try std.testing.expectEqual(@as(u8, 0), buffer[offset]);
     try std.testing.expectEqual(@as(u16, 41), getU16(buffer[offset + 1 ..][0..2]));
@@ -2010,14 +2010,14 @@ test "DNS response validation checks transaction question and compressed answer 
     putU16(wire[6..8], 1);
     var offset: usize = 12;
     offset += (try encodeDnsName("example.com", wire[offset..])).len;
-    putU16(wire[offset..], @intFromEnum(DnsRecordType.A));
-    putU16(wire[offset + 2 ..], @intFromEnum(DnsRecordClass.IN));
+    putU16(wire[offset..], @backingInt(DnsRecordType.A));
+    putU16(wire[offset + 2 ..], @backingInt(DnsRecordClass.IN));
     offset += 4;
     wire[offset] = 0xc0;
     wire[offset + 1] = 0x0c;
     offset += 2;
-    putU16(wire[offset..], @intFromEnum(DnsRecordType.A));
-    putU16(wire[offset + 2 ..], @intFromEnum(DnsRecordClass.IN));
+    putU16(wire[offset..], @backingInt(DnsRecordType.A));
+    putU16(wire[offset + 2 ..], @backingInt(DnsRecordClass.IN));
     putU32(wire[offset + 4 ..], 60);
     putU16(wire[offset + 8 ..], 4);
     offset += 10;
@@ -2118,14 +2118,14 @@ test "DNS parsing is allocation safe for partial arrays" {
             putU16(wire[6..8], 1);
             var offset: usize = 12;
             offset += (try encodeDnsName("example.com", wire[offset..])).len;
-            putU16(wire[offset..], @intFromEnum(DnsRecordType.A));
-            putU16(wire[offset + 2 ..], @intFromEnum(DnsRecordClass.IN));
+            putU16(wire[offset..], @backingInt(DnsRecordType.A));
+            putU16(wire[offset + 2 ..], @backingInt(DnsRecordClass.IN));
             offset += 4;
             wire[offset] = 0xc0;
             wire[offset + 1] = 0x0c;
             offset += 2;
-            putU16(wire[offset..], @intFromEnum(DnsRecordType.A));
-            putU16(wire[offset + 2 ..], @intFromEnum(DnsRecordClass.IN));
+            putU16(wire[offset..], @backingInt(DnsRecordType.A));
+            putU16(wire[offset + 2 ..], @backingInt(DnsRecordClass.IN));
             putU16(wire[offset + 8 ..], 4);
             offset += 10;
             wire[offset..][0..4].* = .{ 1, 2, 3, 4 };
@@ -2136,7 +2136,7 @@ test "DNS parsing is allocation safe for partial arrays" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 
-    var truncated: [32]u8 = [_]u8{0} ** 32;
+    var truncated: [32]u8 = @splat(0);
     putU16(truncated[4..6], 2);
     try std.testing.expectError(
         error.InvalidDnsName,

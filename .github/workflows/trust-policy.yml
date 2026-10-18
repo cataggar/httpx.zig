@@ -21,12 +21,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        optimize: [Debug, ReleaseSafe]
+        optimize: [debug, safe]
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.7.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Synthetic metadata, ownership, and selected-signature tests
         shell: bash
         run: zig build test-tls-standard-trust -Doptimize=${{ matrix.optimize }} --summary all --cache-dir .zig-cache/trust-policy

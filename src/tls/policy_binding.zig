@@ -118,9 +118,9 @@ test "policy binding pairs dispatch and rejects mismatched signature or digest h
 }
 
 test "policy binding leaves existing ABI-v1 request and vtables unchanged" {
-    try std.testing.expectEqual(@as(usize, 1), @typeInfo(trust.TrustProvider.VTable).@"struct".fields.len);
-    try std.testing.expectEqual(@as(usize, 1), @typeInfo(trust.CertificateSignatureVerifier.VTable).@"struct".fields.len);
-    const fields = @typeInfo(trust.VerifyPeerRequest).@"struct".fields;
-    try std.testing.expectEqual(@as(usize, 7), fields.len);
-    try std.testing.expectEqualStrings("signature_verifier", fields[4].name);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(trust.TrustProvider.VTable).@"struct".field_names.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(trust.CertificateSignatureVerifier.VTable).@"struct".field_names.len);
+    const field_names = @typeInfo(trust.VerifyPeerRequest).@"struct".field_names;
+    try std.testing.expectEqual(@as(usize, 7), field_names.len);
+    try std.testing.expectEqualStrings("signature_verifier", field_names[4]);
 }

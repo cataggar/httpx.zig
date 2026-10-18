@@ -82,6 +82,6 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     const codes = [_]httpx.WsCloseCode{ .normal, .going_away, .protocol_error, .message_too_big, .internal_error };
     for (codes) |c| {
-        std.debug.print("  {s} = {d}\n", .{ @tagName(c), @intFromEnum(c) });
+        std.debug.print("  {s} = {d}\n", .{ @tagName(c), @backingInt(c) });
     }
 }

@@ -153,7 +153,7 @@ fn quicFrameExample(_: std.mem.Allocator) !void {
     std.debug.print("ACK frame: {d} bytes (largest_ack={d})\n", .{ ack_len, ack_frame.largest_acknowledged });
 
     const close_frame = httpx.quic.ConnectionCloseFrame{
-        .error_code = @intFromEnum(httpx.quic.TransportError.no_error),
+        .error_code = @backingInt(httpx.quic.TransportError.no_error),
         .frame_type = null,
         .reason_phrase = "graceful shutdown",
     };

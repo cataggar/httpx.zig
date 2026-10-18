@@ -458,7 +458,7 @@ fn selectSuite(hello: *const Hello, caps: p.Capabilities, identity: *const Ident
     const candidates = if (version == .tls_1_3) &suites13 else if (rsa) &rsa12 else &ec12;
     for (candidates) |suite| {
         const algorithms = profile(suite);
-        if (!contains(hello.suites.slice(), @intFromEnum(suite)) or !caps.supportsAead(algorithms.aead) or
+        if (!contains(hello.suites.slice(), @backingInt(suite)) or !caps.supportsAead(algorithms.aead) or
             !caps.supportsHash(algorithms.hash)) continue;
         if (version == .tls_1_3) {
             if (!caps.supportsHkdf(algorithms.hash) or !caps.supportsHmac(algorithms.hash)) continue;
@@ -488,7 +488,7 @@ fn selectSignature(hello: *const Hello, identity: *const Identity, version: tls.
             };
             if (curve) |group| if (!contains(hello.groups.slice(), group)) continue;
         }
-        if (identity.supports(scheme) and contains(hello.signatures.slice(), @intFromEnum(scheme))) return scheme;
+        if (identity.supports(scheme) and contains(hello.signatures.slice(), @backingInt(scheme))) return scheme;
     }
     return error.UnsupportedAlgorithm;
 }
@@ -541,7 +541,7 @@ fn serverHello(out: []u8, hello: *const Hello, version: tls.ProtocolVersion, sui
     try encoder.short(0x0303);
     try encoder.put(random);
     try encoder.vector8(if (version == .tls_1_3) hello.session_id else "");
-    try encoder.short(@intFromEnum(suite));
+    try encoder.short(@backingInt(suite));
     try encoder.byte(0);
     try encoder.vector16(extension_buffer[0..extensions.offset]);
     return encoder.finish();
@@ -654,7 +654,7 @@ fn handshake13(comptime hash: p.HashAlgorithm, conn: *engine.Connection, wire: *
     }, &signature_buffer);
     var cv: Encoder = .{ .bytes = &message_buffer };
     try cv.handshake(15);
-    try cv.short(@intFromEnum(signature_scheme));
+    try cv.short(@backingInt(signature_scheme));
     try cv.vector16(signature);
     try wire.send(&transcript, try cv.finish());
     var server_finished_key = try state.hkdfExpandLabel(provider, K, server_secret, "finished", "", size);
@@ -736,7 +736,7 @@ fn handshake12(comptime hash: p.HashAlgorithm, conn: *engine.Connection, wire: *
     var ske: Encoder = .{ .bytes = &message_buffer };
     try ske.handshake(12);
     try ske.put(params_buffer[0..params.offset]);
-    try ske.short(@intFromEnum(signature_scheme));
+    try ske.short(@backingInt(signature_scheme));
     try ske.vector16(signature);
     try wire.send(&transcript, try ske.finish());
     try wire.send(&transcript, "\x0e\x00\x00\x00");
